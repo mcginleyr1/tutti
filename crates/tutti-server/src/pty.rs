@@ -228,6 +228,14 @@ impl PtyPane {
             .clone()
     }
 
+    /// A clone of the screen scrolled `offset` rows back into the scrollback
+    /// ring, for serving a scrollback view to an attached client.
+    pub fn screen_scrolled(&self, offset: usize) -> vt100::Screen {
+        let mut screen = self.screen();
+        screen.set_scrollback(offset);
+        screen
+    }
+
     /// The pane's text content, oldest line first, including scrollback.
     ///
     /// `unwrapped` joins soft-wrapped rows back into logical lines; `lines`

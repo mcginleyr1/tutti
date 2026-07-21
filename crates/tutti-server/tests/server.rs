@@ -295,7 +295,19 @@ async fn attach_receives_snapshot_then_delta() {
 
     let mut viewer = server.connect().await;
     viewer.send(&Request::Attach).await;
-    assert_eq!(viewer.response().await, Response::Ok, "expected attach_ok");
+    match viewer.response().await {
+        Response::Attached { workspaces, .. } => {
+            assert!(
+                workspaces
+                    .iter()
+                    .flat_map(|w| &w.tabs)
+                    .flat_map(|t| &t.panes)
+                    .any(|p| p.id == pane),
+                "attached view should list the running pane"
+            );
+        }
+        other => panic!("expected Attached, got {other:?}"),
+    }
 
     let snapshot = expect_pane_frame(&mut viewer, pane, true).await;
     assert_eq!(snapshot.pane, pane);
@@ -310,6 +322,56 @@ async fn attach_receives_snapshot_then_delta() {
     let delta = expect_pane_frame(&mut viewer, pane, false).await;
     assert_eq!(delta.pane, pane);
     assert!(!delta.bytes.is_empty(), "delta carried no escape bytes");
+
+    server.stop().await;
+}
+
+/// A `PaneResize` resizes the server-side pty and grid and pushes a fresh
+/// snapshot at the new dimensions to the attached client.
+#[tokio::test]
+async fn attach_resize_reseeds_at_new_size() {
+    let server = TestServer::start().await;
+
+    let mut control = server.connect().await;
+    workspace_id(
+        control
+            .request(Request::WorkspaceNew {
+                dir: std::env::temp_dir(),
+            })
+            .await,
+    );
+    let pane = pane_id(
+        control
+            .request(Request::PaneRun {
+                tab: None,
+                cmd: vec!["/bin/cat".into()],
+            })
+            .await,
+    );
+
+    let mut viewer = server.connect().await;
+    viewer.send(&Request::Attach).await;
+    let _ = viewer.response().await;
+    let first = expect_pane_frame(&mut viewer, pane, true).await;
+    assert_eq!((first.rows, first.cols), (24, 80));
+
+    assert_eq!(
+        control
+            .request(Request::PaneResize {
+                pane,
+                rows: 30,
+                cols: 100,
+            })
+            .await,
+        Response::Ok
+    );
+
+    let resized = expect_pane_frame(&mut viewer, pane, true).await;
+    assert_eq!(
+        (resized.rows, resized.cols),
+        (30, 100),
+        "client should get a fresh snapshot at the new size"
+    );
 
     server.stop().await;
 }

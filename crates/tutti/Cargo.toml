@@ -8,7 +8,11 @@ clap.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 tutti-core.workspace = true
+ratatui.workspace = true
+vt100.workspace = true
 
 [dev-dependencies]
 tutti-core.workspace = true
+tutti-server.workspace = true
 serde_json.workspace = true
+tokio.workspace = true

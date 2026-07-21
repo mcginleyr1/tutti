@@ -1,0 +1,115 @@
+//! The attachable TUI. `run` owns terminal setup/teardown and the event loop;
+//! the pieces it drives — connection, app state, input mapping, layout, and
+//! rendering — live in the submodules and are unit-tested there.
+
+mod app;
+mod connection;
+mod input;
+mod layout;
+mod render;
+
+pub use app::App;
+
+use std::io;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use ratatui::DefaultTerminal;
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
+};
+use ratatui::crossterm::execute;
+use ratatui::layout::Rect;
+use tutti_core::{Frame as WireFrame, Request};
+
+use connection::Connection;
+
+const POLL: Duration = Duration::from_millis(16);
+
+/// Attach the interactive TUI to `session`, auto-starting the daemon. Restores
+/// the terminal on exit and on panic, returning once the user detaches or the
+/// server goes away.
+pub fn run(session: &str) -> Result<()> {
+    let mut conn = Connection::open(session)?;
+    conn.send(&control(&Request::Attach))
+        .context("send attach request")?;
+
+    let mut terminal = ratatui::init();
+    let _ = execute!(io::stdout(), EnableMouseCapture);
+    install_panic_hook();
+
+    let result = event_loop(&mut terminal, &mut conn);
+
+    let _ = execute!(io::stdout(), DisableMouseCapture);
+    ratatui::restore();
+    result
+}
+
+fn event_loop(terminal: &mut DefaultTerminal, conn: &mut Connection) -> Result<()> {
+    let mut app = App::new();
+    let mut dirty = true;
+
+    loop {
+        match conn.drain() {
+            Ok(frames) => {
+                if !frames.is_empty() {
+                    for frame in frames {
+                        app.handle_frame(frame);
+                    }
+                    dirty = true;
+                }
+            }
+            Err(_) => break, // server closed the connection
+        }
+
+        if dirty {
+            let area = terminal.draw(|frame| render::draw(frame, &app))?.area;
+            let content = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+            for frame in app.sync_sizes(content) {
+                let _ = conn.send(&frame);
+            }
+            dirty = false;
+        }
+
+        if event::poll(POLL).context("poll terminal input")? {
+            loop {
+                match event::read().context("read terminal input")? {
+                    Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        for frame in app.on_key(key) {
+                            conn.send(&frame)?;
+                        }
+                        dirty = true;
+                    }
+                    Event::Mouse(mouse) => {
+                        for frame in app.on_mouse(mouse.kind, mouse.column, mouse.row) {
+                            conn.send(&frame)?;
+                        }
+                        dirty = true;
+                    }
+                    Event::Resize(_, _) => dirty = true,
+                    _ => {}
+                }
+                if !event::poll(Duration::ZERO).context("poll terminal input")? {
+                    break;
+                }
+            }
+        }
+
+        if app.should_quit {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+        previous(info);
+    }));
+}
+
+fn control(request: &Request) -> WireFrame {
+    WireFrame::Control(serde_json::to_vec(request).expect("serialize request"))
+}

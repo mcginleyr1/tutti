@@ -26,14 +26,10 @@ impl Client {
 
     /// Connect, auto-starting the daemon on a missing or refused socket.
     pub fn connect_or_start(session: &str) -> Result<Client> {
-        match Client::connect(session) {
-            Ok(client) => Ok(client),
-            Err(e) if not_running(&e) => {
-                spawn_server(session)?;
-                await_server(session)
-            }
-            Err(e) => Err(e).context("connecting to tutti-server"),
-        }
+        Ok(Client {
+            stream: open(session)?,
+            buf: Vec::new(),
+        })
     }
 
     pub fn request(&mut self, request: &Request) -> Result<Response> {
@@ -65,6 +61,19 @@ impl Client {
             }
             self.buf.extend_from_slice(&chunk[..n]);
         }
+    }
+}
+
+/// Open a raw socket to the session's daemon, auto-starting it on a missing or
+/// refused socket. Shared by the control-plane `Client` and the attach TUI.
+pub fn open(session: &str) -> Result<UnixStream> {
+    match UnixStream::connect(socket_path(session)) {
+        Ok(stream) => Ok(stream),
+        Err(e) if not_running(&e) => {
+            spawn_server(session)?;
+            await_server(session).map(|client| client.stream)
+        }
+        Err(e) => Err(e).context("connecting to tutti-server"),
     }
 }
 

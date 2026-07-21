@@ -1,13 +1,11 @@
-mod client;
-mod render;
-
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use tutti_core::{Direction, PaneId, Request, Response, TabId, WorkspaceId};
 
-use client::{Client, StopOutcome};
+use tutti::client::{self, Client, StopOutcome};
+use tutti::render;
 
 #[derive(Parser)]
 #[command(name = "tutti", version, about = "Terminal-native agent multiplexer")]
@@ -44,7 +42,7 @@ enum Command {
         #[command(subcommand)]
         action: PaneAction,
     },
-    /// Attach the interactive TUI (arrives in M2).
+    /// Attach the interactive TUI.
     Attach,
 }
 
@@ -158,8 +156,8 @@ fn run(cli: Cli) -> Result<i32> {
     match cli.command {
         Command::Server { action } => run_server(action, &cli.session),
         Command::Attach => {
-            eprintln!("attach: the tutti TUI arrives in M2; use the CLI verbs for now");
-            Ok(2)
+            tutti::attach::run(&cli.session)?;
+            Ok(0)
         }
         command => {
             let request = to_request(command)?;
@@ -300,6 +298,11 @@ fn emit(response: Response, json: bool) -> i32 {
             for line in lines {
                 println!("{line}");
             }
+            0
+        }
+        // The attach handshake reply is consumed by the TUI, never the CLI.
+        Response::Attached { session, .. } => {
+            println!("attached to {session}");
             0
         }
     }

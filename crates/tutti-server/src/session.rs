@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use tutti_core::{
-    AgentState, Direction, Layout, Pane, PaneId, PaneInfo, TabId, TabInfo, WorkspaceId,
-    WorkspaceInfo,
+    AgentState, Direction, Layout, Pane, PaneId, PaneInfo, TabId, TabInfo, TabView, WorkspaceId,
+    WorkspaceInfo, WorkspaceView,
 };
 
 use crate::pty::{PaneSize, PtyPane, PtySpec};
@@ -211,19 +211,42 @@ impl Session {
         self.spawn_into_tab(tab, spec, title, Some((pane, direction)))
     }
 
+    /// The whole session as the attach protocol's view: workspaces, their tabs,
+    /// each tab's layout tree and the `PaneInfo` for the panes it holds.
+    pub fn view(&self) -> Vec<WorkspaceView> {
+        self.workspaces
+            .iter()
+            .map(|w| WorkspaceView {
+                id: w.id,
+                name: w.name.clone(),
+                tabs: w
+                    .tabs
+                    .iter()
+                    .map(|t| TabView {
+                        id: t.id,
+                        name: t.name.clone(),
+                        active: self.current_tab == Some(t.id),
+                        layout: t.layout.clone(),
+                        active_pane: t.active_pane,
+                        panes: t
+                            .layout
+                            .as_ref()
+                            .map(Layout::panes)
+                            .unwrap_or_default()
+                            .iter()
+                            .filter_map(|id| self.panes.get(id))
+                            .map(pane_info)
+                            .collect(),
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
     pub fn pane_list(&self) -> Vec<PaneInfo> {
         let mut panes: Vec<&PaneSlot> = self.panes.values().collect();
         panes.sort_by_key(|s| s.meta.id.0);
-        panes
-            .into_iter()
-            .map(|s| PaneInfo {
-                id: s.meta.id,
-                title: s.meta.title.clone(),
-                agent: s.meta.agent.clone(),
-                state: s.meta.state,
-                exited: s.meta.exited,
-            })
-            .collect()
+        panes.into_iter().map(pane_info).collect()
     }
 
     /// Kill and forget a pane, collapsing the split that held it.
@@ -398,6 +421,16 @@ impl Session {
             },
         );
         Ok(id)
+    }
+}
+
+fn pane_info(slot: &PaneSlot) -> PaneInfo {
+    PaneInfo {
+        id: slot.meta.id,
+        title: slot.meta.title.clone(),
+        agent: slot.meta.agent.clone(),
+        state: slot.meta.state,
+        exited: slot.meta.exited,
     }
 }
 

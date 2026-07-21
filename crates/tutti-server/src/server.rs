@@ -39,6 +39,8 @@ pub struct Hub {
     /// Last screen broadcast per pane, with its running delta sequence number.
     last: Mutex<HashMap<PaneId, (vt100::Screen, u32)>>,
     next_client: AtomicU64,
+    /// Session name, reported to attaching clients. Derived from the socket file.
+    name: String,
 }
 
 /// Bootstrap the socket, install a SIGTERM/SIGINT shutdown, and serve until it
@@ -72,11 +74,16 @@ pub async fn serve(
     std::fs::write(&pid_path, std::process::id().to_string())
         .with_context(|| format!("write pidfile {}", pid_path.display()))?;
 
+    let name = socket_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "tutti".to_string());
     let hub = Arc::new(Hub {
         session: Mutex::new(Session::new(size)),
         clients: Mutex::new(HashMap::new()),
         last: Mutex::new(HashMap::new()),
         next_client: AtomicU64::new(0),
+        name,
     });
 
     let tick_hub = Arc::clone(&hub);
@@ -174,10 +181,14 @@ async fn read_frame(reader: &mut OwnedReadHalf, buf: &mut Vec<u8>) -> Result<Opt
 fn handle_frame(hub: &Arc<Hub>, cid: u64, tx: &mpsc::UnboundedSender<Vec<u8>>, frame: Frame) {
     match frame {
         Frame::Control(json) => match serde_json::from_slice::<Request>(&json) {
-            // Send attach_ok before joining the broadcast set so it always
-            // precedes the pane snapshots the next tick pushes to this client.
+            // Send the Attached view before joining the broadcast set so it
+            // always precedes the pane snapshots the next tick pushes here.
             Ok(Request::Attach) => {
-                let _ = tx.send(encode_json(&Response::Ok));
+                let workspaces = hub.session.lock().expect("session poisoned").view();
+                let _ = tx.send(encode_json(&Response::Attached {
+                    session: hub.name.clone(),
+                    workspaces,
+                }));
                 hub.clients.lock().expect("clients poisoned").insert(
                     cid,
                     Client {
@@ -190,6 +201,7 @@ fn handle_frame(hub: &Arc<Hub>, cid: u64, tx: &mpsc::UnboundedSender<Vec<u8>>, f
                 hub.clients.lock().expect("clients poisoned").remove(&cid);
                 let _ = tx.send(encode_json(&Response::Ok));
             }
+            Ok(Request::PaneScroll { pane, offset }) => scroll(hub, cid, tx, pane, offset),
             Ok(request) => {
                 let response = dispatch(hub, request);
                 let _ = tx.send(encode_json(&response));
@@ -229,19 +241,17 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
                 .workspace_list(),
         },
         Request::WorkspaceKill { id } => {
-            match hub
-                .session
-                .lock()
-                .expect("session poisoned")
-                .workspace_kill(id)
-            {
+            let mut session = hub.session.lock().expect("session poisoned");
+            match session.workspace_kill(id) {
                 Ok(panes) => {
+                    let view = session.view();
+                    drop(session);
                     let mut last = hub.last.lock().expect("last poisoned");
                     for pane in &panes {
                         last.remove(pane);
                     }
                     drop(last);
-                    broadcast_event(hub, Event::LayoutChanged { workspace: id });
+                    broadcast_event(hub, Event::LayoutChanged { workspaces: view });
                     Response::Ok
                 }
                 Err(err) => error(err),
@@ -279,19 +289,18 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
         Request::PaneSplit { pane, direction } => {
             spawn_pane(hub, |s| s.pane_split(pane, direction))
         }
+        Request::PaneResize { pane, rows, cols } => resize_pane(hub, pane, rows, cols),
         Request::PaneList => Response::Panes {
             panes: hub.session.lock().expect("session poisoned").pane_list(),
         },
         Request::PaneKill { pane } => {
-            match hub
-                .session
-                .lock()
-                .expect("session poisoned")
-                .pane_kill(pane)
-            {
-                Ok(workspace) => {
+            let mut session = hub.session.lock().expect("session poisoned");
+            match session.pane_kill(pane) {
+                Ok(_workspace) => {
+                    let view = session.view();
+                    drop(session);
                     hub.last.lock().expect("last poisoned").remove(&pane);
-                    broadcast_event(hub, Event::LayoutChanged { workspace });
+                    broadcast_event(hub, Event::LayoutChanged { workspaces: view });
                     Response::Ok
                 }
                 Err(err) => error(err),
@@ -354,7 +363,7 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             }
         }
         // Handled in `handle_frame`; unreachable here.
-        Request::Attach | Request::Detach => Response::Ok,
+        Request::Attach | Request::Detach | Request::PaneScroll { .. } => Response::Ok,
     }
 }
 
@@ -365,16 +374,69 @@ fn spawn_pane(hub: &Arc<Hub>, op: impl FnOnce(&mut Session) -> Result<PaneId>) -
     match op(&mut session) {
         Ok(pane) => {
             let pty = session.pty(pane).expect("pane just created");
-            let workspace = session.workspace_of_pane(pane);
+            let view = session.view();
             drop(session);
             spawn_reaper(hub, pane, pty);
-            if let Some(workspace) = workspace {
-                broadcast_event(hub, Event::LayoutChanged { workspace });
-            }
+            broadcast_event(hub, Event::LayoutChanged { workspaces: view });
             Response::PaneCreated { id: pane }
         }
         Err(err) => error(err),
     }
+}
+
+/// Resize a pane's pty and grid, then force a fresh baseline-paired snapshot for
+/// every client (clear the last broadcast screen and each client's seen set) so
+/// the next tick reseeds their parsers at the new size.
+fn resize_pane(hub: &Arc<Hub>, pane: PaneId, rows: u16, cols: u16) -> Response {
+    let pty = match hub.session.lock().expect("session poisoned").pty(pane) {
+        Some(pty) => pty,
+        None => {
+            return Response::Error {
+                message: format!("no pane {pane}"),
+            };
+        }
+    };
+    match pty.resize(rows, cols) {
+        Ok(()) => {
+            hub.last.lock().expect("last poisoned").remove(&pane);
+            for client in hub.clients.lock().expect("clients poisoned").values_mut() {
+                client.seen.remove(&pane);
+            }
+            Response::Ok
+        }
+        Err(err) => error(err),
+    }
+}
+
+/// Serve a scrollback request. A positive `offset` ships a one-off snapshot of
+/// the scrolled region to the requesting client only; `offset == 0` clears the
+/// pane from that client's seen set so the next tick reseeds it live.
+fn scroll(
+    hub: &Arc<Hub>,
+    cid: u64,
+    tx: &mpsc::UnboundedSender<Vec<u8>>,
+    pane: PaneId,
+    offset: usize,
+) {
+    if offset == 0 {
+        if let Some(client) = hub.clients.lock().expect("clients poisoned").get_mut(&cid) {
+            client.seen.remove(&pane);
+        }
+        return;
+    }
+    let Some(pty) = hub.session.lock().expect("session poisoned").pty(pane) else {
+        return;
+    };
+    let screen = pty.screen_scrolled(offset);
+    let (rows, cols) = screen.size();
+    let frame = Frame::PaneSnapshot(PaneData {
+        pane,
+        rows,
+        cols,
+        seq: 0,
+        bytes: screen.contents_formatted(),
+    });
+    let _ = tx.send(frame.encode());
 }
 
 fn spawn_reaper(hub: &Arc<Hub>, pane: PaneId, pty: Arc<PtyPane>) {
