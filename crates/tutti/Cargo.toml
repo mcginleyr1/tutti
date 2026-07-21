@@ -4,8 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-ratatui.workspace = true
-crossterm.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
 tutti-core.workspace = true
 
-
+[dev-dependencies]
+tutti-core.workspace = true
+serde_json.workspace = true
