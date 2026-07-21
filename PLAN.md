@@ -22,10 +22,11 @@ Client/server split, all local:
 - **`tutti` (client)** — a ratatui TUI that attaches to the server over a Unix domain
   socket, renders panes, and forwards input. Detaching (prefix, then `q`) leaves the
   server running.
-- **Control plane** — the same Unix socket speaks a JSON protocol (newline-delimited
-  JSON frames). The `tutti` binary doubles as the CLI: `tutti pane split`, `tutti pane
-  read`, etc. are thin commands over the socket. Anything the TUI can do, the CLI and
-  API can do.
+- **Control plane** — the same Unix socket speaks length-prefixed frames: control
+  frames carry one JSON object each (NDJSON semantics), pane content travels as
+  binary vt100-delta frames (see `docs/transport-decision.md`). The `tutti` binary
+  doubles as the CLI: `tutti pane split`, `tutti pane read`, etc. are thin commands
+  over the socket. Anything the TUI can do, the CLI and API can do.
 
 ### Domain model
 
@@ -96,9 +97,9 @@ worktree workflow, skill), all of Phase 5 (install via `cargo install --path .`)
 
 **Build order:**
 
-1. **M0 — transport spike.** Decide how pane content travels server → client
-   (raw PTY byte forwarding to a client-side parser vs serialized grid deltas).
-   This hardens into the Phase 1 protocol; do not start M1 without it.
+1. **M0 — transport spike.** ✅ Decided — hybrid framing: length-prefixed frames,
+   JSON control messages, server-computed vt100 escape deltas for pane content,
+   snapshot-on-attach. Full analysis in `docs/transport-decision.md`.
 2. **M1 — headless core.** Phase 1 acceptance test: `pane run -- top`, close the
    terminal, `pane read` shows it still running.
 3. **M2 — TUI.** Phase 2 acceptance: two agents side by side, split/resize/zoom,
