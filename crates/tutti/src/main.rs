@@ -211,16 +211,16 @@ fn to_request(command: Command) -> Result<Request> {
         }),
         Command::Tab { action } => Ok(match action {
             TabAction::New { workspace } => Request::TabNew {
-                workspace: WorkspaceId(require(workspace, "--workspace")?),
+                workspace: workspace.map(WorkspaceId),
             },
             TabAction::List { workspace } => Request::TabList {
-                workspace: WorkspaceId(require(workspace, "--workspace")?),
+                workspace: workspace.map(WorkspaceId),
             },
             TabAction::Select { id } => Request::TabSelect { id: TabId(id) },
         }),
         Command::Pane { action } => Ok(match action {
             PaneAction::Run { tab, cmd } => Request::PaneRun {
-                tab: TabId(require(tab, "--tab")?),
+                tab: tab.map(TabId),
                 cmd,
             },
             PaneAction::Split { pane, direction } => Request::PaneSplit {
@@ -249,15 +249,6 @@ fn to_request(command: Command) -> Result<Request> {
             },
         }),
         Command::Server { .. } | Command::Attach => bail!("not a protocol request"),
-    }
-}
-
-/// `TabNew`/`TabList`/`PaneRun` require an owning id that tutti-core has no
-/// default for, so a missing flag is a hard error rather than a silent guess.
-fn require(value: Option<u64>, flag: &str) -> Result<u64> {
-    match value {
-        Some(v) => Ok(v),
-        None => bail!("{flag} <id> is required"),
     }
 }
 
@@ -356,13 +347,13 @@ mod tests {
         assert_eq!(
             request_of(&["tutti", "tab", "new", "--workspace", "2"]),
             Request::TabNew {
-                workspace: WorkspaceId(2)
+                workspace: Some(WorkspaceId(2))
             }
         );
         assert_eq!(
             request_of(&["tutti", "tab", "list", "--workspace", "2"]),
             Request::TabList {
-                workspace: WorkspaceId(2)
+                workspace: Some(WorkspaceId(2))
             }
         );
         assert_eq!(
@@ -372,9 +363,11 @@ mod tests {
     }
 
     #[test]
-    fn tab_new_requires_workspace() {
-        let parsed = Cli::try_parse_from(["tutti", "tab", "new"]).unwrap();
-        assert!(to_request(parsed.command).is_err());
+    fn tab_new_defaults_to_current_workspace() {
+        assert_eq!(
+            request_of(&["tutti", "tab", "new"]),
+            Request::TabNew { workspace: None }
+        );
     }
 
     #[test]
@@ -384,17 +377,22 @@ mod tests {
                 "tutti", "pane", "run", "--tab", "3", "--", "claude", "--flag"
             ]),
             Request::PaneRun {
-                tab: TabId(3),
+                tab: Some(TabId(3)),
                 cmd: vec!["claude".to_string(), "--flag".to_string()],
             }
         );
     }
 
     #[test]
-    fn pane_run_requires_tab_and_command() {
+    fn pane_run_requires_command_but_not_tab() {
         assert!(Cli::try_parse_from(["tutti", "pane", "run", "--tab", "3"]).is_err());
-        let no_tab = Cli::try_parse_from(["tutti", "pane", "run", "--", "ls"]).unwrap();
-        assert!(to_request(no_tab.command).is_err());
+        assert_eq!(
+            request_of(&["tutti", "pane", "run", "--", "ls"]),
+            Request::PaneRun {
+                tab: None,
+                cmd: vec!["ls".into()],
+            }
+        );
     }
 
     #[test]

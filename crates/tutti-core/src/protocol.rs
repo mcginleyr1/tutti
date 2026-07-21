@@ -17,16 +17,16 @@ pub enum Request {
         id: WorkspaceId,
     },
     TabNew {
-        workspace: WorkspaceId,
+        workspace: Option<WorkspaceId>,
     },
     TabList {
-        workspace: WorkspaceId,
+        workspace: Option<WorkspaceId>,
     },
     TabSelect {
         id: TabId,
     },
     PaneRun {
-        tab: TabId,
+        tab: Option<TabId>,
         cmd: Vec<String>,
     },
     PaneSplit {
@@ -132,9 +132,10 @@ mod tests {
             dir: PathBuf::from("/tmp/project"),
         });
         roundtrip(&Request::PaneRun {
-            tab: TabId(3),
+            tab: Some(TabId(3)),
             cmd: vec!["claude".into(), "--dangerously".into()],
         });
+        roundtrip(&Request::TabNew { workspace: None });
         roundtrip(&Request::PaneSplit {
             pane: PaneId(1),
             direction: Direction::Vertical,

@@ -15,12 +15,6 @@ use tutti_core::{
 
 use crate::pty::{PaneSize, PtyPane, PtySpec};
 
-/// `PaneRun` with this tab id targets the current tab instead of a named one;
-/// real tab ids start at 1. This is how the CLI expresses "run here" when it
-/// has not learned the implicit tab's id, since `Request::PaneRun` requires a
-/// `TabId`.
-pub const CURRENT_TAB: TabId = TabId(0);
-
 struct TabEntry {
     id: TabId,
     name: String,
@@ -143,7 +137,8 @@ impl Session {
         Ok(killed)
     }
 
-    pub fn tab_new(&mut self, workspace: WorkspaceId) -> Result<TabId> {
+    pub fn tab_new(&mut self, workspace: Option<WorkspaceId>) -> Result<TabId> {
+        let workspace = self.resolve_workspace(workspace)?;
         let tab = self.new_tab_entry();
         let id = tab.id;
         let ws = self
@@ -156,7 +151,8 @@ impl Session {
         Ok(id)
     }
 
-    pub fn tab_list(&self, workspace: WorkspaceId) -> Result<Vec<TabInfo>> {
+    pub fn tab_list(&self, workspace: Option<WorkspaceId>) -> Result<Vec<TabInfo>> {
+        let workspace = self.resolve_workspace(workspace)?;
         let ws = self
             .workspaces
             .iter()
@@ -185,9 +181,9 @@ impl Session {
         Ok(())
     }
 
-    /// Spawn `cmd` in `tab` (or the current tab when `tab == CURRENT_TAB`),
-    /// placing the new pane in the tab's layout and focusing it.
-    pub fn pane_run(&mut self, tab: TabId, cmd: Vec<String>) -> Result<PaneId> {
+    /// Spawn `cmd` in `tab` (or the current tab when `None`), placing the
+    /// new pane in the tab's layout and focusing it.
+    pub fn pane_run(&mut self, tab: Option<TabId>, cmd: Vec<String>) -> Result<PaneId> {
         let tab = self.resolve_tab(tab)?;
         let (program, args) = cmd.split_first().context("empty command")?;
         let dir = self.tab_workspace_dir(tab)?;
@@ -329,17 +325,27 @@ impl Session {
         }
     }
 
-    fn resolve_tab(&self, tab: TabId) -> Result<TabId> {
-        let target = if tab == CURRENT_TAB {
-            self.current_tab
-                .context("no current tab; create a workspace first")?
-        } else {
-            tab
+    fn resolve_tab(&self, tab: Option<TabId>) -> Result<TabId> {
+        let target = match tab {
+            Some(tab) => tab,
+            None => self
+                .current_tab
+                .context("no current tab; create a workspace first")?,
         };
         if self.workspace_of_tab(target).is_none() {
             bail!("no tab {target}");
         }
         Ok(target)
+    }
+
+    fn resolve_workspace(&self, workspace: Option<WorkspaceId>) -> Result<WorkspaceId> {
+        match workspace {
+            Some(ws) => Ok(ws),
+            None => self
+                .current_tab
+                .and_then(|t| self.workspace_of_tab(t))
+                .context("no current workspace; pass --workspace"),
+        }
     }
 
     fn tab_workspace_dir(&self, tab: TabId) -> Result<PathBuf> {

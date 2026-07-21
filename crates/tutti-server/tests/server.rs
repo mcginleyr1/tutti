@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
 use tutti_core::{Frame, PaneData, PaneId, Request, Response};
-use tutti_server::{CURRENT_TAB, PaneSize, serve};
+use tutti_server::{PaneSize, serve};
 
 const DEADLINE: Duration = Duration::from_secs(5);
 
@@ -131,7 +131,7 @@ async fn run_marker(conn: &mut Conn, cmd: &str) -> PaneId {
     );
     pane_id(
         conn.request(Request::PaneRun {
-            tab: CURRENT_TAB,
+            tab: None,
             cmd: vec!["/bin/sh".into(), "-c".into(), cmd.into()],
         })
         .await,
@@ -195,7 +195,7 @@ async fn pane_send_echoes_into_grid() {
     );
     let pane = pane_id(
         conn.request(Request::PaneRun {
-            tab: CURRENT_TAB,
+            tab: None,
             cmd: vec!["/bin/cat".into()],
         })
         .await,
@@ -233,14 +233,14 @@ async fn kill_removes_panes() {
     );
     let first = pane_id(
         conn.request(Request::PaneRun {
-            tab: CURRENT_TAB,
+            tab: None,
             cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
         })
         .await,
     );
     let second = pane_id(
         conn.request(Request::PaneRun {
-            tab: CURRENT_TAB,
+            tab: None,
             cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
         })
         .await,
@@ -287,7 +287,7 @@ async fn attach_receives_snapshot_then_delta() {
     let pane = pane_id(
         control
             .request(Request::PaneRun {
-                tab: CURRENT_TAB,
+                tab: None,
                 cmd: vec!["/bin/cat".into()],
             })
             .await,
