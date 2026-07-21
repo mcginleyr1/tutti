@@ -21,6 +21,7 @@ clap = { version = "4", features = ["derive"] }
 portable-pty = "0.9"
 vt100 = "0.16"
 anyhow = "1"
+sysinfo = "0.39"
 tutti-core = { path = "crates/tutti-core" }
 tutti-server = { path = "crates/tutti-server" }
 tutti-agents = { path = "crates/tutti-agents" }
