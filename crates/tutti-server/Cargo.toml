@@ -1,0 +1,13 @@
+[package]
+name = "tutti-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tutti-core.workspace = true
+tokio.workspace = true
+portable-pty.workspace = true
+vt100.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true

@@ -1,0 +1,8 @@
+[package]
+name = "tutti-agents"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tutti-core.workspace = true
+serde.workspace = true
