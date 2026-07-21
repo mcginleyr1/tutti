@@ -18,13 +18,20 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
-use tutti_core::{Event, Frame, PaneData, PaneId, Request, Response};
+use tutti_agents::{ProcessTree, Registry};
+use tutti_core::{AgentKind, Event, Frame, PaneData, PaneId, Request, Response, StateEvent};
 
 use crate::keys;
 use crate::pty::{PaneSize, PtyPane};
 use crate::session::Session;
 
+/// Cadence of the render tick: coalesced pane deltas to attached clients.
 const TICK: Duration = Duration::from_millis(16);
+/// Cadence of the agent-detection pass. Process trees change rarely, so this is
+/// deliberately slow and kept off the render tick.
+const DETECT_INTERVAL: Duration = Duration::from_secs(1);
+/// Cadence of the state-classification pass over agent panes.
+const CLASSIFY_INTERVAL: Duration = Duration::from_millis(300);
 
 struct Client {
     tx: mpsc::UnboundedSender<Vec<u8>>,
@@ -41,6 +48,8 @@ pub struct Hub {
     next_client: AtomicU64,
     /// Session name, reported to attaching clients. Derived from the socket file.
     name: String,
+    /// The agent registry driving detection and state classification.
+    registry: Registry,
 }
 
 /// Bootstrap the socket, install a SIGTERM/SIGINT shutdown, and serve until it
@@ -84,6 +93,7 @@ pub async fn serve(
         last: Mutex::new(HashMap::new()),
         next_client: AtomicU64::new(0),
         name,
+        registry: Registry::default(),
     });
 
     let tick_hub = Arc::clone(&hub);
@@ -93,6 +103,27 @@ pub async fn serve(
         loop {
             interval.tick().await;
             broadcast_tick(&tick_hub);
+        }
+    });
+
+    let detect_hub = Arc::clone(&hub);
+    let detector = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(DETECT_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            detect_pass(&detect_hub).await;
+        }
+    });
+
+    let classify_hub = Arc::clone(&hub);
+    let classifier = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(CLASSIFY_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_gen: HashMap<PaneId, u64> = HashMap::new();
+        loop {
+            interval.tick().await;
+            classify_pass(&classify_hub, &mut last_gen);
         }
     });
 
@@ -113,6 +144,8 @@ pub async fn serve(
     }
 
     ticker.abort();
+    detector.abort();
+    classifier.abort();
     hub.session.lock().expect("session poisoned").kill_all();
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(&pid_path);
@@ -362,9 +395,29 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
                 Err(err) => error(err),
             }
         }
+        Request::PaneFocus { pane } => focus_pane(hub, pane),
         // Handled in `handle_frame`; unreachable here.
         Request::Attach | Request::Detach | Request::PaneScroll { .. } => Response::Ok,
     }
+}
+
+/// Focus a pane: record it active and apply a `Focused` state event, flipping a
+/// `Done` pane to `Idle` (marked seen). Broadcasts the transition if it changed.
+fn focus_pane(hub: &Arc<Hub>, pane: PaneId) -> Response {
+    let mut session = hub.session.lock().expect("session poisoned");
+    if session.set_active_pane(pane).is_err() {
+        return Response::Error {
+            message: format!("no pane {pane}"),
+        };
+    }
+    let from = session.pane_state(pane).expect("pane exists");
+    let to = from.apply(StateEvent::Focused);
+    session.set_pane_state(pane, to);
+    drop(session);
+    if from != to {
+        broadcast_event(hub, Event::StateChanged { pane, from, to });
+    }
+    Response::Ok
 }
 
 /// Run a pane-spawning session op, then wire up the new pane's reaper and emit
@@ -444,12 +497,15 @@ fn spawn_reaper(hub: &Arc<Hub>, pane: PaneId, pty: Arc<PtyPane>) {
     tokio::spawn(async move {
         let exit = pty.wait().await;
         let code = exit.code as i32;
-        let marked = hub
+        let transition = hub
             .session
             .lock()
             .expect("session poisoned")
             .mark_exited(pane, code);
-        if marked {
+        if let Some((from, to)) = transition {
+            if from != to {
+                broadcast_event(&hub, Event::StateChanged { pane, from, to });
+            }
             broadcast_event(&hub, Event::PaneExited { pane, code });
         }
     });
@@ -507,6 +563,106 @@ fn broadcast_tick(hub: &Hub) {
                 let _ = client.tx.send(frame.encode());
             }
         }
+    }
+}
+
+/// One agent-detection pass: snapshot the process tree, walk each live pane's
+/// child subtree, and record the matched agent kind. A change to any pane's
+/// agent broadcasts the fresh view so clients relabel their badges.
+async fn detect_pass(hub: &Arc<Hub>) {
+    let panes = hub.session.lock().expect("session poisoned").live_panes();
+    if panes.is_empty() {
+        return;
+    }
+    let tree = tokio::task::spawn_blocking(process_tree)
+        .await
+        .unwrap_or_default();
+    let detected: Vec<(PaneId, Option<AgentKind>)> = panes
+        .iter()
+        .map(|(id, pty)| {
+            let agent = pty
+                .child_pid()
+                .and_then(|pid| hub.registry.detect(&tree, pid));
+            (*id, agent)
+        })
+        .collect();
+
+    let mut session = hub.session.lock().expect("session poisoned");
+    let mut changed = false;
+    for (pane, agent) in detected {
+        changed |= session.set_agent(pane, agent);
+    }
+    if changed {
+        let view = session.view();
+        drop(session);
+        broadcast_event(hub, Event::LayoutChanged { workspaces: view });
+    }
+}
+
+/// A `sysinfo` snapshot reduced to the pid → name and pid → children maps the
+/// registry walks. Built on a blocking thread so the refresh never stalls the
+/// async runtime.
+fn process_tree() -> ProcessTree {
+    use sysinfo::{ProcessesToUpdate, System};
+    let mut sys = System::new();
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+    let mut tree = ProcessTree::default();
+    for (pid, process) in sys.processes() {
+        tree.insert(
+            pid.as_u32(),
+            process.parent().map(|p| p.as_u32()),
+            process.name().to_string_lossy(),
+        );
+    }
+    tree
+}
+
+/// One state-classification pass over agent panes. PTY output since the last
+/// pass is an `Activity` event; a classifier match on the screen text is a
+/// `Classified` event. Both are folded onto the pane's state — activity first
+/// so a screen match takes precedence — and any net change is broadcast.
+fn classify_pass(hub: &Arc<Hub>, last_gen: &mut HashMap<PaneId, u64>) {
+    let panes = hub.session.lock().expect("session poisoned").agent_panes();
+    if panes.is_empty() {
+        return;
+    }
+    let events: Vec<(PaneId, bool, Option<StateEvent>)> = panes
+        .iter()
+        .map(|(pane, kind, pty)| {
+            let generation = *pty.output_receiver().borrow();
+            let advanced = last_gen
+                .insert(*pane, generation)
+                .map_or(generation != 0, |prev| prev != generation);
+            let classified = hub
+                .registry
+                .spec(kind)
+                .and_then(|spec| spec.classify(&pty.screen().contents()))
+                .map(StateEvent::Classified);
+            (*pane, advanced, classified)
+        })
+        .collect();
+
+    let mut session = hub.session.lock().expect("session poisoned");
+    let mut changes = Vec::new();
+    for (pane, advanced, classified) in events {
+        let Some(from) = session.pane_state(pane) else {
+            continue;
+        };
+        let mut to = from;
+        if advanced {
+            to = to.apply(StateEvent::Activity);
+        }
+        if let Some(event) = classified {
+            to = to.apply(event);
+        }
+        if to != from {
+            session.set_pane_state(pane, to);
+            changes.push((pane, from, to));
+        }
+    }
+    drop(session);
+    for (pane, from, to) in changes {
+        broadcast_event(hub, Event::StateChanged { pane, from, to });
     }
 }
 

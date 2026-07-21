@@ -95,11 +95,27 @@ fn event_loop(terminal: &mut DefaultTerminal, conn: &mut Connection) -> Result<(
             }
         }
 
+        if let Some(frame) = app.focus_change() {
+            let _ = conn.send(&frame);
+        }
+        if app.take_bell() {
+            ring_bell();
+        }
+
         if app.should_quit {
             break;
         }
     }
     Ok(())
+}
+
+/// Emit a terminal bell (BEL). Non-printing, so it does not disturb the grid the
+/// next draw restores.
+fn ring_bell() {
+    use std::io::Write;
+    let mut out = io::stdout();
+    let _ = out.write_all(b"\x07");
+    let _ = out.flush();
 }
 
 fn install_panic_hook() {

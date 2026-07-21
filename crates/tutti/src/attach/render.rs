@@ -59,11 +59,9 @@ fn draw_pane(frame: &mut Frame, app: &App, pane: PaneId, rect: Rect) {
     }
     let focused = app.focused == Some(pane);
     let state = app.panes.get(&pane);
-    let title = state.map_or_else(|| pane.to_string(), |s| pane_title(&s.info));
+    let title = state.map_or_else(|| Line::from(pane.to_string()), |s| border_title(&s.info));
 
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::raw(title));
+    let mut block = Block::default().borders(Borders::ALL).title(title);
     if focused {
         block = block
             .border_type(BorderType::Thick)
@@ -168,14 +166,18 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(format!(" {} ", tab.name), style));
     }
 
-    if let Some(pane) = app.focused
-        && let Some(state) = app.panes.get(&pane)
-    {
-        spans.push(Span::raw(format!(
-            "  {} [{}] ",
-            pane_title(&state.info),
-            state_label(state.info.state)
-        )));
+    // Per-pane state badges, the panes needing attention (Blocked) first.
+    let mut infos: Vec<&PaneInfo> = app.panes.values().map(|s| &s.info).collect();
+    infos.sort_by_key(|i| (i.state != AgentState::Blocked, i.id.0));
+    for info in infos {
+        let mut style = state_style(info.state);
+        if app.focused == Some(info.id) {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        spans.push(Span::styled(
+            format!(" {}:{} ", identity(info), state_label(info.state)),
+            style,
+        ));
     }
 
     let message = status_message(app);
@@ -216,15 +218,38 @@ fn status_message(app: &App) -> String {
     }
 }
 
-fn pane_title(info: &PaneInfo) -> String {
-    let mut title = info.title.clone();
-    if let Some(agent) = &info.agent {
-        title = format!("{title} · {agent}");
-    }
+/// A pane's display name: its detected agent kind when known, else the process
+/// title.
+fn identity(info: &PaneInfo) -> String {
+    info.agent
+        .as_ref()
+        .map(|agent| agent.to_string())
+        .unwrap_or_else(|| info.title.clone())
+}
+
+/// The border badge: `{identity} · {state}` with the state coloured, plus the
+/// exit code once the child is gone.
+fn border_title(info: &PaneInfo) -> Line<'static> {
+    let mut spans = vec![
+        Span::raw(identity(info)),
+        Span::raw(" · "),
+        Span::styled(state_label(info.state), state_style(info.state)),
+    ];
     if let Some(code) = info.exited {
-        title = format!("{title} (exited {code})");
+        spans.push(Span::raw(format!(" (exited {code})")));
     }
-    title
+    Line::from(spans)
+}
+
+/// Terminal-palette colours for each state — no theming layer. Blocked is the
+/// loud one: it is the pane asking for the user.
+fn state_style(state: AgentState) -> Style {
+    match state {
+        AgentState::Blocked => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        AgentState::Working => Style::default().fg(Color::Yellow),
+        AgentState::Done => Style::default().fg(Color::Green),
+        AgentState::Idle | AgentState::Unknown => Style::default().add_modifier(Modifier::DIM),
+    }
 }
 
 fn state_label(state: AgentState) -> &'static str {
@@ -322,6 +347,45 @@ mod tests {
         assert!(text.contains("HELLO"), "grid text missing: {text:?}");
         assert!(text.contains("demo"), "session name missing from status");
         assert!(text.contains("main"), "tab name missing from status");
+    }
+
+    #[test]
+    fn state_style_colors_match_the_spec() {
+        assert_eq!(state_style(AgentState::Blocked).fg, Some(Color::Red));
+        assert!(
+            state_style(AgentState::Blocked)
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert_eq!(state_style(AgentState::Working).fg, Some(Color::Yellow));
+        assert_eq!(state_style(AgentState::Done).fg, Some(Color::Green));
+        assert!(
+            state_style(AgentState::Idle)
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
+        assert!(
+            state_style(AgentState::Unknown)
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
+    }
+
+    #[test]
+    fn border_title_shows_agent_and_state() {
+        let info = PaneInfo {
+            id: PaneId(1),
+            title: "zsh".into(),
+            agent: Some("claude".into()),
+            state: AgentState::Working,
+            exited: None,
+        };
+        let text: String = border_title(&info)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text, "claude · working");
     }
 
     #[test]

@@ -12,7 +12,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
-use tutti_core::{Frame, PaneData, PaneId, Request, Response};
+use tutti_core::{AgentState, Event, Frame, PaneData, PaneId, Request, Response};
 use tutti_server::{PaneSize, serve};
 
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -412,4 +412,216 @@ async fn expect_pane_frame(conn: &mut Conn, pane: PaneId, want_snapshot: bool) -
     })
     .await
     .expect("timed out waiting for the expected pane frame")
+}
+
+/// Copy `src` to a fresh temp directory under the name `name` and make it
+/// executable, so a benign binary can masquerade as an agent for detection.
+fn copy_bin(name: &str, src: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("tutti-bin-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dst = dir.join(name);
+    std::fs::copy(src, &dst).unwrap();
+    let mut perms = std::fs::metadata(&dst).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&dst, perms).unwrap();
+    // Apple Silicon refuses to exec a copied system binary whose code signature
+    // no longer matches; an ad-hoc re-sign restores it. A no-op elsewhere (the
+    // command is absent on Linux, where unsigned copies run fine).
+    let _ = std::process::Command::new("codesign")
+        .args(["--sign", "-", "--force"])
+        .arg(&dst)
+        .output();
+    dst
+}
+
+/// Poll `pane list` until `pane` reaches `want` or the deadline elapses.
+async fn wait_state(conn: &mut Conn, pane: PaneId, want: AgentState) -> bool {
+    timeout(DEADLINE, async {
+        loop {
+            if let Response::Panes { panes } = conn.request(Request::PaneList).await
+                && panes.iter().any(|p| p.id == pane && p.state == want)
+            {
+                return true;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// A running binary whose name is in the registry is detected as that agent,
+/// proving the live `sysinfo` process-tree walk (not just the unit matcher).
+#[tokio::test]
+async fn detects_agent_process_by_name() {
+    let server = TestServer::start().await;
+    let mut conn = server.connect().await;
+    let bin = copy_bin("claude", "/bin/sleep");
+
+    workspace_id(
+        conn.request(Request::WorkspaceNew {
+            dir: std::env::temp_dir(),
+        })
+        .await,
+    );
+    let pane = pane_id(
+        conn.request(Request::PaneRun {
+            tab: None,
+            cmd: vec![bin.display().to_string(), "30".into()],
+        })
+        .await,
+    );
+
+    let detected = timeout(DEADLINE, async {
+        loop {
+            if let Response::Panes { panes } = conn.request(Request::PaneList).await
+                && panes.iter().any(|p| {
+                    p.id == pane
+                        && p.agent.as_ref().map(|a| a.to_string()).as_deref() == Some("claude")
+                })
+            {
+                return true;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        detected,
+        "a live process named claude was not detected as the claude agent"
+    );
+
+    server.stop().await;
+}
+
+/// Read state-change events for `pane` off an attached connection, recording
+/// each `to` state, until `want` is seen.
+async fn wait_state_event(
+    viewer: &mut Conn,
+    pane: PaneId,
+    want: AgentState,
+    order: &mut Vec<AgentState>,
+) {
+    timeout(DEADLINE, async {
+        loop {
+            if let Frame::Control(json) = viewer.read_frame().await
+                && let Ok(Event::StateChanged { pane: p, to, .. }) =
+                    serde_json::from_slice::<Event>(&json)
+                && p == pane
+            {
+                order.push(to);
+                if to == want {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("did not observe {want:?} within the deadline"));
+}
+
+/// A detected agent pane emits `StateChanged` events driven by its screen text:
+/// a working marker moves it to `Working`, and a later blocked marker to
+/// `Blocked`, in that order. The pane runs `cat` (renamed `claude`), so sent
+/// text echoes onto the screen; the blocked marker is sent only after `Working`
+/// is observed, fixing the order without depending on classifier timing.
+#[tokio::test]
+async fn agent_state_changes_working_then_blocked() {
+    let server = TestServer::start().await;
+    let mut control = server.connect().await;
+    let bin = copy_bin("claude", "/bin/cat");
+
+    workspace_id(
+        control
+            .request(Request::WorkspaceNew {
+                dir: std::env::temp_dir(),
+            })
+            .await,
+    );
+    let pane = pane_id(
+        control
+            .request(Request::PaneRun {
+                tab: None,
+                cmd: vec![bin.display().to_string()],
+            })
+            .await,
+    );
+
+    let mut viewer = server.connect().await;
+    viewer.send(&Request::Attach).await;
+
+    let mut order = Vec::new();
+
+    assert_eq!(
+        control
+            .request(Request::PaneSend {
+                pane,
+                text: Some("esc to interrupt\n".into()),
+                keys: None,
+            })
+            .await,
+        Response::Ok
+    );
+    wait_state_event(&mut viewer, pane, AgentState::Working, &mut order).await;
+
+    assert_eq!(
+        control
+            .request(Request::PaneSend {
+                pane,
+                text: Some("Do you want to continue?\n".into()),
+                keys: None,
+            })
+            .await,
+        Response::Ok
+    );
+    wait_state_event(&mut viewer, pane, AgentState::Blocked, &mut order).await;
+
+    let working = order.iter().position(|s| *s == AgentState::Working);
+    let blocked = order.iter().position(|s| *s == AgentState::Blocked);
+    assert!(
+        working.is_some() && working < blocked,
+        "expected Working before Blocked, got {order:?}"
+    );
+
+    server.stop().await;
+}
+
+/// Focusing a `Done` pane marks it seen: its state becomes `Idle`.
+#[tokio::test]
+async fn focus_transitions_done_pane_to_idle() {
+    let server = TestServer::start().await;
+    let mut conn = server.connect().await;
+
+    workspace_id(
+        conn.request(Request::WorkspaceNew {
+            dir: std::env::temp_dir(),
+        })
+        .await,
+    );
+    let pane = pane_id(
+        conn.request(Request::PaneRun {
+            tab: None,
+            cmd: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+        })
+        .await,
+    );
+
+    assert!(
+        wait_state(&mut conn, pane, AgentState::Done).await,
+        "an exited pane should reach Done"
+    );
+
+    assert_eq!(
+        conn.request(Request::PaneFocus { pane }).await,
+        Response::Ok
+    );
+    assert!(
+        wait_state(&mut conn, pane, AgentState::Idle).await,
+        "focusing a Done pane should transition it to Idle"
+    );
+
+    server.stop().await;
 }

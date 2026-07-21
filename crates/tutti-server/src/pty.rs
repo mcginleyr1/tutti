@@ -78,6 +78,9 @@ pub struct PtyPane {
     writer: Mutex<Box<dyn Write + Send>>,
     parser: Arc<Mutex<vt100::Parser>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    /// The child's OS process id, the root of the process-tree walk that agent
+    /// detection matches against. `None` if the platform did not report one.
+    pid: Option<u32>,
     size: Mutex<PaneSize>,
     exit_rx: watch::Receiver<Option<PaneExit>>,
     output_rx: watch::Receiver<u64>,
@@ -118,6 +121,7 @@ impl PtyPane {
         drop(pair.slave);
 
         let killer = child.clone_killer();
+        let pid = child.process_id();
         let reader = pair
             .master
             .try_clone_reader()
@@ -165,6 +169,7 @@ impl PtyPane {
             writer: Mutex::new(writer),
             parser,
             killer: Mutex::new(killer),
+            pid,
             size: Mutex::new(size),
             exit_rx,
             output_rx,
@@ -278,6 +283,11 @@ impl PtyPane {
             out.drain(..out.len() - n);
         }
         out
+    }
+
+    /// The child's OS process id, if the platform reported one at spawn.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.pid
     }
 
     /// The child's exit status, or `None` if it is still running.

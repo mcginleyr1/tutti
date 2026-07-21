@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use tutti_core::{
-    AgentState, Direction, Layout, Pane, PaneId, PaneInfo, TabId, TabInfo, TabView, WorkspaceId,
-    WorkspaceInfo, WorkspaceView,
+    AgentKind, AgentState, Direction, Layout, Observation, Pane, PaneId, PaneInfo, StateEvent,
+    TabId, TabInfo, TabView, WorkspaceId, WorkspaceInfo, WorkspaceView,
 };
 
 use crate::pty::{PaneSize, PtyPane, PtySpec};
@@ -306,6 +306,75 @@ impl Session {
             .collect()
     }
 
+    /// Live (not-yet-exited) panes and their ptys, the targets of the agent
+    /// detection pass. Exited panes keep their last-known agent, so they are
+    /// skipped rather than re-detected as "gone".
+    pub fn live_panes(&self) -> Vec<(PaneId, Arc<PtyPane>)> {
+        self.panes
+            .iter()
+            .filter(|(_, s)| s.meta.exited.is_none())
+            .map(|(id, s)| (*id, Arc::clone(&s.pty)))
+            .collect()
+    }
+
+    /// Live panes that have been identified as agents, with their kind and pty —
+    /// the targets of the state-classification pass.
+    pub fn agent_panes(&self) -> Vec<(PaneId, AgentKind, Arc<PtyPane>)> {
+        self.panes
+            .iter()
+            .filter(|(_, s)| s.meta.exited.is_none())
+            .filter_map(|(id, s)| {
+                s.meta
+                    .agent
+                    .clone()
+                    .map(|agent| (*id, agent, Arc::clone(&s.pty)))
+            })
+            .collect()
+    }
+
+    /// Record the agent kind detected for a pane. Returns whether it changed.
+    pub fn set_agent(&mut self, pane: PaneId, agent: Option<AgentKind>) -> bool {
+        match self.panes.get_mut(&pane) {
+            Some(slot) if slot.meta.agent != agent => {
+                slot.meta.agent = agent;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn pane_state(&self, pane: PaneId) -> Option<AgentState> {
+        self.panes.get(&pane).map(|s| s.meta.state)
+    }
+
+    /// Overwrite a pane's state. Returns whether the pane exists; the caller
+    /// computes the transition (via `AgentState::apply`) and decides whether it
+    /// is worth broadcasting.
+    pub fn set_pane_state(&mut self, pane: PaneId, state: AgentState) -> bool {
+        match self.panes.get_mut(&pane) {
+            Some(slot) => {
+                slot.meta.state = state;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Make `pane` the active pane of its tab (and that tab current), as the
+    /// client's focus follows.
+    pub fn set_active_pane(&mut self, pane: PaneId) -> Result<()> {
+        let tab_id = self
+            .panes
+            .get(&pane)
+            .with_context(|| format!("no pane {pane}"))?
+            .tab;
+        self.current_tab = Some(tab_id);
+        if let Some(tab) = self.tab_mut(tab_id) {
+            tab.active_pane = Some(pane);
+        }
+        Ok(())
+    }
+
     pub fn workspace_of_tab(&self, tab: TabId) -> Option<WorkspaceId> {
         self.workspaces
             .iter()
@@ -318,16 +387,20 @@ impl Session {
         self.workspace_of_tab(tab)
     }
 
-    /// Record a child's exit, keeping the pane and its grid readable. Returns
-    /// `false` when the pane is already gone or already marked exited.
-    pub fn mark_exited(&mut self, pane: PaneId, code: i32) -> bool {
+    /// Record a child's exit, keeping the pane and its grid readable. A child
+    /// exit is a `Done` observation, so the state advances the same way the
+    /// classifier would. Returns the `(from, to)` state transition, or `None`
+    /// when the pane is already gone or already marked exited.
+    pub fn mark_exited(&mut self, pane: PaneId, code: i32) -> Option<(AgentState, AgentState)> {
         match self.panes.get_mut(&pane) {
             Some(slot) if slot.meta.exited.is_none() => {
                 slot.meta.exited = Some(code);
-                slot.meta.state = AgentState::Done;
-                true
+                let from = slot.meta.state;
+                let to = from.apply(StateEvent::Classified(Observation::Done));
+                slot.meta.state = to;
+                Some((from, to))
             }
-            _ => false,
+            _ => None,
         }
     }
 

@@ -123,6 +123,10 @@ enum PaneAction {
         #[arg(long)]
         unwrapped: bool,
     },
+    /// Mark a pane focused (records it active and clears its Done badge).
+    Focus {
+        pane: u64,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -245,6 +249,7 @@ fn to_request(command: Command) -> Result<Request> {
                 lines,
                 unwrapped,
             },
+            PaneAction::Focus { pane } => Request::PaneFocus { pane: PaneId(pane) },
         }),
         Command::Server { .. } | Command::Attach => bail!("not a protocol request"),
     }
@@ -475,6 +480,14 @@ mod tests {
             Request::PaneKill { pane: PaneId(7) }
         );
         assert_eq!(request_of(&["tutti", "pane", "list"]), Request::PaneList);
+    }
+
+    #[test]
+    fn pane_focus_parses() {
+        assert_eq!(
+            request_of(&["tutti", "pane", "focus", "3"]),
+            Request::PaneFocus { pane: PaneId(3) }
+        );
     }
 
     #[test]

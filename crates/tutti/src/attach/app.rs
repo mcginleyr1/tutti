@@ -68,6 +68,12 @@ pub struct App {
     pub rects: Vec<(PaneId, Rect)>,
     status: Option<(String, Instant)>,
     requested_sizes: HashMap<PaneId, (u16, u16)>,
+    /// The focus last reported to the server via `PaneFocus`; lets the event
+    /// loop notice a focus change from any source (input, layout, attach).
+    focus_sent: Option<PaneId>,
+    /// Set when a non-focused pane finished or blocked; the event loop rings the
+    /// terminal bell once and clears it.
+    bell: bool,
 }
 
 impl Default for App {
@@ -90,7 +96,27 @@ impl App {
             rects: Vec::new(),
             status: None,
             requested_sizes: HashMap::new(),
+            focus_sent: None,
+            bell: false,
         }
+    }
+
+    /// The `PaneFocus` frame to send if focus changed since the last call, so
+    /// the server can mark the newly-focused pane seen (`Done → Idle`) and track
+    /// the active pane. Returns `None` when focus is unchanged.
+    pub fn focus_change(&mut self) -> Option<WireFrame> {
+        if self.focus_sent == self.focused {
+            return None;
+        }
+        self.focus_sent = self.focused;
+        self.focused
+            .map(|pane| control(&Request::PaneFocus { pane }))
+    }
+
+    /// Whether a bell is pending (a non-focused pane just blocked or finished),
+    /// clearing the flag.
+    pub fn take_bell(&mut self) -> bool {
+        std::mem::take(&mut self.bell)
     }
 
     // ---- inbound frames -------------------------------------------------
@@ -133,9 +159,16 @@ impl App {
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::LayoutChanged { workspaces } => self.set_view(workspaces),
-            Event::StateChanged { pane, to, .. } => {
+            Event::StateChanged { pane, from, to } => {
                 if let Some(state) = self.panes.get_mut(&pane) {
                     state.info.state = to;
+                }
+                // Ring once when a pane that was working needs attention or
+                // finished while the user was looking elsewhere.
+                let needs_attention = matches!(to, AgentState::Blocked | AgentState::Done)
+                    && from == AgentState::Working;
+                if needs_attention && self.focused != Some(pane) {
+                    self.bell = true;
                 }
             }
             Event::PaneExited { pane, code } => {
@@ -829,6 +862,84 @@ mod tests {
         assert!(out.is_empty());
         assert_eq!(app.mode, Mode::Terminal);
         assert!(app.transient().unwrap().contains("unknown"));
+    }
+
+    fn view_two_panes() -> Vec<WorkspaceView> {
+        vec![WorkspaceView {
+            id: WorkspaceId(1),
+            name: "w".into(),
+            tabs: vec![TabView {
+                id: TabId(1),
+                name: "1".into(),
+                active: true,
+                layout: Some(Layout::Split {
+                    direction: Direction::Horizontal,
+                    ratio: 0.5,
+                    first: Box::new(Layout::Leaf(PaneId(1))),
+                    second: Box::new(Layout::Leaf(PaneId(2))),
+                }),
+                active_pane: Some(PaneId(1)),
+                panes: vec![placeholder_info(PaneId(1)), placeholder_info(PaneId(2))],
+            }],
+        }]
+    }
+
+    fn state_changed(app: &mut App, pane: PaneId, from: AgentState, to: AgentState) {
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Event::StateChanged { pane, from, to }).unwrap(),
+        ));
+    }
+
+    #[test]
+    fn focus_change_emits_panefocus_on_attach_then_dedupes() {
+        let mut app = App::new();
+        attached(&mut app);
+        assert_eq!(
+            app.focus_change(),
+            Some(control(&Request::PaneFocus { pane: PaneId(1) })),
+            "attach should notify focus of the initial pane"
+        );
+        assert_eq!(app.focus_change(), None, "unchanged focus emits nothing");
+    }
+
+    #[test]
+    fn bell_rings_only_for_nonfocused_attention_transitions() {
+        let mut app = App::new();
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Response::Attached {
+                session: "t".into(),
+                workspaces: view_two_panes(),
+            })
+            .unwrap(),
+        ));
+        app.focused = Some(PaneId(1));
+
+        // A non-focused pane going Working -> Blocked rings once, then clears.
+        state_changed(
+            &mut app,
+            PaneId(2),
+            AgentState::Working,
+            AgentState::Blocked,
+        );
+        assert!(app.take_bell());
+        assert!(!app.take_bell());
+
+        // Working -> Done on a non-focused pane also rings.
+        state_changed(&mut app, PaneId(2), AgentState::Working, AgentState::Done);
+        assert!(app.take_bell());
+
+        // The focused pane's own transition never rings.
+        state_changed(
+            &mut app,
+            PaneId(1),
+            AgentState::Working,
+            AgentState::Blocked,
+        );
+        assert!(!app.take_bell());
+
+        // A non-attention transition (not from Working) never rings.
+        state_changed(&mut app, PaneId(2), AgentState::Idle, AgentState::Working);
+        assert!(!app.take_bell());
     }
 
     #[test]

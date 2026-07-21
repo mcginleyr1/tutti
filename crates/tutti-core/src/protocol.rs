@@ -63,6 +63,11 @@ pub enum Request {
         pane: PaneId,
         offset: usize,
     },
+    /// Mark `pane` the active pane. The server records it and applies a
+    /// `Focused` state event, so a `Done` pane becomes `Idle` once looked at.
+    PaneFocus {
+        pane: PaneId,
+    },
     Attach,
     Detach,
 }
@@ -219,6 +224,7 @@ mod tests {
             pane: PaneId(2),
             offset: 120,
         });
+        roundtrip(&Request::PaneFocus { pane: PaneId(2) });
         roundtrip(&Request::Attach);
     }
 
