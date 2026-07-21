@@ -15,3 +15,5 @@ anyhow.workspace = true
 [dev-dependencies]
 tokio.workspace = true
 anyhow.workspace = true
+tutti-core.workspace = true
+serde_json.workspace = true

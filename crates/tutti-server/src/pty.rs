@@ -218,6 +218,60 @@ impl PtyPane {
         }
     }
 
+    /// An owned clone of the live screen, for computing `contents_formatted`
+    /// snapshots and `contents_diff` deltas on the broadcast tick.
+    pub fn screen(&self) -> vt100::Screen {
+        self.parser
+            .lock()
+            .expect("pty parser poisoned")
+            .screen()
+            .clone()
+    }
+
+    /// The pane's text content, oldest line first, including scrollback.
+    ///
+    /// `unwrapped` joins soft-wrapped rows back into logical lines; `lines`
+    /// caps the result to that many most-recent lines. Reads a throwaway clone
+    /// so scrolling the view does not disturb attached clients.
+    pub fn read(&self, lines: Option<usize>, unwrapped: bool) -> Vec<String> {
+        let mut screen = self.screen();
+        let (rows, cols) = screen.size();
+        let rows = rows as usize;
+
+        screen.set_scrollback(usize::MAX);
+        let scrollback = screen.scrollback();
+        let total = scrollback + rows;
+
+        // Tile the whole buffer with screen-height windows. `visible_rows`
+        // exposes only `rows` lines at a time, so we step the scrollback
+        // offset and skip the rows an earlier window already yielded.
+        let mut visual: Vec<String> = Vec::with_capacity(total);
+        let mut top = 0usize;
+        while top < total {
+            let offset = scrollback.saturating_sub(top);
+            screen.set_scrollback(offset);
+            let window_top = scrollback - offset;
+            let skip = top - window_top;
+            visual.extend(screen.rows(0, cols).skip(skip));
+            top = window_top + rows;
+        }
+
+        let mut out = if unwrapped {
+            fold_wrapped(visual, cols as usize)
+        } else {
+            visual
+        };
+        while out.last().is_some_and(String::is_empty) {
+            out.pop();
+        }
+        if let Some(n) = lines
+            && out.len() > n
+        {
+            out.drain(..out.len() - n);
+        }
+        out
+    }
+
     /// The child's exit status, or `None` if it is still running.
     pub fn exit_status(&self) -> Option<PaneExit> {
         *self.exit_rx.borrow()
@@ -273,6 +327,22 @@ impl Drop for PtyPane {
             let _ = handle.join();
         }
     }
+}
+
+/// Join rows that filled the full width onto their predecessor: `vt100` marks
+/// such rows as soft-wrapped, and a full row is the only signal reachable
+/// through the public screen API. A genuine full-width line is merged too — an
+/// accepted approximation, since the wire snapshot keeps exact wrapping.
+fn fold_wrapped(rows: Vec<String>, cols: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(rows.len());
+    for row in rows {
+        if out.last().is_some_and(|prev| prev.chars().count() == cols) {
+            out.last_mut().expect("checked non-empty").push_str(&row);
+        } else {
+            out.push(row);
+        }
+    }
+    out
 }
 
 fn read_loop(
