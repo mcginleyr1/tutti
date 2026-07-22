@@ -91,9 +91,10 @@ without falling back to tmux.
   bar; Done → Idle on focus. No agent hook integrations, no desktop notifications.
 
 **Explicitly out until beta:** multi-client attach, drag-resize / text-select /
-OSC 52 copy, navigate-mode fuzzy tree (a plain pane list is fine), config file
-(hardcoded defaults, prefix `Ctrl+B`), all of Phase 4 (wait/orchestration verbs,
-worktree workflow, skill), all of Phase 5 (install via `cargo install --path .`).
+OSC 52 copy, navigate-mode fuzzy tree (a plain pane list is fine), all of
+Phase 4 (wait/orchestration verbs, worktree workflow, skill), all of Phase 5
+except the config file, which landed early (keybindings, presets, prefix, mouse
+— see README Configuration).
 
 **Build order:**
 
