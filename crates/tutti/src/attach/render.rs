@@ -1128,6 +1128,28 @@ mod tests {
     }
 
     #[test]
+    fn two_tone_renders_bright_keys_and_dim_labels() {
+        let line = two_tone_line("j/k", "move");
+        assert_eq!(
+            line.spans[0].style,
+            Style::default(),
+            "key span stays bright"
+        );
+        assert_eq!(
+            line.spans[1].style,
+            Style::default().add_modifier(Modifier::DIM),
+            "label span is dim"
+        );
+        let (spans, _) = two_tone(&[("a", "one"), ("b", "two")]);
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.content == " · " && s.style.add_modifier.contains(Modifier::DIM)),
+            "separator between pairs is dim"
+        );
+    }
+
+    #[test]
     fn status_bar_shows_the_detach_hint() {
         let app = app_with_pane(b"hi");
         let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
