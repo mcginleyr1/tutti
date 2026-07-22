@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -339,29 +340,73 @@ impl PtyPane {
         self.exit_rx.clone()
     }
 
-    /// Terminate the child.
+    /// Terminate the child and every descendant sharing its pty.
+    ///
+    /// portable-pty makes the child a session/process-group leader (`setsid`
+    /// before exec), so its pid doubles as its process-group id. We SIGKILL the
+    /// whole group: a descendant that inherited the slave pty (a backgrounded
+    /// grandchild, say) would otherwise outlive the direct child — leaking, and
+    /// on Linux holding the master reader open past EOF so the reader-thread
+    /// join in `Drop` hangs. portable-pty's own killer only SIGHUPs the direct
+    /// child, which a descendant can ignore or a grandchild never receives.
     pub fn kill(&self) -> Result<()> {
+        if let Some(pid) = self.pid {
+            signal_group(pid, SIGKILL);
+            return Ok(());
+        }
+        // No pid was reported (not expected on Unix): fall back to the direct
+        // child so we at least terminate it.
         self.killer
             .lock()
             .expect("pty killer poisoned")
             .kill()
-            .context("kill child failed")?;
-        Ok(())
+            .context("kill child failed")
     }
 }
 
 impl Drop for PtyPane {
     fn drop(&mut self) {
-        if let Ok(mut killer) = self.killer.lock() {
-            let _ = killer.kill();
-        }
+        // Kill the whole process group (see `kill`) so a lingering descendant
+        // cannot keep the reader blocked and hang the joins below.
+        let _ = self.kill();
         if let Some(handle) = self.reader_thread.take() {
-            let _ = handle.join();
+            join_or_detach(handle);
         }
         if let Some(handle) = self.wait_thread.take() {
-            let _ = handle.join();
+            join_or_detach(handle);
         }
     }
+}
+
+/// SIGKILL: the child called `setsid`, so its pid is its process-group id and a
+/// negative pid signals the whole group. We bind `kill(2)` directly rather than
+/// via the `libc` crate, which is not a declared dependency — mirroring how
+/// `tutti-core` binds `getuid`.
+const SIGKILL: i32 = 9;
+
+/// Upper bound on how long `Drop` waits for a pty thread before detaching it, so
+/// a pathological descendant that survives SIGKILL while holding the slave open
+/// cannot hang shutdown indefinitely.
+const JOIN_BACKSTOP: Duration = Duration::from_secs(2);
+
+/// SIGKILL the process group led by `pid` (a negative pid targets the group).
+fn signal_group(pid: u32, sig: i32) {
+    let _ = libc_kill(-(pid as i32), sig);
+}
+
+/// Join `handle`, but detach rather than block indefinitely if it does not
+/// finish within `JOIN_BACKSTOP`. After a process-group kill the reader sees EOF
+/// and returns at once; this only guards a descendant that survives the kill
+/// while holding the slave open.
+fn join_or_detach(handle: JoinHandle<()>) {
+    let deadline = std::time::Instant::now() + JOIN_BACKSTOP;
+    while !handle.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let _ = handle.join();
 }
 
 /// Join rows that filled the full width onto their predecessor: `vt100` marks
@@ -478,7 +523,13 @@ impl NotifyScanner {
                     self.overflow = false;
                 }
                 0x1b => {} // a run of ESCs stays poised for the introducer
-                _ => self.state = ScanState::Ground,
+                _ => {
+                    // Not the OSC introducer: abandon the escape and reinterpret
+                    // this byte from ground, so an `ESC BEL` still rings (matches
+                    // the re-feed the `OscEsc` state already does).
+                    self.state = ScanState::Ground;
+                    self.step(b, out);
+                }
             },
             ScanState::Osc => match b {
                 // A bare BEL here is the OSC terminator, not a bell.
@@ -547,6 +598,11 @@ fn parse_osc(buf: &[u8]) -> Option<Notification> {
 
 fn non_empty(s: &str) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
+}
+
+unsafe extern "C" {
+    #[link_name = "kill"]
+    safe fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
 const _: fn() = || {
@@ -658,12 +714,93 @@ mod tests {
     }
 
     #[test]
+    fn esc_bel_still_counts_as_a_bell() {
+        // A bare `ESC BEL`, and an `ESC <byte> BEL`, both surface the bell that
+        // the `Esc` state used to swallow.
+        assert_eq!(scan(b"\x1b\x07"), vec![bell()]);
+        assert_eq!(scan(b"\x1bx\x07"), vec![bell()]);
+    }
+
+    #[test]
+    fn esc_bel_is_incremental_across_every_cut_point() {
+        for input in [b"\x1b\x07".as_slice(), b"\x1bx\x07".as_slice()] {
+            let whole = scan(input);
+            assert_eq!(whole, vec![bell()], "whole scan of {input:?}");
+            for cut in 0..=input.len() {
+                assert_eq!(
+                    scan_split(input, cut),
+                    whole,
+                    "mismatch cutting {input:?} at {cut}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn scanning_is_incremental_across_every_cut_point() {
         let input = b"pre\x07\x1b]9;done\x07mid\x1b]777;notify;A;B\x1b\\post\x07";
         let whole = scan(input);
         assert_eq!(whole.len(), 4, "bell, osc9, osc777, bell");
         for cut in 0..=input.len() {
             assert_eq!(scan_split(input, cut), whole, "mismatch cutting at {cut}");
+        }
+    }
+
+    /// Killing a pane must terminate the child's whole process group. A
+    /// backgrounded grandchild that ignores SIGHUP and holds the slave pty
+    /// survives portable-pty's SIGHUP-to-the-direct-child kill (and, on Linux,
+    /// keeps the master reader blocked so `Drop` hangs); only a process-group
+    /// kill takes it down. We assert the group is fully reaped, then that
+    /// dropping the pane does not hang.
+    #[test]
+    fn kill_reaps_the_whole_process_group() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Instant;
+
+        let mut spec = PtySpec::new("/bin/sh");
+        spec.args = vec![
+            "-c".into(),
+            "sh -c 'trap \"\" HUP; while :; do sleep 1; done' & exec sleep 30".into(),
+        ];
+        let pane = PtyPane::spawn(spec, PaneSize::new(24, 80)).unwrap();
+        let pid = pane.child_pid().expect("unix reports a child pid");
+
+        // Let the shell fork the backgrounded grandchild into the group.
+        std::thread::sleep(Duration::from_millis(250));
+        pane.kill().unwrap();
+
+        // The child is its own group leader, so `kill(-pid, 0)` succeeds while
+        // any group member (the grandchild) is still alive.
+        let reaped = {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                if libc_kill(-(pid as i32), 0) != 0 {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        assert!(
+            reaped,
+            "process group survived the kill: a descendant was left running"
+        );
+
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        std::thread::spawn(move || {
+            drop(pane);
+            flag.store(true, Ordering::SeqCst);
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !done.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "dropping a killed pane hung: the reader thread never saw EOF"
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 }

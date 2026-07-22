@@ -473,6 +473,94 @@ async fn expect_pane_frame(conn: &mut Conn, pane: PaneId, want_snapshot: bool) -
     .expect("timed out waiting for the expected pane frame")
 }
 
+/// A client that attaches and then stops reading has its outbound queue bounded:
+/// once it backs up the server disconnects it (its socket reaches EOF), while a
+/// second, well-behaved client attached at the same time keeps receiving frames
+/// and can still complete a request round-trip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wedged_client_is_dropped_but_others_keep_flowing() {
+    let server = TestServer::start();
+
+    let mut control = server.connect().await;
+    new_workspace(&mut control).await;
+
+    // Attaches, then never reads again: its bounded queue will fill.
+    let mut wedged = server.connect().await;
+    wedged.send(&Request::Attach).await;
+
+    // Attaches and will keep draining.
+    let mut good = server.connect().await;
+    good.send(&Request::Attach).await;
+    assert!(matches!(good.response().await, Response::Attached { .. }));
+
+    // Flood a pane with bells; each becomes a broadcast frame, so the
+    // non-reading client's queue overflows within a second or two. Emitted in
+    // throttled bursts rather than a tight loop, so the flood stays a good CPU
+    // citizen next to the well-behaved client (and to concurrent tests).
+    pane_id(
+        control
+            .request(Request::PaneRun {
+                tab: None,
+                cmd: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "while :; do i=0; while [ $i -lt 40 ]; do printf '\\007'; \
+                     i=$((i+1)); done; sleep 0.02; done"
+                        .into(),
+                ],
+            })
+            .await,
+    );
+
+    // Drain `good` continuously; after a grace period, prove it can still round
+    // trip a request while the flood is in flight.
+    let good_handle = tokio::spawn(async move {
+        let mut good = good;
+        let mut sent = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+        loop {
+            if !sent && tokio::time::Instant::now() >= deadline {
+                good.send(&Request::PaneList).await;
+                sent = true;
+            }
+            let frame = good.read_frame().await;
+            if sent
+                && let Frame::Control(json) = &frame
+                && matches!(
+                    serde_json::from_slice::<Response>(json),
+                    Ok(Response::Panes { .. })
+                )
+            {
+                return;
+            }
+        }
+    });
+
+    // Deliberately leave `wedged` unread until now — reading it would drain its
+    // queue and un-wedge it. By this point the server has dropped it, so a drain
+    // to EOF confirms the disconnect.
+    sleep(Duration::from_secs(2)).await;
+    let dropped = timeout(DEADLINE, async {
+        let mut buf = [0u8; 4096];
+        loop {
+            match wedged.stream.read(&mut buf).await {
+                Ok(0) | Err(_) => return true,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(dropped, "server did not disconnect the wedged client");
+
+    timeout(DEADLINE, good_handle)
+        .await
+        .expect("well-behaved client round-trip timed out")
+        .expect("good task panicked");
+
+    server.stop().await;
+}
+
 /// Copy `src` to a fresh temp directory under the name `name` and make it
 /// executable, so a benign binary can masquerade as an agent for detection.
 fn copy_bin(name: &str, src: &str) -> PathBuf {

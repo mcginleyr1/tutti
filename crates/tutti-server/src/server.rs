@@ -4,6 +4,7 @@
 //! control events until it detaches or disconnects.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,9 +35,20 @@ const TICK: Duration = Duration::from_millis(16);
 const DETECT_INTERVAL: Duration = Duration::from_secs(1);
 /// Cadence of the state-classification pass over agent panes.
 const CLASSIFY_INTERVAL: Duration = Duration::from_millis(300);
+/// Depth of a client's outbound frame queue. A client that cannot drain this
+/// many frames is wedged: rather than grow memory without bound or silently drop
+/// frames (a lost delta corrupts its grid forever, a lost event is gone), we
+/// disconnect it — it can simply reattach.
+const CLIENT_QUEUE_CAP: usize = 256;
 
 struct Client {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: mpsc::Sender<Vec<u8>>,
+    /// Aborts this client's writer task, dropping the socket's write half so a
+    /// wedged client is forced to disconnect.
+    writer: tokio::task::AbortHandle,
+    /// Held back from the render tick until the `Attached` reply is queued, so
+    /// the first pane frame a client sees always follows its `Attached`.
+    ready: bool,
     /// Panes this client has already been sent a snapshot for; the rest of its
     /// panes fall into the shared delta cadence.
     seen: HashSet<PaneId>,
@@ -183,21 +195,32 @@ fn prepare_socket(path: &Path) -> Result<()> {
 async fn handle_conn(hub: Arc<Hub>, stream: tokio::net::UnixStream) -> Result<()> {
     let cid = hub.next_client.fetch_add(1, Ordering::Relaxed);
     let (mut read_half, write_half) = stream.into_split();
-    let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(CLIENT_QUEUE_CAP);
     let writer = tokio::spawn(writer_loop(write_half, rx));
+    let abort = writer.abort_handle();
 
     let mut buf = Vec::new();
+    let mut wedged = false;
     while let Some(frame) = read_frame(&mut read_half, &mut buf).await? {
-        handle_frame(&hub, cid, &tx, frame);
+        if handle_frame(&hub, cid, &tx, &abort, frame).is_break() {
+            wedged = true;
+            break;
+        }
     }
 
     hub.clients.lock().expect("clients poisoned").remove(&cid);
-    drop(tx);
-    let _ = writer.await;
+    if wedged {
+        // The client's own reply queue backed up: it is not draining, so abort
+        // the writer to drop the socket rather than block awaiting a flush.
+        writer.abort();
+    } else {
+        drop(tx);
+        let _ = writer.await;
+    }
     Ok(())
 }
 
-async fn writer_loop(mut half: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+async fn writer_loop(mut half: OwnedWriteHalf, mut rx: mpsc::Receiver<Vec<u8>>) {
     while let Some(bytes) = rx.recv().await {
         if half.write_all(&bytes).await.is_err() {
             break;
@@ -220,44 +243,87 @@ async fn read_frame(reader: &mut OwnedReadHalf, buf: &mut Vec<u8>) -> Result<Opt
     }
 }
 
-fn handle_frame(hub: &Arc<Hub>, cid: u64, tx: &mpsc::UnboundedSender<Vec<u8>>, frame: Frame) {
+fn handle_frame(
+    hub: &Arc<Hub>,
+    cid: u64,
+    tx: &mpsc::Sender<Vec<u8>>,
+    writer: &tokio::task::AbortHandle,
+    frame: Frame,
+) -> ControlFlow<()> {
     match frame {
         Frame::Control(json) => match serde_json::from_slice::<Request>(&json) {
-            // Send the Attached view before joining the broadcast set so it
-            // always precedes the pane snapshots the next tick pushes here.
             Ok(Request::Attach) => {
-                let workspaces = hub.session().view();
-                let _ = tx.send(encode_json(&Response::Attached {
-                    session: hub.name.clone(),
-                    workspaces,
-                }));
+                // Register this client before snapshotting the view, so a
+                // StateChanged/LayoutChanged broadcast in the gap is delivered
+                // (an early or duplicate event the client applies idempotently)
+                // rather than lost. It stays held back from the render tick
+                // until its Attached reply is queued below, so no pane frame can
+                // slip ahead of Attached. Locks stay un-nested: clients and
+                // session are never held together.
                 hub.clients.lock().expect("clients poisoned").insert(
                     cid,
                     Client {
                         tx: tx.clone(),
+                        writer: writer.clone(),
+                        ready: false,
                         seen: HashSet::new(),
                     },
                 );
+                let workspaces = hub.session().view();
+                let reply = encode_json(&Response::Attached {
+                    session: hub.name.clone(),
+                    workspaces,
+                });
+                let flow = send_reply(hub, cid, tx, reply);
+                if flow.is_continue()
+                    && let Some(client) =
+                        hub.clients.lock().expect("clients poisoned").get_mut(&cid)
+                {
+                    client.ready = true;
+                }
+                flow
             }
             Ok(Request::Detach) => {
                 hub.clients.lock().expect("clients poisoned").remove(&cid);
-                let _ = tx.send(encode_json(&Response::Ok));
+                send_reply(hub, cid, tx, encode_json(&Response::Ok))
             }
             Ok(Request::PaneScroll { pane, offset }) => scroll(hub, cid, tx, pane, offset),
             Ok(request) => {
                 let response = dispatch(hub, request);
-                let _ = tx.send(encode_json(&response));
+                send_reply(hub, cid, tx, encode_json(&response))
             }
-            Err(err) => {
-                let _ = tx.send(encode_json(&Response::Error {
+            Err(err) => send_reply(
+                hub,
+                cid,
+                tx,
+                encode_json(&Response::Error {
                     message: format!("bad request: {err}"),
-                }));
-            }
+                }),
+            ),
         },
         Frame::Input { pane, bytes } => {
             let _ = hub.session().pane_send(pane, &bytes);
+            ControlFlow::Continue(())
         }
-        Frame::PaneSnapshot(_) | Frame::PaneDelta(_) => {}
+        Frame::PaneSnapshot(_) | Frame::PaneDelta(_) => ControlFlow::Continue(()),
+    }
+}
+
+/// Enqueue a reply on the client's own channel. A full or closed queue means the
+/// client is not draining: drop it from the broadcast set and tell the caller to
+/// tear the connection down.
+fn send_reply(
+    hub: &Arc<Hub>,
+    cid: u64,
+    tx: &mpsc::Sender<Vec<u8>>,
+    bytes: Vec<u8>,
+) -> ControlFlow<()> {
+    match tx.try_send(bytes) {
+        Ok(()) => ControlFlow::Continue(()),
+        Err(_) => {
+            hub.clients.lock().expect("clients poisoned").remove(&cid);
+            ControlFlow::Break(())
+        }
     }
 }
 
@@ -467,18 +533,18 @@ fn resize_pane(hub: &Arc<Hub>, pane: PaneId, rows: u16, cols: u16) -> Response {
 fn scroll(
     hub: &Arc<Hub>,
     cid: u64,
-    tx: &mpsc::UnboundedSender<Vec<u8>>,
+    tx: &mpsc::Sender<Vec<u8>>,
     pane: PaneId,
     offset: usize,
-) {
+) -> ControlFlow<()> {
     if offset == 0 {
         if let Some(client) = hub.clients.lock().expect("clients poisoned").get_mut(&cid) {
             client.seen.remove(&pane);
         }
-        return;
+        return ControlFlow::Continue(());
     }
     let Some(pty) = hub.session().pty(pane) else {
-        return;
+        return ControlFlow::Continue(());
     };
     let screen = pty.screen_scrolled(offset);
     let (rows, cols) = screen.size();
@@ -489,7 +555,7 @@ fn scroll(
         seq: 0,
         bytes: screen.contents_formatted(),
     });
-    let _ = tx.send(frame.encode());
+    send_reply(hub, cid, tx, frame.encode())
 }
 
 fn spawn_reaper(hub: &Arc<Hub>, pane: PaneId, pty: Arc<PtyPane>) {
@@ -528,6 +594,9 @@ fn broadcast_tick(hub: &Hub) {
     if hub.clients.lock().expect("clients poisoned").is_empty() {
         return;
     }
+    // Clients whose bounded queue filled this tick, disconnected once the loop
+    // releases the clients lock.
+    let mut doomed: HashSet<u64> = HashSet::new();
     for (pane, pty) in panes {
         let generation = *pty.output_receiver().borrow();
 
@@ -571,28 +640,37 @@ fn broadcast_tick(hub: &Hub) {
         };
 
         let mut clients = hub.clients.lock().expect("clients poisoned");
-        for client in clients.values_mut() {
-            if client.seen.insert(pane) {
-                let frame = Frame::PaneSnapshot(PaneData {
+        for (cid, client) in clients.iter_mut() {
+            if !client.ready || doomed.contains(cid) {
+                continue;
+            }
+            let bytes = if client.seen.insert(pane) {
+                Frame::PaneSnapshot(PaneData {
                     pane,
                     rows,
                     cols,
                     seq,
                     bytes: cur.contents_formatted(),
-                });
-                let _ = client.tx.send(frame.encode());
+                })
+                .encode()
             } else if let Some(diff) = &delta {
-                let frame = Frame::PaneDelta(PaneData {
+                Frame::PaneDelta(PaneData {
                     pane,
                     rows,
                     cols,
                     seq,
                     bytes: diff.clone(),
-                });
-                let _ = client.tx.send(frame.encode());
+                })
+                .encode()
+            } else {
+                continue;
+            };
+            if client.tx.try_send(bytes).is_err() {
+                doomed.insert(*cid);
             }
         }
     }
+    disconnect(hub, doomed);
 }
 
 /// One agent-detection pass: snapshot the process tree, walk each live pane's
@@ -700,8 +778,32 @@ fn classify_pass(hub: &Arc<Hub>, last_gen: &mut HashMap<PaneId, u64>) {
 
 fn broadcast_event(hub: &Hub, event: Event) {
     let bytes = encode_json(&event);
-    for client in hub.clients.lock().expect("clients poisoned").values() {
-        let _ = client.tx.send(bytes.clone());
+    let mut doomed = Vec::new();
+    {
+        let clients = hub.clients.lock().expect("clients poisoned");
+        for (cid, client) in clients.iter() {
+            if client.tx.try_send(bytes.clone()).is_err() {
+                doomed.push(*cid);
+            }
+        }
+    }
+    disconnect(hub, doomed);
+}
+
+/// Drop wedged clients: remove each from the broadcast set and abort its writer
+/// so the socket closes. Callers collect the ids while iterating, release the
+/// clients lock, then call this — the clients lock must not be held here.
+fn disconnect(hub: &Hub, cids: impl IntoIterator<Item = u64>) {
+    let mut cids = cids.into_iter().peekable();
+    if cids.peek().is_none() {
+        return;
+    }
+    let mut clients = hub.clients.lock().expect("clients poisoned");
+    for cid in cids {
+        if let Some(client) = clients.remove(&cid) {
+            client.writer.abort();
+            eprintln!("tutti: client {cid} send queue full; disconnecting");
+        }
     }
 }
 
