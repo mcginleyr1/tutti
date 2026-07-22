@@ -15,6 +15,26 @@ pub enum Request {
     WorkspaceList,
     WorkspaceKill {
         id: WorkspaceId,
+        /// Discard a *forked* workspace's checkout on kill: `jj workspace forget`
+        /// it at its origin and delete its directory. Rejected for a workspace
+        /// tutti did not create — tutti never removes a checkout it did not fork.
+        #[serde(default)]
+        discard: bool,
+    },
+    /// Fork a jj workspace: `jj workspace add` a sibling checkout named `name`
+    /// (optionally at `revision`), then mount it as a tutti workspace with a
+    /// shell pane. The source workspace must be under a `.jj` repo. Answered with
+    /// `Response::WorkspaceCreated`.
+    WorkspaceFork {
+        id: WorkspaceId,
+        name: String,
+        revision: Option<String>,
+    },
+    /// Update a stale forked workspace by running `jj workspace update-stale` in
+    /// its directory, then refreshing. The manual fix for the sidebar's `stale`
+    /// tag. Answered with `Response::Ok` or `Response::Error`.
+    WorkspaceUpdate {
+        id: WorkspaceId,
     },
     TabNew {
         workspace: Option<WorkspaceId>,
@@ -134,6 +154,12 @@ pub struct WorkspaceView {
     /// changes, or has not been probed yet — the sidebar stays quiet then.
     #[serde(default)]
     pub changes: Option<String>,
+    /// Whether this workspace's jj working copy is stale — its `@` was rewritten
+    /// from another workspace, so it needs `jj workspace update-stale`. Surfaced
+    /// as a sidebar tag; never auto-fixed. Defaults false for non-jj workspaces
+    /// and older servers.
+    #[serde(default)]
+    pub stale: bool,
     pub tabs: Vec<TabView>,
 }
 
@@ -249,6 +275,21 @@ mod tests {
             id: WorkspaceId(2),
             stat: true,
         });
+        roundtrip(&Request::WorkspaceKill {
+            id: WorkspaceId(3),
+            discard: true,
+        });
+        roundtrip(&Request::WorkspaceFork {
+            id: WorkspaceId(4),
+            name: "feature".into(),
+            revision: Some("@".into()),
+        });
+        roundtrip(&Request::WorkspaceFork {
+            id: WorkspaceId(4),
+            name: "feature".into(),
+            revision: None,
+        });
+        roundtrip(&Request::WorkspaceUpdate { id: WorkspaceId(5) });
         roundtrip(&Request::TabNew { workspace: None });
         roundtrip(&Request::PaneSplit {
             pane: PaneId(1),
@@ -289,6 +330,7 @@ mod tests {
             dir: PathBuf::from("/tmp/w"),
             branch: Some("main".into()),
             changes: Some("4 files +120 −33".into()),
+            stale: false,
             tabs: vec![TabView {
                 id: TabId(1),
                 name: "main".into(),
@@ -410,10 +452,31 @@ mod tests {
                 stat: false,
             }
         );
-        // A view serialized without `changes` (older server) parses as `None`.
+        // A view serialized without `changes`/`stale` (older server) defaults.
         let view: WorkspaceView =
             serde_json::from_str(r#"{"id":1,"name":"api","dir":"/tmp/w","branch":null,"tabs":[]}"#)
                 .unwrap();
         assert_eq!(view.changes, None);
+        assert!(!view.stale);
+        // `workspace_kill` from before `discard` existed still parses (keep).
+        let kill: Request = serde_json::from_str(r#"{"type":"workspace_kill","id":2}"#).unwrap();
+        assert_eq!(
+            kill,
+            Request::WorkspaceKill {
+                id: WorkspaceId(2),
+                discard: false,
+            }
+        );
+        // `workspace_fork` without a revision defaults to `None`.
+        let fork: Request =
+            serde_json::from_str(r#"{"type":"workspace_fork","id":1,"name":"x"}"#).unwrap();
+        assert_eq!(
+            fork,
+            Request::WorkspaceFork {
+                id: WorkspaceId(1),
+                name: "x".into(),
+                revision: None,
+            }
+        );
     }
 }

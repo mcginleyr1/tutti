@@ -14,6 +14,10 @@ use tutti_core::Response;
 /// hung external diff tool must never stall a client or a background refresh.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A longer cap for `jj workspace add`: forking materializes a whole working
+/// copy on disk, so it needs more headroom than a read-only probe.
+const FORK_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Cap on lines returned to a client. A larger diff is truncated with a final
 /// marker so the protocol frame — and the consumer rendering it — stay bounded.
 const MAX_LINES: usize = 10_000;
@@ -38,6 +42,24 @@ pub fn is_workspace(dir: &Path) -> bool {
     workspace_root(dir).is_some()
 }
 
+/// The sibling destination for a fork of the repo at `repo_root`, named `name`:
+/// `<repo-parent>/<repo-basename>-<name>`. `None` when `repo_root` has no parent
+/// or no file name (e.g. the filesystem root).
+pub fn fork_dest(repo_root: &Path, name: &str) -> Option<PathBuf> {
+    let parent = repo_root.parent()?;
+    let base = repo_root.file_name()?.to_string_lossy();
+    Some(parent.join(format!("{base}-{name}")))
+}
+
+/// Whether `name` is a valid fork name: one or more `[A-Za-z0-9_-]`. It becomes
+/// both a path component and a jj workspace name, so anything else is rejected.
+pub fn valid_fork_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// Run `jj diff` (or `--stat`) in `dir` and shape it into a protocol `Response`.
 /// The protocol path renders plain text, so `--color=never`. Bounded by a
 /// timeout (the child is killed on expiry) and a line cap. A non-`.jj` directory
@@ -50,7 +72,7 @@ pub async fn diff(dir: &Path, stat: bool) -> Response {
     }
     let mut cmd = base_command(dir, stat);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let output = match run(cmd).await {
+    let output = match run(cmd, TIMEOUT).await {
         Ok(output) => output,
         Err(message) => return Response::Error { message },
     };
@@ -84,11 +106,130 @@ pub async fn change_stat(dir: &Path) -> Option<String> {
     }
     let mut cmd = base_command(dir, true);
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
-    let output = run(cmd).await.ok()?;
+    let output = run(cmd, TIMEOUT).await.ok()?;
     if !output.status.success() {
         return None;
     }
     parse_stat(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Whether the jj workspace at `dir` has a stale working copy — its `@` was
+/// rewritten from another workspace, so it needs `jj workspace update-stale`.
+/// Probes with `jj log -r @`, which snapshots the working copy (the operation
+/// that surfaces staleness) and prints a `stale` warning to stderr when it is.
+/// A non-repo or any spawn failure reads as not-stale, so the sidebar stays
+/// quiet. `--ignore-working-copy` is deliberately *not* passed: it would skip
+/// the snapshot and hide the very condition being probed.
+pub async fn is_stale(dir: &Path) -> bool {
+    if !is_workspace(dir) {
+        return false;
+    }
+    let mut cmd = Command::new("jj");
+    cmd.arg("--no-pager")
+        .arg("log")
+        .arg("-r")
+        .arg("@")
+        .arg("--no-graph")
+        .arg("-T")
+        .arg("")
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    match run(cmd, TIMEOUT).await {
+        Ok(output) => String::from_utf8_lossy(&output.stderr).contains("stale"),
+        Err(_) => false,
+    }
+}
+
+/// Fork the jj repo rooted at `repo_root` into a new workspace at `dest`, named
+/// `name` (optionally checked out at `revision`). Runs `jj workspace add` from
+/// the repo root. `Ok(())` on success; the jj stderr (or a spawn/timeout error)
+/// otherwise. The caller has already verified `dest` does not exist.
+pub async fn fork(
+    repo_root: &Path,
+    dest: &Path,
+    name: &str,
+    revision: Option<&str>,
+) -> Result<(), String> {
+    let mut cmd = Command::new("jj");
+    cmd.arg("--no-pager")
+        .arg("workspace")
+        .arg("add")
+        .arg("--name")
+        .arg(name);
+    if let Some(rev) = revision {
+        cmd.arg("--revision").arg(rev);
+    }
+    cmd.arg(dest)
+        .current_dir(repo_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    match run(cmd, FORK_TIMEOUT).await {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(stderr_or(&output, "jj workspace add failed")),
+        Err(message) => Err(message),
+    }
+}
+
+/// Forget the workspace named `jj_name`, run at its origin repo `origin_root`
+/// (`jj workspace forget` must run from a workspace that still exists, not the
+/// one being removed). `Ok(())` on success; the jj stderr otherwise.
+pub async fn forget(origin_root: &Path, jj_name: &str) -> Result<(), String> {
+    let mut cmd = Command::new("jj");
+    cmd.arg("--no-pager")
+        .arg("workspace")
+        .arg("forget")
+        .arg(jj_name)
+        .current_dir(origin_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    match run(cmd, TIMEOUT).await {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(stderr_or(&output, "jj workspace forget failed")),
+        Err(message) => Err(message),
+    }
+}
+
+/// Update a stale working copy in `dir` (`jj workspace update-stale`). Answered
+/// as a protocol `Response`: `Ok` on success, `Error` for a non-repo, a jj
+/// failure, or a spawn/timeout error.
+pub async fn update_stale(dir: &Path) -> Response {
+    if !is_workspace(dir) {
+        return Response::Error {
+            message: format!("not a jj workspace: {}", dir.display()),
+        };
+    }
+    let mut cmd = Command::new("jj");
+    cmd.arg("--no-pager")
+        .arg("workspace")
+        .arg("update-stale")
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    match run(cmd, TIMEOUT).await {
+        Ok(output) if output.status.success() => Response::Ok,
+        Ok(output) => Response::Error {
+            message: stderr_or(&output, "jj workspace update-stale failed"),
+        },
+        Err(message) => Response::Error { message },
+    }
+}
+
+/// The trimmed stderr of a failed jj command, or `fallback` (with the exit
+/// status) when jj printed nothing.
+fn stderr_or(output: &std::process::Output, fallback: &str) -> String {
+    match String::from_utf8_lossy(&output.stderr).trim() {
+        "" => format!("{fallback} (status {})", output.status),
+        text => text.to_string(),
+    }
 }
 
 /// A `jj --no-pager diff [--stat] --color=never` command rooted at `dir`, with
@@ -103,14 +244,14 @@ fn base_command(dir: &Path, stat: bool) -> Command {
     cmd
 }
 
-/// Spawn `cmd` and collect its output within the timeout. On expiry the future
-/// is dropped, which drops the owned `Child`; `kill_on_drop` then reaps it.
-async fn run(mut cmd: Command) -> Result<std::process::Output, String> {
+/// Spawn `cmd` and collect its output within `timeout`. On expiry the future is
+/// dropped, which drops the owned `Child`; `kill_on_drop` then reaps it.
+async fn run(mut cmd: Command, timeout: Duration) -> Result<std::process::Output, String> {
     let child = cmd.spawn().map_err(|e| format!("spawn jj: {e}"))?;
-    match tokio::time::timeout(TIMEOUT, child.wait_with_output()).await {
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(output)) => Ok(output),
-        Ok(Err(e)) => Err(format!("jj diff failed: {e}")),
-        Err(_) => Err(format!("jj diff timed out after {}s", TIMEOUT.as_secs())),
+        Ok(Err(e)) => Err(format!("jj failed: {e}")),
+        Err(_) => Err(format!("jj timed out after {}s", timeout.as_secs())),
     }
 }
 
@@ -179,6 +320,26 @@ mod tests {
         assert_eq!(parse_stat(""), None);
         assert_eq!(parse_stat("not a stat line at all"), None);
         assert_eq!(parse_stat("files changed, but no number"), None);
+    }
+
+    #[test]
+    fn fork_dest_is_a_named_sibling_of_the_repo_root() {
+        assert_eq!(
+            fork_dest(Path::new("/home/me/proj"), "feat").as_deref(),
+            Some(Path::new("/home/me/proj-feat"))
+        );
+        // No parent (filesystem root) yields None.
+        assert_eq!(fork_dest(Path::new("/"), "feat"), None);
+    }
+
+    #[test]
+    fn valid_fork_name_accepts_word_chars_and_rejects_the_rest() {
+        assert!(valid_fork_name("feature-1_x"));
+        assert!(valid_fork_name("ABC"));
+        assert!(!valid_fork_name(""));
+        assert!(!valid_fork_name("has space"));
+        assert!(!valid_fork_name("has/slash"));
+        assert!(!valid_fork_name("dots.bad"));
     }
 
     #[test]

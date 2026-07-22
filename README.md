@@ -169,7 +169,9 @@ right-aligned count:
   rather than echoing the name; a clean or non-jj workspace shows no stat. The
   stat refreshes as agents work (on every state transition, on attach, and when a
   workspace is created) and is dropped first when the column is too narrow for
-  both. Selecting a workspace jumps to its tab.
+  both. A [forked](#forked-workspaces) workspace whose `@` was rewritten from
+  another workspace shows a dim-red `stale` tag in the stat's place until you run
+  `workspace update`. Selecting a workspace jumps to its tab.
 - **agents** — one row per agent pane across *every* workspace: a state dot
   (blocked red, working an animated spinner, done green, idle/unknown dim), the
   pane title, and a dim `state · kind` line. Sorted blocked-first so whatever
@@ -210,6 +212,33 @@ notification naming the pane. The focused pane is left alone (you are already
 looking). The status flash and re-emit are gated by `notifications = true`
 (default); the sidebar 🔔 mark is always on regardless.
 
+### Forked workspaces
+
+Tutti can fan an agent out onto its own isolated checkout with jj workspaces
+(jj is the required VCS — there are no git/hg adapters). `tutti workspace fork
+<id> --name <name>` runs `jj workspace add` to materialize a **sibling**
+directory next to the repo root (`<repo>-<name>`), mounts it as a tutti
+workspace, and drops a shell pane into it. Pass `-r <rev>` to check out a
+specific revision; the name must be `[A-Za-z0-9_-]+` (it becomes both a path
+component and a jj workspace name). The source workspace must live under a `.jj`
+repo, and the destination must not already exist — neither is silently reused.
+
+Because several workspaces share one repo, a fork's working copy can go **stale**
+when its `@` is rewritten from elsewhere. Tutti surfaces this as a dim-red
+`stale` tag on the workspace's sidebar row and never fixes it for you;
+`tutti workspace update <id>` runs `jj workspace update-stale` to reconcile it.
+
+Two ways to remove a fork, differing only in what happens on disk:
+
+- `tutti workspace kill <id>` — the panes die and the workspace leaves tutti, but
+  the jj workspace and its directory stay on disk. It is your checkout and your
+  call; nothing is deleted.
+- `tutti workspace kill <id> --discard` — additionally `jj workspace forget`s the
+  fork at its origin and removes its directory. `--discard` is **only** honoured
+  for a workspace tutti forked; it is a hard error on any other workspace, so
+  tutti never deletes a checkout it did not create. Merging a fork back is left a
+  human decision.
+
 ## Agent state badges
 
 Panes running a detected agent show live state on the pane border and in the
@@ -229,7 +258,9 @@ scriptable, it isn't done:
 
 ```
 tutti server start|stop [-s session]
-tutti workspace new --dir <path> | list | kill <id>
+tutti workspace new --dir <path> | list | kill <id> [--discard]
+tutti workspace fork <id> --name <name> [-r <rev>]   # jj workspace add onto a sibling checkout
+tutti workspace update <id>          # jj workspace update-stale (clears the sidebar's stale tag)
 tutti workspace diff <id> [--stat]   # the workspace's jj diff (jj is required; --json for raw lines)
 tutti tab new | list | select <id>
 tutti pane run [--tab <id>] [--ephemeral] -- <cmd...>

@@ -23,6 +23,9 @@ pub struct WorkspaceRow {
     /// A short jj change stat (`4 files +120 −33`), right-aligned on the subtitle
     /// line. `None` when the workspace is not a jj repo or has no changes.
     pub changes: Option<String>,
+    /// Whether the workspace's jj working copy is stale (needs
+    /// `workspace update`). Surfaced as a dim-red tag that wins over the stat.
+    pub stale: bool,
     /// Whether this workspace owns the active tab (rendered bold).
     pub active: bool,
     /// The tab that selecting this workspace jumps to.
@@ -100,6 +103,7 @@ pub fn build(workspaces: &[WorkspaceView], active_tab: Option<TabId>) -> Sidebar
                     .clone()
                     .or_else(|| shorten_home(&w.dir, std::env::var_os("HOME").map(Into::into))),
                 changes: w.changes.clone(),
+                stale: w.stale,
                 active: owns,
                 jump_tab,
             }));
@@ -248,6 +252,21 @@ mod tests {
             "the stat rides onto the row"
         );
         assert_eq!(web.changes, None, "a workspace without a stat stays quiet");
+    }
+
+    #[test]
+    fn build_carries_the_workspace_stale_flag() {
+        let mut view = two_workspace_view();
+        view[0].stale = true;
+        let sidebar = build(&view, Some(TabId(2)));
+        let SidebarEntry::Workspace(api) = &sidebar.entries[0] else {
+            panic!("expected workspace row");
+        };
+        let SidebarEntry::Workspace(web) = &sidebar.entries[1] else {
+            panic!("expected workspace row");
+        };
+        assert!(api.stale, "the stale flag rides onto the row");
+        assert!(!web.stale, "a healthy workspace is not stale");
     }
 
     #[test]

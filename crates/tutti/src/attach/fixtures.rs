@@ -79,6 +79,7 @@ pub(crate) fn workspace(
         dir: PathBuf::from("/tmp/w"),
         branch: branch.map(Into::into),
         changes: None,
+        stale: false,
         tabs,
     }
 }

@@ -31,7 +31,24 @@ struct WorkspaceEntry {
     /// The last-computed jj change stat (`4 files +120 −33`), refreshed off the
     /// hot path. `None` until probed, when not a jj repo, or when clean.
     changes: Option<String>,
+    /// Whether the last stale probe found this workspace's jj working copy stale
+    /// (its `@` was rewritten elsewhere). Only forks ever go stale in practice.
+    stale: bool,
+    /// Present when tutti created this workspace via `workspace fork`. Carries
+    /// what a `--discard` kill needs to `jj workspace forget` it at its origin.
+    fork: Option<ForkMeta>,
     tabs: Vec<TabEntry>,
+}
+
+/// What a forked workspace remembers about its origin, so `kill --discard` can
+/// forget it from the repo it was forked out of and remove its checkout.
+#[derive(Clone)]
+pub struct ForkMeta {
+    /// The `.jj` repo root the fork was added from — where `jj workspace forget`
+    /// must run (a workspace cannot forget itself).
+    pub origin_root: PathBuf,
+    /// The jj workspace name (`jj workspace add --name`), the forget argument.
+    pub jj_name: String,
 }
 
 struct PaneSlot {
@@ -85,21 +102,58 @@ impl Session {
     }
 
     pub fn workspace_new(&mut self, dir: PathBuf) -> WorkspaceId {
+        self.push_workspace(dir, None).0
+    }
+
+    /// Create a workspace at `dir` marked as a fork, returning its id and the id
+    /// of its (empty) first tab so the caller can spawn the fork's shell pane
+    /// into exactly that tab.
+    pub fn workspace_new_forked(&mut self, dir: PathBuf, fork: ForkMeta) -> (WorkspaceId, TabId) {
+        self.push_workspace(dir, Some(fork))
+    }
+
+    /// Push a fresh workspace (with its first empty tab, made current) and return
+    /// its ids. Shared by the plain and forked constructors.
+    fn push_workspace(&mut self, dir: PathBuf, fork: Option<ForkMeta>) -> (WorkspaceId, TabId) {
         let id = self.ids.workspace();
         let name = dir
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| format!("workspace-{id}"));
         let tab = self.new_tab_entry();
-        self.current_tab = Some(tab.id);
+        let tab_id = tab.id;
+        self.current_tab = Some(tab_id);
         self.workspaces.push(WorkspaceEntry {
             id,
             name,
             dir,
             changes: None,
+            stale: false,
+            fork,
             tabs: vec![tab],
         });
-        id
+        (id, tab_id)
+    }
+
+    /// The fork metadata for workspace `id`, or `None` for a plain (non-forked)
+    /// workspace or an unknown id. Drives whether a `--discard` kill is allowed.
+    pub fn workspace_fork_meta(&self, id: WorkspaceId) -> Option<ForkMeta> {
+        self.workspaces
+            .iter()
+            .find(|w| w.id == id)
+            .and_then(|w| w.fork.clone())
+    }
+
+    /// Store a freshly-probed stale flag for workspace `id`, returning whether it
+    /// moved (so the caller only rebroadcasts on a real change).
+    pub fn set_stale(&mut self, id: WorkspaceId, stale: bool) -> bool {
+        match self.workspaces.iter_mut().find(|w| w.id == id) {
+            Some(w) if w.stale != stale => {
+                w.stale = stale;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// The directory of workspace `id`, for probing its VCS off the hot path.
@@ -266,6 +320,7 @@ impl Session {
                 dir: w.dir.clone(),
                 branch: git_branch(&w.dir),
                 changes: w.changes.clone(),
+                stale: w.stale,
                 tabs: w
                     .tabs
                     .iter()

@@ -150,6 +150,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
             lines.push(workspace_subtitle(
                 row.subtitle.as_deref().unwrap_or(""),
                 row.changes.as_deref(),
+                row.stale,
                 sel,
                 w,
             ));
@@ -249,22 +250,35 @@ fn agent_subtitle(a: &AgentRow, sel: bool, notified: bool, width: u16) -> Line<'
     finish_row(spans, sel, width)
 }
 
-/// A workspace's dim subtitle line: the branch (or dir) on the left, and the jj
-/// change stat right-aligned against the sidebar's edge. The stat is dropped
-/// first when the two would collide, so a narrow sidebar still shows the branch.
-fn workspace_subtitle(branch: &str, changes: Option<&str>, sel: bool, width: u16) -> Line<'static> {
+/// A workspace's dim subtitle line: the branch (or dir) on the left, and a
+/// right-aligned tag against the sidebar's edge — a dim-red `stale` marker when
+/// the working copy is stale, otherwise the dim jj change stat. The stale tag
+/// wins over the stat, and either is dropped first when it would collide with
+/// the branch, so a narrow sidebar still shows the branch.
+fn workspace_subtitle(
+    branch: &str,
+    changes: Option<&str>,
+    stale: bool,
+    sel: bool,
+    width: u16,
+) -> Line<'static> {
     let left = format!("  {branch}");
     // The gutter (drawn by `finish_row`) takes the first column.
     let content = (width as usize).saturating_sub(1);
-    if let Some(changes) = changes {
-        let need = left.chars().count() + 1 + changes.chars().count();
+    let tag: Option<(String, Style)> = if stale {
+        Some(("stale".to_string(), dim().fg(Color::Red)))
+    } else {
+        changes.map(|c| (c.to_string(), dim()))
+    };
+    if let Some((text, style)) = tag {
+        let need = left.chars().count() + 1 + text.chars().count();
         if need <= content {
-            let gap = content - left.chars().count() - changes.chars().count();
+            let gap = content - left.chars().count() - text.chars().count();
             return finish_row(
                 vec![
                     Span::styled(left, dim()),
                     Span::styled(" ".repeat(gap), dim()),
-                    Span::styled(changes.to_string(), dim()),
+                    Span::styled(text, style),
                 ],
                 sel,
                 width,
@@ -866,6 +880,50 @@ mod tests {
         assert!(
             text.contains("4 files +120 −33"),
             "change stat missing from the subtitle line: {text:?}"
+        );
+    }
+
+    #[test]
+    fn sidebar_shows_a_dim_red_stale_tag_for_a_stale_workspace() {
+        let mut app = App::new();
+        let mut view = vec![workspace(
+            1,
+            "api",
+            Some("main"),
+            vec![tab(
+                1,
+                "1",
+                true,
+                leaf(1),
+                vec![pane(1, "zsh", None, AgentState::Idle)],
+            )],
+        )];
+        // A stale workspace whose change stat is suppressed (jj reports staleness
+        // instead of a diff) — the stale tag takes the stat's place.
+        view[0].stale = true;
+        view[0].changes = None;
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Response::Attached {
+                session: "demo".into(),
+                workspaces: view,
+            })
+            .unwrap(),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("stale"), "stale tag missing: {text:?}");
+        // The tag renders in red (the one place a workspace subtitle takes colour).
+        let stale_start = buf
+            .content()
+            .windows(5)
+            .position(|w| w.iter().map(|c| c.symbol()).collect::<String>() == "stale")
+            .expect("the stale glyphs are contiguous");
+        assert_eq!(
+            buf.content()[stale_start].fg,
+            Color::Red,
+            "the stale tag should be dim-red"
         );
     }
 

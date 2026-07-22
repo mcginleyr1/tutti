@@ -2,7 +2,7 @@
 //! listener on a private temp path, serves it in-process, and talks the wire
 //! protocol over `tokio::net::UnixStream`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
 use tutti_core::{
-    AgentState, Direction, Event, Frame, Layout, PaneData, PaneId, Request, Response,
+    AgentState, Direction, Event, Frame, Layout, PaneData, PaneId, Request, Response, WorkspaceId,
 };
 use tutti_server::{PaneSize, serve};
 
@@ -256,7 +256,11 @@ async fn kill_removes_panes() {
     assert_eq!(pane_ids(&mut conn).await, vec![second]);
 
     assert_eq!(
-        conn.request(Request::WorkspaceKill { id: workspace }).await,
+        conn.request(Request::WorkspaceKill {
+            id: workspace,
+            discard: false,
+        })
+        .await,
         Response::Ok
     );
     assert_eq!(pane_ids(&mut conn).await, Vec::<PaneId>::new());
@@ -951,5 +955,379 @@ async fn focus_transitions_done_pane_to_idle() {
         "focusing a Done pane should transition it to Idle"
     );
 
+    server.stop().await;
+}
+
+/// Run a `jj` subcommand in `dir` and return its output (helpers below drive a
+/// real repo directly to set up stale/forget scenarios).
+fn run_jj(dir: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new("jj")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap()
+}
+
+/// The short id of `dir`'s current jj operation.
+fn jj_op_head(dir: &Path) -> String {
+    let out = run_jj(
+        dir,
+        &[
+            "op",
+            "log",
+            "--no-graph",
+            "--limit",
+            "1",
+            "-T",
+            "id.short()",
+        ],
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// The sibling fork destination for `repo` named `name`, matching the server's
+/// `<repo-parent>/<repo-basename>-<name>` rule.
+fn fork_sibling(repo: &Path, name: &str) -> PathBuf {
+    repo.parent().unwrap().join(format!(
+        "{}-{name}",
+        repo.file_name().unwrap().to_string_lossy()
+    ))
+}
+
+/// The ids of the session's workspaces.
+async fn workspace_ids(conn: &mut Conn) -> Vec<WorkspaceId> {
+    match conn.request(Request::WorkspaceList).await {
+        Response::Workspaces { workspaces } => workspaces.into_iter().map(|w| w.id).collect(),
+        other => panic!("expected Workspaces, got {other:?}"),
+    }
+}
+
+/// Read `LayoutChanged` events on an attached connection until workspace `ws`
+/// reports `stale == want`.
+async fn wait_workspace_stale(viewer: &mut Conn, ws: WorkspaceId, want: bool) -> bool {
+    timeout(DEADLINE, async {
+        loop {
+            if let Frame::Control(json) = viewer.read_frame().await
+                && let Ok(Event::LayoutChanged { workspaces }) =
+                    serde_json::from_slice::<Event>(&json)
+                && workspaces.iter().any(|w| w.id == ws && w.stale == want)
+            {
+                return true;
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Forking a jj workspace materializes a sibling checkout and mounts it as a
+/// tutti workspace with a shell pane. Skips cleanly without `jj`.
+#[tokio::test]
+async fn fork_creates_sibling_checkout_with_a_shell_pane() {
+    let Some(origin) = init_jj_repo() else {
+        return;
+    };
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let ws = workspace_id(
+        conn.request(Request::WorkspaceNew {
+            dir: origin.clone(),
+        })
+        .await,
+    );
+    let fork = workspace_id(
+        conn.request(Request::WorkspaceFork {
+            id: ws,
+            name: "feature".into(),
+            revision: None,
+        })
+        .await,
+    );
+
+    let dest = fork_sibling(&origin, "feature");
+    assert!(
+        dest.join(".jj").exists(),
+        "the fork should have its own jj working copy at {}",
+        dest.display()
+    );
+
+    // Both workspaces are listed, and the fork carries a shell pane.
+    let ids = workspace_ids(&mut conn).await;
+    assert!(
+        ids.contains(&ws) && ids.contains(&fork),
+        "both listed: {ids:?}"
+    );
+
+    let mut viewer = server.connect().await;
+    viewer.send(&Request::Attach).await;
+    let workspaces = match viewer.response().await {
+        Response::Attached { workspaces, .. } => workspaces,
+        other => panic!("expected Attached, got {other:?}"),
+    };
+    let forked = workspaces
+        .iter()
+        .find(|w| w.id == fork)
+        .expect("fork workspace present in the view");
+    assert!(
+        forked.tabs.iter().any(|t| !t.panes.is_empty()),
+        "the fork should have been given a shell pane"
+    );
+
+    let _ = std::fs::remove_dir_all(&origin);
+    let _ = std::fs::remove_dir_all(&dest);
+    server.stop().await;
+}
+
+/// A fork whose destination directory already exists is refused rather than
+/// silently reused. Skips cleanly without `jj`.
+#[tokio::test]
+async fn fork_name_collision_errors() {
+    let Some(origin) = init_jj_repo() else {
+        return;
+    };
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let ws = workspace_id(
+        conn.request(Request::WorkspaceNew {
+            dir: origin.clone(),
+        })
+        .await,
+    );
+    // First fork succeeds.
+    workspace_id(
+        conn.request(Request::WorkspaceFork {
+            id: ws,
+            name: "dup".into(),
+            revision: None,
+        })
+        .await,
+    );
+    // Second fork with the same name collides on the existing directory.
+    match conn
+        .request(Request::WorkspaceFork {
+            id: ws,
+            name: "dup".into(),
+            revision: None,
+        })
+        .await
+    {
+        Response::Error { message } => assert!(
+            message.contains("already exists"),
+            "expected a destination-exists error, got {message:?}"
+        ),
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&origin);
+    let _ = std::fs::remove_dir_all(fork_sibling(&origin, "dup"));
+    server.stop().await;
+}
+
+/// An invalid fork name is rejected fail-fast, before any jj call (so this runs
+/// even without `jj` installed).
+#[tokio::test]
+async fn fork_invalid_name_errors() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let ws = workspace_id(
+        conn.request(Request::WorkspaceNew {
+            dir: std::env::temp_dir(),
+        })
+        .await,
+    );
+    match conn
+        .request(Request::WorkspaceFork {
+            id: ws,
+            name: "bad name".into(),
+            revision: None,
+        })
+        .await
+    {
+        Response::Error { message } => assert!(
+            message.contains("invalid fork name"),
+            "expected an invalid-name error, got {message:?}"
+        ),
+        other => panic!("expected Error, got {other:?}"),
+    }
+    server.stop().await;
+}
+
+/// Forking a workspace that is not under a jj repo errors (jj is required; no
+/// git/hg adapters). Needs no `jj` binary — the check is a `.jj` ancestor walk.
+#[tokio::test]
+async fn fork_of_non_jj_workspace_errors() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let dir = fresh_dir("nonjj-fork");
+    let ws = workspace_id(
+        conn.request(Request::WorkspaceNew { dir: dir.clone() })
+            .await,
+    );
+    match conn
+        .request(Request::WorkspaceFork {
+            id: ws,
+            name: "x".into(),
+            revision: None,
+        })
+        .await
+    {
+        Response::Error { message } => assert!(
+            message.contains("not a jj workspace"),
+            "expected a not-a-jj-workspace error, got {message:?}"
+        ),
+        other => panic!("expected Error, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    server.stop().await;
+}
+
+/// A fork whose `@` is rewritten from the origin is reported stale, and
+/// `workspace update` clears it. Skips cleanly without `jj`.
+#[tokio::test]
+async fn fork_goes_stale_then_update_clears_it() {
+    let Some(origin) = init_jj_repo() else {
+        return;
+    };
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let ws = workspace_id(
+        conn.request(Request::WorkspaceNew {
+            dir: origin.clone(),
+        })
+        .await,
+    );
+    let fork = workspace_id(
+        conn.request(Request::WorkspaceFork {
+            id: ws,
+            name: "stalefork".into(),
+            revision: None,
+        })
+        .await,
+    );
+    let dest = fork_sibling(&origin, "stalefork");
+
+    // Make the fork stale: note the origin's op, advance the fork's own working
+    // copy, then rewind the repo from the origin to before that advance. jj then
+    // sees the fork's on-disk state ahead of the view — the stale condition.
+    let before = jj_op_head(&origin);
+    std::fs::write(dest.join("forkwork.txt"), "local\n").unwrap();
+    run_jj(&dest, &["status"]);
+    let restored = run_jj(&origin, &["op", "restore", &before]);
+    assert!(
+        restored.status.success(),
+        "op restore failed: {}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+
+    // Attaching triggers a refresh across all workspaces, flipping the stale flag.
+    let mut viewer = server.connect().await;
+    viewer.send(&Request::Attach).await;
+    assert!(matches!(viewer.response().await, Response::Attached { .. }));
+    assert!(
+        wait_workspace_stale(&mut viewer, fork, true).await,
+        "the fork should be reported stale after its @ was rewritten"
+    );
+
+    // `workspace update` runs update-stale and refreshes, clearing the flag.
+    assert_eq!(
+        conn.request(Request::WorkspaceUpdate { id: fork }).await,
+        Response::Ok
+    );
+    assert!(
+        wait_workspace_stale(&mut viewer, fork, false).await,
+        "workspace update should clear the stale flag"
+    );
+
+    let _ = std::fs::remove_dir_all(&origin);
+    let _ = std::fs::remove_dir_all(&dest);
+    server.stop().await;
+}
+
+/// `kill --discard` on a fork removes the checkout from disk, forgets it in jj,
+/// and drops the tutti workspace. Skips cleanly without `jj`.
+#[tokio::test]
+async fn discard_removes_and_forgets_a_fork() {
+    let Some(origin) = init_jj_repo() else {
+        return;
+    };
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let ws = workspace_id(
+        conn.request(Request::WorkspaceNew {
+            dir: origin.clone(),
+        })
+        .await,
+    );
+    let fork = workspace_id(
+        conn.request(Request::WorkspaceFork {
+            id: ws,
+            name: "gone".into(),
+            revision: None,
+        })
+        .await,
+    );
+    let dest = fork_sibling(&origin, "gone");
+    assert!(dest.exists(), "fork checkout should exist before discard");
+
+    // The reply follows the async cleanup, so by the time it lands the checkout
+    // is gone and jj has forgotten the workspace.
+    assert_eq!(
+        conn.request(Request::WorkspaceKill {
+            id: fork,
+            discard: true,
+        })
+        .await,
+        Response::Ok
+    );
+    assert!(!dest.exists(), "discard should remove the fork checkout");
+    let listed = run_jj(&origin, &["workspace", "list"]);
+    assert!(
+        !String::from_utf8_lossy(&listed.stdout).contains("gone"),
+        "jj should no longer list the forgotten workspace"
+    );
+    let ids = workspace_ids(&mut conn).await;
+    assert!(!ids.contains(&fork), "the tutti workspace should be gone");
+
+    let _ = std::fs::remove_dir_all(&origin);
+    server.stop().await;
+}
+
+/// `kill --discard` on a workspace tutti did not fork is refused outright, and
+/// nothing on disk is touched — tutti never deletes a checkout it did not create.
+#[tokio::test]
+async fn discard_on_a_non_fork_is_refused_and_deletes_nothing() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let dir = fresh_dir("keepme");
+    std::fs::write(dir.join("sentinel.txt"), "keep\n").unwrap();
+    let ws = workspace_id(
+        conn.request(Request::WorkspaceNew { dir: dir.clone() })
+            .await,
+    );
+
+    match conn
+        .request(Request::WorkspaceKill {
+            id: ws,
+            discard: true,
+        })
+        .await
+    {
+        Response::Error { message } => assert!(
+            message.contains("did not fork"),
+            "expected a refusal error, got {message:?}"
+        ),
+        other => panic!("expected Error, got {other:?}"),
+    }
+    assert!(
+        dir.join("sentinel.txt").exists(),
+        "a non-fork workspace must not be deleted by --discard"
+    );
+    let ids = workspace_ids(&mut conn).await;
+    assert!(
+        ids.contains(&ws),
+        "a refused discard must leave the workspace in place"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
     server.stop().await;
 }

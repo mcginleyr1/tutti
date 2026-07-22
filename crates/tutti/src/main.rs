@@ -71,6 +71,24 @@ enum WorkspaceAction {
     List,
     Kill {
         id: u64,
+        /// Discard a forked workspace's checkout: `jj workspace forget` it and
+        /// delete its directory. Refused for a workspace tutti did not fork.
+        #[arg(long)]
+        discard: bool,
+    },
+    /// Fork a jj workspace into a named sibling checkout (`jj workspace add`) and
+    /// mount it with a shell pane.
+    Fork {
+        id: u64,
+        #[arg(long)]
+        name: String,
+        /// The revision to check out in the fork (`jj workspace add --revision`).
+        #[arg(long, short = 'r')]
+        revision: Option<String>,
+    },
+    /// Update a stale forked workspace (`jj workspace update-stale`).
+    Update {
+        id: u64,
     },
     /// Show the workspace's jj diff (`--stat` for the summary only).
     Diff {
@@ -329,7 +347,16 @@ fn to_request(command: Command) -> Result<Request> {
                 dir: absolutize(&dir),
             },
             WorkspaceAction::List => Request::WorkspaceList,
-            WorkspaceAction::Kill { id } => Request::WorkspaceKill {
+            WorkspaceAction::Kill { id, discard } => Request::WorkspaceKill {
+                id: WorkspaceId(id),
+                discard,
+            },
+            WorkspaceAction::Fork { id, name, revision } => Request::WorkspaceFork {
+                id: WorkspaceId(id),
+                name,
+                revision,
+            },
+            WorkspaceAction::Update { id } => Request::WorkspaceUpdate {
                 id: WorkspaceId(id),
             },
             WorkspaceAction::Diff { id, stat } => Request::WorkspaceDiff {
@@ -489,7 +516,50 @@ mod tests {
         );
         assert_eq!(
             request_of(&["tutti", "workspace", "kill", "4"]),
-            Request::WorkspaceKill { id: WorkspaceId(4) }
+            Request::WorkspaceKill {
+                id: WorkspaceId(4),
+                discard: false,
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_fork_update_and_discard_parse() {
+        assert_eq!(
+            request_of(&["tutti", "workspace", "kill", "4", "--discard"]),
+            Request::WorkspaceKill {
+                id: WorkspaceId(4),
+                discard: true,
+            }
+        );
+        assert_eq!(
+            request_of(&["tutti", "workspace", "fork", "2", "--name", "feature"]),
+            Request::WorkspaceFork {
+                id: WorkspaceId(2),
+                name: "feature".into(),
+                revision: None,
+            }
+        );
+        assert_eq!(
+            request_of(&[
+                "tutti",
+                "workspace",
+                "fork",
+                "2",
+                "--name",
+                "feature",
+                "-r",
+                "@-"
+            ]),
+            Request::WorkspaceFork {
+                id: WorkspaceId(2),
+                name: "feature".into(),
+                revision: Some("@-".into()),
+            }
+        );
+        assert_eq!(
+            request_of(&["tutti", "workspace", "update", "5"]),
+            Request::WorkspaceUpdate { id: WorkspaceId(5) }
         );
     }
 

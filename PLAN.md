@@ -198,12 +198,14 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
 4. **Agent skill**: ship a `skills/tutti/SKILL.md` (Claude Code skill) documenting the
    CLI so any Claude instance inside a tutti pane can herd its own sub-agents.
 5. **jj workspace workflow** (first-class; jj is the required VCS for all
-   workspace-level VCS features — no git/hg adapters): `tutti workspace fork
-   <workspace> --branch <name>` runs `jj workspace add` and points a tutti
-   workspace at it; `workspace kill --discard` forgets and removes it; stale
-   workspaces are surfaced in the sidebar. `tutti workspace diff [--stat]`
-   serves per-workspace diffs (sidebar shows `N files +A −B` per workspace,
-   refreshed on state transitions). Merging back stays a human decision.
+   workspace-level VCS features — no git/hg adapters): ✅ `tutti workspace fork
+   <workspace> --name <name> [-r <rev>]` runs `jj workspace add` onto a sibling
+   checkout and points a tutti workspace at it; ✅ `workspace kill --discard`
+   forgets and removes a fork (refused for a non-fork); ✅ stale forks are
+   surfaced in the sidebar with a dim-red tag and cleared by `workspace update`
+   (`jj workspace update-stale`). ✅ `tutti workspace diff [--stat]` serves
+   per-workspace diffs (sidebar shows `N files +A −B` per workspace, refreshed on
+   state transitions). Merging back stays a human decision.
 6. **Agent-event ingest + Claude Code hook integration**: panes get
    `TUTTI_PANE`/`TUTTI_SESSION` in their env; a shipped hook config makes the
    agent call `tutti agent-event` on subagent spawn/tool-use/stop and on

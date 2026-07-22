@@ -293,6 +293,11 @@ fn handle_frame(
             }
             Ok(Request::PaneScroll { pane, offset }) => scroll(hub, cid, tx, pane, offset),
             Ok(Request::WorkspaceDiff { id, stat }) => workspace_diff(hub, tx, id, stat),
+            Ok(Request::WorkspaceKill { id, discard }) => workspace_kill(hub, cid, tx, id, discard),
+            Ok(Request::WorkspaceFork { id, name, revision }) => {
+                workspace_fork(hub, cid, tx, id, name, revision)
+            }
+            Ok(Request::WorkspaceUpdate { id }) => workspace_update(hub, tx, id),
             Ok(request) => {
                 let response = dispatch(hub, request);
                 send_reply(hub, cid, tx, encode_json(&response))
@@ -342,23 +347,6 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
         Request::WorkspaceList => Response::Workspaces {
             workspaces: hub.session().workspace_list(),
         },
-        Request::WorkspaceKill { id } => {
-            let mut session = hub.session();
-            match session.workspace_kill(id) {
-                Ok(panes) => {
-                    let view = session.view();
-                    drop(session);
-                    let mut last = hub.last.lock().expect("last poisoned");
-                    for pane in &panes {
-                        last.remove(pane);
-                    }
-                    drop(last);
-                    broadcast_event(hub, Event::LayoutChanged { workspaces: view });
-                    Response::Ok
-                }
-                Err(err) => error(err),
-            }
-        }
         Request::TabNew { workspace } => {
             let r = hub.session().tab_new(workspace);
             match r {
@@ -459,7 +447,10 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
         Request::Attach
         | Request::Detach
         | Request::PaneScroll { .. }
-        | Request::WorkspaceDiff { .. } => Response::Ok,
+        | Request::WorkspaceDiff { .. }
+        | Request::WorkspaceKill { .. }
+        | Request::WorkspaceFork { .. }
+        | Request::WorkspaceUpdate { .. } => Response::Ok,
     }
 }
 
@@ -595,6 +586,206 @@ fn workspace_diff(
     ControlFlow::Continue(())
 }
 
+/// Kill a workspace. `--discard` additionally scrubs a *forked* checkout from
+/// disk: the panes die and tutti drops the workspace right away (a half-cleaned
+/// fork must still disappear), then a spawned task runs `jj workspace forget` at
+/// the origin and removes the directory, replying once cleanup finishes. Discard
+/// on a non-fork is refused outright — tutti never deletes a checkout it did not
+/// create. The plain (non-discard) path keeps the old behaviour: panes die,
+/// tutti forgets the entry, the checkout stays on disk.
+fn workspace_kill(
+    hub: &Arc<Hub>,
+    cid: u64,
+    tx: &mpsc::Sender<Vec<u8>>,
+    id: WorkspaceId,
+    discard: bool,
+) -> ControlFlow<()> {
+    let mut session = hub.session();
+    // Read what discard needs *before* the kill removes the entry.
+    let fork = session.workspace_fork_meta(id);
+    let dir = session.workspace_dir(id);
+    if discard && fork.is_none() {
+        drop(session);
+        return send_reply(
+            hub,
+            cid,
+            tx,
+            encode_json(&Response::Error {
+                message: "refusing to discard a workspace tutti did not fork".into(),
+            }),
+        );
+    }
+    match session.workspace_kill(id) {
+        Ok(panes) => {
+            let view = session.view();
+            drop(session);
+            let mut last = hub.last.lock().expect("last poisoned");
+            for pane in &panes {
+                last.remove(pane);
+            }
+            drop(last);
+            broadcast_event(hub, Event::LayoutChanged { workspaces: view });
+            if !discard {
+                return send_reply(hub, cid, tx, encode_json(&Response::Ok));
+            }
+            // Fork discard: forget at the origin, then remove the checkout. Each
+            // failure is surfaced but neither aborts the other, so a half-cleaned
+            // fork has still left tutti (the LayoutChanged above already dropped
+            // it). The reply follows the cleanup on the requester's channel.
+            let fork = fork.expect("discard on a non-fork was rejected above");
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut errors = Vec::new();
+                if let Err(e) = jj::forget(&fork.origin_root, &fork.jj_name).await {
+                    errors.push(e);
+                }
+                if let Some(dir) = dir
+                    && let Err(e) = tokio::fs::remove_dir_all(&dir).await
+                {
+                    errors.push(format!("remove {}: {e}", dir.display()));
+                }
+                let response = if errors.is_empty() {
+                    Response::Ok
+                } else {
+                    Response::Error {
+                        message: errors.join("; "),
+                    }
+                };
+                let _ = tx.send(encode_json(&response)).await;
+            });
+            ControlFlow::Continue(())
+        }
+        Err(err) => {
+            drop(session);
+            send_reply(hub, cid, tx, encode_json(&error(err)))
+        }
+    }
+}
+
+/// Fork a jj workspace into a named sibling checkout and mount it. Validation
+/// (name shape, source is a jj repo, destination is free) is synchronous; the
+/// `jj workspace add` — which materializes a working copy — runs on a spawned
+/// task so it never stalls the frame loop, and the `WorkspaceCreated` reply
+/// lands on the requester's channel once the fork's shell pane is up.
+fn workspace_fork(
+    hub: &Arc<Hub>,
+    cid: u64,
+    tx: &mpsc::Sender<Vec<u8>>,
+    id: WorkspaceId,
+    name: String,
+    revision: Option<String>,
+) -> ControlFlow<()> {
+    if !jj::valid_fork_name(&name) {
+        return send_reply(
+            hub,
+            cid,
+            tx,
+            encode_json(&Response::Error {
+                message: format!("invalid fork name {name:?}: use letters, digits, '-' or '_'"),
+            }),
+        );
+    }
+    // Bind the workspace dir before dropping the session guard; the rest of the
+    // checks are pure (no lock) so nothing re-locks the Mutex here.
+    let source = hub.session().workspace_dir(id);
+    let Some(source) = source else {
+        return send_reply(
+            hub,
+            cid,
+            tx,
+            encode_json(&Response::Error {
+                message: format!("no workspace {id}"),
+            }),
+        );
+    };
+    let Some(repo_root) = jj::workspace_root(&source) else {
+        return send_reply(
+            hub,
+            cid,
+            tx,
+            encode_json(&Response::Error {
+                message: format!("not a jj workspace: {}", source.display()),
+            }),
+        );
+    };
+    let Some(dest) = jj::fork_dest(&repo_root, &name) else {
+        return send_reply(
+            hub,
+            cid,
+            tx,
+            encode_json(&Response::Error {
+                message: format!("cannot place a fork beside {}", repo_root.display()),
+            }),
+        );
+    };
+    if dest.exists() {
+        return send_reply(
+            hub,
+            cid,
+            tx,
+            encode_json(&Response::Error {
+                message: format!("fork destination already exists: {}", dest.display()),
+            }),
+        );
+    }
+
+    let hub = Arc::clone(hub);
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        if let Err(message) = jj::fork(&repo_root, &dest, &name, revision.as_deref()).await {
+            let _ = tx.send(encode_json(&Response::Error { message })).await;
+            return;
+        }
+        let meta = crate::session::ForkMeta {
+            origin_root: repo_root,
+            jj_name: name,
+        };
+        // Create the tutti workspace, then spawn its shell into that exact tab.
+        // The session guard is dropped before `spawn_pane` re-locks the Mutex.
+        let (ws_id, tab_id) = {
+            let mut session = hub.session();
+            session.workspace_new_forked(dest, meta)
+        };
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        spawn_pane(&hub, |s| s.pane_run(Some(tab_id), vec![shell], false));
+        // Seed the fork's change stat / stale flag now that it exists.
+        refresh_changes(&hub, ws_id);
+        let _ = tx
+            .send(encode_json(&Response::WorkspaceCreated { id: ws_id }))
+            .await;
+    });
+    ControlFlow::Continue(())
+}
+
+/// Clear a stale working copy with `jj workspace update-stale`, then refresh the
+/// workspace's stale flag. Runs on a spawned task (it touches the working copy)
+/// and replies when done.
+fn workspace_update(
+    hub: &Arc<Hub>,
+    tx: &mpsc::Sender<Vec<u8>>,
+    id: WorkspaceId,
+) -> ControlFlow<()> {
+    let dir = hub.session().workspace_dir(id);
+    let hub = Arc::clone(hub);
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let response = match dir {
+            Some(dir) => {
+                let response = jj::update_stale(&dir).await;
+                if matches!(response, Response::Ok) {
+                    refresh_changes(&hub, id);
+                }
+                response
+            }
+            None => Response::Error {
+                message: format!("no workspace {id}"),
+            },
+        };
+        let _ = tx.send(encode_json(&response)).await;
+    });
+    ControlFlow::Continue(())
+}
+
 fn spawn_reaper(hub: &Arc<Hub>, pane: PaneId, pty: Arc<PtyPane>) {
     let hub = Arc::clone(hub);
     tokio::spawn(async move {
@@ -630,9 +821,11 @@ fn spawn_reaper(hub: &Arc<Hub>, pane: PaneId, pty: Arc<PtyPane>) {
     });
 }
 
-/// Recompute a workspace's jj change stat off the render/dispatch path and, when
-/// it moved, rebroadcast the view so sidebars update. jj is shelled out to on a
-/// spawned task, so a slow repo never stalls the caller (the tick or dispatch).
+/// Recompute a workspace's jj change stat *and* stale flag off the
+/// render/dispatch path and, when either moved, rebroadcast the view so sidebars
+/// update. jj is shelled out to on a spawned task, so a slow repo never stalls
+/// the caller (the tick or dispatch). The two probes ride the same task so the
+/// stat and the stale tag stay in lockstep.
 fn refresh_changes(hub: &Arc<Hub>, workspace: WorkspaceId) {
     let Some(dir) = hub.session().workspace_dir(workspace) else {
         return;
@@ -640,8 +833,11 @@ fn refresh_changes(hub: &Arc<Hub>, workspace: WorkspaceId) {
     let hub = Arc::clone(hub);
     tokio::spawn(async move {
         let changes = jj::change_stat(&dir).await;
+        let stale = jj::is_stale(&dir).await;
         let mut session = hub.session();
-        if session.set_changes(workspace, changes) {
+        let stat_moved = session.set_changes(workspace, changes);
+        let stale_moved = session.set_stale(workspace, stale);
+        if stat_moved || stale_moved {
             let view = session.view();
             drop(session);
             broadcast_event(&hub, Event::LayoutChanged { workspaces: view });
