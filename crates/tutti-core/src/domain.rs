@@ -133,7 +133,56 @@ impl Layout {
             Layout::Split { first, second, .. } => first.contains(pane) || second.contains(pane),
         }
     }
+
+    /// Adjust the ratio of the nearest ancestor split of `target` whose axis is
+    /// `axis`, by `delta`, clamping the result to `[MIN_RATIO, MAX_RATIO]`.
+    /// Returns the rebuilt layout, or `None` when `target` has no enclosing
+    /// split on that axis. "Nearest" is the split closest to the leaf.
+    pub fn resize_split(&self, target: PaneId, axis: Direction, delta: f32) -> Option<Layout> {
+        let Layout::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } = self
+        else {
+            return None;
+        };
+        let into_first = first.contains(target);
+        if !into_first && !second.contains(target) {
+            return None;
+        }
+        let child = if into_first { first } else { second };
+        // Prefer the deepest matching-axis split on the path to the target.
+        if let Some(new_child) = child.resize_split(target, axis, delta) {
+            let (first, second) = if into_first {
+                (Box::new(new_child), second.clone())
+            } else {
+                (first.clone(), Box::new(new_child))
+            };
+            return Some(Layout::Split {
+                direction: *direction,
+                ratio: *ratio,
+                first,
+                second,
+            });
+        }
+        if *direction == axis {
+            return Some(Layout::Split {
+                direction: *direction,
+                ratio: (ratio + delta).clamp(MIN_RATIO, MAX_RATIO),
+                first: first.clone(),
+                second: second.clone(),
+            });
+        }
+        None
+    }
 }
+
+/// The ratio bounds a split is clamped to when resized, so neither child can be
+/// shrunk to nothing.
+const MIN_RATIO: f32 = 0.10;
+const MAX_RATIO: f32 = 0.90;
 
 #[cfg(test)]
 mod tests {
@@ -202,5 +251,70 @@ mod tests {
         let kind: AgentKind = "claude".into();
         assert_eq!(kind, AgentKind("claude".to_string()));
         assert_eq!(kind.to_string(), "claude");
+    }
+
+    fn leaf(id: u64) -> Layout {
+        Layout::Leaf(PaneId(id))
+    }
+    fn split(direction: Direction, ratio: f32, first: Layout, second: Layout) -> Layout {
+        Layout::Split {
+            direction,
+            ratio,
+            first: Box::new(first),
+            second: Box::new(second),
+        }
+    }
+    fn ratio_of(layout: &Layout) -> f32 {
+        match layout {
+            Layout::Split { ratio, .. } => *ratio,
+            Layout::Leaf(_) => panic!("expected a split"),
+        }
+    }
+
+    #[test]
+    fn resize_split_adjusts_matching_axis() {
+        let layout = split(Direction::Horizontal, 0.5, leaf(1), leaf(2));
+        let resized = layout
+            .resize_split(PaneId(1), Direction::Horizontal, 0.05)
+            .unwrap();
+        assert!((ratio_of(&resized) - 0.55).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resize_split_clamps_to_bounds() {
+        let layout = split(Direction::Horizontal, 0.88, leaf(1), leaf(2));
+        let resized = layout
+            .resize_split(PaneId(2), Direction::Horizontal, 0.10)
+            .unwrap();
+        assert!((ratio_of(&resized) - 0.90).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resize_split_ignores_wrong_axis() {
+        let layout = split(Direction::Horizontal, 0.5, leaf(1), leaf(2));
+        assert!(
+            layout
+                .resize_split(PaneId(1), Direction::Vertical, 0.05)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resize_split_targets_nearest_matching_ancestor() {
+        // Outer horizontal split; the right child is itself a horizontal split.
+        // Resizing horizontally from pane 3 should adjust the inner split, not
+        // the outer one.
+        let inner = split(Direction::Horizontal, 0.5, leaf(2), leaf(3));
+        let layout = split(Direction::Horizontal, 0.5, leaf(1), inner);
+        let resized = layout
+            .resize_split(PaneId(3), Direction::Horizontal, 0.05)
+            .unwrap();
+        // Outer ratio unchanged; inner ratio nudged.
+        assert!((ratio_of(&resized) - 0.5).abs() < 1e-6);
+        if let Layout::Split { second, .. } = &resized {
+            assert!((ratio_of(second) - 0.55).abs() < 1e-6);
+        } else {
+            panic!("expected a split");
+        }
     }
 }

@@ -22,17 +22,48 @@ first use (one daemon per named session, `-s <name>`, default `tutti`).
 ## Quickstart
 
 ```sh
-tutti workspace new --dir ~/code/myproject   # workspace = project, anchored to a dir
-tutti pane run -- claude                     # run an agent in a pane (current tab)
-tutti attach                                 # sit inside the TUI
+cd ~/code/myproject && tutti     # auto-starts the daemon and drops you into a shell pane
 ```
 
-Detach and everything keeps running. Reattach with `tutti attach`, or inspect
-headlessly: `tutti pane list`, `tutti pane read 1`, `tutti pane send 1 --text 'y'`.
+Bare `tutti` (no subcommand) attaches to the session, starting the daemon if
+needed. If the session has no workspaces yet, it bootstraps one anchored to the
+current directory with a shell pane — so `cd repo && tutti` is all you need.
+`tutti attach` is an alias for the same thing.
+
+Inside, split (`Ctrl+B %`), run an agent, and move around:
+
+```sh
+tutti pane run -- claude                     # run an agent in a pane (current tab)
+```
+
+Detach (`Ctrl+B d`) and everything keeps running. Reattach with `tutti`, or
+inspect headlessly: `tutti pane list`, `tutti pane read 1`,
+`tutti pane send 1 --text 'y'`.
+
+### Stopping
+
+Detaching never kills anything. To stop a session's daemon (and every pane it
+owns), run `tutti server stop` (add `-s <name>` for a non-default session). The
+daemon is per-session, so stopping one leaves the others running.
 
 ## TUI keys
 
-Prefix is `Ctrl+B`, then:
+Direct keys work without the prefix (smart-splits / zellij-nav muscle memory):
+
+| Key | Action |
+| --- | --- |
+| `Ctrl+h/j/k/l` | focus the pane to the left/down/up/right |
+| `Ctrl+h`/`Ctrl+l` at the edge | move to the previous / next tab |
+| `Alt+h/j/k/l` | resize the focused split toward that direction |
+| `Alt+x` | kill the focused pane (confirms) |
+
+Because these intercept their chords before the pane sees them, apps in a pane
+no longer receive those bytes (e.g. `Ctrl+l` no longer clears the shell). Rebind
+or disable any of them in the config (set an entry to `"none"` to hand the key
+back to the pane).
+
+Everything else lives behind the prefix (`Ctrl+B` by default). The `default`
+preset:
 
 | Key | Action |
 | --- | --- |
@@ -45,8 +76,56 @@ Prefix is `Ctrl+B`, then:
 | `d` or `q` | detach |
 | `?` | help |
 
-Mouse: click focuses a pane, wheel scrolls its history. Colors come from your
-terminal — tutti has no theme of its own.
+You never have to memorise these. The status bar always shows a compact hint on
+its right edge (`C-b ? help · C-b q detach`), and if you press the prefix and
+pause, a **which-key** popup lists every follow-up (press the key, or `esc` to
+back out). `Ctrl+B ?` opens the full help overlay — detach first, then the rest
+of the active keymap, the direct keys, and how to stop the daemon.
+
+Mouse: click focuses a pane, wheel scrolls its history (disable with
+`mouse = false`). Colors come from your terminal — tutti has no theme of its own.
+
+## Configuration
+
+Optional, at `$XDG_CONFIG_HOME/tutti/config.toml` (falling back to
+`~/.config/tutti/config.toml`). A missing file uses the defaults below; a
+malformed file, an unknown key, or an unparseable chord is a hard error naming
+the offending entry (nothing is silently ignored).
+
+```toml
+prefix = "C-b"          # prefix chord
+mouse = true            # master mouse switch
+preset = "default"      # prefix keymap: "default" (emacs/tmux-flavored) or "vim"
+
+[keys]                  # direct bindings; every entry optional; "none" disables
+focus_left  = "C-h"
+focus_down  = "C-j"
+focus_up    = "C-k"
+focus_right = "C-l"
+resize_left  = "A-h"
+resize_down  = "A-j"
+resize_up    = "A-k"
+resize_right = "A-l"
+kill_pane    = "A-x"
+```
+
+Chord syntax is `C-<char>` (Ctrl), `A-<char>` (Alt), or a bare printable
+character. The table above is exactly the default, so a file that reproduces it
+changes nothing.
+
+**Presets.** `preset` selects the *prefix* keymap table. The which-key popup and
+help overlay always render whichever preset is active, so they stay accurate.
+
+- `default` — the emacs/tmux-flavored table above (`%`/`"` split, `x` kill,
+  `d`/`q` detach, …). The `C-b` prefix chord is itself already emacs-style.
+- `vim` — mnemonics vim users reach for: `v`/`s` split right/below, `h/j/k/l`
+  directional focus, `q` kill pane (`:q` closes a window), `d` detach (so detach
+  stays reachable), `t` new tab, `n`/`p` next/prev tab, `z`/`[`/`?` unchanged.
+
+An unknown preset is a hard error. A dedicated `emacs` preset may land later; for
+now `default` already covers that muscle memory. The `[keys]` direct bindings are
+shared across presets and override the defaults on top (e.g. set
+`focus_left = "none"` to reclaim `C-h` regardless of preset).
 
 ## Agent state badges
 
@@ -71,7 +150,7 @@ tutti pane split <pane> right|down
 tutti pane list | kill | rename | focus <pane>
 tutti pane send <pane> --text <s> | --keys <s>
 tutti pane read <pane> [--lines N] [--unwrapped]
-tutti attach
+tutti [attach]                       # bare `tutti` attaches; bootstraps an empty session
 ```
 
 `--json` on any verb emits the raw protocol response for scripting.
@@ -87,6 +166,6 @@ crates/tutti-agents   agent registry & screen-state classifier (data-driven)
 
 ## Alpha limitations (deliberate — see PLAN.md)
 
-Single attached client; no layout persistence across daemon restarts; no config
-file (prefix fixed at `Ctrl+B`); mouse limited to focus + scroll; worktree
-workspaces and the orchestration verbs (`pane wait`, composite `run`) come next.
+Single attached client; no layout persistence across daemon restarts; mouse
+limited to focus + scroll; worktree workspaces and the orchestration verbs
+(`pane wait`, composite `run`) come next.

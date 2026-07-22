@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 use tutti_core::{
     AgentKind, AgentState, Direction, Event, Frame as WireFrame, Layout, PaneId, PaneInfo, Request,
@@ -14,10 +14,13 @@ use tutti_core::{
 
 use super::input;
 use super::layout::pane_rects;
+use crate::config::{Action, Config, PrefixAction, RESIZE_DELTA};
 
 const SCROLLBACK: usize = 10_000;
 const STATUS_TTL: Duration = Duration::from_secs(4);
 const MOUSE_SCROLL_STEP: usize = 3;
+/// How long the prefix can sit unanswered before the which-key popup appears.
+const WHICHKEY_DELAY: Duration = Duration::from_millis(500);
 
 /// One pane's client-side mirror: a parser fed by snapshots/deltas plus the
 /// metadata the status bar shows.
@@ -74,6 +77,11 @@ pub struct App {
     /// Set when a non-focused pane finished or blocked; the event loop rings the
     /// terminal bell once and clears it.
     bell: bool,
+    /// When the prefix was pressed, while awaiting the follow-up key. Drives the
+    /// which-key popup's delayed appearance.
+    prefix_since: Option<Instant>,
+    /// Prefix chord, direct bindings, and the active prefix keymap.
+    config: Config,
 }
 
 impl Default for App {
@@ -84,6 +92,10 @@ impl Default for App {
 
 impl App {
     pub fn new() -> Self {
+        Self::with_config(Config::default())
+    }
+
+    pub fn with_config(config: Config) -> Self {
         Self {
             session: String::new(),
             workspaces: Vec::new(),
@@ -98,7 +110,23 @@ impl App {
             requested_sizes: HashMap::new(),
             focus_sent: None,
             bell: false,
+            prefix_since: None,
+            config,
         }
+    }
+
+    /// The active configuration, for the renderer (hint, which-key, help).
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Whether the which-key popup should be shown: the prefix has been held,
+    /// unanswered, past the delay.
+    pub fn whichkey_visible(&self) -> bool {
+        matches!(self.mode, Mode::Prefix)
+            && self
+                .prefix_since
+                .is_some_and(|since| since.elapsed() >= WHICHKEY_DELAY)
     }
 
     /// The `PaneFocus` frame to send if focus changed since the last call, so
@@ -244,10 +272,14 @@ impl App {
     }
 
     fn on_key_terminal(&mut self, key: KeyEvent) -> Vec<WireFrame> {
-        if input::is_prefix(key) {
+        if self.config.prefix.matches(key) {
             self.mode = Mode::Prefix;
-            self.set_status("prefix (Ctrl+B): % \" x n p c o z d [ ?".into());
+            self.prefix_since = Some(Instant::now());
             return Vec::new();
+        }
+        // Direct bindings intercept their chords before they reach the pane.
+        if let Some(action) = self.config.keys.action_for(key) {
+            return self.direct_action(action);
         }
         match (self.focused, input::encode_key(key)) {
             (Some(pane), Some(bytes)) => vec![WireFrame::Input { pane, bytes }],
@@ -255,55 +287,91 @@ impl App {
         }
     }
 
-    fn on_key_prefix(&mut self, key: KeyEvent) -> Vec<WireFrame> {
-        self.mode = Mode::Terminal;
-        self.status = None;
-        let focused = self.focused;
-        match key.code {
-            KeyCode::Char('%') => self.split(Direction::Horizontal),
-            KeyCode::Char('"') => self.split(Direction::Vertical),
-            KeyCode::Char('x') => {
-                match focused {
-                    Some(pane) => {
-                        self.mode = Mode::ConfirmKill(pane);
-                        self.set_status(format!("kill pane {pane}? (y/n)"));
-                    }
-                    None => self.set_status("no pane to kill".into()),
-                }
+    /// Perform a direct-binding action: directional focus (with edge-to-tab
+    /// wrap on left/right), split resize, or killing the focused pane.
+    fn direct_action(&mut self, action: Action) -> Vec<WireFrame> {
+        match action {
+            Action::FocusLeft => self.focus_or_tab(FocusDir::Left),
+            Action::FocusRight => self.focus_or_tab(FocusDir::Right),
+            Action::FocusUp => {
+                self.move_focus(FocusDir::Up);
                 Vec::new()
             }
-            KeyCode::Char('n') => self.switch_tab(1),
-            KeyCode::Char('p') => self.switch_tab(-1),
-            KeyCode::Char('c') => self.new_tab(),
-            KeyCode::Char('o') => {
+            Action::FocusDown => {
+                self.move_focus(FocusDir::Down);
+                Vec::new()
+            }
+            Action::ResizeLeft => self.resize_split(Direction::Horizontal, -RESIZE_DELTA),
+            Action::ResizeRight => self.resize_split(Direction::Horizontal, RESIZE_DELTA),
+            Action::ResizeUp => self.resize_split(Direction::Vertical, -RESIZE_DELTA),
+            Action::ResizeDown => self.resize_split(Direction::Vertical, RESIZE_DELTA),
+            Action::KillPane => self.request_kill(),
+        }
+    }
+
+    fn on_key_prefix(&mut self, key: KeyEvent) -> Vec<WireFrame> {
+        self.mode = Mode::Terminal;
+        self.prefix_since = None;
+        self.status = None;
+        // Esc (and any key while the which-key popup is up) leaves prefix mode.
+        if key.code == KeyCode::Esc {
+            return Vec::new();
+        }
+        // The prefix pressed twice forwards the literal prefix chord to the pane.
+        if self.config.prefix.matches(key) {
+            return match (self.focused, input::encode_key(key)) {
+                (Some(pane), Some(bytes)) => vec![WireFrame::Input { pane, bytes }],
+                _ => Vec::new(),
+            };
+        }
+        match self.config.prefix_action(key.code) {
+            Some(action) => self.prefix_action(action),
+            None => {
+                self.set_status(format!("unknown prefix key: {}", describe(key.code)));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Perform a prefix-mode action from the active keymap.
+    fn prefix_action(&mut self, action: PrefixAction) -> Vec<WireFrame> {
+        match action {
+            PrefixAction::SplitRight => self.split(Direction::Horizontal),
+            PrefixAction::SplitDown => self.split(Direction::Vertical),
+            PrefixAction::FocusLeft => {
+                self.move_focus(FocusDir::Left);
+                Vec::new()
+            }
+            PrefixAction::FocusDown => {
+                self.move_focus(FocusDir::Down);
+                Vec::new()
+            }
+            PrefixAction::FocusUp => {
+                self.move_focus(FocusDir::Up);
+                Vec::new()
+            }
+            PrefixAction::FocusRight => {
+                self.move_focus(FocusDir::Right);
+                Vec::new()
+            }
+            PrefixAction::FocusCycle => {
                 self.focus_cycle();
                 Vec::new()
             }
-            KeyCode::Left => self.focus_dir(FocusDir::Left),
-            KeyCode::Right => self.focus_dir(FocusDir::Right),
-            KeyCode::Up => self.focus_dir(FocusDir::Up),
-            KeyCode::Down => self.focus_dir(FocusDir::Down),
-            KeyCode::Char('z') => {
+            PrefixAction::KillPane => self.request_kill(),
+            PrefixAction::Zoom => {
                 if self.focused.is_some() {
                     self.zoom = !self.zoom;
                 }
                 Vec::new()
             }
-            KeyCode::Char('d') | KeyCode::Char('q') => self.detach(),
-            KeyCode::Char('[') => self.enter_scroll(),
-            KeyCode::Char('?') => {
+            PrefixAction::Scrollback => self.enter_scroll(),
+            PrefixAction::TabNext => self.switch_tab(1),
+            PrefixAction::TabPrev => self.switch_tab(-1),
+            PrefixAction::TabNew => self.new_tab(),
+            PrefixAction::Detach => self.detach(),
+            PrefixAction::Help => {
                 self.mode = Mode::Help;
-                Vec::new()
-            }
-            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => match focused {
-                Some(pane) => vec![WireFrame::Input {
-                    pane,
-                    bytes: vec![0x02],
-                }],
-                None => Vec::new(),
-            },
-            other => {
-                self.set_status(format!("unknown prefix key: {}", describe(other)));
                 Vec::new()
             }
         }
@@ -351,6 +419,7 @@ impl App {
                     self.focused = Some(pane);
                     if matches!(self.mode, Mode::Prefix) {
                         self.mode = Mode::Terminal;
+                        self.prefix_since = None;
                     }
                 }
                 Vec::new()
@@ -509,9 +578,12 @@ impl App {
         self.focused = Some(panes[(current + 1) % panes.len()]);
     }
 
-    fn focus_dir(&mut self, dir: FocusDir) -> Vec<WireFrame> {
+    /// Move focus to the nearest pane in `dir` (overlapping axis, closest
+    /// centre). Returns whether focus actually moved — `false` means the
+    /// focused pane is already at that edge of the layout.
+    fn move_focus(&mut self, dir: FocusDir) -> bool {
         let Some(current) = self.focused else {
-            return Vec::new();
+            return false;
         };
         let Some(from) = self
             .rects
@@ -519,7 +591,7 @@ impl App {
             .find(|(p, _)| *p == current)
             .map(|(_, r)| *r)
         else {
-            return Vec::new();
+            return false;
         };
         let (fx, fy) = center(from);
         let best = self
@@ -532,10 +604,52 @@ impl App {
                 (fx.abs_diff(cx) as u32).pow(2) + (fy.abs_diff(cy) as u32).pow(2)
             })
             .map(|(p, _)| *p);
-        if let Some(pane) = best {
-            self.focused = Some(pane);
+        match best {
+            Some(pane) => {
+                self.focused = Some(pane);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Directional focus that falls through to the neighbouring tab when the
+    /// focused pane is at the left/right edge (zellij-nav parity). Vertical
+    /// edges are no-ops.
+    fn focus_or_tab(&mut self, dir: FocusDir) -> Vec<WireFrame> {
+        if self.move_focus(dir) {
+            return Vec::new();
+        }
+        match dir {
+            FocusDir::Left => self.switch_tab(-1),
+            FocusDir::Right => self.switch_tab(1),
+            FocusDir::Up | FocusDir::Down => Vec::new(),
+        }
+    }
+
+    /// Confirm-kill the focused pane, reusing the prefix-`x` flow.
+    fn request_kill(&mut self) -> Vec<WireFrame> {
+        match self.focused {
+            Some(pane) => {
+                self.mode = Mode::ConfirmKill(pane);
+                self.set_status(format!("kill pane {pane}? (y/n)"));
+            }
+            None => self.set_status("no pane to kill".into()),
         }
         Vec::new()
+    }
+
+    /// Ask the server to nudge the focused pane's enclosing split ratio along
+    /// `axis` by `delta`.
+    fn resize_split(&mut self, axis: Direction, delta: f32) -> Vec<WireFrame> {
+        match self.focused {
+            Some(pane) => vec![control(&Request::PaneResizeSplit {
+                pane,
+                direction: axis,
+                delta,
+            })],
+            None => Vec::new(),
+        }
     }
 
     fn refocus(&mut self) {
@@ -676,6 +790,7 @@ fn describe(code: KeyCode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::crossterm::event::KeyModifiers;
     use tutti_core::{PaneData, TabView};
 
     fn view_one_pane() -> Vec<WorkspaceView> {
@@ -951,5 +1066,263 @@ mod tests {
         ));
         assert!(app.panes.is_empty());
         assert_eq!(app.focused, None);
+    }
+
+    fn attach_with(app: &mut App, workspaces: Vec<WorkspaceView>) {
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Response::Attached {
+                session: "t".into(),
+                workspaces,
+            })
+            .unwrap(),
+        ));
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+    fn alt(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
+    }
+    fn plain(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+    fn vim_config() -> Config {
+        Config::parse("preset = \"vim\"\n").unwrap()
+    }
+
+    /// A 2x2 grid: left column stacks panes 1 (top) / 3 (bottom); right column
+    /// stacks 2 (top) / 4 (bottom).
+    fn view_2x2() -> Vec<WorkspaceView> {
+        let column = |top, bottom| Layout::Split {
+            direction: Direction::Vertical,
+            ratio: 0.5,
+            first: Box::new(Layout::Leaf(top)),
+            second: Box::new(Layout::Leaf(bottom)),
+        };
+        let layout = Layout::Split {
+            direction: Direction::Horizontal,
+            ratio: 0.5,
+            first: Box::new(column(PaneId(1), PaneId(3))),
+            second: Box::new(column(PaneId(2), PaneId(4))),
+        };
+        vec![WorkspaceView {
+            id: WorkspaceId(1),
+            name: "w".into(),
+            tabs: vec![TabView {
+                id: TabId(1),
+                name: "1".into(),
+                active: true,
+                layout: Some(layout),
+                active_pane: Some(PaneId(1)),
+                panes: (1..=4).map(|id| placeholder_info(PaneId(id))).collect(),
+            }],
+        }]
+    }
+
+    fn view_two_tabs() -> Vec<WorkspaceView> {
+        let tab = |id: u64, active: bool, pane: u64| TabView {
+            id: TabId(id),
+            name: id.to_string(),
+            active,
+            layout: Some(Layout::Leaf(PaneId(pane))),
+            active_pane: Some(PaneId(pane)),
+            panes: vec![placeholder_info(PaneId(pane))],
+        };
+        vec![WorkspaceView {
+            id: WorkspaceId(1),
+            name: "w".into(),
+            tabs: vec![tab(1, true, 1), tab(2, false, 2)],
+        }]
+    }
+
+    #[test]
+    fn ctrl_l_moves_focus_to_the_right_pane() {
+        let mut app = App::new();
+        attach_with(&mut app, view_2x2());
+        app.sync_sizes(Rect::new(0, 0, 80, 24));
+        assert_eq!(app.focused, Some(PaneId(1)));
+        let out = app.on_key(ctrl('l'));
+        assert!(out.is_empty(), "focus keys never forward bytes");
+        assert_eq!(app.focused, Some(PaneId(2)));
+    }
+
+    #[test]
+    fn ctrl_j_moves_focus_to_the_pane_below() {
+        let mut app = App::new();
+        attach_with(&mut app, view_2x2());
+        app.sync_sizes(Rect::new(0, 0, 80, 24));
+        app.on_key(ctrl('j'));
+        assert_eq!(app.focused, Some(PaneId(3)));
+    }
+
+    #[test]
+    fn ctrl_l_on_rightmost_pane_switches_to_next_tab() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_tabs());
+        app.sync_sizes(Rect::new(0, 0, 80, 24));
+        assert_eq!(app.active_tab, Some(TabId(1)));
+        let out = app.on_key(ctrl('l'));
+        assert_eq!(out, vec![control(&Request::TabSelect { id: TabId(2) })]);
+        assert_eq!(app.active_tab, Some(TabId(2)));
+    }
+
+    #[test]
+    fn ctrl_h_on_leftmost_pane_switches_to_previous_tab() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_tabs());
+        app.sync_sizes(Rect::new(0, 0, 80, 24));
+        let out = app.on_key(ctrl('h'));
+        assert_eq!(out, vec![control(&Request::TabSelect { id: TabId(2) })]);
+        assert_eq!(app.active_tab, Some(TabId(2)));
+    }
+
+    #[test]
+    fn ctrl_j_at_a_vertical_edge_is_a_noop() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_tabs());
+        app.sync_sizes(Rect::new(0, 0, 80, 24));
+        let out = app.on_key(ctrl('j'));
+        assert!(out.is_empty());
+        assert_eq!(app.focused, Some(PaneId(1)));
+        assert_eq!(app.active_tab, Some(TabId(1)));
+    }
+
+    #[test]
+    fn alt_x_confirms_kill_of_the_focused_pane() {
+        let mut app = App::new();
+        attached(&mut app);
+        let out = app.on_key(alt('x'));
+        assert!(out.is_empty());
+        assert_eq!(app.mode, Mode::ConfirmKill(PaneId(1)));
+    }
+
+    #[test]
+    fn alt_h_and_alt_l_send_horizontal_resize_requests() {
+        let mut app = App::new();
+        attached(&mut app);
+        assert_eq!(
+            app.on_key(alt('l')),
+            vec![control(&Request::PaneResizeSplit {
+                pane: PaneId(1),
+                direction: Direction::Horizontal,
+                delta: RESIZE_DELTA,
+            })]
+        );
+        assert_eq!(
+            app.on_key(alt('h')),
+            vec![control(&Request::PaneResizeSplit {
+                pane: PaneId(1),
+                direction: Direction::Horizontal,
+                delta: -RESIZE_DELTA,
+            })]
+        );
+    }
+
+    #[test]
+    fn alt_j_sends_a_vertical_resize_request() {
+        let mut app = App::new();
+        attached(&mut app);
+        assert_eq!(
+            app.on_key(alt('j')),
+            vec![control(&Request::PaneResizeSplit {
+                pane: PaneId(1),
+                direction: Direction::Vertical,
+                delta: RESIZE_DELTA,
+            })]
+        );
+    }
+
+    #[test]
+    fn ctrl_c_and_ctrl_d_forward_to_the_focused_pane() {
+        let mut app = App::new();
+        attached(&mut app);
+        assert_eq!(
+            app.on_key(ctrl('c')),
+            vec![WireFrame::Input {
+                pane: PaneId(1),
+                bytes: vec![0x03],
+            }],
+            "Ctrl+C must reach the pane so interrupts still work"
+        );
+        assert_eq!(
+            app.on_key(ctrl('d')),
+            vec![WireFrame::Input {
+                pane: PaneId(1),
+                bytes: vec![0x04],
+            }],
+            "Ctrl+D must reach the pane so EOF still works"
+        );
+    }
+
+    #[test]
+    fn whichkey_popup_appears_only_after_the_delay() {
+        let mut app = App::new();
+        attached(&mut app);
+        app.on_key(ctrl('b'));
+        assert_eq!(app.mode, Mode::Prefix);
+        assert!(!app.whichkey_visible(), "hidden immediately after prefix");
+
+        // Simulate the delay elapsing.
+        app.prefix_since = Some(Instant::now() - WHICHKEY_DELAY - Duration::from_millis(10));
+        assert!(app.whichkey_visible(), "shown once the delay passes");
+
+        // A follow-up key dispatches and dismisses the popup.
+        app.on_key(plain('z'));
+        assert_eq!(app.mode, Mode::Terminal);
+        assert!(!app.whichkey_visible());
+    }
+
+    #[test]
+    fn esc_closes_prefix_without_acting() {
+        let mut app = App::new();
+        attached(&mut app);
+        app.on_key(ctrl('b'));
+        let out = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(out.is_empty());
+        assert_eq!(app.mode, Mode::Terminal);
+        assert!(app.prefix_since.is_none());
+    }
+
+    #[test]
+    fn prefix_pressed_twice_forwards_the_prefix_byte() {
+        let mut app = App::new();
+        attached(&mut app);
+        app.on_key(ctrl('b'));
+        assert_eq!(
+            app.on_key(ctrl('b')),
+            vec![WireFrame::Input {
+                pane: PaneId(1),
+                bytes: vec![0x02],
+            }]
+        );
+        assert_eq!(app.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn vim_preset_prefix_dispatch() {
+        let mut app = App::with_config(vim_config());
+        attached(&mut app);
+
+        // v → split right
+        app.on_key(ctrl('b'));
+        assert_eq!(
+            app.on_key(plain('v')),
+            vec![control(&Request::PaneSplit {
+                pane: PaneId(1),
+                direction: Direction::Horizontal,
+            })]
+        );
+
+        // q → kill pane (confirm), n cancels
+        app.on_key(ctrl('b'));
+        app.on_key(plain('q'));
+        assert_eq!(app.mode, Mode::ConfirmKill(PaneId(1)));
+        app.on_key(plain('n'));
+
+        // d → detach (stays reachable in vim)
+        app.on_key(ctrl('b'));
+        assert_eq!(app.on_key(plain('d')), vec![control(&Request::Detach)]);
+        assert!(app.should_quit);
     }
 }

@@ -24,30 +24,39 @@ use tutti_core::{Frame as WireFrame, Request};
 
 use connection::Connection;
 
+use crate::config::Config;
+
 const POLL: Duration = Duration::from_millis(16);
 
 /// Attach the interactive TUI to `session`, auto-starting the daemon. Restores
 /// the terminal on exit and on panic, returning once the user detaches or the
-/// server goes away.
-pub fn run(session: &str) -> Result<()> {
+/// server goes away. `config` supplies the prefix chord, direct bindings, and
+/// the master mouse switch.
+pub fn run(session: &str, config: Config) -> Result<()> {
     let mut conn = Connection::open(session)?;
     conn.send(&control(&Request::Attach))
         .context("send attach request")?;
 
+    let mouse = config.mouse;
     let mut terminal = ratatui::init();
-    let _ = execute!(io::stdout(), EnableMouseCapture);
-    install_panic_hook();
+    if mouse {
+        let _ = execute!(io::stdout(), EnableMouseCapture);
+    }
+    install_panic_hook(mouse);
 
-    let result = event_loop(&mut terminal, &mut conn);
+    let result = event_loop(&mut terminal, &mut conn, config);
 
-    let _ = execute!(io::stdout(), DisableMouseCapture);
+    if mouse {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+    }
     ratatui::restore();
     result
 }
 
-fn event_loop(terminal: &mut DefaultTerminal, conn: &mut Connection) -> Result<()> {
-    let mut app = App::new();
+fn event_loop(terminal: &mut DefaultTerminal, conn: &mut Connection, config: Config) -> Result<()> {
+    let mut app = App::with_config(config);
     let mut dirty = true;
+    let mut whichkey = false;
 
     loop {
         match conn.drain() {
@@ -60,6 +69,13 @@ fn event_loop(terminal: &mut DefaultTerminal, conn: &mut Connection) -> Result<(
                 }
             }
             Err(_) => break, // server closed the connection
+        }
+
+        // The which-key popup appears purely on elapsed time; redraw when its
+        // visibility flips even without any input event.
+        if app.whichkey_visible() != whichkey {
+            whichkey = app.whichkey_visible();
+            dirty = true;
         }
 
         if dirty {
@@ -118,10 +134,12 @@ fn ring_bell() {
     let _ = out.flush();
 }
 
-fn install_panic_hook() {
+fn install_panic_hook(mouse: bool) {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(io::stdout(), DisableMouseCapture);
+        if mouse {
+            let _ = execute!(io::stdout(), DisableMouseCapture);
+        }
         previous(info);
     }));
 }

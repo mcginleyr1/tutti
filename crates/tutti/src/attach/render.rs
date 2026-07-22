@@ -12,19 +12,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use tutti_core::{AgentState, PaneId, PaneInfo};
 
 use super::app::{App, Mode};
-
-const HELP: &[&str] = &[
-    "tutti — prefix Ctrl+B, then:",
-    "",
-    "  %   split right        \"   split down",
-    "  x   kill pane          z   zoom focused pane",
-    "  o   focus next pane    ←↑↓→  focus by direction",
-    "  n/p next / prev tab    c   new tab",
-    "  [   scrollback mode    d/q detach",
-    "  ?   this help",
-    "",
-    "  (any key closes this help)",
-];
+use crate::config::{self, Config, PrefixAction};
 
 /// Render the whole UI: the active tab's panes and the status bar.
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -48,8 +36,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     draw_status(frame, app, status);
 
+    if app.whichkey_visible() {
+        draw_whichkey(frame, app.config(), content);
+    }
     if app.mode == Mode::Help {
-        draw_help(frame, area);
+        draw_help(frame, app.config(), area);
     }
 }
 
@@ -180,32 +171,141 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
+    // A transient/mode message occupies the status line; otherwise the always-on
+    // discoverability hint sits on the right edge.
     let message = status_message(app);
-    if !message.is_empty() {
+    let show_hint = message.is_empty();
+    if !show_hint {
         spans.push(Span::styled(
             format!("  {message}"),
             Style::default().add_modifier(Modifier::DIM),
         ));
     }
 
+    let line = Line::from(spans);
+    let left_width = line.width() as u16;
     frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().add_modifier(Modifier::REVERSED)),
+        Paragraph::new(line).style(Style::default().add_modifier(Modifier::REVERSED)),
         area,
+    );
+
+    if show_hint {
+        draw_hint(frame, app.config(), area, left_width);
+    }
+}
+
+/// The compact "how to get out" hint pinned to the status bar's right edge:
+/// `<prefix> ? help · <prefix> q detach`, degrading to `<prefix> ?` when space
+/// is tight, using the configured prefix and keymap.
+fn draw_hint(frame: &mut Frame, cfg: &Config, area: Rect, left_width: u16) {
+    let prefix = cfg.prefix.label();
+    let help = cfg.prefix_key(PrefixAction::Help).map(config::key_label);
+    let detach = cfg.prefix_key(PrefixAction::Detach).map(config::key_label);
+
+    let full = match (&help, &detach) {
+        (Some(h), Some(d)) => Some(format!("{prefix} {h} help · {prefix} {d} detach")),
+        _ => None,
+    };
+    let short = help.as_ref().map(|h| format!("{prefix} {h}"));
+
+    let avail = area.width.saturating_sub(left_width + 1);
+    let text = match (full, short) {
+        (Some(full), _) if full.chars().count() as u16 <= avail => full,
+        (_, Some(short)) if short.chars().count() as u16 <= avail => short,
+        _ => return,
+    };
+
+    let w = text.chars().count() as u16;
+    let rect = Rect::new(area.x + area.width - w, area.y, w, 1);
+    frame.render_widget(
+        Paragraph::new(text)
+            .style(Style::default().add_modifier(Modifier::REVERSED | Modifier::DIM)),
+        rect,
     );
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
-    let width = 46u16.min(area.width);
-    let height = (HELP.len() as u16 + 2).min(area.height);
+/// The which-key popup: one `key → description` row per active prefix binding
+/// (the same table dispatch reads), plus `esc → close`. Pinned bottom-right,
+/// dim border.
+fn draw_whichkey(frame: &mut Frame, cfg: &Config, area: Rect) {
+    let mut lines: Vec<Line> = cfg
+        .prefix_bindings()
+        .iter()
+        .map(|b| Line::from(format!(" {} → {} ", config::key_label(b.key), b.desc)))
+        .collect();
+    lines.push(Line::from(" esc → close "));
+
+    let inner_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let width = (inner_w + 2).min(area.width);
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let x = area.x + area.width.saturating_sub(width);
+    let y = area.y + area.height.saturating_sub(height);
+    let popup = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().add_modifier(Modifier::DIM))
+                .title("prefix"),
+        ),
+        popup,
+    );
+}
+
+fn draw_help(frame: &mut Frame, cfg: &Config, area: Rect) {
+    let lines = help_lines(cfg);
+    let inner_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let width = (inner_w + 2).min(area.width);
+    let height = (lines.len() as u16 + 2).min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect::new(x, y, width, height);
-    let lines: Vec<Line> = HELP.iter().map(|l| Line::from(*l)).collect();
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("help")),
         popup,
     );
+}
+
+/// The help overlay content, generated from the active keymap so it always
+/// matches dispatch. Detach is listed first (it is what a stuck user needs).
+fn help_lines(cfg: &Config) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(format!("tutti — press {}, then:", cfg.prefix.label())),
+        Line::from(String::new()),
+    ];
+    if let Some(key) = cfg.prefix_key(PrefixAction::Detach) {
+        lines.push(Line::from(format!("  {} → detach", config::key_label(key))));
+    }
+    // The remaining prefix bindings, two per row to stay compact.
+    let entries: Vec<String> = cfg
+        .prefix_bindings()
+        .iter()
+        .filter(|b| b.action != PrefixAction::Detach)
+        .map(|b| format!("{} → {}", config::key_label(b.key), b.desc))
+        .collect();
+    for pair in entries.chunks(2) {
+        let line = match pair {
+            [a, b] => format!("  {a:<22}{b}"),
+            [a] => format!("  {a}"),
+            _ => String::new(),
+        };
+        lines.push(Line::from(line));
+    }
+    lines.push(Line::from(String::new()));
+    lines.push(Line::from("direct keys (no prefix):".to_string()));
+    lines.push(Line::from("  Ctrl+h/j/k/l  focus by direction".to_string()));
+    lines.push(Line::from("  Alt+h/j/k/l   resize split".to_string()));
+    lines.push(Line::from("  Alt+x         kill pane".to_string()));
+    lines.push(Line::from(String::new()));
+    lines.push(Line::from(
+        "stop the daemon:  tutti server stop".to_string(),
+    ));
+    lines.push(Line::from(String::new()));
+    lines.push(Line::from("(any key closes)".to_string()));
+    lines
 }
 
 fn status_message(app: &App) -> String {
@@ -397,6 +497,43 @@ mod tests {
         assert!(
             text.contains("no panes"),
             "expected empty-session hint: {text:?}"
+        );
+    }
+
+    #[test]
+    fn status_bar_shows_the_detach_hint() {
+        let app = app_with_pane(b"hi");
+        let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("C-b"), "hint prefix missing: {text:?}");
+        assert!(text.contains("detach"), "hint detach missing: {text:?}");
+    }
+
+    #[test]
+    fn help_overlay_lists_detach_first_with_direct_keys_and_stop() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = app_with_pane(b"hi");
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Help);
+
+        let mut terminal = Terminal::new(TestBackend::new(64, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("detach"), "help missing detach: {text:?}");
+        assert!(
+            text.contains("tutti server stop"),
+            "help missing daemon-stop line: {text:?}"
+        );
+        assert!(
+            text.contains("direct keys"),
+            "help missing direct keys section: {text:?}"
+        );
+        // Detach is listed before the split bindings.
+        assert!(
+            text.find("detach") < text.find("split"),
+            "detach should be listed first: {text:?}"
         );
     }
 }

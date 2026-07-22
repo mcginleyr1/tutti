@@ -68,6 +68,15 @@ pub enum Request {
     PaneFocus {
         pane: PaneId,
     },
+    /// Nudge the ratio of the nearest split enclosing `pane` whose axis is
+    /// `direction`, by `delta` (clamped server-side). `h`/`l` drive a
+    /// `Horizontal` split, `j`/`k` a `Vertical` one; a positive `delta` grows
+    /// the first (left/top) child.
+    PaneResizeSplit {
+        pane: PaneId,
+        direction: Direction,
+        delta: f32,
+    },
     Attach,
     Detach,
 }
@@ -225,6 +234,11 @@ mod tests {
             offset: 120,
         });
         roundtrip(&Request::PaneFocus { pane: PaneId(2) });
+        roundtrip(&Request::PaneResizeSplit {
+            pane: PaneId(2),
+            direction: Direction::Horizontal,
+            delta: 0.05,
+        });
         roundtrip(&Request::Attach);
     }
 

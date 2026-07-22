@@ -19,7 +19,9 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
 use tutti_agents::{ProcessTree, Registry};
-use tutti_core::{AgentKind, Event, Frame, PaneData, PaneId, Request, Response, StateEvent};
+use tutti_core::{
+    AgentKind, Direction, Event, Frame, PaneData, PaneId, Request, Response, StateEvent,
+};
 
 use crate::keys;
 use crate::pty::{PaneSize, PtyPane};
@@ -396,8 +398,30 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             }
         }
         Request::PaneFocus { pane } => focus_pane(hub, pane),
+        Request::PaneResizeSplit {
+            pane,
+            direction,
+            delta,
+        } => resize_split(hub, pane, direction, delta),
         // Handled in `handle_frame`; unreachable here.
         Request::Attach | Request::Detach | Request::PaneScroll { .. } => Response::Ok,
+    }
+}
+
+/// Adjust the ratio of the nearest matching-axis split enclosing `pane` and
+/// broadcast the fresh view. The attached client re-syncs pane sizes off the
+/// new layout, so the ptys resize and reseed on the next tick.
+fn resize_split(hub: &Arc<Hub>, pane: PaneId, axis: Direction, delta: f32) -> Response {
+    let mut session = hub.session.lock().expect("session poisoned");
+    match session.pane_resize_split(pane, axis, delta) {
+        Ok(true) => {
+            let view = session.view();
+            drop(session);
+            broadcast_event(hub, Event::LayoutChanged { workspaces: view });
+            Response::Ok
+        }
+        Ok(false) => Response::Ok,
+        Err(err) => error(err),
     }
 }
 

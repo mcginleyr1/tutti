@@ -268,6 +268,28 @@ impl Session {
         Ok(workspace)
     }
 
+    /// Nudge the ratio of the nearest split enclosing `pane` whose axis is
+    /// `axis`, by `delta`. Returns whether the layout actually changed (it does
+    /// not when the pane has no enclosing split on that axis).
+    pub fn pane_resize_split(&mut self, pane: PaneId, axis: Direction, delta: f32) -> Result<bool> {
+        let tab_id = self
+            .panes
+            .get(&pane)
+            .with_context(|| format!("no pane {pane}"))?
+            .tab;
+        let tab = self.tab_mut(tab_id).context("pane's tab vanished")?;
+        let Some(layout) = tab.layout.as_ref() else {
+            return Ok(false);
+        };
+        match layout.resize_split(pane, axis, delta) {
+            Some(new) => {
+                tab.layout = Some(new);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     pub fn pane_rename(&mut self, pane: PaneId, title: String) -> Result<()> {
         let slot = self
             .panes

@@ -35,12 +35,6 @@ pub fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// True when `key` is the TUI prefix (`Ctrl+B`), which the event loop consumes
-/// rather than forwarding to a pane.
-pub fn is_prefix(key: KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b')
-}
-
 fn encode_char(c: char, ctrl: bool, alt: bool) -> Vec<u8> {
     let mut out = Vec::new();
     if alt {
@@ -217,12 +211,5 @@ mod tests {
     fn unmapped_keys_return_none() {
         assert_eq!(encode_key(key(KeyCode::Null)), None);
         assert_eq!(encode_key(key(KeyCode::CapsLock)), None);
-    }
-
-    #[test]
-    fn prefix_detection() {
-        assert!(is_prefix(keym(KeyCode::Char('b'), KeyModifiers::CONTROL)));
-        assert!(!is_prefix(key(KeyCode::Char('b'))));
-        assert!(!is_prefix(keym(KeyCode::Char('c'), KeyModifiers::CONTROL)));
     }
 }

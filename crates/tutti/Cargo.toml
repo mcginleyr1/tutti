@@ -5,7 +5,9 @@ edition.workspace = true
 
 [dependencies]
 clap.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 anyhow.workspace = true
 tutti-core.workspace = true
 ratatui.workspace = true

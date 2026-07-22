@@ -12,7 +12,9 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
-use tutti_core::{AgentState, Event, Frame, PaneData, PaneId, Request, Response};
+use tutti_core::{
+    AgentState, Direction, Event, Frame, Layout, PaneData, PaneId, Request, Response,
+};
 use tutti_server::{PaneSize, serve};
 
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -397,6 +399,86 @@ async fn pidfile_tracks_server_lifetime() {
 
     server.stop().await;
     assert!(!pid_path.exists(), "pidfile should be removed on shutdown");
+}
+
+/// A `PaneResizeSplit` nudges the ratio of the focused pane's enclosing split
+/// and broadcasts the fresh view carrying the new ratio.
+#[tokio::test]
+async fn resize_split_adjusts_ratio_and_broadcasts() {
+    let server = TestServer::start().await;
+
+    let mut control = server.connect().await;
+    workspace_id(
+        control
+            .request(Request::WorkspaceNew {
+                dir: std::env::temp_dir(),
+            })
+            .await,
+    );
+    let first = pane_id(
+        control
+            .request(Request::PaneRun {
+                tab: None,
+                cmd: vec!["/bin/cat".into()],
+            })
+            .await,
+    );
+    // Split beside it: a Horizontal split at ratio 0.5.
+    pane_id(
+        control
+            .request(Request::PaneSplit {
+                pane: first,
+                direction: Direction::Horizontal,
+            })
+            .await,
+    );
+
+    // Attach after the split so the only LayoutChanged the viewer sees is ours.
+    let mut viewer = server.connect().await;
+    viewer.send(&Request::Attach).await;
+    assert!(matches!(viewer.response().await, Response::Attached { .. }));
+
+    assert_eq!(
+        control
+            .request(Request::PaneResizeSplit {
+                pane: first,
+                direction: Direction::Horizontal,
+                delta: 0.05,
+            })
+            .await,
+        Response::Ok
+    );
+
+    let ratio = next_split_ratio(&mut viewer).await;
+    assert!(
+        (ratio - 0.55).abs() < 1e-3,
+        "expected the split ratio nudged to ~0.55, got {ratio}"
+    );
+
+    server.stop().await;
+}
+
+/// Read events until a `LayoutChanged` carrying a split arrives, returning its
+/// ratio.
+async fn next_split_ratio(viewer: &mut Conn) -> f32 {
+    timeout(DEADLINE, async {
+        loop {
+            if let Frame::Control(json) = viewer.read_frame().await
+                && let Ok(Event::LayoutChanged { workspaces }) =
+                    serde_json::from_slice::<Event>(&json)
+            {
+                for w in &workspaces {
+                    for t in &w.tabs {
+                        if let Some(Layout::Split { ratio, .. }) = &t.layout {
+                            return *ratio;
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("a LayoutChanged carrying a split")
 }
 
 /// Read frames until a snapshot (`want_snapshot`) or delta for `pane` arrives.

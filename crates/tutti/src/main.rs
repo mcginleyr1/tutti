@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use tutti_core::{Direction, PaneId, Request, Response, TabId, WorkspaceId};
 
 use tutti::client::{self, Client, StopOutcome};
+use tutti::config::Config;
 use tutti::render;
 
 #[derive(Parser)]
@@ -16,8 +17,10 @@ struct Cli {
     /// Print raw JSON responses instead of formatted output.
     #[arg(long, global = true)]
     json: bool,
+    /// With no subcommand, `tutti` attaches (bootstrapping a shell pane when the
+    /// session is empty).
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -42,7 +45,7 @@ enum Command {
         #[command(subcommand)]
         action: PaneAction,
     },
-    /// Attach the interactive TUI.
+    /// Attach the interactive TUI (alias for bare `tutti`).
     Attach,
 }
 
@@ -158,18 +161,49 @@ fn main() {
 
 fn run(cli: Cli) -> Result<i32> {
     match cli.command {
-        Command::Server { action } => run_server(action, &cli.session),
-        Command::Attach => {
-            tutti::attach::run(&cli.session)?;
+        Some(Command::Server { action }) => run_server(action, &cli.session),
+        // Bare `tutti` and `tutti attach` both attach, bootstrapping the session.
+        None | Some(Command::Attach) => {
+            attach_session(&cli.session)?;
             Ok(0)
         }
-        command => {
+        Some(command) => {
             let request = to_request(command)?;
             let mut client = Client::connect_or_start(&cli.session)?;
             let response = client.request(&request)?;
             Ok(emit(response, cli.json))
         }
     }
+}
+
+/// Load config, ensure the session has at least one pane, and attach. A fresh
+/// session is bootstrapped with a shell pane in the current directory so
+/// `cd repo && tutti` drops straight into a working session.
+fn attach_session(session: &str) -> Result<()> {
+    let config = Config::load()?;
+    bootstrap_if_empty(session)?;
+    tutti::attach::run(session, config)?;
+    Ok(())
+}
+
+/// When the session has no workspaces yet, create one anchored to the current
+/// directory and run a login shell in it.
+fn bootstrap_if_empty(session: &str) -> Result<()> {
+    let mut client = Client::connect_or_start(session)?;
+    let workspaces = match client.request(&Request::WorkspaceList)? {
+        Response::Workspaces { workspaces } => workspaces,
+        other => bail!("unexpected reply to workspace list: {other:?}"),
+    };
+    if workspaces.is_empty() {
+        let dir = std::env::current_dir().context("resolve current directory")?;
+        client.request(&Request::WorkspaceNew { dir })?;
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        client.request(&Request::PaneRun {
+            tab: None,
+            cmd: vec![shell],
+        })?;
+    }
+    Ok(())
 }
 
 fn run_server(action: ServerAction, session: &str) -> Result<i32> {
@@ -318,7 +352,7 @@ mod tests {
     use super::*;
 
     fn request_of(args: &[&str]) -> Request {
-        to_request(Cli::try_parse_from(args).unwrap().command).unwrap()
+        to_request(Cli::try_parse_from(args).unwrap().command.unwrap()).unwrap()
     }
 
     #[test]
@@ -330,6 +364,18 @@ mod tests {
         let cli = Cli::try_parse_from(["tutti", "-s", "work", "--json", "pane", "list"]).unwrap();
         assert_eq!(cli.session, "work");
         assert!(cli.json);
+    }
+
+    #[test]
+    fn bare_command_defaults_to_attach() {
+        // No subcommand parses (routed to the bootstrap-attach path in `run`).
+        let cli = Cli::try_parse_from(["tutti"]).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.session, "tutti");
+
+        // A subcommand still parses alongside the now-optional default.
+        let cli = Cli::try_parse_from(["tutti", "pane", "list"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Pane { .. })));
     }
 
     #[test]
@@ -496,21 +542,21 @@ mod tests {
             Cli::try_parse_from(["tutti", "server", "start", "--foreground"])
                 .unwrap()
                 .command,
-            Command::Server {
+            Some(Command::Server {
                 action: ServerAction::Start { foreground: true }
-            }
+            })
         ));
         assert!(matches!(
             Cli::try_parse_from(["tutti", "server", "stop"])
                 .unwrap()
                 .command,
-            Command::Server {
+            Some(Command::Server {
                 action: ServerAction::Stop
-            }
+            })
         ));
         assert!(matches!(
             Cli::try_parse_from(["tutti", "attach"]).unwrap().command,
-            Command::Attach
+            Some(Command::Attach)
         ));
     }
 
