@@ -1,9 +1,6 @@
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{PaneId, TabId, WorkspaceId};
-use crate::state::AgentState;
+use crate::ids::PaneId;
 
 /// The kind of agent running in a pane. A newtype over `String` keeps the
 /// registry data-driven: new agents are added as data, not enum variants.
@@ -21,31 +18,6 @@ impl std::fmt::Display for AgentKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Workspace {
-    pub id: WorkspaceId,
-    pub dir: PathBuf,
-    pub name: String,
-    pub tabs: Vec<Tab>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Tab {
-    pub id: TabId,
-    pub name: String,
-    pub layout: Layout,
-    pub active_pane: Option<PaneId>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Pane {
-    pub id: PaneId,
-    pub title: String,
-    pub agent: Option<AgentKind>,
-    pub state: AgentState,
-    pub exited: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

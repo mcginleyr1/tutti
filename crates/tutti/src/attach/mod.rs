@@ -9,7 +9,11 @@ mod layout;
 mod render;
 mod sidebar;
 
+#[cfg(test)]
+pub(crate) mod fixtures;
+
 pub use app::App;
+use app::control;
 
 use std::io;
 use std::time::Duration;
@@ -20,8 +24,7 @@ use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
 };
 use ratatui::crossterm::execute;
-use ratatui::layout::Rect;
-use tutti_core::{Frame as WireFrame, Request};
+use tutti_core::Request;
 
 use connection::Connection;
 
@@ -109,7 +112,7 @@ fn event_loop(
 
         if dirty {
             let area = terminal.draw(|frame| render::draw(frame, &app))?.area;
-            let content = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+            let (content, _) = App::content_rect(area);
             for frame in app.sync_sizes(content) {
                 let _ = conn.send(&frame);
             }
@@ -176,8 +179,4 @@ fn install_panic_hook(mouse: bool) {
         }
         previous(info);
     }));
-}
-
-fn control(request: &Request) -> WireFrame {
-    WireFrame::Control(serde_json::to_vec(request).expect("serialize request"))
 }

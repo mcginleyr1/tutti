@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use tutti_core::{
-    AgentKind, AgentState, Direction, Layout, Observation, Pane, PaneId, PaneInfo, StateEvent,
-    TabId, TabInfo, TabView, WorkspaceId, WorkspaceInfo, WorkspaceView,
+    AgentKind, AgentState, Direction, Layout, Observation, PaneId, PaneInfo, StateEvent, TabId,
+    TabInfo, TabView, WorkspaceId, WorkspaceInfo, WorkspaceView,
 };
 
 use crate::pty::{PaneSize, PtyPane, PtySpec};
@@ -32,7 +32,7 @@ struct WorkspaceEntry {
 }
 
 struct PaneSlot {
-    meta: Pane,
+    meta: PaneInfo,
     pty: Arc<PtyPane>,
     tab: TabId,
 }
@@ -506,7 +506,7 @@ impl Session {
         self.panes.insert(
             id,
             PaneSlot {
-                meta: Pane {
+                meta: PaneInfo {
                     id,
                     title,
                     agent: None,
@@ -522,13 +522,7 @@ impl Session {
 }
 
 fn pane_info(slot: &PaneSlot) -> PaneInfo {
-    PaneInfo {
-        id: slot.meta.id,
-        title: slot.meta.title.clone(),
-        agent: slot.meta.agent.clone(),
-        state: slot.meta.state,
-        exited: slot.meta.exited,
-    }
+    slot.meta.clone()
 }
 
 fn pane_title(program: &str) -> String {

@@ -60,6 +60,10 @@ impl Frame {
             Frame::PaneDelta(d) => (KIND_DELTA, PANE_HEADER + d.bytes.len()),
             Frame::Input { bytes, .. } => (KIND_INPUT, 8 + bytes.len()),
         };
+        assert!(
+            payload_len < MAX_FRAME_LEN,
+            "frame payload {payload_len} exceeds MAX_FRAME_LEN"
+        );
         let mut out = Vec::with_capacity(4 + 1 + payload_len);
         out.extend_from_slice(&(1 + payload_len as u32).to_le_bytes());
         out.push(kind);

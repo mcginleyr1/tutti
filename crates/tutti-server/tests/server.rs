@@ -28,7 +28,7 @@ struct TestServer {
 }
 
 impl TestServer {
-    async fn start() -> Self {
+    fn start() -> Self {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("tutti-test-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -117,6 +117,16 @@ fn workspace_id(response: Response) -> tutti_core::WorkspaceId {
     }
 }
 
+/// Create a workspace rooted at the temp dir and return its id.
+async fn new_workspace(conn: &mut Conn) -> tutti_core::WorkspaceId {
+    workspace_id(
+        conn.request(Request::WorkspaceNew {
+            dir: std::env::temp_dir(),
+        })
+        .await,
+    )
+}
+
 fn pane_id(response: Response) -> PaneId {
     match response {
         Response::PaneCreated { id } => id,
@@ -125,12 +135,7 @@ fn pane_id(response: Response) -> PaneId {
 }
 
 async fn run_marker(conn: &mut Conn, cmd: &str) -> PaneId {
-    workspace_id(
-        conn.request(Request::WorkspaceNew {
-            dir: std::env::temp_dir(),
-        })
-        .await,
-    );
+    new_workspace(conn).await;
     pane_id(
         conn.request(Request::PaneRun {
             tab: None,
@@ -166,7 +171,7 @@ async fn read_until(conn: &mut Conn, pane: PaneId, needle: &str) -> bool {
 /// fresh connection can read its output.
 #[tokio::test]
 async fn pane_survives_client_disconnect() {
-    let server = TestServer::start().await;
+    let server = TestServer::start();
 
     // launcher disconnects at the end of this block
     let pane = {
@@ -186,15 +191,10 @@ async fn pane_survives_client_disconnect() {
 /// Bytes sent with `pane send` reach the child and echo back onto its grid.
 #[tokio::test]
 async fn pane_send_echoes_into_grid() {
-    let server = TestServer::start().await;
+    let server = TestServer::start();
     let mut conn = server.connect().await;
 
-    workspace_id(
-        conn.request(Request::WorkspaceNew {
-            dir: std::env::temp_dir(),
-        })
-        .await,
-    );
+    new_workspace(&mut conn).await;
     let pane = pane_id(
         conn.request(Request::PaneRun {
             tab: None,
@@ -224,15 +224,10 @@ async fn pane_send_echoes_into_grid() {
 /// `pane kill` drops one pane; `workspace kill` tears the rest down.
 #[tokio::test]
 async fn kill_removes_panes() {
-    let server = TestServer::start().await;
+    let server = TestServer::start();
     let mut conn = server.connect().await;
 
-    let workspace = workspace_id(
-        conn.request(Request::WorkspaceNew {
-            dir: std::env::temp_dir(),
-        })
-        .await,
-    );
+    let workspace = new_workspace(&mut conn).await;
     let first = pane_id(
         conn.request(Request::PaneRun {
             tab: None,
@@ -276,16 +271,10 @@ async fn pane_ids(conn: &mut Conn) -> Vec<PaneId> {
 /// changes the screen produces a delta on the shared tick.
 #[tokio::test]
 async fn attach_receives_snapshot_then_delta() {
-    let server = TestServer::start().await;
+    let server = TestServer::start();
 
     let mut control = server.connect().await;
-    workspace_id(
-        control
-            .request(Request::WorkspaceNew {
-                dir: std::env::temp_dir(),
-            })
-            .await,
-    );
+    new_workspace(&mut control).await;
     let pane = pane_id(
         control
             .request(Request::PaneRun {
@@ -332,16 +321,10 @@ async fn attach_receives_snapshot_then_delta() {
 /// snapshot at the new dimensions to the attached client.
 #[tokio::test]
 async fn attach_resize_reseeds_at_new_size() {
-    let server = TestServer::start().await;
+    let server = TestServer::start();
 
     let mut control = server.connect().await;
-    workspace_id(
-        control
-            .request(Request::WorkspaceNew {
-                dir: std::env::temp_dir(),
-            })
-            .await,
-    );
+    new_workspace(&mut control).await;
     let pane = pane_id(
         control
             .request(Request::PaneRun {
@@ -382,7 +365,7 @@ async fn attach_resize_reseeds_at_new_size() {
 /// removes it on clean shutdown, so `tutti server stop` can SIGTERM it.
 #[tokio::test]
 async fn pidfile_tracks_server_lifetime() {
-    let server = TestServer::start().await;
+    let server = TestServer::start();
     let pid_path = server.path.with_extension("pid");
 
     let contents = timeout(DEADLINE, async {
@@ -405,16 +388,10 @@ async fn pidfile_tracks_server_lifetime() {
 /// and broadcasts the fresh view carrying the new ratio.
 #[tokio::test]
 async fn resize_split_adjusts_ratio_and_broadcasts() {
-    let server = TestServer::start().await;
+    let server = TestServer::start();
 
     let mut control = server.connect().await;
-    workspace_id(
-        control
-            .request(Request::WorkspaceNew {
-                dir: std::env::temp_dir(),
-            })
-            .await,
-    );
+    new_workspace(&mut control).await;
     let first = pane_id(
         control
             .request(Request::PaneRun {
@@ -488,7 +465,7 @@ async fn expect_pane_frame(conn: &mut Conn, pane: PaneId, want_snapshot: bool) -
             match conn.read_frame().await {
                 Frame::PaneSnapshot(data) if want_snapshot && data.pane == pane => return data,
                 Frame::PaneDelta(data) if !want_snapshot && data.pane == pane => return data,
-                _ => continue,
+                _ => {}
             }
         }
     })
@@ -534,20 +511,35 @@ async fn wait_state(conn: &mut Conn, pane: PaneId, want: AgentState) -> bool {
     .unwrap_or(false)
 }
 
+/// Poll `pane list` until `pane` is detected as agent `kind` or the deadline
+/// elapses.
+async fn wait_agent(conn: &mut Conn, pane: PaneId, kind: &str) -> bool {
+    timeout(DEADLINE, async {
+        loop {
+            if let Response::Panes { panes } = conn.request(Request::PaneList).await
+                && panes.iter().any(|p| {
+                    p.id == pane
+                        && p.agent.as_ref().map(ToString::to_string).as_deref() == Some(kind)
+                })
+            {
+                return true;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// A running binary whose name is in the registry is detected as that agent,
 /// proving the live `sysinfo` process-tree walk (not just the unit matcher).
 #[tokio::test]
 async fn detects_agent_process_by_name() {
-    let server = TestServer::start().await;
+    let server = TestServer::start();
     let mut conn = server.connect().await;
     let bin = copy_bin("claude", "/bin/sleep");
 
-    workspace_id(
-        conn.request(Request::WorkspaceNew {
-            dir: std::env::temp_dir(),
-        })
-        .await,
-    );
+    new_workspace(&mut conn).await;
     let pane = pane_id(
         conn.request(Request::PaneRun {
             tab: None,
@@ -556,23 +548,8 @@ async fn detects_agent_process_by_name() {
         .await,
     );
 
-    let detected = timeout(DEADLINE, async {
-        loop {
-            if let Response::Panes { panes } = conn.request(Request::PaneList).await
-                && panes.iter().any(|p| {
-                    p.id == pane
-                        && p.agent.as_ref().map(|a| a.to_string()).as_deref() == Some("claude")
-                })
-            {
-                return true;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .unwrap_or(false);
     assert!(
-        detected,
+        wait_agent(&mut conn, pane, "claude").await,
         "a live process named claude was not detected as the claude agent"
     );
 
@@ -612,17 +589,11 @@ async fn wait_state_event(
 /// is observed, fixing the order without depending on classifier timing.
 #[tokio::test]
 async fn agent_state_changes_working_then_blocked() {
-    let server = TestServer::start().await;
+    let server = TestServer::start();
     let mut control = server.connect().await;
     let bin = copy_bin("claude", "/bin/cat");
 
-    workspace_id(
-        control
-            .request(Request::WorkspaceNew {
-                dir: std::env::temp_dir(),
-            })
-            .await,
-    );
+    new_workspace(&mut control).await;
     let pane = pane_id(
         control
             .request(Request::PaneRun {
@@ -674,15 +645,10 @@ async fn agent_state_changes_working_then_blocked() {
 /// Focusing a `Done` pane marks it seen: its state becomes `Idle`.
 #[tokio::test]
 async fn focus_transitions_done_pane_to_idle() {
-    let server = TestServer::start().await;
+    let server = TestServer::start();
     let mut conn = server.connect().await;
 
-    workspace_id(
-        conn.request(Request::WorkspaceNew {
-            dir: std::env::temp_dir(),
-        })
-        .await,
-    );
+    new_workspace(&mut conn).await;
     let pane = pane_id(
         conn.request(Request::PaneRun {
             tab: None,

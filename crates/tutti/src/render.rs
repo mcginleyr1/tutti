@@ -46,7 +46,7 @@ pub fn panes(items: &[PaneInfo]) -> String {
     table(&["ID", "TITLE", "AGENT", "STATE", "EXIT"], &rows)
 }
 
-fn state_label(state: AgentState) -> &'static str {
+pub(crate) fn state_label(state: AgentState) -> &'static str {
     match state {
         AgentState::Unknown => "unknown",
         AgentState::Working => "working",

@@ -16,7 +16,7 @@ use tutti_core::{
 use super::input;
 use super::layout::pane_rects;
 use super::sidebar::{self, Sidebar, SidebarEntry};
-use crate::config::{Action, Config, PrefixAction, RESIZE_DELTA, SidebarVisibility};
+use crate::config::{self, Action, Config, PrefixAction, RESIZE_DELTA, SidebarVisibility};
 
 /// The sidebar's fixed column width, and the minimum total width below which it
 /// is suppressed entirely so panes keep usable room.
@@ -470,7 +470,10 @@ impl App {
         match self.config.prefix_action(key.code) {
             Some(action) => self.prefix_action(action),
             None => {
-                self.set_status(format!("unknown prefix key: {}", describe(key.code)));
+                self.set_status(format!(
+                    "unknown prefix key: {}",
+                    config::key_label(key.code)
+                ));
                 Vec::new()
             }
         }
@@ -610,7 +613,7 @@ impl App {
     /// Split a content area into the sidebar column (when shown) and the region
     /// to its right. The single source of truth for the sidebar column: the
     /// region right of it is further split into the tab bar and panes.
-    pub fn split_content(&self, content: Rect) -> (Option<Rect>, Rect) {
+    fn split_content(&self, content: Rect) -> (Option<Rect>, Rect) {
         if !self.sidebar_shown(content.width) {
             return (None, content);
         }
@@ -632,6 +635,15 @@ impl App {
         let tabs = Rect::new(right.x, right.y, right.width, 1);
         let panes = Rect::new(right.x, right.y + 1, right.width, right.height - 1);
         (sidebar, tabs, panes)
+    }
+
+    /// Split the terminal `area` into the content region (everything above the
+    /// bottom bar) and the one-row bottom bar — the single source of truth for
+    /// that split, shared by the renderer and the resize sync.
+    pub fn content_rect(area: Rect) -> (Rect, Rect) {
+        let content = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+        let bottom = Rect::new(area.x, area.y + content.height, area.width, 1);
+        (content, bottom)
     }
 
     /// Focus the sidebar, revealing it if hidden. Refuses when the terminal is
@@ -763,7 +775,7 @@ impl App {
                 if self.in_sidebar(col, row) {
                     return self.sidebar_click(row);
                 }
-                if self.in_rect(self.tab_bar_rect, col, row) {
+                if self.tab_bar_rect.is_some_and(|r| contains(r, col, row)) {
                     return self.tab_bar_click(col);
                 }
                 Vec::new()
@@ -775,13 +787,7 @@ impl App {
     }
 
     fn in_sidebar(&self, col: u16, row: u16) -> bool {
-        self.in_rect(self.sidebar_rect, col, row)
-    }
-
-    fn in_rect(&self, rect: Option<Rect>, col: u16, row: u16) -> bool {
-        rect.is_some_and(|r| {
-            col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
-        })
+        self.sidebar_rect.is_some_and(|r| contains(r, col, row))
     }
 
     /// The tab-bar chips, left to right: one per tab (carrying its id) then a
@@ -1128,7 +1134,7 @@ impl App {
     fn pane_at(&self, col: u16, row: u16) -> Option<PaneId> {
         self.rects
             .iter()
-            .find(|(_, r)| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height)
+            .find(|(_, r)| contains(*r, col, row))
             .map(|(p, _)| *p)
     }
 
@@ -1161,6 +1167,11 @@ impl FocusDir {
     }
 }
 
+/// Whether the point `(col, row)` lies inside `r`.
+fn contains(r: Rect, col: u16, row: u16) -> bool {
+    col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+}
+
 fn center(r: Rect) -> (u16, u16) {
     (r.x + r.width / 2, r.y + r.height / 2)
 }
@@ -1174,7 +1185,7 @@ fn inner_size(rect: Rect) -> (u16, u16) {
     )
 }
 
-fn control(request: &Request) -> WireFrame {
+pub(crate) fn control(request: &Request) -> WireFrame {
     WireFrame::Control(serde_json::to_vec(request).expect("serialize request"))
 }
 
@@ -1252,34 +1263,20 @@ fn placeholder_info(pane: PaneId) -> PaneInfo {
     }
 }
 
-fn describe(code: KeyCode) -> String {
-    match code {
-        KeyCode::Char(c) => c.to_string(),
-        other => format!("{other:?}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attach::fixtures::{agent, alt, ctrl, leaf, plain, shell, split, tab, workspace};
     use ratatui::crossterm::event::KeyModifiers;
-    use tutti_core::{PaneData, TabView};
+    use tutti_core::PaneData;
 
     fn view_one_pane() -> Vec<WorkspaceView> {
-        vec![WorkspaceView {
-            id: WorkspaceId(1),
-            name: "w".into(),
-            dir: std::path::PathBuf::from("/tmp/w"),
-            branch: None,
-            tabs: vec![TabView {
-                id: TabId(1),
-                name: "1".into(),
-                active: true,
-                layout: Some(Layout::Leaf(PaneId(1))),
-                active_pane: Some(PaneId(1)),
-                panes: vec![placeholder_info(PaneId(1))],
-            }],
-        }]
+        vec![workspace(
+            1,
+            "w",
+            None,
+            vec![tab(1, "1", true, leaf(1), vec![shell(1)])],
+        )]
     }
 
     fn attached(app: &mut App) {
@@ -1456,25 +1453,18 @@ mod tests {
     }
 
     fn view_two_panes() -> Vec<WorkspaceView> {
-        vec![WorkspaceView {
-            id: WorkspaceId(1),
-            name: "w".into(),
-            dir: std::path::PathBuf::from("/tmp/w"),
-            branch: None,
-            tabs: vec![TabView {
-                id: TabId(1),
-                name: "1".into(),
-                active: true,
-                layout: Some(Layout::Split {
-                    direction: Direction::Horizontal,
-                    ratio: 0.5,
-                    first: Box::new(Layout::Leaf(PaneId(1))),
-                    second: Box::new(Layout::Leaf(PaneId(2))),
-                }),
-                active_pane: Some(PaneId(1)),
-                panes: vec![placeholder_info(PaneId(1)), placeholder_info(PaneId(2))],
-            }],
-        }]
+        vec![workspace(
+            1,
+            "w",
+            None,
+            vec![tab(
+                1,
+                "1",
+                true,
+                split(Direction::Horizontal, leaf(1), leaf(2)),
+                vec![shell(1), shell(2)],
+            )],
+        )]
     }
 
     fn state_changed(app: &mut App, pane: PaneId, from: AgentState, to: AgentState) {
@@ -1556,15 +1546,6 @@ mod tests {
         ));
     }
 
-    fn ctrl(c: char) -> KeyEvent {
-        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
-    }
-    fn alt(c: char) -> KeyEvent {
-        KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
-    }
-    fn plain(c: char) -> KeyEvent {
-        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
-    }
     fn vim_config() -> Config {
         Config::parse("preset = \"vim\"\n").unwrap()
     }
@@ -1572,50 +1553,26 @@ mod tests {
     /// A 2x2 grid: left column stacks panes 1 (top) / 3 (bottom); right column
     /// stacks 2 (top) / 4 (bottom).
     fn view_2x2() -> Vec<WorkspaceView> {
-        let column = |top, bottom| Layout::Split {
-            direction: Direction::Vertical,
-            ratio: 0.5,
-            first: Box::new(Layout::Leaf(top)),
-            second: Box::new(Layout::Leaf(bottom)),
-        };
-        let layout = Layout::Split {
-            direction: Direction::Horizontal,
-            ratio: 0.5,
-            first: Box::new(column(PaneId(1), PaneId(3))),
-            second: Box::new(column(PaneId(2), PaneId(4))),
-        };
-        vec![WorkspaceView {
-            id: WorkspaceId(1),
-            name: "w".into(),
-            dir: std::path::PathBuf::from("/tmp/w"),
-            branch: None,
-            tabs: vec![TabView {
-                id: TabId(1),
-                name: "1".into(),
-                active: true,
-                layout: Some(layout),
-                active_pane: Some(PaneId(1)),
-                panes: (1..=4).map(|id| placeholder_info(PaneId(id))).collect(),
-            }],
-        }]
+        let column = |top, bottom| split(Direction::Vertical, leaf(top), leaf(bottom));
+        let layout = split(Direction::Horizontal, column(1, 3), column(2, 4));
+        vec![workspace(
+            1,
+            "w",
+            None,
+            vec![tab(1, "1", true, layout, (1..=4).map(shell).collect())],
+        )]
     }
 
     fn view_two_tabs() -> Vec<WorkspaceView> {
-        let tab = |id: u64, active: bool, pane: u64| TabView {
-            id: TabId(id),
-            name: id.to_string(),
-            active,
-            layout: Some(Layout::Leaf(PaneId(pane))),
-            active_pane: Some(PaneId(pane)),
-            panes: vec![placeholder_info(PaneId(pane))],
-        };
-        vec![WorkspaceView {
-            id: WorkspaceId(1),
-            name: "w".into(),
-            dir: std::path::PathBuf::from("/tmp/w"),
-            branch: None,
-            tabs: vec![tab(1, true, 1), tab(2, false, 2)],
-        }]
+        vec![workspace(
+            1,
+            "w",
+            None,
+            vec![
+                tab(1, "1", true, leaf(1), vec![shell(1)]),
+                tab(2, "2", false, leaf(2), vec![shell(2)]),
+            ],
+        )]
     }
 
     #[test]
@@ -1810,56 +1767,31 @@ mod tests {
 
     // ---- sidebar --------------------------------------------------------
 
-    fn agent_info(id: PaneId, kind: &str, state: AgentState) -> PaneInfo {
-        PaneInfo {
-            id,
-            title: format!("pane-{}", id.0),
-            agent: Some(kind.into()),
-            state,
-            exited: None,
-        }
-    }
-
     /// Workspace `api` (tab 1, active, one shell) and `web` (tab 2, two agents:
     /// pane 2 working, pane 3 blocked).
     fn view_two_workspaces() -> Vec<WorkspaceView> {
         vec![
-            WorkspaceView {
-                id: WorkspaceId(1),
-                name: "api".into(),
-                dir: std::path::PathBuf::from("/tmp/w"),
-                branch: Some("main".into()),
-                tabs: vec![TabView {
-                    id: TabId(1),
-                    name: "1".into(),
-                    active: true,
-                    layout: Some(Layout::Leaf(PaneId(1))),
-                    active_pane: Some(PaneId(1)),
-                    panes: vec![placeholder_info(PaneId(1))],
-                }],
-            },
-            WorkspaceView {
-                id: WorkspaceId(2),
-                name: "web".into(),
-                dir: std::path::PathBuf::from("/tmp/w"),
-                branch: None,
-                tabs: vec![TabView {
-                    id: TabId(2),
-                    name: "2".into(),
-                    active: false,
-                    layout: Some(Layout::Split {
-                        direction: Direction::Horizontal,
-                        ratio: 0.5,
-                        first: Box::new(Layout::Leaf(PaneId(2))),
-                        second: Box::new(Layout::Leaf(PaneId(3))),
-                    }),
-                    active_pane: Some(PaneId(2)),
-                    panes: vec![
-                        agent_info(PaneId(2), "claude", AgentState::Working),
-                        agent_info(PaneId(3), "claude", AgentState::Blocked),
+            workspace(
+                1,
+                "api",
+                Some("main"),
+                vec![tab(1, "1", true, leaf(1), vec![shell(1)])],
+            ),
+            workspace(
+                2,
+                "web",
+                None,
+                vec![tab(
+                    2,
+                    "2",
+                    false,
+                    split(Direction::Horizontal, leaf(2), leaf(3)),
+                    vec![
+                        agent(2, "claude", AgentState::Working),
+                        agent(3, "claude", AgentState::Blocked),
                     ],
-                }],
-            },
+                )],
+            ),
         ]
     }
 

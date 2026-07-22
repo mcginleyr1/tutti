@@ -14,6 +14,7 @@ use tutti_core::{AgentState, PaneId, PaneInfo};
 use super::app::{App, Mode};
 use super::sidebar::{AgentRow, SidebarEntry, WorkspaceRow};
 use crate::config::{self, Config, PrefixAction};
+use crate::render::state_label;
 
 /// The single accent colour — terminal blue — that marks the focused or active
 /// thing. Everything else renders dim so the one accent is unmistakable. State
@@ -28,6 +29,11 @@ const SIDEBAR_HINT: &[(&str, &str)] = &[
     ("esc", "back"),
 ];
 
+/// The default dim style, applied to nearly everything that is not the accent.
+fn dim() -> Style {
+    Style::default().add_modifier(Modifier::DIM)
+}
+
 /// Render the whole UI: the pane area under a top tab bar, the sidebar, and the
 /// bottom bar.
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -35,8 +41,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if area.height == 0 {
         return;
     }
-    let content = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
-    let bottom = Rect::new(area.x, area.y + content.height, area.width, 1);
+    let (content, bottom) = App::content_rect(area);
     let (sidebar_rect, tabs_rect, panes_area) = app.regions(content);
     // One spinner frame for the whole draw so every working agent — sidebar dot
     // and pane border alike — animates in lockstep.
@@ -89,7 +94,7 @@ fn tab_chip_style(active: bool) -> Style {
     if active {
         Style::default().fg(Color::Black).bg(ACCENT)
     } else {
-        Style::default().add_modifier(Modifier::DIM)
+        dim()
     }
 }
 
@@ -109,7 +114,7 @@ fn draw_empty_hint(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(
         Paragraph::new(text)
             .alignment(Alignment::Center)
-            .style(Style::default().add_modifier(Modifier::DIM)),
+            .style(dim()),
         row,
     );
 }
@@ -120,9 +125,7 @@ fn draw_empty_hint(frame: &mut Frame, app: &App, area: Rect) {
 /// the sidebar is focused and not prompting) gets a subtle background and an
 /// accent bar. The new-project prompt overwrites the foot row when active.
 fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
-    let block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(Style::default().add_modifier(Modifier::DIM));
+    let block = Block::default().borders(Borders::RIGHT).border_style(dim());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -191,7 +194,7 @@ fn workspace_line(w: &WorkspaceRow, sel: bool, width: u16) -> Line<'static> {
     let (dot, dot_style) = if w.active {
         ('●', Style::default().fg(ACCENT))
     } else {
-        ('○', Style::default().add_modifier(Modifier::DIM))
+        ('○', dim())
     };
     let mut name = Style::default().add_modifier(Modifier::BOLD);
     if !sel {
@@ -229,7 +232,7 @@ fn agent_line(a: &AgentRow, sel: bool, spinner: char, width: u16) -> Line<'stati
 fn agent_subtitle(a: &AgentRow, sel: bool, notified: bool, width: u16) -> Line<'static> {
     let mut spans = vec![Span::styled(
         format!("  {} · {}", state_label(a.state), a.kind),
-        Style::default().add_modifier(Modifier::DIM),
+        dim(),
     )];
     if notified {
         spans.push(Span::styled(
@@ -242,39 +245,24 @@ fn agent_subtitle(a: &AgentRow, sel: bool, notified: bool, width: u16) -> Line<'
 
 /// A dim indented second line (a workspace's branch, blank when unknown).
 fn subtitle_line(text: &str, sel: bool, width: u16) -> Line<'static> {
-    finish_row(
-        vec![Span::styled(
-            format!("  {text}"),
-            Style::default().add_modifier(Modifier::DIM),
-        )],
-        sel,
-        width,
-    )
+    finish_row(vec![Span::styled(format!("  {text}"), dim())], sel, width)
 }
 
 /// A dim placeholder line so an empty section never looks broken.
 fn placeholder_line(text: &str) -> Line<'static> {
-    Line::from(Span::styled(
-        format!("  {text}"),
-        Style::default().add_modifier(Modifier::DIM),
-    ))
+    Line::from(Span::styled(format!("  {text}"), dim()))
 }
 
 /// The state dot for an agent: a spinner glyph while working (so multiple
 /// working agents animate in lockstep), a solid coloured `●` for
 /// blocked/done, a dim `○` when idle/unknown.
 fn agent_dot(state: AgentState, spinner: char) -> (char, Style) {
-    match state {
-        AgentState::Working => (spinner, Style::default().fg(Color::Yellow)),
-        AgentState::Blocked => (
-            '●',
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ),
-        AgentState::Done => ('●', Style::default().fg(Color::Green)),
-        AgentState::Idle | AgentState::Unknown => {
-            ('○', Style::default().add_modifier(Modifier::DIM))
-        }
-    }
+    let dot = match state {
+        AgentState::Working => spinner,
+        AgentState::Blocked | AgentState::Done => '●',
+        AgentState::Idle | AgentState::Unknown => '○',
+    };
+    (dot, state_style(state))
 }
 
 /// Turn a row's content spans into a full line: a leading gutter (`▍` accent
@@ -543,7 +531,7 @@ fn draw_whichkey(frame: &mut Frame, cfg: &Config, area: Rect) {
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().add_modifier(Modifier::DIM))
+                .border_style(dim())
                 .title("prefix"),
         ),
         popup,
@@ -615,10 +603,7 @@ fn help_lines(cfg: &Config) -> Vec<Line<'static>> {
 fn two_tone_line(key: &str, label: &str) -> Line<'static> {
     Line::from(vec![
         Span::raw(format!(" {key}")),
-        Span::styled(
-            format!(" {label} "),
-            Style::default().add_modifier(Modifier::DIM),
-        ),
+        Span::styled(format!(" {label} "), dim()),
     ])
 }
 
@@ -628,10 +613,7 @@ fn status_message(app: &App) -> String {
         Mode::ConfirmKill(_) => app.transient().unwrap_or("confirm kill? (y/n)").to_string(),
         Mode::Scroll(_) => app.transient().unwrap_or("SCROLL (q to exit)").to_string(),
         Mode::Help => "HELP (any key closes)".to_string(),
-        Mode::Sidebar => app
-            .transient()
-            .unwrap_or("SIDEBAR (j/k move · enter jump · n new · esc back)")
-            .to_string(),
+        Mode::Sidebar => app.transient().unwrap_or_default().to_string(),
         Mode::SidebarPrompt => app.transient().unwrap_or("new workspace dir").to_string(),
         Mode::Terminal => app.transient().unwrap_or("").to_string(),
     }
@@ -655,10 +637,7 @@ fn border_title(info: &PaneInfo, spinner: char) -> Line<'static> {
         Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
     )];
     if info.agent.is_some() {
-        spans.push(Span::styled(
-            " · ",
-            Style::default().add_modifier(Modifier::DIM),
-        ));
+        spans.push(Span::styled(" · ", dim()));
         let label = if info.state == AgentState::Working {
             format!("{spinner} working")
         } else {
@@ -667,10 +646,7 @@ fn border_title(info: &PaneInfo, spinner: char) -> Line<'static> {
         spans.push(Span::styled(label, state_style(info.state)));
     }
     if let Some(code) = info.exited {
-        spans.push(Span::styled(
-            format!(" exited {code}"),
-            Style::default().add_modifier(Modifier::DIM),
-        ));
+        spans.push(Span::styled(format!(" exited {code}"), dim()));
     }
     Line::from(spans)
 }
@@ -684,7 +660,7 @@ fn pane_border_style(focused: bool, state: Option<AgentState>) -> Style {
     } else if state == Some(AgentState::Blocked) {
         Style::default().fg(Color::Red)
     } else {
-        Style::default().add_modifier(Modifier::DIM)
+        dim()
     }
 }
 
@@ -695,27 +671,17 @@ fn state_style(state: AgentState) -> Style {
         AgentState::Blocked => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         AgentState::Working => Style::default().fg(Color::Yellow),
         AgentState::Done => Style::default().fg(Color::Green),
-        AgentState::Idle | AgentState::Unknown => Style::default().add_modifier(Modifier::DIM),
-    }
-}
-
-fn state_label(state: AgentState) -> &'static str {
-    match state {
-        AgentState::Unknown => "unknown",
-        AgentState::Working => "working",
-        AgentState::Blocked => "blocked",
-        AgentState::Done => "done",
-        AgentState::Idle => "idle",
+        AgentState::Idle | AgentState::Unknown => dim(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attach::fixtures::{leaf, pane, tab, workspace};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use tutti_core::{Frame as WireFrame, Layout, PaneData, Response, TabView, WorkspaceView};
-    use tutti_core::{TabId, WorkspaceId};
+    use tutti_core::{Frame as WireFrame, PaneData, Response};
 
     #[test]
     fn maps_default_indexed_and_rgb_colors() {
@@ -750,26 +716,18 @@ mod tests {
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
                 session: "demo".into(),
-                workspaces: vec![WorkspaceView {
-                    id: WorkspaceId(1),
-                    name: "w".into(),
-                    dir: std::path::PathBuf::from("/tmp/w"),
-                    branch: None,
-                    tabs: vec![TabView {
-                        id: TabId(1),
-                        name: "main".into(),
-                        active: true,
-                        layout: Some(Layout::Leaf(PaneId(1))),
-                        active_pane: Some(PaneId(1)),
-                        panes: vec![PaneInfo {
-                            id: PaneId(1),
-                            title: "shell".into(),
-                            agent: None,
-                            state: AgentState::Idle,
-                            exited: None,
-                        }],
-                    }],
-                }],
+                workspaces: vec![workspace(
+                    1,
+                    "w",
+                    None,
+                    vec![tab(
+                        1,
+                        "main",
+                        true,
+                        leaf(1),
+                        vec![pane(1, "shell", None, AgentState::Idle)],
+                    )],
+                )],
             })
             .unwrap(),
         ));
@@ -804,46 +762,30 @@ mod tests {
             serde_json::to_vec(&Response::Attached {
                 session: "demo".into(),
                 workspaces: vec![
-                    WorkspaceView {
-                        id: WorkspaceId(1),
-                        name: "api".into(),
-                        dir: std::path::PathBuf::from("/tmp/w"),
-                        branch: Some("main".into()),
-                        tabs: vec![TabView {
-                            id: TabId(1),
-                            name: "1".into(),
-                            active: true,
-                            layout: Some(Layout::Leaf(PaneId(1))),
-                            active_pane: Some(PaneId(1)),
-                            panes: vec![PaneInfo {
-                                id: PaneId(1),
-                                title: "zsh".into(),
-                                agent: None,
-                                state: AgentState::Idle,
-                                exited: None,
-                            }],
-                        }],
-                    },
-                    WorkspaceView {
-                        id: WorkspaceId(2),
-                        name: "web".into(),
-                        dir: std::path::PathBuf::from("/tmp/w"),
-                        branch: None,
-                        tabs: vec![TabView {
-                            id: TabId(2),
-                            name: "2".into(),
-                            active: false,
-                            layout: Some(Layout::Leaf(PaneId(2))),
-                            active_pane: Some(PaneId(2)),
-                            panes: vec![PaneInfo {
-                                id: PaneId(2),
-                                title: "agent".into(),
-                                agent: Some("claude".into()),
-                                state: AgentState::Blocked,
-                                exited: None,
-                            }],
-                        }],
-                    },
+                    workspace(
+                        1,
+                        "api",
+                        Some("main"),
+                        vec![tab(
+                            1,
+                            "1",
+                            true,
+                            leaf(1),
+                            vec![pane(1, "zsh", None, AgentState::Idle)],
+                        )],
+                    ),
+                    workspace(
+                        2,
+                        "web",
+                        None,
+                        vec![tab(
+                            2,
+                            "2",
+                            false,
+                            leaf(2),
+                            vec![pane(2, "agent", Some("claude"), AgentState::Blocked)],
+                        )],
+                    ),
                 ],
             })
             .unwrap(),
@@ -875,26 +817,18 @@ mod tests {
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
                 session: "demo".into(),
-                workspaces: vec![WorkspaceView {
-                    id: WorkspaceId(1),
-                    name: "solo".into(),
-                    dir: std::path::PathBuf::from("/tmp/w"),
-                    branch: None,
-                    tabs: vec![TabView {
-                        id: TabId(1),
-                        name: "1".into(),
-                        active: true,
-                        layout: Some(Layout::Leaf(PaneId(1))),
-                        active_pane: Some(PaneId(1)),
-                        panes: vec![PaneInfo {
-                            id: PaneId(1),
-                            title: "zsh".into(),
-                            agent: None,
-                            state: AgentState::Idle,
-                            exited: None,
-                        }],
-                    }],
-                }],
+                workspaces: vec![workspace(
+                    1,
+                    "solo",
+                    None,
+                    vec![tab(
+                        1,
+                        "1",
+                        true,
+                        leaf(1),
+                        vec![pane(1, "zsh", None, AgentState::Idle)],
+                    )],
+                )],
             })
             .unwrap(),
         ));
@@ -1135,11 +1069,7 @@ mod tests {
             Style::default(),
             "key span stays bright"
         );
-        assert_eq!(
-            line.spans[1].style,
-            Style::default().add_modifier(Modifier::DIM),
-            "label span is dim"
-        );
+        assert_eq!(line.spans[1].style, dim(), "label span is dim");
         let (spans, _) = two_tone(&[("a", "one"), ("b", "two")]);
         assert!(
             spans

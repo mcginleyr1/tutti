@@ -150,66 +150,43 @@ fn shorten_home(dir: &std::path::Path, home: Option<std::path::PathBuf>) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tutti_core::{Direction, Layout, PaneInfo, TabView, WorkspaceId};
-
-    fn pane(id: u64, agent: Option<&str>, state: AgentState) -> PaneInfo {
-        PaneInfo {
-            id: PaneId(id),
-            title: format!("pane-{id}"),
-            agent: agent.map(Into::into),
-            state,
-            exited: None,
-        }
-    }
+    use crate::attach::fixtures::{agent, leaf, pane, split, tab, workspace};
+    use tutti_core::Direction;
 
     /// Two workspaces: `api` (tab 1) with a working agent and a plain shell;
     /// `web` (tab 2, the active tab) with a blocked agent and a done agent.
     fn two_workspace_view() -> Vec<WorkspaceView> {
         vec![
-            WorkspaceView {
-                id: WorkspaceId(1),
-                name: "api".into(),
-                dir: std::path::PathBuf::from("/tmp/w"),
-                branch: Some("main".into()),
-                tabs: vec![TabView {
-                    id: TabId(1),
-                    name: "1".into(),
-                    active: false,
-                    layout: Some(Layout::Split {
-                        direction: Direction::Horizontal,
-                        ratio: 0.5,
-                        first: Box::new(Layout::Leaf(PaneId(1))),
-                        second: Box::new(Layout::Leaf(PaneId(2))),
-                    }),
-                    active_pane: Some(PaneId(1)),
-                    panes: vec![
-                        pane(1, Some("claude"), AgentState::Working),
-                        pane(2, None, AgentState::Idle),
+            workspace(
+                1,
+                "api",
+                Some("main"),
+                vec![tab(
+                    1,
+                    "1",
+                    false,
+                    split(Direction::Horizontal, leaf(1), leaf(2)),
+                    vec![
+                        agent(1, "claude", AgentState::Working),
+                        pane(2, "pane-2", None, AgentState::Idle),
                     ],
-                }],
-            },
-            WorkspaceView {
-                id: WorkspaceId(2),
-                name: "web".into(),
-                dir: std::path::PathBuf::from("/tmp/w"),
-                branch: None,
-                tabs: vec![TabView {
-                    id: TabId(2),
-                    name: "2".into(),
-                    active: true,
-                    layout: Some(Layout::Split {
-                        direction: Direction::Horizontal,
-                        ratio: 0.5,
-                        first: Box::new(Layout::Leaf(PaneId(3))),
-                        second: Box::new(Layout::Leaf(PaneId(4))),
-                    }),
-                    active_pane: Some(PaneId(3)),
-                    panes: vec![
-                        pane(3, Some("codex"), AgentState::Done),
-                        pane(4, Some("claude"), AgentState::Blocked),
+                )],
+            ),
+            workspace(
+                2,
+                "web",
+                None,
+                vec![tab(
+                    2,
+                    "2",
+                    true,
+                    split(Direction::Horizontal, leaf(3), leaf(4)),
+                    vec![
+                        agent(3, "codex", AgentState::Done),
+                        agent(4, "claude", AgentState::Blocked),
                     ],
-                }],
-            },
+                )],
+            ),
         ]
     }
 

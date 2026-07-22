@@ -45,13 +45,20 @@ struct Client {
 pub struct Hub {
     session: Mutex<Session>,
     clients: Mutex<HashMap<u64, Client>>,
-    /// Last screen broadcast per pane, with its running delta sequence number.
-    last: Mutex<HashMap<PaneId, (vt100::Screen, u32)>>,
+    /// Last screen broadcast per pane, with its running delta sequence number
+    /// and the pty output generation it was captured at.
+    last: Mutex<HashMap<PaneId, (vt100::Screen, u32, u64)>>,
     next_client: AtomicU64,
     /// Session name, reported to attaching clients. Derived from the socket file.
     name: String,
     /// The agent registry driving detection and state classification.
     registry: Registry,
+}
+
+impl Hub {
+    fn session(&self) -> std::sync::MutexGuard<'_, Session> {
+        self.session.lock().expect("session poisoned")
+    }
 }
 
 /// Bootstrap the socket, install a SIGTERM/SIGINT shutdown, and serve until it
@@ -148,7 +155,7 @@ pub async fn serve(
     ticker.abort();
     detector.abort();
     classifier.abort();
-    hub.session.lock().expect("session poisoned").kill_all();
+    hub.session().kill_all();
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(&pid_path);
     Ok(())
@@ -219,7 +226,7 @@ fn handle_frame(hub: &Arc<Hub>, cid: u64, tx: &mpsc::UnboundedSender<Vec<u8>>, f
             // Send the Attached view before joining the broadcast set so it
             // always precedes the pane snapshots the next tick pushes here.
             Ok(Request::Attach) => {
-                let workspaces = hub.session.lock().expect("session poisoned").view();
+                let workspaces = hub.session().view();
                 let _ = tx.send(encode_json(&Response::Attached {
                     session: hub.name.clone(),
                     workspaces,
@@ -248,11 +255,7 @@ fn handle_frame(hub: &Arc<Hub>, cid: u64, tx: &mpsc::UnboundedSender<Vec<u8>>, f
             }
         },
         Frame::Input { pane, bytes } => {
-            let _ = hub
-                .session
-                .lock()
-                .expect("session poisoned")
-                .pane_send(pane, &bytes);
+            let _ = hub.session().pane_send(pane, &bytes);
         }
         Frame::PaneSnapshot(_) | Frame::PaneDelta(_) => {}
     }
@@ -261,22 +264,14 @@ fn handle_frame(hub: &Arc<Hub>, cid: u64, tx: &mpsc::UnboundedSender<Vec<u8>>, f
 fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
     match request {
         Request::WorkspaceNew { dir } => {
-            let id = hub
-                .session
-                .lock()
-                .expect("session poisoned")
-                .workspace_new(dir);
+            let id = hub.session().workspace_new(dir);
             Response::WorkspaceCreated { id }
         }
         Request::WorkspaceList => Response::Workspaces {
-            workspaces: hub
-                .session
-                .lock()
-                .expect("session poisoned")
-                .workspace_list(),
+            workspaces: hub.session().workspace_list(),
         },
         Request::WorkspaceKill { id } => {
-            let mut session = hub.session.lock().expect("session poisoned");
+            let mut session = hub.session();
             match session.workspace_kill(id) {
                 Ok(panes) => {
                     let view = session.view();
@@ -293,29 +288,22 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             }
         }
         Request::TabNew { workspace } => {
-            match hub
-                .session
-                .lock()
-                .expect("session poisoned")
-                .tab_new(workspace)
-            {
+            let r = hub.session().tab_new(workspace);
+            match r {
                 Ok(id) => Response::TabCreated { id },
                 Err(err) => error(err),
             }
         }
         Request::TabList { workspace } => {
-            match hub
-                .session
-                .lock()
-                .expect("session poisoned")
-                .tab_list(workspace)
-            {
+            let r = hub.session().tab_list(workspace);
+            match r {
                 Ok(tabs) => Response::Tabs { tabs },
                 Err(err) => error(err),
             }
         }
         Request::TabSelect { id } => {
-            match hub.session.lock().expect("session poisoned").tab_select(id) {
+            let r = hub.session().tab_select(id);
+            match r {
                 Ok(()) => Response::Ok,
                 Err(err) => error(err),
             }
@@ -326,10 +314,10 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
         }
         Request::PaneResize { pane, rows, cols } => resize_pane(hub, pane, rows, cols),
         Request::PaneList => Response::Panes {
-            panes: hub.session.lock().expect("session poisoned").pane_list(),
+            panes: hub.session().pane_list(),
         },
         Request::PaneKill { pane } => {
-            let mut session = hub.session.lock().expect("session poisoned");
+            let mut session = hub.session();
             match session.pane_kill(pane) {
                 Ok(_workspace) => {
                     let view = session.view();
@@ -342,12 +330,8 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             }
         }
         Request::PaneRename { pane, title } => {
-            match hub
-                .session
-                .lock()
-                .expect("session poisoned")
-                .pane_rename(pane, title)
-            {
+            let r = hub.session().pane_rename(pane, title);
+            match r {
                 Ok(()) => Response::Ok,
                 Err(err) => error(err),
             }
@@ -372,12 +356,8 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
                     message: "pane send needs text or keys".into(),
                 };
             }
-            match hub
-                .session
-                .lock()
-                .expect("session poisoned")
-                .pane_send(pane, &bytes)
-            {
+            let r = hub.session().pane_send(pane, &bytes);
+            match r {
                 Ok(()) => Response::Ok,
                 Err(err) => error(err),
             }
@@ -387,12 +367,8 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             lines,
             unwrapped,
         } => {
-            match hub
-                .session
-                .lock()
-                .expect("session poisoned")
-                .pane_read(pane, lines, unwrapped)
-            {
+            let r = hub.session().pane_read(pane, lines, unwrapped);
+            match r {
                 Ok(lines) => Response::Content { lines },
                 Err(err) => error(err),
             }
@@ -412,7 +388,7 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
 /// broadcast the fresh view. The attached client re-syncs pane sizes off the
 /// new layout, so the ptys resize and reseed on the next tick.
 fn resize_split(hub: &Arc<Hub>, pane: PaneId, axis: Direction, delta: f32) -> Response {
-    let mut session = hub.session.lock().expect("session poisoned");
+    let mut session = hub.session();
     match session.pane_resize_split(pane, axis, delta) {
         Ok(true) => {
             let view = session.view();
@@ -428,7 +404,7 @@ fn resize_split(hub: &Arc<Hub>, pane: PaneId, axis: Direction, delta: f32) -> Re
 /// Focus a pane: record it active and apply a `Focused` state event, flipping a
 /// `Done` pane to `Idle` (marked seen). Broadcasts the transition if it changed.
 fn focus_pane(hub: &Arc<Hub>, pane: PaneId) -> Response {
-    let mut session = hub.session.lock().expect("session poisoned");
+    let mut session = hub.session();
     if session.set_active_pane(pane).is_err() {
         return Response::Error {
             message: format!("no pane {pane}"),
@@ -447,7 +423,7 @@ fn focus_pane(hub: &Arc<Hub>, pane: PaneId) -> Response {
 /// Run a pane-spawning session op, then wire up the new pane's reaper and emit
 /// `LayoutChanged`.
 fn spawn_pane(hub: &Arc<Hub>, op: impl FnOnce(&mut Session) -> Result<PaneId>) -> Response {
-    let mut session = hub.session.lock().expect("session poisoned");
+    let mut session = hub.session();
     match op(&mut session) {
         Ok(pane) => {
             let pty = session.pty(pane).expect("pane just created");
@@ -465,7 +441,7 @@ fn spawn_pane(hub: &Arc<Hub>, op: impl FnOnce(&mut Session) -> Result<PaneId>) -
 /// every client (clear the last broadcast screen and each client's seen set) so
 /// the next tick reseeds their parsers at the new size.
 fn resize_pane(hub: &Arc<Hub>, pane: PaneId, rows: u16, cols: u16) -> Response {
-    let pty = match hub.session.lock().expect("session poisoned").pty(pane) {
+    let pty = match hub.session().pty(pane) {
         Some(pty) => pty,
         None => {
             return Response::Error {
@@ -501,7 +477,7 @@ fn scroll(
         }
         return;
     }
-    let Some(pty) = hub.session.lock().expect("session poisoned").pty(pane) else {
+    let Some(pty) = hub.session().pty(pane) else {
         return;
     };
     let screen = pty.screen_scrolled(offset);
@@ -521,11 +497,7 @@ fn spawn_reaper(hub: &Arc<Hub>, pane: PaneId, pty: Arc<PtyPane>) {
     tokio::spawn(async move {
         let exit = pty.wait().await;
         let code = exit.code as i32;
-        let transition = hub
-            .session
-            .lock()
-            .expect("session poisoned")
-            .mark_exited(pane, code);
+        let transition = hub.session().mark_exited(pane, code);
         if let Some((from, to)) = transition {
             if from != to {
                 broadcast_event(&hub, Event::StateChanged { pane, from, to });
@@ -536,11 +508,7 @@ fn spawn_reaper(hub: &Arc<Hub>, pane: PaneId, pty: Arc<PtyPane>) {
 }
 
 fn broadcast_tick(hub: &Hub) {
-    let panes = hub
-        .session
-        .lock()
-        .expect("session poisoned")
-        .panes_with_pty();
+    let panes = hub.session().live_panes();
 
     // Drain each pane's bells/notifications every tick so the queues stay
     // bounded even with nobody attached; `broadcast_event` is a no-op then.
@@ -561,6 +529,27 @@ fn broadcast_tick(hub: &Hub) {
         return;
     }
     for (pane, pty) in panes {
+        let generation = *pty.output_receiver().borrow();
+
+        // A quiescent pane (output generation unchanged since we last stored it)
+        // whose screen every client already holds needs no fresh clone/diff this
+        // tick. A fresh client, missing it from `seen`, still gets its snapshot
+        // below, so only skip when every client has already seen it.
+        let unchanged = matches!(
+            hub.last.lock().expect("last poisoned").get(&pane),
+            Some((_, _, stored)) if *stored == generation
+        );
+        if unchanged
+            && hub
+                .clients
+                .lock()
+                .expect("clients poisoned")
+                .values()
+                .all(|c| c.seen.contains(&pane))
+        {
+            continue;
+        }
+
         let cur = pty.screen();
         let (rows, cols) = cur.size();
 
@@ -568,7 +557,7 @@ fn broadcast_tick(hub: &Hub) {
             let mut last = hub.last.lock().expect("last poisoned");
             let outcome = match last.get(&pane) {
                 None => (0, None),
-                Some((prev, seq)) => {
+                Some((prev, seq, _)) => {
                     let diff = cur.contents_diff(prev);
                     if diff.is_empty() {
                         (*seq, None)
@@ -577,7 +566,7 @@ fn broadcast_tick(hub: &Hub) {
                     }
                 }
             };
-            last.insert(pane, (cur.clone(), outcome.0));
+            last.insert(pane, (cur.clone(), outcome.0, generation));
             outcome
         };
 
@@ -610,7 +599,7 @@ fn broadcast_tick(hub: &Hub) {
 /// child subtree, and record the matched agent kind. A change to any pane's
 /// agent broadcasts the fresh view so clients relabel their badges.
 async fn detect_pass(hub: &Arc<Hub>) {
-    let panes = hub.session.lock().expect("session poisoned").live_panes();
+    let panes = hub.session().live_panes();
     if panes.is_empty() {
         return;
     }
@@ -627,7 +616,7 @@ async fn detect_pass(hub: &Arc<Hub>) {
         })
         .collect();
 
-    let mut session = hub.session.lock().expect("session poisoned");
+    let mut session = hub.session();
     let mut changed = false;
     for (pane, agent) in detected {
         changed |= session.set_agent(pane, agent);
@@ -650,7 +639,7 @@ fn process_tree() -> ProcessTree {
     for (pid, process) in sys.processes() {
         tree.insert(
             pid.as_u32(),
-            process.parent().map(|p| p.as_u32()),
+            process.parent().map(sysinfo::Pid::as_u32),
             process.name().to_string_lossy(),
         );
     }
@@ -662,7 +651,7 @@ fn process_tree() -> ProcessTree {
 /// `Classified` event. Both are folded onto the pane's state — activity first
 /// so a screen match takes precedence — and any net change is broadcast.
 fn classify_pass(hub: &Arc<Hub>, last_gen: &mut HashMap<PaneId, u64>) {
-    let panes = hub.session.lock().expect("session poisoned").agent_panes();
+    let panes = hub.session().agent_panes();
     if panes.is_empty() {
         return;
     }
@@ -681,8 +670,11 @@ fn classify_pass(hub: &Arc<Hub>, last_gen: &mut HashMap<PaneId, u64>) {
             (*pane, advanced, classified)
         })
         .collect();
+    // Drop generations for panes that have gone away so the map cannot grow
+    // without bound as panes come and go.
+    last_gen.retain(|pane, _| panes.iter().any(|(p, _, _)| p == pane));
 
-    let mut session = hub.session.lock().expect("session poisoned");
+    let mut session = hub.session();
     let mut changes = Vec::new();
     for (pane, advanced, classified) in events {
         let Some(from) = session.pane_state(pane) else {

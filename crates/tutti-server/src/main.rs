@@ -19,7 +19,7 @@ fn main() -> Result<()> {
         match args[i].as_str() {
             "--session" => {
                 i += 1;
-                session = args.get(i).context("--session needs a value")?.clone();
+                session.clone_from(args.get(i).context("--session needs a value")?);
             }
             "--foreground" => foreground = true,
             other => bail!("unknown argument {other:?}"),

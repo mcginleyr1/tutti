@@ -221,9 +221,7 @@ fn absolutize(dir: &Path) -> PathBuf {
     if dir.is_absolute() {
         dir.to_path_buf()
     } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(dir))
-            .unwrap_or_else(|_| dir.to_path_buf())
+        std::env::current_dir().map_or_else(|_| dir.to_path_buf(), |cwd| cwd.join(dir))
     }
 }
 
@@ -659,7 +657,7 @@ mod tests {
     fn projects_to_create_skips_already_mounted_dirs_and_trailing_slashes() {
         let existing = vec![PathBuf::from("/a/b")];
         let projects = vec![PathBuf::from("/a/b/"), PathBuf::from("/c")];
-        let out = projects_to_create(&projects, &existing, |p| p.to_path_buf());
+        let out = projects_to_create(&projects, &existing, Path::to_path_buf);
         assert_eq!(
             out,
             vec![PathBuf::from("/c")],
@@ -694,7 +692,7 @@ mod tests {
             &[PathBuf::from("/a"), PathBuf::from("/b")],
             &[],
             "/bin/zsh",
-            |p| p.to_path_buf(),
+            Path::to_path_buf,
             |req| {
                 sent.push(req.clone());
                 Ok(match req {
@@ -736,7 +734,7 @@ mod tests {
             &[PathBuf::from("/a"), PathBuf::from("/b")],
             &[PathBuf::from("/a")],
             "/bin/zsh",
-            |p| p.to_path_buf(),
+            Path::to_path_buf,
             |req| {
                 sent.push(req.clone());
                 Ok(match req {
@@ -773,7 +771,7 @@ mod tests {
             &[PathBuf::from("/missing"), PathBuf::from("/ok")],
             &[],
             "/bin/zsh",
-            |p| p.to_path_buf(),
+            Path::to_path_buf,
             |req| {
                 sent.push(req.clone());
                 Ok(match req {
