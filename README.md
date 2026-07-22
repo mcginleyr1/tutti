@@ -22,13 +22,15 @@ first use (one daemon per named session, `-s <name>`, default `tutti`).
 ## Quickstart
 
 ```sh
-cd ~/code/myproject && tutti     # auto-starts the daemon and drops you into a shell pane
+cd ~/code/myproject && tutti     # auto-starts the daemon and asks where to start
 ```
 
 Bare `tutti` (no subcommand) attaches to the session, starting the daemon if
-needed. If the session has no workspaces yet, it bootstraps one anchored to the
-current directory with a shell pane — so `cd repo && tutti` is all you need.
-`tutti attach` is an alias for the same thing.
+needed. On a **fresh** session it does not assume anything: the sidebar opens
+focused on a new-project prompt prefilled with your current directory — press
+Enter to take it as-is, edit it first, or `esc` to skip and add a project later
+with `n`. Configure `[[projects]]` (see below) and those mount automatically
+instead, skipping the prompt. `tutti attach` is an alias for the same thing.
 
 Inside, split (`Ctrl+B %`), run an agent, and move around:
 
@@ -77,14 +79,23 @@ preset:
 | `d` or `q` | detach |
 | `?` | help |
 
-You never have to memorise these. The status bar always shows a compact hint on
-its right edge (`C-b ? help · C-b q detach`), and if you press the prefix and
-pause, a **which-key** popup lists every follow-up (press the key, or `esc` to
-back out). `Ctrl+B ?` opens the full help overlay — detach first, then the rest
-of the active keymap, the direct keys, and how to stop the daemon.
+You never have to memorise these. The bottom bar always shows a compact hint on
+its right edge (`C-b ? help · C-b q detach`, the key bright and its label dim),
+and if you press the prefix and pause, a **which-key** popup lists every
+follow-up (press the key, or `esc` to back out). `Ctrl+B ?` opens the full help
+overlay — detach first, then the rest of the active keymap, the direct keys, and
+how to stop the daemon.
 
-Mouse: click focuses a pane, wheel scrolls its history (disable with
-`mouse = false`). Colors come from your terminal — tutti has no theme of its own.
+A **top tab bar** runs above the panes: one chip per tab (the active one an
+accent block), plus a trailing ` + ` chip. Click a chip to select it, the `+` to
+open a tab. The **bottom bar** stays out of the way: the session name on the
+left with any transient/mode message, the standing hint on the right.
+
+Mouse: click focuses a pane, click a tab chip or sidebar entry to jump, wheel
+scrolls a pane's history (disable with `mouse = false`). Colors come from your
+terminal — tutti has no theme of its own: everything renders dim, with one accent
+(terminal blue) marking the focused/active thing and the red/yellow/green state
+dots the only other colour.
 
 ## Configuration
 
@@ -97,7 +108,7 @@ the offending entry (nothing is silently ignored).
 prefix = "C-b"          # prefix chord
 mouse = true            # master mouse switch
 preset = "default"      # prefix keymap: "default" (emacs/tmux-flavored) or "vim"
-sidebar = "auto"        # workspace/agent sidebar: "auto", "on", or "off"
+sidebar = "on"          # workspace/agent sidebar: "on" (default), "auto", or "off"
 notifications = true    # re-emit pane bells/notifications to your real terminal
 
 [keys]                  # direct bindings; every entry optional; "none" disables
@@ -110,6 +121,16 @@ resize_down  = "A-j"
 resize_up    = "A-k"
 resize_right = "A-l"
 kill_pane    = "A-x"
+
+# Startup projects: workspace dirs mounted (each with a shell pane) on attach.
+# Idempotent — a dir already open is left alone, so restarts don't duplicate it.
+# Mounting any project skips the first-run prompt. A dir that does not exist on
+# disk surfaces a transient error after attach; the other projects still mount.
+[[projects]]
+dir = "~/develop/tutti"   # required; `~` expands to your home
+
+[[projects]]
+dir = "~/develop/other"
 ```
 
 Chord syntax is `C-<char>` (Ctrl), `A-<char>` (Alt), or a bare printable
@@ -133,31 +154,39 @@ shared across presets and override the defaults on top (e.g. set
 ## Sidebar
 
 A left column that turns the TUI into a control center for many projects and
-agents at once. It has two stacked sections:
+agents at once. It renders dim by default, with the focused row popping in the
+accent colour. Two stacked sections, each with a lowercase header and a
+right-aligned count:
 
-- **WORKSPACES** — one row per workspace: its name (bold when it owns the active
-  tab) over a dim line showing the git branch (read straight from `.git/HEAD`,
-  including worktrees) or the directory name. Selecting one jumps to its tab.
-- **AGENTS** — one row per agent pane across *every* workspace: a state-coloured
-  dot (blocked red, working yellow, done green, idle/unknown dim), the pane
-  title, and a dim `state · kind` line. Sorted blocked-first so whatever needs
-  you is at the top. Selecting one jumps to that pane, switching workspace and
-  tab as needed. A pane that rings a bell or fires a desktop notification while
-  in the background gets a 🔔 mark here that clears when you focus it.
+- **workspaces** — one row per workspace: an `●` (accent) when it owns the active
+  tab, else a dim `○`, then the bold name, over a dim line showing the git branch
+  (read straight from `.git/HEAD`, including worktrees). No branch leaves that
+  line blank rather than echoing the name. Selecting one jumps to its tab.
+- **agents** — one row per agent pane across *every* workspace: a state dot
+  (blocked red, working an animated spinner, done green, idle/unknown dim), the
+  pane title, and a dim `state · kind` line. Sorted blocked-first so whatever
+  needs you is at the top. Selecting one jumps to that pane, switching workspace
+  and tab as needed. A pane that rings a bell or fires a desktop notification
+  while in the background gets a 🔔 mark here that clears when you focus it. When
+  no agents are running the section shows a dim `no agents yet` placeholder.
+
+The selected row (while the sidebar is focused) carries a `▍` accent bar and a
+subtle full-row background, unmistakable even with a single entry.
 
 Press the prefix then `w` to focus the sidebar (revealing it if hidden). While
 focused, `j`/`k` (or the arrows) move the highlight across both sections, `Enter`
 jumps and hands focus back to the pane, `esc`/`w` unfocus, and `n` opens a
-one-line `dir:` prompt to create a new workspace (`~` expands to your home;
-relative paths resolve against the client's cwd; a bad directory surfaces the
-server's error). A mouse click focuses the sidebar, or jumps straight to the
-entry clicked.
+one-line prompt to create a new workspace (`~` expands to your home; relative
+paths resolve against the client's cwd and are canonicalized to an absolute path
+before the daemon sees them; a bad directory surfaces the server's error). A
+mouse click focuses the sidebar, or jumps straight to the entry clicked.
 
-Visibility is set by the `sidebar` config value: `auto` (default) shows it once
-the session is worth surfacing — more than one workspace, or at least one agent
-pane — while `on` always shows it and `off` keeps it hidden until you focus it
-with `w`. It is suppressed on very narrow terminals so panes keep usable room;
-there, the blocked-first status-bar badges remain the fallback surface.
+Visibility is set by the `sidebar` config value: `on` (default) always shows it
+— the control column is the point — while `auto` reveals it only once the
+session is worth surfacing (more than one workspace, or at least one agent pane)
+and `off` keeps it hidden until you focus it with `w`. It is suppressed on very
+narrow terminals so panes keep usable room. With the sidebar off, a **blocked**
+agent still rings the bell and turns its pane border red until you focus it.
 
 ### Notifications
 
@@ -171,12 +200,15 @@ looking). The status flash and re-emit are gated by `notifications = true`
 
 ## Agent state badges
 
-Panes running a detected agent show a live badge: **blocked** (red — needs your
-input, listed first in the status bar), **working** (yellow), **done** (green —
-finished, not yet viewed; focusing it makes it **idle**). Background panes ring
-the terminal bell when they block or finish. The alpha registry detects
-`claude` and `codex`; adding an agent is one data-table row in
-`crates/tutti-agents` (codex screen patterns are seeds pending live tuning).
+Panes running a detected agent show live state on the pane border and in the
+sidebar's agents section: **blocked** (red — needs your input; sorted first in
+the sidebar and reddening the pane border), **working** (yellow, an animated
+braille spinner), **done** (green — finished, not yet viewed; focusing it makes
+it **idle**). The pane's border title carries the same `agent · state` suffix;
+a plain shell shows just its name. Background panes ring the terminal bell when
+they block or finish. The alpha registry detects `claude` and `codex`; adding an
+agent is one data-table row in `crates/tutti-agents` (codex screen patterns are
+seeds pending live tuning).
 
 ## CLI surface
 
@@ -192,7 +224,7 @@ tutti pane split <pane> right|down
 tutti pane list | kill | rename | focus <pane>
 tutti pane send <pane> --text <s> | --keys <s>
 tutti pane read <pane> [--lines N] [--unwrapped]
-tutti [attach]                       # bare `tutti` attaches; bootstraps an empty session
+tutti [attach]                       # bare `tutti` attaches; a fresh session asks where to start
 ```
 
 `--json` on any verb emits the raw protocol response for scripting.

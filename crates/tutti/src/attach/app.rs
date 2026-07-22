@@ -20,7 +20,7 @@ use crate::config::{Action, Config, PrefixAction, RESIZE_DELTA, SidebarVisibilit
 
 /// The sidebar's fixed column width, and the minimum total width below which it
 /// is suppressed entirely so panes keep usable room.
-const SIDEBAR_WIDTH: u16 = 28;
+const SIDEBAR_WIDTH: u16 = 30;
 const SIDEBAR_MIN_TOTAL: u16 = 80;
 
 const SCROLLBACK: usize = 10_000;
@@ -28,6 +28,12 @@ const STATUS_TTL: Duration = Duration::from_secs(4);
 const MOUSE_SCROLL_STEP: usize = 3;
 /// How long the prefix can sit unanswered before the which-key popup appears.
 const WHICHKEY_DELAY: Duration = Duration::from_millis(500);
+
+/// The braille working-spinner frames and their advance interval, shared by
+/// every working agent so they animate in lockstep. Swap for ASCII by editing
+/// this one const — no config knob.
+const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const SPINNER_TICK: Duration = Duration::from_millis(100);
 
 /// One pane's client-side mirror: a parser fed by snapshots/deltas plus the
 /// metadata the status bar shows.
@@ -97,6 +103,11 @@ pub struct App {
     sidebar_prompt: String,
     /// The sidebar column from the last size sync, for mouse hit-testing.
     sidebar_rect: Option<Rect>,
+    /// The top tab-bar row from the last size sync, for mouse hit-testing.
+    tab_bar_rect: Option<Rect>,
+    /// When the client attached — the epoch the working spinner advances from,
+    /// so every working agent shares one frame counter.
+    spinner_epoch: Instant,
     /// The content width from the last size sync, so the sidebar key can refuse
     /// to focus a column too narrow to render.
     last_content_width: u16,
@@ -144,6 +155,8 @@ impl App {
             sidebar_selected: 0,
             sidebar_prompt: String::new(),
             sidebar_rect: None,
+            tab_bar_rect: None,
+            spinner_epoch: Instant::now(),
             last_content_width: 0,
             adopt_active_view: false,
             notified: HashSet::new(),
@@ -157,6 +170,21 @@ impl App {
         &self.config
     }
 
+    /// Arm the first-run prompt: open the sidebar's new-project prompt prefilled
+    /// with `dir`, so an empty session asks where to start instead of assuming
+    /// the cwd. Reuses the sidebar prompt machinery — Enter creates the
+    /// workspace + shell pane, Esc drops to the (empty) sidebar creating nothing.
+    pub fn start_first_run_prompt(&mut self, dir: String) {
+        self.mode = Mode::SidebarPrompt;
+        self.sidebar_prompt = dir;
+    }
+
+    /// Post a transient status line — e.g. a startup-project error surfaced once
+    /// the client has attached.
+    pub fn note(&mut self, message: String) {
+        self.set_status(message);
+    }
+
     /// Whether the which-key popup should be shown: the prefix has been held,
     /// unanswered, past the delay.
     pub fn whichkey_visible(&self) -> bool {
@@ -164,6 +192,26 @@ impl App {
             && self
                 .prefix_since
                 .is_some_and(|since| since.elapsed() >= WHICHKEY_DELAY)
+    }
+
+    /// The current working-spinner frame index. The event loop watches this to
+    /// redraw while an agent works; the renderer reads `spinner_char`.
+    pub fn spinner_frame(&self) -> usize {
+        (self.spinner_epoch.elapsed().as_millis() / SPINNER_TICK.as_millis()) as usize
+            % SPINNER.len()
+    }
+
+    /// The braille glyph for the current spinner frame.
+    pub fn spinner_char(&self) -> char {
+        SPINNER[self.spinner_frame()]
+    }
+
+    /// Whether any pane is a working agent — the condition under which the event
+    /// loop must keep redrawing to animate the spinner.
+    pub fn has_working_agent(&self) -> bool {
+        self.panes
+            .values()
+            .any(|s| s.info.agent.is_some() && s.info.state == AgentState::Working)
     }
 
     /// The `PaneFocus` frame to send if focus changed since the last call, so
@@ -559,9 +607,9 @@ impl App {
             .any(|p| p.agent.is_some())
     }
 
-    /// Split a content area into the sidebar column (when shown) and the panes
-    /// region to its right. The single source of truth for every rect that must
-    /// account for the sidebar: rendering, resize sync, and mouse hit-testing.
+    /// Split a content area into the sidebar column (when shown) and the region
+    /// to its right. The single source of truth for the sidebar column: the
+    /// region right of it is further split into the tab bar and panes.
     pub fn split_content(&self, content: Rect) -> (Option<Rect>, Rect) {
         if !self.sidebar_shown(content.width) {
             return (None, content);
@@ -570,6 +618,20 @@ impl App {
         let sidebar = Rect::new(content.x, content.y, w, content.height);
         let panes = Rect::new(content.x + w, content.y, content.width - w, content.height);
         (Some(sidebar), panes)
+    }
+
+    /// The three regions a content area splits into: the sidebar column (when
+    /// shown, full height), the top tab-bar row, and the pane area below it.
+    /// Every rect the renderer, resize sync, and mouse hit-testing use flows
+    /// from here so they stay in agreement.
+    pub fn regions(&self, content: Rect) -> (Option<Rect>, Rect, Rect) {
+        let (sidebar, right) = self.split_content(content);
+        if right.height <= 1 {
+            return (sidebar, right, right);
+        }
+        let tabs = Rect::new(right.x, right.y, right.width, 1);
+        let panes = Rect::new(right.x, right.y + 1, right.width, right.height - 1);
+        (sidebar, tabs, panes)
     }
 
     /// Focus the sidebar, revealing it if hidden. Refuses when the terminal is
@@ -701,6 +763,9 @@ impl App {
                 if self.in_sidebar(col, row) {
                     return self.sidebar_click(row);
                 }
+                if self.in_rect(self.tab_bar_rect, col, row) {
+                    return self.tab_bar_click(col);
+                }
                 Vec::new()
             }
             MouseEventKind::ScrollUp => self.mouse_scroll(col, row, true),
@@ -710,9 +775,51 @@ impl App {
     }
 
     fn in_sidebar(&self, col: u16, row: u16) -> bool {
-        self.sidebar_rect.is_some_and(|r| {
+        self.in_rect(self.sidebar_rect, col, row)
+    }
+
+    fn in_rect(&self, rect: Option<Rect>, col: u16, row: u16) -> bool {
+        rect.is_some_and(|r| {
             col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
         })
+    }
+
+    /// The tab-bar chips, left to right: one per tab (carrying its id) then a
+    /// trailing `+` (a `None` target = new tab). Shared by the renderer and the
+    /// click hit-test so a click lands on exactly what is drawn.
+    pub fn tab_chips(&self) -> Vec<(Option<TabId>, String)> {
+        let mut chips: Vec<(Option<TabId>, String)> = self
+            .all_tabs()
+            .iter()
+            .map(|t| (Some(t.id), format!(" {} ", t.name)))
+            .collect();
+        chips.push((None, " + ".into()));
+        chips
+    }
+
+    /// A click on the tab bar: select the tab whose chip was hit, or create a
+    /// new tab when the trailing `+` chip was hit.
+    fn tab_bar_click(&mut self, col: u16) -> Vec<WireFrame> {
+        let Some(rect) = self.tab_bar_rect else {
+            return Vec::new();
+        };
+        let mut x = rect.x;
+        for (target, label) in self.tab_chips() {
+            let w = label.chars().count() as u16;
+            if col >= x && col < x + w {
+                return match target {
+                    Some(id) => {
+                        self.active_tab = Some(id);
+                        self.zoom = false;
+                        self.refocus();
+                        vec![control(&Request::TabSelect { id })]
+                    }
+                    None => self.new_tab(),
+                };
+            }
+            x += w;
+        }
+        Vec::new()
     }
 
     /// A left-click inside the sidebar: focus it, and if the click landed on an
@@ -768,8 +875,9 @@ impl App {
     /// pane whose rendered size changed, so the server's ptys track the client.
     pub fn sync_sizes(&mut self, content: Rect) -> Vec<WireFrame> {
         self.last_content_width = content.width;
-        let (sidebar_rect, _) = self.split_content(content);
+        let (sidebar_rect, tab_bar_rect, _) = self.regions(content);
         self.sidebar_rect = sidebar_rect;
+        self.tab_bar_rect = Some(tab_bar_rect);
         self.rects = self.compute_rects(content);
         let mut out = Vec::new();
         for (pane, rect) in &self.rects {
@@ -787,7 +895,7 @@ impl App {
     }
 
     pub fn compute_rects(&self, content: Rect) -> Vec<(PaneId, Rect)> {
-        let (_, panes) = self.split_content(content);
+        let (_, _, panes) = self.regions(content);
         let Some(layout) = self.active_tab_view().and_then(|t| t.layout.as_ref()) else {
             return Vec::new();
         };
@@ -1091,11 +1199,15 @@ fn osc9(text: &str) -> Vec<u8> {
 }
 
 /// Resolve a prompt-entered directory against the live environment: `~`
-/// expands to `$HOME`, relative paths against the client's cwd.
+/// expands to `$HOME`, relative paths against the client's cwd. The result is
+/// canonicalized to an absolute path so the daemon (which has its own cwd)
+/// records the real directory — without this, `.`-relative inputs land against
+/// the daemon's cwd and its git-branch probe misses.
 fn expand_dir(input: &str) -> PathBuf {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    resolve_dir(input, home.as_deref(), &cwd)
+    let resolved = resolve_dir(input, home.as_deref(), &cwd);
+    std::fs::canonicalize(&resolved).unwrap_or(resolved)
 }
 
 /// Pure directory resolution: `~`/`~/rest` against `home`, relative paths
@@ -1313,7 +1425,9 @@ mod tests {
 
     #[test]
     fn sync_sizes_requests_resize_once_per_size() {
-        let mut app = App::new();
+        // Sidebar off so the lone pane keeps the full width; the top tab bar
+        // still costs one row of height.
+        let mut app = App::with_config(Config::parse("sidebar = \"off\"\n").unwrap());
         attached(&mut app);
         let area = Rect::new(0, 0, 80, 24);
         let first = app.sync_sizes(area);
@@ -1321,7 +1435,7 @@ mod tests {
             first,
             vec![control(&Request::PaneResize {
                 pane: PaneId(1),
-                rows: 22,
+                rows: 21,
                 cols: 78,
             })]
         );
@@ -1751,30 +1865,37 @@ mod tests {
 
     #[test]
     fn sidebar_visibility_follows_config_and_width() {
+        fn auto() -> App {
+            App::with_config(Config::parse("sidebar = \"auto\"\n").unwrap())
+        }
+
         // auto: hidden for a single plain workspace.
-        let mut app = App::new();
+        let mut app = auto();
         attached(&mut app);
         let (sb, panes) = app.split_content(Rect::new(0, 0, 100, 24));
         assert!(sb.is_none(), "auto hides an agentless single workspace");
         assert_eq!(panes.width, 100);
 
         // auto: shown with multiple workspaces, panes shrink by the column width.
-        let mut app = App::new();
+        let mut app = auto();
         attach_with(&mut app, view_two_workspaces());
         let (sb, panes) = app.split_content(Rect::new(0, 0, 100, 24));
-        assert_eq!(sb.unwrap().width, 28);
-        assert_eq!(panes.width, 72);
-        assert_eq!(panes.x, 28);
+        assert_eq!(sb.unwrap().width, 30);
+        assert_eq!(panes.width, 70);
+        assert_eq!(panes.x, 30);
 
         // width floor suppresses it regardless of contents.
         let (sb, panes) = app.split_content(Rect::new(0, 0, 79, 24));
         assert!(sb.is_none(), "below the width floor the sidebar is hidden");
         assert_eq!(panes.width, 79);
 
-        // on: shown even for a plain single workspace.
-        let mut app = App::with_config(Config::parse("sidebar = \"on\"\n").unwrap());
+        // on (the default): shown even for a plain single workspace.
+        let mut app = App::new();
         attached(&mut app);
-        assert!(app.split_content(Rect::new(0, 0, 100, 24)).0.is_some());
+        assert!(
+            app.split_content(Rect::new(0, 0, 100, 24)).0.is_some(),
+            "on is the default and shows for a single workspace"
+        );
 
         // off: hidden even with multiple workspaces.
         let mut app = App::with_config(Config::parse("sidebar = \"off\"\n").unwrap());
@@ -1877,6 +1998,72 @@ mod tests {
     }
 
     #[test]
+    fn spinner_advances_only_with_a_working_agent() {
+        let mut app = App::new();
+        attached(&mut app); // a single shell, no agent
+        assert!(!app.has_working_agent());
+        assert!(SPINNER.contains(&app.spinner_char()));
+
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        assert!(
+            app.has_working_agent(),
+            "the working claude agent drives the spinner"
+        );
+    }
+
+    #[test]
+    fn first_run_prompt_arms_prefilled_with_cwd() {
+        let mut app = App::new();
+        app.start_first_run_prompt("/home/alice/proj".into());
+        // Attaching an empty session leaves the prompt engaged and prefilled.
+        attach_with(&mut app, vec![]);
+        assert!(
+            app.sidebar_prompt_active(),
+            "the first-run prompt is active"
+        );
+        assert_eq!(app.sidebar_prompt(), "/home/alice/proj");
+        assert!(app.sidebar_focused());
+    }
+
+    #[test]
+    fn first_run_prompt_enter_creates_workspace_and_shell() {
+        let mut app = App::new();
+        app.start_first_run_prompt("/tmp/proj".into());
+        attach_with(&mut app, vec![]);
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            out,
+            vec![
+                control(&Request::WorkspaceNew {
+                    dir: PathBuf::from("/tmp/proj"),
+                }),
+                control(&Request::PaneRun {
+                    tab: None,
+                    cmd: vec![shell],
+                }),
+            ],
+        );
+        assert_eq!(app.mode, Mode::Terminal);
+        assert!(
+            app.adopt_active_view,
+            "the jump to the new workspace is armed"
+        );
+    }
+
+    #[test]
+    fn first_run_prompt_esc_creates_nothing_and_drops_to_the_sidebar() {
+        let mut app = App::new();
+        app.start_first_run_prompt("/tmp/proj".into());
+        attach_with(&mut app, vec![]);
+        let out = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(out.is_empty(), "esc creates nothing");
+        assert_eq!(app.mode, Mode::Sidebar);
+        assert!(app.sidebar_prompt().is_empty());
+    }
+
+    #[test]
     fn new_workspace_prompt_esc_cancels_back_to_the_sidebar() {
         let mut app = App::new();
         attach_with(&mut app, view_two_workspaces());
@@ -1921,11 +2108,11 @@ mod tests {
         app.sync_sizes(Rect::new(0, 0, 100, 24));
 
         let left = app.rects.iter().find(|(p, _)| *p == PaneId(2)).unwrap().1;
-        assert_eq!(left.x, 28, "the leftmost pane sits right of the sidebar");
+        assert_eq!(left.x, 30, "the leftmost pane sits right of the sidebar");
 
         assert!(
-            app.pane_at(30, 5).is_some(),
-            "clicks past the sidebar hit a pane"
+            app.pane_at(32, 5).is_some(),
+            "clicks past the sidebar and below the tab bar hit a pane"
         );
         assert!(
             app.pane_at(5, 5).is_none(),
@@ -1938,10 +2125,42 @@ mod tests {
         let mut app = App::new();
         attach_with(&mut app, view_two_workspaces());
         app.sync_sizes(Rect::new(0, 0, 100, 24));
-        // Header row 0, workspace 0 rows 1-2, workspace 1 rows 3-4.
-        let out = app.on_mouse(MouseEventKind::Down(MouseButton::Left), 2, 3);
+        // Top pad row 0, header row 1, workspace 0 rows 2-3, workspace 1 rows 4-5.
+        let out = app.on_mouse(MouseEventKind::Down(MouseButton::Left), 2, 4);
         assert_eq!(out, vec![control(&Request::TabSelect { id: TabId(2) })]);
         assert_eq!(app.active_tab, Some(TabId(2)));
+    }
+
+    #[test]
+    fn clicking_the_sidebar_background_focuses_it_without_jumping() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        app.sync_sizes(Rect::new(0, 0, 100, 24));
+        // Row 0 is the top pad — background, not an entry.
+        let out = app.on_mouse(MouseEventKind::Down(MouseButton::Left), 2, 0);
+        assert!(out.is_empty(), "a background click jumps nowhere");
+        assert!(app.sidebar_focused(), "but it does focus the sidebar");
+    }
+
+    #[test]
+    fn clicking_a_tab_chip_selects_it_and_plus_creates_a_tab() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_tabs());
+        app.sync_sizes(Rect::new(0, 0, 100, 24));
+        // Tab bar sits right of the 30-wide sidebar on the top row: chips are
+        // " 1 " (x 30-33), " 2 " (33-36), " + " (36-39).
+        let out = app.on_mouse(MouseEventKind::Down(MouseButton::Left), 34, 0);
+        assert_eq!(out, vec![control(&Request::TabSelect { id: TabId(2) })]);
+        assert_eq!(app.active_tab, Some(TabId(2)));
+
+        let out = app.on_mouse(MouseEventKind::Down(MouseButton::Left), 37, 0);
+        assert_eq!(
+            out,
+            vec![control(&Request::TabNew {
+                workspace: Some(WorkspaceId(1)),
+            })],
+            "the + chip creates a tab in the active workspace"
+        );
     }
 
     // ---- notifications --------------------------------------------------

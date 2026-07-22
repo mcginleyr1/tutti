@@ -16,9 +16,10 @@ pub enum SidebarEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceRow {
     pub name: String,
-    /// Branch when known, else the workspace name (its directory's last path
-    /// component) — the dim second line.
-    pub subtitle: String,
+    /// The git branch, when known — the dim second line. `None` renders a blank
+    /// line rather than repeating the name (the workspace name is already the
+    /// directory basename, so echoing it as a subtitle read as a bug).
+    pub subtitle: Option<String>,
     /// Whether this workspace owns the active tab (rendered bold).
     pub active: bool,
     /// The tab that selecting this workspace jumps to.
@@ -53,16 +54,17 @@ impl Sidebar {
     }
 
     /// The entry a click at `row` (relative to the sidebar's inner top) selects,
-    /// or `None` for a header, the section gap, or empty space. The layout is:
-    /// header at row 0, then two rows per workspace, a blank, a header, then two
-    /// rows per agent.
+    /// or `None` for padding, a header, the section gap, or empty space. The
+    /// layout mirrors the renderer: a blank top-pad row, the workspaces header,
+    /// two rows per workspace, a blank, the agents header, then two rows per
+    /// agent (or one placeholder row when there are none).
     pub fn entry_at_row(&self, row: usize) -> Option<usize> {
-        let ws_start = 1;
+        let ws_start = TOP_PAD + 1; // top pad + workspaces header
         let ws_end = ws_start + 2 * self.workspace_count;
         if (ws_start..ws_end).contains(&row) {
             return Some((row - ws_start) / 2);
         }
-        let agents_start = ws_end + 2; // blank line + AGENTS header
+        let agents_start = ws_end + 2; // blank line + agents header
         let agents_end = agents_start + 2 * (self.entries.len() - self.workspace_count);
         if (agents_start..agents_end).contains(&row) {
             return Some(self.workspace_count + (row - agents_start) / 2);
@@ -70,6 +72,10 @@ impl Sidebar {
         None
     }
 }
+
+/// The blank padding row rendered above the first section header. The hit-test
+/// and the renderer both offset by this so clicks land on the right entry.
+pub const TOP_PAD: usize = 1;
 
 /// Build the sidebar from the client's view. `active_tab` decides which
 /// workspace is bold and where each workspace jump lands. Agents are gathered
@@ -86,7 +92,7 @@ pub fn build(workspaces: &[WorkspaceView], active_tab: Option<TabId>) -> Sidebar
         if let Some(jump_tab) = jump_tab {
             entries.push(SidebarEntry::Workspace(WorkspaceRow {
                 name: w.name.clone(),
-                subtitle: w.branch.clone().unwrap_or_else(|| w.name.clone()),
+                subtitle: w.branch.clone(),
                 active: owns,
                 jump_tab,
             }));
@@ -212,10 +218,17 @@ mod tests {
             TabId(1),
             "inactive workspace jumps to its tab"
         );
-        assert_eq!(api.subtitle, "main", "branch drives the subtitle");
+        assert_eq!(
+            api.subtitle.as_deref(),
+            Some("main"),
+            "branch drives the subtitle"
+        );
         assert!(web.active, "web owns the active tab");
         assert_eq!(web.jump_tab, TabId(2));
-        assert_eq!(web.subtitle, "web", "no branch falls back to the name");
+        assert_eq!(
+            web.subtitle, None,
+            "no branch renders a blank line, never the name again"
+        );
     }
 
     #[test]
@@ -244,22 +257,23 @@ mod tests {
     }
 
     #[test]
-    fn entry_at_row_maps_clicks_past_headers_and_the_gap() {
+    fn entry_at_row_maps_clicks_past_padding_headers_and_the_gap() {
         let sidebar = build(&two_workspace_view(), Some(TabId(2)));
-        // Row 0 is the WORKSPACES header.
+        // Row 0 is the top pad, row 1 the workspaces header.
         assert_eq!(sidebar.entry_at_row(0), None);
-        // Rows 1-2 are workspace 0, rows 3-4 workspace 1.
-        assert_eq!(sidebar.entry_at_row(1), Some(0));
+        assert_eq!(sidebar.entry_at_row(1), None);
+        // Rows 2-3 are workspace 0, rows 4-5 workspace 1.
         assert_eq!(sidebar.entry_at_row(2), Some(0));
-        assert_eq!(sidebar.entry_at_row(3), Some(1));
-        // Row 5 blank, row 6 AGENTS header — neither selectable.
-        assert_eq!(sidebar.entry_at_row(5), None);
+        assert_eq!(sidebar.entry_at_row(3), Some(0));
+        assert_eq!(sidebar.entry_at_row(4), Some(1));
+        // Row 6 blank, row 7 agents header — neither selectable.
         assert_eq!(sidebar.entry_at_row(6), None);
-        // Rows 7-8 first agent (entry index 2), 9-10 second, 11-12 third.
-        assert_eq!(sidebar.entry_at_row(7), Some(2));
-        assert_eq!(sidebar.entry_at_row(10), Some(3));
-        assert_eq!(sidebar.entry_at_row(12), Some(4));
+        assert_eq!(sidebar.entry_at_row(7), None);
+        // Rows 8-9 first agent (entry index 2), 10-11 second, 12-13 third.
+        assert_eq!(sidebar.entry_at_row(8), Some(2));
+        assert_eq!(sidebar.entry_at_row(11), Some(3));
+        assert_eq!(sidebar.entry_at_row(13), Some(4));
         // Past the last agent.
-        assert_eq!(sidebar.entry_at_row(13), None);
+        assert_eq!(sidebar.entry_at_row(14), None);
     }
 }

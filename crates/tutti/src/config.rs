@@ -4,7 +4,7 @@
 //! defaults; a malformed file, an unknown key, or an unparseable chord is a
 //! hard error naming the offending entry — never silently ignored.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -66,9 +66,10 @@ pub enum PrefixAction {
     Help,
 }
 
-/// Whether the workspace/agent sidebar is rendered. `Auto` shows it once the
-/// session is worth surfacing (more than one workspace, or any agent pane);
-/// focusing it with the sidebar key forces it visible regardless.
+/// Whether the workspace/agent sidebar is rendered. `On` is the default — the
+/// control column is the product. `Auto` shows it once the session is worth
+/// surfacing (more than one workspace, or any agent pane); `Off` hides it until
+/// focused. Focusing it with the sidebar key forces it visible regardless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarVisibility {
     Auto,
@@ -231,6 +232,9 @@ pub struct Config {
     /// Whether pane notifications re-emit to the real terminal and flash the
     /// status bar. The sidebar bell mark is unaffected — always on.
     pub notifications: bool,
+    /// Startup projects: workspace dirs to mount (idempotently) on attach, each
+    /// `~`-expanded. Empty by default.
+    pub projects: Vec<PathBuf>,
     prefix_bindings: Vec<PrefixBinding>,
 }
 
@@ -279,13 +283,20 @@ impl Config {
         .to_vec();
 
         let sidebar = match raw.sidebar.as_deref() {
-            None | Some("auto") => SidebarVisibility::Auto,
-            Some("on") => SidebarVisibility::On,
+            None | Some("on") => SidebarVisibility::On,
+            Some("auto") => SidebarVisibility::Auto,
             Some("off") => SidebarVisibility::Off,
             Some(other) => {
                 bail!("sidebar: unknown value {other:?} (expected \"auto\", \"on\", or \"off\")")
             }
         };
+
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let projects = raw
+            .projects
+            .into_iter()
+            .map(|p| expand_home(&p.dir, home.as_deref()))
+            .collect();
 
         let mut overrides = raw.keys.into_map();
         let mut bindings = Vec::new();
@@ -309,6 +320,7 @@ impl Config {
             preset,
             sidebar,
             notifications,
+            projects,
             prefix_bindings,
         })
     }
@@ -347,6 +359,14 @@ struct RawConfig {
     notifications: Option<bool>,
     #[serde(default)]
     keys: RawKeys,
+    #[serde(default)]
+    projects: Vec<RawProject>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProject {
+    dir: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -382,6 +402,20 @@ impl RawKeys {
         .filter_map(|(name, spec)| spec.map(|spec| (name, spec)))
         .collect()
     }
+}
+
+/// Expand a configured project dir: `~` / `~/rest` against `$HOME`, everything
+/// else taken as written (absolute or relative to the client's cwd at mount).
+fn expand_home(input: &str, home: Option<&Path>) -> PathBuf {
+    if let Some(home) = home {
+        if input == "~" {
+            return home.to_path_buf();
+        }
+        if let Some(rest) = input.strip_prefix("~/") {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(input)
 }
 
 fn config_path() -> PathBuf {
@@ -607,8 +641,8 @@ kill_pane    = "A-x"
     }
 
     #[test]
-    fn sidebar_defaults_to_auto_and_parses_values() {
-        assert_eq!(Config::default().sidebar, SidebarVisibility::Auto);
+    fn sidebar_defaults_to_on_and_parses_values() {
+        assert_eq!(Config::default().sidebar, SidebarVisibility::On);
         assert_eq!(
             Config::parse("sidebar = \"on\"\n").unwrap().sidebar,
             SidebarVisibility::On
@@ -620,6 +654,43 @@ kill_pane    = "A-x"
         assert_eq!(
             Config::parse("sidebar = \"auto\"\n").unwrap().sidebar,
             SidebarVisibility::Auto
+        );
+    }
+
+    #[test]
+    fn projects_default_empty_and_parse_a_dir_list() {
+        assert!(Config::default().projects.is_empty());
+        let cfg =
+            Config::parse("[[projects]]\ndir = \"/srv/api\"\n\n[[projects]]\ndir = \"/srv/web\"\n")
+                .unwrap();
+        assert_eq!(
+            cfg.projects,
+            vec![PathBuf::from("/srv/api"), PathBuf::from("/srv/web")]
+        );
+    }
+
+    #[test]
+    fn project_requires_a_dir() {
+        let err = Config::parse("[[projects]]\n").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("dir"),
+            "error should name the missing key: {err:#}"
+        );
+    }
+
+    #[test]
+    fn expand_home_expands_tilde_only() {
+        let home = Path::new("/home/alice");
+        assert_eq!(expand_home("~", Some(home)), PathBuf::from("/home/alice"));
+        assert_eq!(
+            expand_home("~/develop/x", Some(home)),
+            PathBuf::from("/home/alice/develop/x")
+        );
+        assert_eq!(expand_home("/abs", Some(home)), PathBuf::from("/abs"));
+        assert_eq!(
+            expand_home("~", None),
+            PathBuf::from("~"),
+            "without a home, ~ is taken literally"
         );
     }
 

@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
@@ -17,8 +18,8 @@ struct Cli {
     /// Print raw JSON responses instead of formatted output.
     #[arg(long, global = true)]
     json: bool,
-    /// With no subcommand, `tutti` attaches (bootstrapping a shell pane when the
-    /// session is empty).
+    /// With no subcommand, `tutti` attaches (a fresh session asks where to start
+    /// instead of assuming the current directory).
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -162,7 +163,7 @@ fn main() {
 fn run(cli: Cli) -> Result<i32> {
     match cli.command {
         Some(Command::Server { action }) => run_server(action, &cli.session),
-        // Bare `tutti` and `tutti attach` both attach, bootstrapping the session.
+        // Bare `tutti` and `tutti attach` both attach, mounting startup projects.
         None | Some(Command::Attach) => {
             attach_session(&cli.session)?;
             Ok(0)
@@ -176,34 +177,111 @@ fn run(cli: Cli) -> Result<i32> {
     }
 }
 
-/// Load config, ensure the session has at least one pane, and attach. A fresh
-/// session is bootstrapped with a shell pane in the current directory so
-/// `cd repo && tutti` drops straight into a working session.
+/// Load config, mount any configured startup projects (idempotently), and
+/// attach. An empty session with no configured projects attaches straight into
+/// the first-run prompt (prefilled with the cwd) rather than assuming it —
+/// `first_run` carries that prefill. A project that fails to start yields a
+/// `notice` surfaced after attach; the rest still mount.
 fn attach_session(session: &str) -> Result<()> {
     let config = Config::load()?;
-    bootstrap_if_empty(session)?;
-    tutti::attach::run(session, config)?;
+    // Absolutize project dirs client-side so the daemon (which has its own cwd)
+    // records the real directory and its git-branch probe hits.
+    let projects: Vec<PathBuf> = config.projects.iter().map(|d| absolutize(d)).collect();
+    let mut client = Client::connect_or_start(session)?;
+    let existing = existing_dirs(&mut client)?;
+    let was_empty = existing.is_empty();
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let notices = mount_projects(
+        &projects,
+        &existing,
+        &shell,
+        |p| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()),
+        |req| client.request(req),
+    )?;
+    drop(client);
+
+    let first_run = (was_empty && config.projects.is_empty())
+        .then(|| std::env::current_dir().map(|d| d.display().to_string()))
+        .transpose()
+        .context("resolve current directory")?;
+    let notice = (!notices.is_empty()).then(|| notices.join("; "));
+
+    tutti::attach::run(session, config, first_run, notice)?;
     Ok(())
 }
 
-/// When the session has no workspaces yet, create one anchored to the current
-/// directory and run a login shell in it.
-fn bootstrap_if_empty(session: &str) -> Result<()> {
-    let mut client = Client::connect_or_start(session)?;
-    let workspaces = match client.request(&Request::WorkspaceList)? {
-        Response::Workspaces { workspaces } => workspaces,
-        other => bail!("unexpected reply to workspace list: {other:?}"),
-    };
-    if workspaces.is_empty() {
-        let dir = std::env::current_dir().context("resolve current directory")?;
-        client.request(&Request::WorkspaceNew { dir })?;
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        client.request(&Request::PaneRun {
-            tab: None,
-            cmd: vec![shell],
-        })?;
+/// Resolve `dir` to an absolute path client-side. Canonicalize when it exists
+/// (collapsing `.`/`..`/symlinks); otherwise join a relative path onto the
+/// client's cwd. The daemon has its own cwd, so a relative `--dir .` would
+/// otherwise anchor to the wrong place and miss the workspace's git branch.
+fn absolutize(dir: &Path) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(dir) {
+        return canon;
     }
-    Ok(())
+    if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(dir))
+            .unwrap_or_else(|_| dir.to_path_buf())
+    }
+}
+
+/// The dirs of the session's live workspaces.
+fn existing_dirs(client: &mut Client) -> Result<Vec<PathBuf>> {
+    match client.request(&Request::WorkspaceList)? {
+        Response::Workspaces { workspaces } => Ok(workspaces.into_iter().map(|w| w.dir).collect()),
+        other => bail!("unexpected reply to workspace list: {other:?}"),
+    }
+}
+
+/// The configured project dirs that need creating: those whose canonical path is
+/// not already a live workspace's. `canon` is injected so this stays pure — it
+/// collapses symlinks and trailing slashes so restarts are idempotent.
+fn projects_to_create(
+    projects: &[PathBuf],
+    existing: &[PathBuf],
+    canon: impl Fn(&Path) -> PathBuf,
+) -> Vec<PathBuf> {
+    let mut seen: HashSet<PathBuf> = existing.iter().map(|d| canon(d)).collect();
+    projects
+        .iter()
+        .filter(|dir| seen.insert(canon(dir)))
+        .cloned()
+        .collect()
+}
+
+/// Create a workspace + shell pane for each configured project not already
+/// mounted. A project whose dir cannot be started (e.g. it does not exist)
+/// yields a notice naming the path — surfaced as a transient message after
+/// attach — and the remaining projects still mount.
+fn mount_projects(
+    projects: &[PathBuf],
+    existing: &[PathBuf],
+    shell: &str,
+    canon: impl Fn(&Path) -> PathBuf,
+    mut send: impl FnMut(&Request) -> Result<Response>,
+) -> Result<Vec<String>> {
+    let mut notices = Vec::new();
+    for dir in projects_to_create(projects, existing, &canon) {
+        match send(&Request::WorkspaceNew { dir: dir.clone() })? {
+            Response::WorkspaceCreated { .. } => {}
+            Response::Error { message } => {
+                notices.push(format!("{}: {message}", dir.display()));
+                continue;
+            }
+            other => bail!("unexpected reply to workspace new: {other:?}"),
+        }
+        match send(&Request::PaneRun {
+            tab: None,
+            cmd: vec![shell.to_string()],
+        })? {
+            Response::PaneCreated { .. } | Response::Ok => {}
+            Response::Error { message } => notices.push(format!("{}: {message}", dir.display())),
+            other => bail!("unexpected reply to pane run: {other:?}"),
+        }
+    }
+    Ok(notices)
 }
 
 fn run_server(action: ServerAction, session: &str) -> Result<i32> {
@@ -239,7 +317,9 @@ fn run_server(action: ServerAction, session: &str) -> Result<i32> {
 fn to_request(command: Command) -> Result<Request> {
     match command {
         Command::Workspace { action } => Ok(match action {
-            WorkspaceAction::New { dir } => Request::WorkspaceNew { dir },
+            WorkspaceAction::New { dir } => Request::WorkspaceNew {
+                dir: absolutize(&dir),
+            },
             WorkspaceAction::List => Request::WorkspaceList,
             WorkspaceAction::Kill { id } => Request::WorkspaceKill {
                 id: WorkspaceId(id),
@@ -558,6 +638,174 @@ mod tests {
             Cli::try_parse_from(["tutti", "attach"]).unwrap().command,
             Some(Command::Attach)
         ));
+    }
+
+    #[test]
+    fn workspace_new_absolutizes_a_relative_dir() {
+        // A relative `--dir .` must reach the daemon as an absolute path so its
+        // git-branch probe resolves against the client's directory, not the
+        // daemon's.
+        let req = request_of(&["tutti", "workspace", "new", "--dir", "."]);
+        let Request::WorkspaceNew { dir } = req else {
+            panic!("expected a workspace-new request");
+        };
+        assert!(
+            dir.is_absolute(),
+            "the dir is absolutized client-side: {dir:?}"
+        );
+    }
+
+    #[test]
+    fn projects_to_create_skips_already_mounted_dirs_and_trailing_slashes() {
+        let existing = vec![PathBuf::from("/a/b")];
+        let projects = vec![PathBuf::from("/a/b/"), PathBuf::from("/c")];
+        let out = projects_to_create(&projects, &existing, |p| p.to_path_buf());
+        assert_eq!(
+            out,
+            vec![PathBuf::from("/c")],
+            "the trailing-slash duplicate is skipped, /c is new"
+        );
+    }
+
+    #[test]
+    fn projects_to_create_dedups_via_canonicalization() {
+        // A symlink and its target canonicalize to the same path.
+        let existing = vec![PathBuf::from("/real")];
+        let projects = vec![PathBuf::from("/link"), PathBuf::from("/other")];
+        let canon = |p: &Path| {
+            if p == Path::new("/link") {
+                PathBuf::from("/real")
+            } else {
+                p.to_path_buf()
+            }
+        };
+        let out = projects_to_create(&projects, &existing, canon);
+        assert_eq!(
+            out,
+            vec![PathBuf::from("/other")],
+            "the symlink resolves to an existing dir"
+        );
+    }
+
+    #[test]
+    fn mount_projects_requests_workspace_then_shell_per_project() {
+        let mut sent = Vec::new();
+        let notices = mount_projects(
+            &[PathBuf::from("/a"), PathBuf::from("/b")],
+            &[],
+            "/bin/zsh",
+            |p| p.to_path_buf(),
+            |req| {
+                sent.push(req.clone());
+                Ok(match req {
+                    Request::WorkspaceNew { .. } => {
+                        Response::WorkspaceCreated { id: WorkspaceId(1) }
+                    }
+                    Request::PaneRun { .. } => Response::PaneCreated { id: PaneId(1) },
+                    _ => Response::Ok,
+                })
+            },
+        )
+        .unwrap();
+        assert!(notices.is_empty());
+        assert_eq!(
+            sent,
+            vec![
+                Request::WorkspaceNew {
+                    dir: PathBuf::from("/a")
+                },
+                Request::PaneRun {
+                    tab: None,
+                    cmd: vec!["/bin/zsh".into()]
+                },
+                Request::WorkspaceNew {
+                    dir: PathBuf::from("/b")
+                },
+                Request::PaneRun {
+                    tab: None,
+                    cmd: vec!["/bin/zsh".into()]
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn mount_projects_skips_a_dir_already_mounted() {
+        let mut sent = Vec::new();
+        mount_projects(
+            &[PathBuf::from("/a"), PathBuf::from("/b")],
+            &[PathBuf::from("/a")],
+            "/bin/zsh",
+            |p| p.to_path_buf(),
+            |req| {
+                sent.push(req.clone());
+                Ok(match req {
+                    Request::WorkspaceNew { .. } => {
+                        Response::WorkspaceCreated { id: WorkspaceId(1) }
+                    }
+                    Request::PaneRun { .. } => Response::PaneCreated { id: PaneId(1) },
+                    _ => Response::Ok,
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            sent,
+            vec![
+                Request::WorkspaceNew {
+                    dir: PathBuf::from("/b")
+                },
+                Request::PaneRun {
+                    tab: None,
+                    cmd: vec!["/bin/zsh".into()]
+                },
+            ],
+            "only the not-yet-mounted /b is created",
+        );
+    }
+
+    #[test]
+    fn mount_projects_surfaces_a_failed_project_and_mounts_the_rest() {
+        // The server errors at pane-run when the dir does not exist on disk.
+        let mut sent = Vec::new();
+        let mut last_dir: Option<PathBuf> = None;
+        let notices = mount_projects(
+            &[PathBuf::from("/missing"), PathBuf::from("/ok")],
+            &[],
+            "/bin/zsh",
+            |p| p.to_path_buf(),
+            |req| {
+                sent.push(req.clone());
+                Ok(match req {
+                    Request::WorkspaceNew { dir } => {
+                        last_dir = Some(dir.clone());
+                        Response::WorkspaceCreated { id: WorkspaceId(1) }
+                    }
+                    Request::PaneRun { .. } => {
+                        if last_dir.as_deref() == Some(Path::new("/missing")) {
+                            Response::Error {
+                                message: "spawn pty: No such file or directory".into(),
+                            }
+                        } else {
+                            Response::PaneCreated { id: PaneId(1) }
+                        }
+                    }
+                    _ => Response::Ok,
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0].contains("/missing"),
+            "the notice names the failing path: {notices:?}"
+        );
+        assert!(
+            sent.contains(&Request::WorkspaceNew {
+                dir: PathBuf::from("/ok")
+            }),
+            "the healthy project still mounts after the failure: {sent:?}"
+        );
     }
 
     #[test]

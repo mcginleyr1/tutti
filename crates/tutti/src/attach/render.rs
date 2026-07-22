@@ -5,7 +5,7 @@
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
@@ -15,32 +15,47 @@ use super::app::{App, Mode};
 use super::sidebar::{AgentRow, SidebarEntry, WorkspaceRow};
 use crate::config::{self, Config, PrefixAction};
 
-/// Render the whole UI: the active tab's panes and the status bar.
+/// The single accent colour — terminal blue — that marks the focused or active
+/// thing. Everything else renders dim so the one accent is unmistakable. State
+/// colours (red/yellow/green) appear only on state dots and the blocked border.
+const ACCENT: Color = Color::Blue;
+
+/// The sidebar-mode key hint, rendered two-tone in the bottom bar.
+const SIDEBAR_HINT: &[(&str, &str)] = &[
+    ("j/k", "move"),
+    ("enter", "jump"),
+    ("n", "new"),
+    ("esc", "back"),
+];
+
+/// Render the whole UI: the pane area under a top tab bar, the sidebar, and the
+/// bottom bar.
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
     if area.height == 0 {
         return;
     }
     let content = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
-    let status = Rect::new(area.x, area.y + content.height, area.width, 1);
-    let (sidebar_rect, panes_area) = app.split_content(content);
+    let bottom = Rect::new(area.x, area.y + content.height, area.width, 1);
+    let (sidebar_rect, tabs_rect, panes_area) = app.regions(content);
+    // One spinner frame for the whole draw so every working agent — sidebar dot
+    // and pane border alike — animates in lockstep.
+    let spinner = app.spinner_char();
 
     let rects = app.compute_rects(content);
     if rects.is_empty() {
-        let hint = Paragraph::new("no panes — run `tutti pane run -- <cmd>` to start one")
-            .style(Style::default().add_modifier(Modifier::DIM));
-        frame.render_widget(hint, panes_area);
+        draw_empty_hint(frame, app, panes_area);
     } else {
         for (pane, rect) in rects {
-            draw_pane(frame, app, pane, rect);
+            draw_pane(frame, app, pane, rect, spinner);
         }
     }
 
+    draw_tab_bar(frame, app, tabs_rect);
     if let Some(sidebar_rect) = sidebar_rect {
-        draw_sidebar(frame, app, sidebar_rect);
+        draw_sidebar(frame, app, sidebar_rect, spinner);
     }
-
-    draw_status(frame, app, status);
+    draw_bottom_bar(frame, app, bottom);
 
     if app.whichkey_visible() {
         draw_whichkey(frame, app.config(), panes_area);
@@ -50,10 +65,61 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
-/// The sidebar column: a WORKSPACES section over an AGENTS section, a right
-/// border separating it from the panes. The selection bar and the
-/// new-workspace prompt appear while the sidebar is focused.
-fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
+/// The top tab bar: a chip per tab (active = accent background with dark text,
+/// inactive = dim) plus a trailing dim ` + ` new-tab chip. Sits right of the
+/// sidebar; the chip widths match `App::tab_chips` so clicks land true.
+fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let spans: Vec<Span> = app
+        .tab_chips()
+        .into_iter()
+        .map(|(target, label)| {
+            let active = matches!(target, Some(id) if app.active_tab == Some(id));
+            Span::styled(label, tab_chip_style(active))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The style of a tab-bar chip: the active tab is an accent block, every other
+/// chip (and the `+`) is dim.
+fn tab_chip_style(active: bool) -> Style {
+    if active {
+        Style::default().fg(Color::Black).bg(ACCENT)
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    }
+}
+
+/// The centred hint shown when the active area holds no panes: how to add the
+/// first project on a fresh session (nothing mounted yet), or how to start a
+/// pane in an existing but empty tab.
+fn draw_empty_hint(frame: &mut Frame, app: &App, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let text = if app.workspaces.is_empty() {
+        "n → add a project"
+    } else {
+        "no panes — run `tutti pane run -- <cmd>` to start one"
+    };
+    let row = Rect::new(area.x, area.y + area.height / 2, area.width, 1);
+    frame.render_widget(
+        Paragraph::new(text)
+            .alignment(Alignment::Center)
+            .style(Style::default().add_modifier(Modifier::DIM)),
+        row,
+    );
+}
+
+/// The sidebar column: a blank top-pad row, a lowercase ` workspaces` section
+/// over an ` agents` section, each header carrying a right-aligned count, a
+/// full-height dim `│` right edge. Dim by default; the selected row (only while
+/// the sidebar is focused and not prompting) gets a subtle background and an
+/// accent bar. The new-project prompt overwrites the foot row when active.
+fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
     let block = Block::default()
         .borders(Borders::RIGHT)
         .border_style(Style::default().add_modifier(Modifier::DIM));
@@ -62,126 +128,222 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     if inner.width == 0 || inner.height == 0 {
         return;
     }
+    let w = inner.width;
 
     let sidebar = app.sidebar();
-    let focused = app.sidebar_focused();
+    let ws_count = sidebar.workspace_count;
+    let agent_count = sidebar.entries.len() - ws_count;
+    // A selection only pops while the sidebar holds focus and is not prompting.
+    let pop = app.sidebar_focused() && !app.sidebar_prompt_active();
     let selected = app.sidebar_selected();
-    let selected_at = |i: usize| focused && selected == i;
 
-    let mut lines = vec![section_header("WORKSPACES")];
-    for (i, entry) in sidebar
-        .entries
-        .iter()
-        .take(sidebar.workspace_count)
-        .enumerate()
-    {
-        if let SidebarEntry::Workspace(w) = entry {
-            lines.push(workspace_line(w, selected_at(i)));
-            lines.push(sidebar_subtitle(&w.subtitle, selected_at(i)));
+    let mut lines = vec![Line::from(String::new())]; // top-pad breathing room
+    lines.push(section_header("workspaces", ws_count.to_string(), w));
+    for (i, entry) in sidebar.entries.iter().take(ws_count).enumerate() {
+        if let SidebarEntry::Workspace(row) = entry {
+            let sel = pop && selected == i;
+            lines.push(workspace_line(row, sel, w));
+            lines.push(subtitle_line(row.subtitle.as_deref().unwrap_or(""), sel, w));
         }
     }
     lines.push(Line::from(String::new()));
-    lines.push(section_header("AGENTS"));
-    for (i, entry) in sidebar
-        .entries
-        .iter()
-        .enumerate()
-        .skip(sidebar.workspace_count)
-    {
-        if let SidebarEntry::Agent(a) = entry {
-            lines.push(agent_line(a, selected_at(i), app.is_notified(a.pane)));
-            lines.push(sidebar_subtitle(
-                &format!("{} · {}", state_label(a.state), a.kind),
-                selected_at(i),
-            ));
+    let agents_meta = if agent_count == 0 {
+        "none".to_string()
+    } else {
+        agent_count.to_string()
+    };
+    lines.push(section_header("agents", agents_meta, w));
+    if agent_count == 0 {
+        lines.push(placeholder_line("no agents yet"));
+    } else {
+        for (i, entry) in sidebar.entries.iter().enumerate().skip(ws_count) {
+            if let SidebarEntry::Agent(a) = entry {
+                let sel = pop && selected == i;
+                lines.push(agent_line(a, sel, spinner, w));
+                lines.push(agent_subtitle(a, sel, app.is_notified(a.pane), w));
+            }
         }
     }
     frame.render_widget(Paragraph::new(lines), inner);
 
     if app.sidebar_prompt_active() {
-        let row = Rect::new(
-            inner.x,
-            inner.y + inner.height.saturating_sub(1),
-            inner.width,
-            1,
-        );
-        frame.render_widget(Clear, row);
-        frame.render_widget(
-            Paragraph::new(format!("dir: {}", app.sidebar_prompt()))
-                .style(Style::default().add_modifier(Modifier::REVERSED)),
-            row,
-        );
+        draw_sidebar_prompt(frame, app.sidebar_prompt(), inner);
     }
 }
 
-/// A dim section label heading a sidebar group.
-fn section_header(text: &str) -> Line<'static> {
-    Line::from(Span::styled(
-        text.to_string(),
-        Style::default().add_modifier(Modifier::DIM),
-    ))
+/// A lowercase dim section header with its count right-aligned one space from
+/// the `│` edge.
+fn section_header(title: &str, meta: String, width: u16) -> Line<'static> {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let left = format!(" {title}");
+    let used = left.chars().count() + meta.chars().count() + 1;
+    let pad = (width as usize).saturating_sub(used).max(1);
+    Line::from(vec![
+        Span::styled(left, dim),
+        Span::styled(" ".repeat(pad), dim),
+        Span::styled(format!("{meta} "), dim),
+    ])
 }
 
-/// A workspace entry's title line: bold when it owns the active tab, the whole
-/// row reversed when it is the sidebar's selection.
-fn workspace_line(w: &WorkspaceRow, selected: bool) -> Line<'static> {
-    let mut style = Style::default();
-    if w.active {
-        style = style.add_modifier(Modifier::BOLD);
+/// A workspace row: an active `●` (accent) or inactive `○` (dim) dot, then the
+/// bold name. Dim unless it is the popped selection.
+fn workspace_line(w: &WorkspaceRow, sel: bool, width: u16) -> Line<'static> {
+    let (dot, dot_style) = if w.active {
+        ('●', Style::default().fg(ACCENT))
+    } else {
+        ('○', Style::default().add_modifier(Modifier::DIM))
+    };
+    let mut name = Style::default().add_modifier(Modifier::BOLD);
+    if !sel {
+        name = name.add_modifier(Modifier::DIM);
     }
-    if selected {
-        style = style.add_modifier(Modifier::REVERSED);
-    }
-    Line::from(Span::styled(format!(" {}", w.name), style))
+    finish_row(
+        vec![
+            Span::styled(format!("{dot} "), dot_style),
+            Span::styled(w.name.clone(), name),
+        ],
+        sel,
+        width,
+    )
 }
 
-/// An agent entry's title line: a state-coloured dot, the pane title, and a
-/// trailing bell mark while the pane has an unseen notification.
-fn agent_line(a: &AgentRow, selected: bool, notified: bool) -> Line<'static> {
-    let mut dot = state_style(a.state);
+/// An agent row: a state dot (a spinner while working) then the pane title.
+fn agent_line(a: &AgentRow, sel: bool, spinner: char, width: u16) -> Line<'static> {
+    let (dot, dot_style) = agent_dot(a.state, spinner);
     let mut title = Style::default();
-    if selected {
-        dot = dot.add_modifier(Modifier::REVERSED);
-        title = title.add_modifier(Modifier::REVERSED);
+    if !sel {
+        title = title.add_modifier(Modifier::DIM);
     }
-    let mut spans = vec![
-        Span::styled(" ● ", dot),
-        Span::styled(a.title.clone(), title),
-    ];
+    finish_row(
+        vec![
+            Span::styled(format!("{dot} "), dot_style),
+            Span::styled(a.title.clone(), title),
+        ],
+        sel,
+        width,
+    )
+}
+
+/// The dim `state · kind` second line for an agent, plus the bell mark when a
+/// notification is pending.
+fn agent_subtitle(a: &AgentRow, sel: bool, notified: bool, width: u16) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        format!("  {} · {}", state_label(a.state), a.kind),
+        Style::default().add_modifier(Modifier::DIM),
+    )];
     if notified {
         spans.push(Span::styled(
             " 🔔",
             Style::default().add_modifier(Modifier::BOLD),
         ));
     }
+    finish_row(spans, sel, width)
+}
+
+/// A dim indented second line (a workspace's branch, blank when unknown).
+fn subtitle_line(text: &str, sel: bool, width: u16) -> Line<'static> {
+    finish_row(
+        vec![Span::styled(
+            format!("  {text}"),
+            Style::default().add_modifier(Modifier::DIM),
+        )],
+        sel,
+        width,
+    )
+}
+
+/// A dim placeholder line so an empty section never looks broken.
+fn placeholder_line(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("  {text}"),
+        Style::default().add_modifier(Modifier::DIM),
+    ))
+}
+
+/// The state dot for an agent: a spinner glyph while working (so multiple
+/// working agents animate in lockstep), a solid coloured `●` for
+/// blocked/done, a dim `○` when idle/unknown.
+fn agent_dot(state: AgentState, spinner: char) -> (char, Style) {
+    match state {
+        AgentState::Working => (spinner, Style::default().fg(Color::Yellow)),
+        AgentState::Blocked => (
+            '●',
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        AgentState::Done => ('●', Style::default().fg(Color::Green)),
+        AgentState::Idle | AgentState::Unknown => {
+            ('○', Style::default().add_modifier(Modifier::DIM))
+        }
+    }
+}
+
+/// Turn a row's content spans into a full line: a leading gutter (`▍` accent
+/// when selected, else a space), and — when selected — a subtle full-width
+/// background so the selection reads as one bar even with a single entry.
+fn finish_row(mut content: Vec<Span<'static>>, sel: bool, width: u16) -> Line<'static> {
+    let bg = Color::DarkGray;
+    let gutter = if sel {
+        Span::styled("▍", Style::default().fg(ACCENT).bg(bg))
+    } else {
+        Span::raw(" ")
+    };
+    if sel {
+        for span in &mut content {
+            span.style = span.style.bg(bg);
+        }
+    }
+    let used: usize = 1 + content
+        .iter()
+        .map(|s| s.content.chars().count())
+        .sum::<usize>();
+    let mut spans = vec![gutter];
+    spans.extend(content);
+    if sel && used < width as usize {
+        spans.push(Span::styled(
+            " ".repeat(width as usize - used),
+            Style::default().bg(bg),
+        ));
+    }
     Line::from(spans)
 }
 
-/// A dim second line under a sidebar entry (branch, or `state · kind`).
-fn sidebar_subtitle(text: &str, selected: bool) -> Line<'static> {
-    let mut style = Style::default().add_modifier(Modifier::DIM);
-    if selected {
-        style = style.add_modifier(Modifier::REVERSED);
-    }
-    Line::from(Span::styled(format!("   {text}"), style))
+/// The new-project prompt on the sidebar's foot row: an accent bar, the typed
+/// path, and a visible block cursor.
+fn draw_sidebar_prompt(frame: &mut Frame, text: &str, inner: Rect) {
+    let row = Rect::new(
+        inner.x,
+        inner.y + inner.height.saturating_sub(1),
+        inner.width,
+        1,
+    );
+    frame.render_widget(Clear, row);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("▍", Style::default().fg(ACCENT)),
+            Span::styled(text.to_string(), Style::default()),
+            Span::styled("█", Style::default().fg(ACCENT)),
+        ])),
+        row,
+    );
 }
 
-fn draw_pane(frame: &mut Frame, app: &App, pane: PaneId, rect: Rect) {
+fn draw_pane(frame: &mut Frame, app: &App, pane: PaneId, rect: Rect, spinner: char) {
     if rect.width < 2 || rect.height < 2 {
         return;
     }
     let focused = app.focused == Some(pane);
     let state = app.panes.get(&pane);
-    let title = state.map_or_else(|| Line::from(pane.to_string()), |s| border_title(&s.info));
+    let pane_state = state.map(|s| s.info.state);
+    let title = state.map_or_else(
+        || Line::from(pane.to_string()),
+        |s| border_title(&s.info, spinner),
+    );
 
-    let mut block = Block::default().borders(Borders::ALL).title(title);
-    if focused {
-        block = block
-            .border_type(BorderType::Thick)
-            .border_style(Style::default().fg(Color::Cyan));
-    } else {
-        block = block.border_style(Style::default().add_modifier(Modifier::DIM));
-    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(pane_border_style(focused, pane_state))
+        .title(title);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
@@ -263,87 +425,99 @@ pub fn map_color(color: vt100::Color) -> Color {
     }
 }
 
-fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
+/// The decluttered bottom bar: a dim inverse session chip on the left, then a
+/// transient/mode message (the sidebar mode shows a two-tone hint). With
+/// nothing to say, the standing help/detach hint sits on the right. The tab
+/// list and per-pane state chips are gone — the top bar and sidebar own those.
+fn draw_bottom_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let dim = Style::default().add_modifier(Modifier::DIM);
     let mut spans = vec![Span::styled(
         format!(" {} ", app.session),
-        Style::default().add_modifier(Modifier::BOLD),
+        Style::default().add_modifier(Modifier::REVERSED | Modifier::DIM),
     )];
 
-    for tab in app.all_tabs() {
-        let active = app.active_tab == Some(tab.id);
-        let style = if active {
-            Style::default().fg(Color::Black).bg(Color::Cyan)
-        } else {
-            Style::default().add_modifier(Modifier::DIM)
-        };
-        spans.push(Span::styled(format!(" {} ", tab.name), style));
-    }
-
-    // Per-pane state badges, the panes needing attention (Blocked) first.
-    let mut infos: Vec<&PaneInfo> = app.panes.values().map(|s| &s.info).collect();
-    infos.sort_by_key(|i| (i.state != AgentState::Blocked, i.id.0));
-    for info in infos {
-        let mut style = state_style(info.state);
-        if app.focused == Some(info.id) {
-            style = style.add_modifier(Modifier::BOLD);
+    let show_hint = match (app.mode, app.transient()) {
+        (Mode::Terminal, None) => true,
+        (Mode::Sidebar, None) => {
+            spans.push(Span::raw("  "));
+            spans.extend(two_tone(SIDEBAR_HINT).0);
+            false
         }
-        spans.push(Span::styled(
-            format!(" {}:{} ", identity(info), state_label(info.state)),
-            style,
-        ));
-    }
-
-    // A transient/mode message occupies the status line; otherwise the always-on
-    // discoverability hint sits on the right edge.
-    let message = status_message(app);
-    let show_hint = message.is_empty();
-    if !show_hint {
-        spans.push(Span::styled(
-            format!("  {message}"),
-            Style::default().add_modifier(Modifier::DIM),
-        ));
-    }
+        _ => {
+            spans.push(Span::styled(format!("  {}", status_message(app)), dim));
+            false
+        }
+    };
 
     let line = Line::from(spans);
     let left_width = line.width() as u16;
-    frame.render_widget(
-        Paragraph::new(line).style(Style::default().add_modifier(Modifier::REVERSED)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(line), area);
 
     if show_hint {
         draw_hint(frame, app.config(), area, left_width);
     }
 }
 
-/// The compact "how to get out" hint pinned to the status bar's right edge:
-/// `<prefix> ? help · <prefix> q detach`, degrading to `<prefix> ?` when space
-/// is tight, using the configured prefix and keymap.
+/// The compact "how to get out" hint pinned to the bottom bar's right edge,
+/// two-tone (key bright, label dim): `<prefix> ? help · <prefix> q detach`,
+/// degrading to just help when space is tight.
 fn draw_hint(frame: &mut Frame, cfg: &Config, area: Rect, left_width: u16) {
     let prefix = cfg.prefix.label();
     let help = cfg.prefix_key(PrefixAction::Help).map(config::key_label);
     let detach = cfg.prefix_key(PrefixAction::Detach).map(config::key_label);
 
-    let full = match (&help, &detach) {
-        (Some(h), Some(d)) => Some(format!("{prefix} {h} help · {prefix} {d} detach")),
-        _ => None,
-    };
-    let short = help.as_ref().map(|h| format!("{prefix} {h}"));
+    let mut pairs: Vec<(String, &str)> = Vec::new();
+    if let Some(h) = &help {
+        pairs.push((format!("{prefix} {h}"), "help"));
+    }
+    if let Some(d) = &detach {
+        pairs.push((format!("{prefix} {d}"), "detach"));
+    }
+    if pairs.is_empty() {
+        return;
+    }
 
     let avail = area.width.saturating_sub(left_width + 1);
-    let text = match (full, short) {
-        (Some(full), _) if full.chars().count() as u16 <= avail => full,
-        (_, Some(short)) if short.chars().count() as u16 <= avail => short,
-        _ => return,
-    };
-
-    let w = text.chars().count() as u16;
+    let (spans, w) = fit_hint(&pairs, avail);
+    if spans.is_empty() {
+        return;
+    }
     let rect = Rect::new(area.x + area.width - w, area.y, w, 1);
-    frame.render_widget(
-        Paragraph::new(text)
-            .style(Style::default().add_modifier(Modifier::REVERSED | Modifier::DIM)),
-        rect,
-    );
+    frame.render_widget(Paragraph::new(Line::from(spans)), rect);
+}
+
+/// The widest two-tone hint that fits `avail`: the full pair list, else just the
+/// first pair, else nothing.
+fn fit_hint(pairs: &[(String, &str)], avail: u16) -> (Vec<Span<'static>>, u16) {
+    let (spans, w) = two_tone(pairs);
+    if w <= avail {
+        return (spans, w);
+    }
+    let (spans, w) = two_tone(&pairs[..1]);
+    if w <= avail {
+        (spans, w)
+    } else {
+        (Vec::new(), 0)
+    }
+}
+
+/// Two-tone key hints: each key bright, its label dim, joined by a dim `·`.
+/// Returns the spans and their total rendered width.
+fn two_tone<S: AsRef<str>>(pairs: &[(S, &str)]) -> (Vec<Span<'static>>, u16) {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut spans = Vec::new();
+    let mut width = 0usize;
+    for (i, (key, label)) in pairs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", dim));
+            width += 3;
+        }
+        let key = key.as_ref().to_string();
+        width += key.chars().count() + 1 + label.chars().count();
+        spans.push(Span::raw(key));
+        spans.push(Span::styled(format!(" {label}"), dim));
+    }
+    (spans, width as u16)
 }
 
 /// The which-key popup: one `key → description` row per active prefix binding
@@ -353,9 +527,9 @@ fn draw_whichkey(frame: &mut Frame, cfg: &Config, area: Rect) {
     let mut lines: Vec<Line> = cfg
         .prefix_bindings()
         .iter()
-        .map(|b| Line::from(format!(" {} → {} ", config::key_label(b.key), b.desc)))
+        .map(|b| two_tone_line(&config::key_label(b.key), b.desc))
         .collect();
-    lines.push(Line::from(" esc → close "));
+    lines.push(two_tone_line("esc", "close"));
 
     let inner_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
     let width = (inner_w + 2).min(area.width);
@@ -393,34 +567,41 @@ fn draw_help(frame: &mut Frame, cfg: &Config, area: Rect) {
 
 /// The help overlay content, generated from the active keymap so it always
 /// matches dispatch. Detach is listed first (it is what a stuck user needs).
+/// Every key hint is two-tone: the key bright, its label dim.
 fn help_lines(cfg: &Config) -> Vec<Line<'static>> {
+    let dim = Style::default().add_modifier(Modifier::DIM);
     let mut lines = vec![
         Line::from(format!("tutti — press {}, then:", cfg.prefix.label())),
         Line::from(String::new()),
     ];
     if let Some(key) = cfg.prefix_key(PrefixAction::Detach) {
-        lines.push(Line::from(format!("  {} → detach", config::key_label(key))));
+        lines.push(two_tone_line(&config::key_label(key), "detach"));
     }
     // The remaining prefix bindings, two per row to stay compact.
-    let entries: Vec<String> = cfg
+    let entries: Vec<(String, &str)> = cfg
         .prefix_bindings()
         .iter()
         .filter(|b| b.action != PrefixAction::Detach)
-        .map(|b| format!("{} → {}", config::key_label(b.key), b.desc))
+        .map(|b| (config::key_label(b.key), b.desc))
         .collect();
     for pair in entries.chunks(2) {
-        let line = match pair {
-            [a, b] => format!("  {a:<22}{b}"),
-            [a] => format!("  {a}"),
-            _ => String::new(),
-        };
-        lines.push(Line::from(line));
+        let mut spans = vec![Span::raw(" ")];
+        for (i, (key, desc)) in pair.iter().enumerate() {
+            spans.push(Span::raw(format!(" {key}")));
+            let label = if i == 0 && pair.len() == 2 {
+                format!(" {desc:<14}")
+            } else {
+                format!(" {desc}")
+            };
+            spans.push(Span::styled(label, dim));
+        }
+        lines.push(Line::from(spans));
     }
     lines.push(Line::from(String::new()));
     lines.push(Line::from("direct keys (no prefix):".to_string()));
-    lines.push(Line::from("  Ctrl+h/j/k/l  focus by direction".to_string()));
-    lines.push(Line::from("  Alt+h/j/k/l   resize split".to_string()));
-    lines.push(Line::from("  Alt+x         kill pane".to_string()));
+    lines.push(two_tone_line("  Ctrl+h/j/k/l", "focus by direction"));
+    lines.push(two_tone_line("  Alt+h/j/k/l", "resize split"));
+    lines.push(two_tone_line("  Alt+x", "kill pane"));
     lines.push(Line::from(String::new()));
     lines.push(Line::from(
         "stop the daemon:  tutti server stop".to_string(),
@@ -428,6 +609,17 @@ fn help_lines(cfg: &Config) -> Vec<Line<'static>> {
     lines.push(Line::from(String::new()));
     lines.push(Line::from("(any key closes)".to_string()));
     lines
+}
+
+/// One two-tone hint line: the key bright, its label dim.
+fn two_tone_line(key: &str, label: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::raw(format!(" {key}")),
+        Span::styled(
+            format!(" {label} "),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+    ])
 }
 
 fn status_message(app: &App) -> String {
@@ -454,18 +646,46 @@ fn identity(info: &PaneInfo) -> String {
         .unwrap_or_else(|| info.title.clone())
 }
 
-/// The border badge: `{identity} · {state}` with the state coloured, plus the
-/// exit code once the child is gone.
-fn border_title(info: &PaneInfo) -> Line<'static> {
-    let mut spans = vec![
-        Span::raw(identity(info)),
-        Span::raw(" · "),
-        Span::styled(state_label(info.state), state_style(info.state)),
-    ];
+/// The border badge. The name is dim-bold; a detected agent adds a dim `·`
+/// then the state in its colour (a spinner precedes `working`); a plain shell
+/// shows just its name. An exited pane appends a dim `exited <code>`.
+fn border_title(info: &PaneInfo, spinner: char) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        identity(info),
+        Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
+    )];
+    if info.agent.is_some() {
+        spans.push(Span::styled(
+            " · ",
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+        let label = if info.state == AgentState::Working {
+            format!("{spinner} working")
+        } else {
+            state_label(info.state).to_string()
+        };
+        spans.push(Span::styled(label, state_style(info.state)));
+    }
     if let Some(code) = info.exited {
-        spans.push(Span::raw(format!(" (exited {code})")));
+        spans.push(Span::styled(
+            format!(" exited {code}"),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
     }
     Line::from(spans)
+}
+
+/// A pane's border style: accent (bold) when focused; red when an unfocused
+/// pane's agent is blocked (the one place a state colour touches a border);
+/// dim otherwise.
+fn pane_border_style(focused: bool, state: Option<AgentState>) -> Style {
+    if focused {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else if state == Some(AgentState::Blocked) {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    }
 }
 
 /// Terminal-palette colours for each state — no theming layer. Blocked is the
@@ -630,19 +850,120 @@ mod tests {
 
     #[test]
     fn sidebar_renders_both_sections_with_branch_and_agent() {
-        // Two workspaces trigger the auto sidebar; 100 cols clears the floor.
+        // 100 cols clears the width floor so the sidebar shows.
+        let app = app_two_workspaces();
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("workspaces"),
+            "workspaces header missing: {text:?}"
+        );
+        assert!(text.contains("agents"), "agents header missing: {text:?}");
+        assert!(text.contains("api"), "workspace name missing: {text:?}");
+        assert!(text.contains("main"), "branch subtitle missing: {text:?}");
+        assert!(text.contains("claude"), "agent kind missing: {text:?}");
+    }
+
+    #[test]
+    fn sidebar_shows_a_placeholder_when_no_agents() {
+        // A single agentless workspace, sidebar forced on.
+        let mut app = App::with_config(Config::parse("sidebar = \"on\"\n").unwrap());
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Response::Attached {
+                session: "demo".into(),
+                workspaces: vec![WorkspaceView {
+                    id: WorkspaceId(1),
+                    name: "solo".into(),
+                    branch: None,
+                    tabs: vec![TabView {
+                        id: TabId(1),
+                        name: "1".into(),
+                        active: true,
+                        layout: Some(Layout::Leaf(PaneId(1))),
+                        active_pane: Some(PaneId(1)),
+                        panes: vec![PaneInfo {
+                            id: PaneId(1),
+                            title: "zsh".into(),
+                            agent: None,
+                            state: AgentState::Idle,
+                            exited: None,
+                        }],
+                    }],
+                }],
+            })
+            .unwrap(),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("no agents yet"),
+            "empty agents section needs a placeholder: {text:?}"
+        );
+    }
+
+    fn accent_bar_row(buf: &Buffer) -> Option<u16> {
+        let w = buf.area.width;
+        buf.content()
+            .iter()
+            .position(|c| c.symbol() == "▍")
+            .map(|i| i as u16 / w)
+    }
+
+    #[test]
+    fn focused_sidebar_shows_a_moving_accent_selection() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = app_two_workspaces();
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        // Establish the content width so the sidebar key may focus.
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        app.sync_sizes(Rect::new(0, 0, 100, 20));
+
+        // Prefix then `w` focuses the sidebar.
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert!(app.sidebar_focused(), "w focuses the sidebar");
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let before = accent_bar_row(terminal.backend().buffer());
+        assert!(before.is_some(), "the selection accent bar is drawn");
+
+        // `j` moves the visible selection to a new row.
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let after = accent_bar_row(terminal.backend().buffer());
+        assert!(after.is_some());
+        assert_ne!(before, after, "j slides the accent bar down a row");
+    }
+
+    #[test]
+    fn top_tab_bar_lists_a_new_tab_chip() {
         let app = app_two_workspaces();
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("+"), "new-tab chip missing: {text:?}");
+    }
+
+    #[test]
+    fn bottom_bar_drops_the_tab_list_and_pane_badges() {
+        let (w, h) = (100usize, 12usize);
+        let app = app_two_workspaces();
+        let mut terminal = Terminal::new(TestBackend::new(w as u16, h as u16)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let content = terminal.backend().buffer().content();
+        let bottom: String = content[(h - 1) * w..h * w]
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
         assert!(
-            text.contains("WORKSPACES"),
-            "workspaces header missing: {text:?}"
+            bottom.contains("demo"),
+            "session name belongs in the bottom bar: {bottom:?}"
         );
-        assert!(text.contains("AGENTS"), "agents header missing: {text:?}");
-        assert!(text.contains("api"), "workspace name missing: {text:?}");
-        assert!(text.contains("main"), "branch subtitle missing: {text:?}");
-        assert!(text.contains("claude"), "agent kind missing: {text:?}");
+        assert!(
+            !bottom.contains("blocked"),
+            "no per-pane state chips in the bottom bar: {bottom:?}"
+        );
     }
 
     #[test]
@@ -685,8 +1006,29 @@ mod tests {
         );
     }
 
+    fn title_text(info: &PaneInfo) -> String {
+        // A fixed spinner frame keeps the assertion deterministic.
+        border_title(info, '⠋')
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+    }
+
     #[test]
     fn border_title_shows_agent_and_state() {
+        let info = PaneInfo {
+            id: PaneId(1),
+            title: "zsh".into(),
+            agent: Some("claude".into()),
+            state: AgentState::Blocked,
+            exited: None,
+        };
+        assert_eq!(title_text(&info), "claude · blocked");
+    }
+
+    #[test]
+    fn border_title_animates_a_working_agent_with_the_spinner() {
         let info = PaneInfo {
             id: PaneId(1),
             title: "zsh".into(),
@@ -694,23 +1036,90 @@ mod tests {
             state: AgentState::Working,
             exited: None,
         };
-        let text: String = border_title(&info)
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
-        assert_eq!(text, "claude · working");
+        assert_eq!(title_text(&info), "claude · ⠋ working");
     }
 
     #[test]
-    fn empty_session_renders_hint() {
+    fn border_title_omits_state_for_a_plain_shell() {
+        let info = PaneInfo {
+            id: PaneId(1),
+            title: "zsh".into(),
+            agent: None,
+            state: AgentState::Unknown,
+            exited: None,
+        };
+        assert_eq!(title_text(&info), "zsh", "no `· unknown` suffix");
+    }
+
+    #[test]
+    fn border_title_shows_exit_marker_for_an_exited_shell() {
+        let info = PaneInfo {
+            id: PaneId(1),
+            title: "zsh".into(),
+            agent: None,
+            state: AgentState::Done,
+            exited: Some(0),
+        };
+        assert_eq!(title_text(&info), "zsh exited 0");
+    }
+
+    #[test]
+    fn pane_border_style_reflects_focus_and_blocked_attention() {
+        assert_eq!(
+            pane_border_style(true, Some(AgentState::Idle)).fg,
+            Some(ACCENT),
+            "focused pane border is the accent"
+        );
+        assert_eq!(
+            pane_border_style(false, Some(AgentState::Blocked)).fg,
+            Some(Color::Red),
+            "an unfocused blocked pane border turns red"
+        );
+        assert_eq!(
+            pane_border_style(true, Some(AgentState::Blocked)).fg,
+            Some(ACCENT),
+            "focus wins over the blocked red"
+        );
+        assert!(
+            pane_border_style(false, Some(AgentState::Idle))
+                .add_modifier
+                .contains(Modifier::DIM),
+            "an ordinary unfocused pane border is dim"
+        );
+    }
+
+    #[test]
+    fn agent_dot_spins_only_while_working() {
+        assert_eq!(
+            agent_dot(AgentState::Working, '⠹').0,
+            '⠹',
+            "working shows the current spinner frame"
+        );
+        assert_eq!(agent_dot(AgentState::Blocked, '⠹').0, '●');
+        assert_eq!(agent_dot(AgentState::Done, '⠹').0, '●');
+        assert_eq!(agent_dot(AgentState::Idle, '⠹').0, '○');
+    }
+
+    #[test]
+    fn active_tab_chip_uses_the_accent_background() {
+        assert_eq!(tab_chip_style(true).bg, Some(ACCENT));
+        assert_eq!(tab_chip_style(true).fg, Some(Color::Black));
+        assert!(
+            tab_chip_style(false).add_modifier.contains(Modifier::DIM),
+            "inactive chips are dim with no background"
+        );
+        assert_eq!(tab_chip_style(false).bg, None);
+    }
+
+    #[test]
+    fn empty_session_renders_add_project_hint() {
         let app = App::new();
         let mut terminal = Terminal::new(TestBackend::new(60, 4)).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
         assert!(
-            text.contains("no panes"),
-            "expected empty-session hint: {text:?}"
+            text.contains("add a project"),
+            "expected the fresh-session add-project hint: {text:?}"
         );
     }
 

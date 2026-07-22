@@ -32,8 +32,15 @@ const POLL: Duration = Duration::from_millis(16);
 /// Attach the interactive TUI to `session`, auto-starting the daemon. Restores
 /// the terminal on exit and on panic, returning once the user detaches or the
 /// server goes away. `config` supplies the prefix chord, direct bindings, and
-/// the master mouse switch.
-pub fn run(session: &str, config: Config) -> Result<()> {
+/// the master mouse switch. `first_run` (a prefill dir) arms the first-run
+/// new-project prompt on an empty session; `notice` posts a one-shot status
+/// line (e.g. a startup-project error) once attached.
+pub fn run(
+    session: &str,
+    config: Config,
+    first_run: Option<String>,
+    notice: Option<String>,
+) -> Result<()> {
     let mut conn = Connection::open(session)?;
     conn.send(&control(&Request::Attach))
         .context("send attach request")?;
@@ -45,7 +52,7 @@ pub fn run(session: &str, config: Config) -> Result<()> {
     }
     install_panic_hook(mouse);
 
-    let result = event_loop(&mut terminal, &mut conn, config);
+    let result = event_loop(&mut terminal, &mut conn, config, first_run, notice);
 
     if mouse {
         let _ = execute!(io::stdout(), DisableMouseCapture);
@@ -54,10 +61,23 @@ pub fn run(session: &str, config: Config) -> Result<()> {
     result
 }
 
-fn event_loop(terminal: &mut DefaultTerminal, conn: &mut Connection, config: Config) -> Result<()> {
+fn event_loop(
+    terminal: &mut DefaultTerminal,
+    conn: &mut Connection,
+    config: Config,
+    first_run: Option<String>,
+    notice: Option<String>,
+) -> Result<()> {
     let mut app = App::with_config(config);
+    if let Some(prefill) = first_run {
+        app.start_first_run_prompt(prefill);
+    }
+    if let Some(message) = notice {
+        app.note(message);
+    }
     let mut dirty = true;
     let mut whichkey = false;
+    let mut spinner = app.spinner_frame();
 
     loop {
         match conn.drain() {
@@ -76,6 +96,14 @@ fn event_loop(terminal: &mut DefaultTerminal, conn: &mut Connection, config: Con
         // visibility flips even without any input event.
         if app.whichkey_visible() != whichkey {
             whichkey = app.whichkey_visible();
+            dirty = true;
+        }
+
+        // While an agent is working, advance the shared spinner on its own tick
+        // so the animation runs without any input event.
+        let frame = app.spinner_frame();
+        if app.has_working_agent() && frame != spinner {
+            spinner = frame;
             dirty = true;
         }
 
