@@ -219,6 +219,7 @@ impl Session {
             .map(|w| WorkspaceView {
                 id: w.id,
                 name: w.name.clone(),
+                dir: w.dir.clone(),
                 branch: git_branch(&w.dir),
                 tabs: w
                     .tabs

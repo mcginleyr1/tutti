@@ -112,6 +112,7 @@ pub struct PaneInfo {
 pub struct WorkspaceView {
     pub id: WorkspaceId,
     pub name: String,
+    pub dir: PathBuf,
     /// The workspace's current git branch, when its directory is a git
     /// checkout. `None` when it is not a repo or HEAD is unreadable.
     pub branch: Option<String>,
@@ -257,6 +258,7 @@ mod tests {
         vec![WorkspaceView {
             id: WorkspaceId(1),
             name: "api".into(),
+            dir: PathBuf::from("/tmp/w"),
             branch: Some("main".into()),
             tabs: vec![TabView {
                 id: TabId(1),

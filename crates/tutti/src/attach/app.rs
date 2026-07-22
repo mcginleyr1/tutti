@@ -1269,6 +1269,7 @@ mod tests {
         vec![WorkspaceView {
             id: WorkspaceId(1),
             name: "w".into(),
+            dir: std::path::PathBuf::from("/tmp/w"),
             branch: None,
             tabs: vec![TabView {
                 id: TabId(1),
@@ -1458,6 +1459,7 @@ mod tests {
         vec![WorkspaceView {
             id: WorkspaceId(1),
             name: "w".into(),
+            dir: std::path::PathBuf::from("/tmp/w"),
             branch: None,
             tabs: vec![TabView {
                 id: TabId(1),
@@ -1585,6 +1587,7 @@ mod tests {
         vec![WorkspaceView {
             id: WorkspaceId(1),
             name: "w".into(),
+            dir: std::path::PathBuf::from("/tmp/w"),
             branch: None,
             tabs: vec![TabView {
                 id: TabId(1),
@@ -1609,6 +1612,7 @@ mod tests {
         vec![WorkspaceView {
             id: WorkspaceId(1),
             name: "w".into(),
+            dir: std::path::PathBuf::from("/tmp/w"),
             branch: None,
             tabs: vec![tab(1, true, 1), tab(2, false, 2)],
         }]
@@ -1823,6 +1827,7 @@ mod tests {
             WorkspaceView {
                 id: WorkspaceId(1),
                 name: "api".into(),
+                dir: std::path::PathBuf::from("/tmp/w"),
                 branch: Some("main".into()),
                 tabs: vec![TabView {
                     id: TabId(1),
@@ -1836,6 +1841,7 @@ mod tests {
             WorkspaceView {
                 id: WorkspaceId(2),
                 name: "web".into(),
+                dir: std::path::PathBuf::from("/tmp/w"),
                 branch: None,
                 tabs: vec![TabView {
                     id: TabId(2),

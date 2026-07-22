@@ -92,7 +92,10 @@ pub fn build(workspaces: &[WorkspaceView], active_tab: Option<TabId>) -> Sidebar
         if let Some(jump_tab) = jump_tab {
             entries.push(SidebarEntry::Workspace(WorkspaceRow {
                 name: w.name.clone(),
-                subtitle: w.branch.clone(),
+                subtitle: w
+                    .branch
+                    .clone()
+                    .or_else(|| shorten_home(&w.dir, std::env::var_os("HOME").map(Into::into))),
                 active: owns,
                 jump_tab,
             }));
@@ -131,6 +134,19 @@ fn state_rank(state: AgentState) -> u8 {
     }
 }
 
+/// `~`-shorten `dir` for the subtitle line; `None` for an empty path.
+fn shorten_home(dir: &std::path::Path, home: Option<std::path::PathBuf>) -> Option<String> {
+    if dir.as_os_str().is_empty() {
+        return None;
+    }
+    let text = match home.and_then(|h| dir.strip_prefix(h).map(|r| r.to_owned()).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => dir.display().to_string(),
+    };
+    Some(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +169,7 @@ mod tests {
             WorkspaceView {
                 id: WorkspaceId(1),
                 name: "api".into(),
+                dir: std::path::PathBuf::from("/tmp/w"),
                 branch: Some("main".into()),
                 tabs: vec![TabView {
                     id: TabId(1),
@@ -174,6 +191,7 @@ mod tests {
             WorkspaceView {
                 id: WorkspaceId(2),
                 name: "web".into(),
+                dir: std::path::PathBuf::from("/tmp/w"),
                 branch: None,
                 tabs: vec![TabView {
                     id: TabId(2),
@@ -226,9 +244,29 @@ mod tests {
         assert!(web.active, "web owns the active tab");
         assert_eq!(web.jump_tab, TabId(2));
         assert_eq!(
-            web.subtitle, None,
-            "no branch renders a blank line, never the name again"
+            web.subtitle.as_deref(),
+            Some("/tmp/w"),
+            "no branch falls back to the dir, never the name"
         );
+    }
+
+    #[test]
+    fn shorten_home_prefers_tilde_and_skips_empty_dirs() {
+        use std::path::{Path, PathBuf};
+        let home = || Some(PathBuf::from("/Users/me"));
+        assert_eq!(
+            shorten_home(Path::new("/Users/me/develop/x"), home()),
+            Some("~/develop/x".into())
+        );
+        assert_eq!(
+            shorten_home(Path::new("/Users/me"), home()),
+            Some("~".into())
+        );
+        assert_eq!(
+            shorten_home(Path::new("/srv/data"), home()),
+            Some("/srv/data".into())
+        );
+        assert_eq!(shorten_home(Path::new(""), home()), None);
     }
 
     #[test]
