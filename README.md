@@ -11,6 +11,10 @@ for the wire protocol.
 
 ## Install
 
+Core multiplexing works anywhere. The workspace-level VCS features (per-workspace
+diffs, `workspace fork` onto isolated checkouts, branch display) are prescriptive:
+they require [jj](https://jj-vcs.github.io) — there are no git/mercurial adapters.
+
 ```sh
 cargo install --path crates/tutti
 cargo install --path crates/tutti-server

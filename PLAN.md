@@ -197,10 +197,20 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    create pane, run agent, return pane id — one call for orchestrators.
 4. **Agent skill**: ship a `skills/tutti/SKILL.md` (Claude Code skill) documenting the
    CLI so any Claude instance inside a tutti pane can herd its own sub-agents.
-5. **Git worktree workflow** (first-class, since plugins are deferred):
-   `tutti workspace new --worktree <branch>` creates a git worktree and a workspace
-   pointed at it; `workspace kill --merge/--discard` cleans up. This enables the
-   N-parallel-agents-on-N-branches pattern.
+5. **jj workspace workflow** (first-class; jj is the required VCS for all
+   workspace-level VCS features — no git/hg adapters): `tutti workspace fork
+   <workspace> --branch <name>` runs `jj workspace add` and points a tutti
+   workspace at it; `workspace kill --discard` forgets and removes it; stale
+   workspaces are surfaced in the sidebar. `tutti workspace diff [--stat]`
+   serves per-workspace diffs (sidebar shows `N files +A −B` per workspace,
+   refreshed on state transitions). Merging back stays a human decision.
+6. **Agent-event ingest + Claude Code hook integration**: panes get
+   `TUTTI_PANE`/`TUTTI_SESSION` in their env; a shipped hook config makes the
+   agent call `tutti agent-event` on subagent spawn/tool-use/stop and on
+   permission notifications. Server attaches live subagent rows to the pane
+   (shown indented under the agent in the sidebar) and upgrades Blocked/Done
+   detection from screen heuristics to exact hook signals. Display only — tutti
+   does not manage a foreign agent's subagents.
 
 **Acceptance:** a script (or an agent) can: create 3 worktree workspaces, launch an
 agent in each, `wait --until done` on all three, read back each diff summary.
