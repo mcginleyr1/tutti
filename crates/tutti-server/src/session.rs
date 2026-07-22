@@ -28,6 +28,9 @@ struct WorkspaceEntry {
     id: WorkspaceId,
     name: String,
     dir: PathBuf,
+    /// The last-computed jj change stat (`4 files +120 −33`), refreshed off the
+    /// hot path. `None` until probed, when not a jj repo, or when clean.
+    changes: Option<String>,
     tabs: Vec<TabEntry>,
 }
 
@@ -35,6 +38,9 @@ struct PaneSlot {
     meta: PaneInfo,
     pty: Arc<PtyPane>,
     tab: TabId,
+    /// An ephemeral pane is removed outright when its child exits (the reaper
+    /// drops it from the layout) instead of being kept as an exited corpse.
+    ephemeral: bool,
 }
 
 #[derive(Default)]
@@ -90,9 +96,41 @@ impl Session {
             id,
             name,
             dir,
+            changes: None,
             tabs: vec![tab],
         });
         id
+    }
+
+    /// The directory of workspace `id`, for probing its VCS off the hot path.
+    pub fn workspace_dir(&self, id: WorkspaceId) -> Option<PathBuf> {
+        self.workspaces
+            .iter()
+            .find(|w| w.id == id)
+            .map(|w| w.dir.clone())
+    }
+
+    /// Every workspace's id, for a refresh pass that recomputes their stats.
+    pub fn workspace_ids(&self) -> Vec<WorkspaceId> {
+        self.workspaces.iter().map(|w| w.id).collect()
+    }
+
+    /// Store a freshly-computed change stat for workspace `id`. Returns whether
+    /// it moved (so the caller only rebroadcasts the view when something changed,
+    /// and a vanished workspace is a silent no-op).
+    pub fn set_changes(&mut self, id: WorkspaceId, changes: Option<String>) -> bool {
+        match self.workspaces.iter_mut().find(|w| w.id == id) {
+            Some(w) if w.changes != changes => {
+                w.changes = changes;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `pane` is ephemeral (torn down on child exit rather than kept).
+    pub fn is_ephemeral(&self, pane: PaneId) -> bool {
+        self.panes.get(&pane).is_some_and(|s| s.ephemeral)
     }
 
     pub fn workspace_list(&self) -> Vec<WorkspaceInfo> {
@@ -182,8 +220,14 @@ impl Session {
     }
 
     /// Spawn `cmd` in `tab` (or the current tab when `None`), placing the
-    /// new pane in the tab's layout and focusing it.
-    pub fn pane_run(&mut self, tab: Option<TabId>, cmd: Vec<String>) -> Result<PaneId> {
+    /// new pane in the tab's layout and focusing it. An `ephemeral` pane is torn
+    /// down entirely when its child exits.
+    pub fn pane_run(
+        &mut self,
+        tab: Option<TabId>,
+        cmd: Vec<String>,
+        ephemeral: bool,
+    ) -> Result<PaneId> {
         let tab = self.resolve_tab(tab)?;
         let (program, args) = cmd.split_first().context("empty command")?;
         let dir = self.tab_workspace_dir(tab)?;
@@ -192,7 +236,7 @@ impl Session {
         spec.cwd = Some(dir);
         spec.env = vec![("TERM".into(), "xterm-256color".into())];
         let title = pane_title(program);
-        self.spawn_into_tab(tab, spec, title, None)
+        self.spawn_into_tab(tab, spec, title, None, ephemeral)
     }
 
     /// Split `pane`'s cell in its tab, spawning a login shell in the new half.
@@ -208,7 +252,7 @@ impl Session {
         spec.cwd = Some(dir);
         spec.env = vec![("TERM".into(), "xterm-256color".into())];
         let title = pane_title(&shell);
-        self.spawn_into_tab(tab, spec, title, Some((pane, direction)))
+        self.spawn_into_tab(tab, spec, title, Some((pane, direction)), false)
     }
 
     /// The whole session as the attach protocol's view: workspaces, their tabs,
@@ -221,6 +265,7 @@ impl Session {
                 name: w.name.clone(),
                 dir: w.dir.clone(),
                 branch: git_branch(&w.dir),
+                changes: w.changes.clone(),
                 tabs: w
                     .tabs
                     .iter()
@@ -489,6 +534,7 @@ impl Session {
         spec: PtySpec,
         title: String,
         split: Option<(PaneId, Direction)>,
+        ephemeral: bool,
     ) -> Result<PaneId> {
         let pty = Arc::new(PtyPane::spawn(spec, self.size).context("spawn pty")?);
         let id = self.ids.pane();
@@ -515,6 +561,7 @@ impl Session {
                 },
                 pty,
                 tab,
+                ephemeral,
             },
         );
         Ok(id)

@@ -72,6 +72,12 @@ enum WorkspaceAction {
     Kill {
         id: u64,
     },
+    /// Show the workspace's jj diff (`--stat` for the summary only).
+    Diff {
+        id: u64,
+        #[arg(long)]
+        stat: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -95,6 +101,9 @@ enum PaneAction {
     Run {
         #[arg(long)]
         tab: Option<u64>,
+        /// Remove the pane entirely when its command exits (no exited row).
+        #[arg(long)]
+        ephemeral: bool,
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
     },
@@ -273,6 +282,7 @@ fn mount_projects(
         match send(&Request::PaneRun {
             tab: None,
             cmd: vec![shell.to_string()],
+            ephemeral: false,
         })? {
             Response::PaneCreated { .. } | Response::Ok => {}
             Response::Error { message } => notices.push(format!("{}: {message}", dir.display())),
@@ -322,6 +332,10 @@ fn to_request(command: Command) -> Result<Request> {
             WorkspaceAction::Kill { id } => Request::WorkspaceKill {
                 id: WorkspaceId(id),
             },
+            WorkspaceAction::Diff { id, stat } => Request::WorkspaceDiff {
+                id: WorkspaceId(id),
+                stat,
+            },
         }),
         Command::Tab { action } => Ok(match action {
             TabAction::New { workspace } => Request::TabNew {
@@ -333,9 +347,14 @@ fn to_request(command: Command) -> Result<Request> {
             TabAction::Select { id } => Request::TabSelect { id: TabId(id) },
         }),
         Command::Pane { action } => Ok(match action {
-            PaneAction::Run { tab, cmd } => Request::PaneRun {
+            PaneAction::Run {
+                tab,
+                ephemeral,
+                cmd,
+            } => Request::PaneRun {
                 tab: tab.map(TabId),
                 cmd,
+                ephemeral,
             },
             PaneAction::Split { pane, direction } => Request::PaneSplit {
                 pane: PaneId(pane),
@@ -511,6 +530,7 @@ mod tests {
             Request::PaneRun {
                 tab: Some(TabId(3)),
                 cmd: vec!["claude".to_string(), "--flag".to_string()],
+                ephemeral: false,
             }
         );
     }
@@ -523,6 +543,37 @@ mod tests {
             Request::PaneRun {
                 tab: None,
                 cmd: vec!["ls".into()],
+                ephemeral: false,
+            }
+        );
+    }
+
+    #[test]
+    fn pane_run_ephemeral_flag_sets_the_field() {
+        assert_eq!(
+            request_of(&["tutti", "pane", "run", "--ephemeral", "--", "less"]),
+            Request::PaneRun {
+                tab: None,
+                cmd: vec!["less".into()],
+                ephemeral: true,
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_diff_verb_parses() {
+        assert_eq!(
+            request_of(&["tutti", "workspace", "diff", "3"]),
+            Request::WorkspaceDiff {
+                id: WorkspaceId(3),
+                stat: false,
+            }
+        );
+        assert_eq!(
+            request_of(&["tutti", "workspace", "diff", "3", "--stat"]),
+            Request::WorkspaceDiff {
+                id: WorkspaceId(3),
+                stat: true,
             }
         );
     }
@@ -714,14 +765,16 @@ mod tests {
                 },
                 Request::PaneRun {
                     tab: None,
-                    cmd: vec!["/bin/zsh".into()]
+                    cmd: vec!["/bin/zsh".into()],
+                    ephemeral: false,
                 },
                 Request::WorkspaceNew {
                     dir: PathBuf::from("/b")
                 },
                 Request::PaneRun {
                     tab: None,
-                    cmd: vec!["/bin/zsh".into()]
+                    cmd: vec!["/bin/zsh".into()],
+                    ephemeral: false,
                 },
             ],
         );
@@ -755,7 +808,8 @@ mod tests {
                 },
                 Request::PaneRun {
                     tab: None,
-                    cmd: vec!["/bin/zsh".into()]
+                    cmd: vec!["/bin/zsh".into()],
+                    ephemeral: false,
                 },
             ],
             "only the not-yet-mounted /b is created",

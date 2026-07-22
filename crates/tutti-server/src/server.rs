@@ -22,8 +22,10 @@ use tokio::sync::mpsc;
 use tutti_agents::{ProcessTree, Registry};
 use tutti_core::{
     AgentKind, Direction, Event, Frame, PaneData, PaneId, Request, Response, StateEvent,
+    WorkspaceId,
 };
 
+use crate::jj;
 use crate::keys;
 use crate::pty::{PaneSize, PtyPane};
 use crate::session::Session;
@@ -281,6 +283,8 @@ fn handle_frame(
                 {
                     client.ready = true;
                 }
+                // Seed every workspace's change stat now that a client is looking.
+                refresh_all_changes(hub);
                 flow
             }
             Ok(Request::Detach) => {
@@ -288,6 +292,7 @@ fn handle_frame(
                 send_reply(hub, cid, tx, encode_json(&Response::Ok))
             }
             Ok(Request::PaneScroll { pane, offset }) => scroll(hub, cid, tx, pane, offset),
+            Ok(Request::WorkspaceDiff { id, stat }) => workspace_diff(hub, tx, id, stat),
             Ok(request) => {
                 let response = dispatch(hub, request);
                 send_reply(hub, cid, tx, encode_json(&response))
@@ -331,6 +336,7 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
     match request {
         Request::WorkspaceNew { dir } => {
             let id = hub.session().workspace_new(dir);
+            refresh_changes(hub, id);
             Response::WorkspaceCreated { id }
         }
         Request::WorkspaceList => Response::Workspaces {
@@ -374,7 +380,11 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
                 Err(err) => error(err),
             }
         }
-        Request::PaneRun { tab, cmd } => spawn_pane(hub, |s| s.pane_run(tab, cmd)),
+        Request::PaneRun {
+            tab,
+            cmd,
+            ephemeral,
+        } => spawn_pane(hub, |s| s.pane_run(tab, cmd, ephemeral)),
         Request::PaneSplit { pane, direction } => {
             spawn_pane(hub, |s| s.pane_split(pane, direction))
         }
@@ -446,7 +456,10 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             delta,
         } => resize_split(hub, pane, direction, delta),
         // Handled in `handle_frame`; unreachable here.
-        Request::Attach | Request::Detach | Request::PaneScroll { .. } => Response::Ok,
+        Request::Attach
+        | Request::Detach
+        | Request::PaneScroll { .. }
+        | Request::WorkspaceDiff { .. } => Response::Ok,
     }
 }
 
@@ -558,19 +571,103 @@ fn scroll(
     send_reply(hub, cid, tx, frame.encode())
 }
 
+/// Serve a workspace diff. jj is shelled out to on a spawned task so a slow (or
+/// large) diff never stalls this connection's frame loop; the reply lands on the
+/// requester's own outbound channel when it is ready. A vanished workspace
+/// answers Error without touching jj.
+fn workspace_diff(
+    hub: &Arc<Hub>,
+    tx: &mpsc::Sender<Vec<u8>>,
+    id: WorkspaceId,
+    stat: bool,
+) -> ControlFlow<()> {
+    let dir = hub.session().workspace_dir(id);
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let response = match dir {
+            Some(dir) => jj::diff(&dir, stat).await,
+            None => Response::Error {
+                message: format!("no workspace {id}"),
+            },
+        };
+        let _ = tx.send(encode_json(&response)).await;
+    });
+    ControlFlow::Continue(())
+}
+
 fn spawn_reaper(hub: &Arc<Hub>, pane: PaneId, pty: Arc<PtyPane>) {
     let hub = Arc::clone(hub);
     tokio::spawn(async move {
         let exit = pty.wait().await;
         let code = exit.code as i32;
+        // An ephemeral pane (e.g. the diff view) leaves no corpse: drop it from
+        // the layout + pane map and rebroadcast the view. `pane_kill` also fixes
+        // the tab's active pane, so focus falls back to a remaining pane. The
+        // probe is bound (not called inline in the `if`) so no session guard is
+        // live when the block re-locks the Mutex.
+        let ephemeral = hub.session().is_ephemeral(pane);
+        if ephemeral {
+            let mut session = hub.session();
+            let workspace = session.pane_kill(pane).ok();
+            let view = session.view();
+            drop(session);
+            hub.last.lock().expect("last poisoned").remove(&pane);
+            broadcast_event(&hub, Event::LayoutChanged { workspaces: view });
+            if let Some(workspace) = workspace {
+                refresh_changes(&hub, workspace);
+            }
+            return;
+        }
         let transition = hub.session().mark_exited(pane, code);
         if let Some((from, to)) = transition {
             if from != to {
                 broadcast_event(&hub, Event::StateChanged { pane, from, to });
             }
             broadcast_event(&hub, Event::PaneExited { pane, code });
+            // A finished agent likely touched files; refresh its workspace stat.
+            refresh_pane_workspace(&hub, pane);
         }
     });
+}
+
+/// Recompute a workspace's jj change stat off the render/dispatch path and, when
+/// it moved, rebroadcast the view so sidebars update. jj is shelled out to on a
+/// spawned task, so a slow repo never stalls the caller (the tick or dispatch).
+fn refresh_changes(hub: &Arc<Hub>, workspace: WorkspaceId) {
+    let Some(dir) = hub.session().workspace_dir(workspace) else {
+        return;
+    };
+    let hub = Arc::clone(hub);
+    tokio::spawn(async move {
+        let changes = jj::change_stat(&dir).await;
+        let mut session = hub.session();
+        if session.set_changes(workspace, changes) {
+            let view = session.view();
+            drop(session);
+            broadcast_event(&hub, Event::LayoutChanged { workspaces: view });
+        }
+    });
+}
+
+/// Refresh the change stat of the workspace owning `pane`, if it still exists.
+/// The lookup is bound before the `if let` so the session guard is released
+/// before `refresh_changes` re-locks it (the std Mutex is non-reentrant).
+fn refresh_pane_workspace(hub: &Arc<Hub>, pane: PaneId) {
+    let workspace = hub.session().workspace_of_pane(pane);
+    if let Some(workspace) = workspace {
+        refresh_changes(hub, workspace);
+    }
+}
+
+/// Refresh every workspace's change stat — used on attach to seed the sidebars.
+/// The ids are bound before the loop: a `for` holds its iterator's temporaries
+/// (here the session guard) across the whole body, so leaving the guard live
+/// would deadlock against `refresh_changes` re-locking the same Mutex.
+fn refresh_all_changes(hub: &Arc<Hub>) {
+    let ids = hub.session().workspace_ids();
+    for workspace in ids {
+        refresh_changes(hub, workspace);
+    }
 }
 
 fn broadcast_tick(hub: &Hub) {
@@ -771,8 +868,18 @@ fn classify_pass(hub: &Arc<Hub>, last_gen: &mut HashMap<PaneId, u64>) {
         }
     }
     drop(session);
+    // Dedupe the workspaces of the changed panes so a burst of transitions in
+    // one workspace triggers a single jj refresh, not one per pane.
+    let mut workspaces: HashSet<WorkspaceId> = HashSet::new();
     for (pane, from, to) in changes {
         broadcast_event(hub, Event::StateChanged { pane, from, to });
+        let workspace = hub.session().workspace_of_pane(pane);
+        if let Some(workspace) = workspace {
+            workspaces.insert(workspace);
+        }
+    }
+    for workspace in workspaces {
+        refresh_changes(hub, workspace);
     }
 }
 

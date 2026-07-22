@@ -164,8 +164,12 @@ right-aligned count:
 
 - **workspaces** — one row per workspace: an `●` (accent) when it owns the active
   tab, else a dim `○`, then the bold name, over a dim line showing the git branch
-  (read straight from `.git/HEAD`, including worktrees). No branch leaves that
-  line blank rather than echoing the name. Selecting one jumps to its tab.
+  (read straight from `.git/HEAD`, including worktrees) on the left and the jj
+  change stat (`4 files +120 −33`) right-aligned. No branch leaves the left blank
+  rather than echoing the name; a clean or non-jj workspace shows no stat. The
+  stat refreshes as agents work (on every state transition, on attach, and when a
+  workspace is created) and is dropped first when the column is too narrow for
+  both. Selecting a workspace jumps to its tab.
 - **agents** — one row per agent pane across *every* workspace: a state dot
   (blocked red, working an animated spinner, done green, idle/unknown dim), the
   pane title, and a dim `state · kind` line. Sorted blocked-first so whatever
@@ -182,8 +186,12 @@ focused, `j`/`k` (or the arrows) move the highlight across both sections, `Enter
 jumps and hands focus back to the pane, `esc`/`w` unfocus, and `n` opens a
 one-line prompt to create a new workspace (`~` expands to your home; relative
 paths resolve against the client's cwd and are canonicalized to an absolute path
-before the daemon sees them; a bad directory surfaces the server's error). A
-mouse click focuses the sidebar, or jumps straight to the entry clicked.
+before the daemon sees them; a bad directory surfaces the server's error). `d`
+opens the selected workspace's **jj diff** in an ephemeral pane — a real terminal
+running `jj diff | less -R`, coloured, that vanishes the moment you quit `less`
+(pressing `d` on an agent row opens the diff for the agent's workspace). A
+non-jj workspace shows a transient error instead of spawning. A mouse click
+focuses the sidebar, or jumps straight to the entry clicked.
 
 Visibility is set by the `sidebar` config value: `on` (default) always shows it
 — the control column is the point — while `auto` reveals it only once the
@@ -222,8 +230,9 @@ scriptable, it isn't done:
 ```
 tutti server start|stop [-s session]
 tutti workspace new --dir <path> | list | kill <id>
+tutti workspace diff <id> [--stat]   # the workspace's jj diff (jj is required; --json for raw lines)
 tutti tab new | list | select <id>
-tutti pane run [--tab <id>] -- <cmd...>
+tutti pane run [--tab <id>] [--ephemeral] -- <cmd...>
 tutti pane split <pane> right|down
 tutti pane list | kill | rename | focus <pane>
 tutti pane send <pane> --text <s> | --keys <s>

@@ -28,6 +28,11 @@ pub enum Request {
     PaneRun {
         tab: Option<TabId>,
         cmd: Vec<String>,
+        /// An ephemeral pane is removed entirely when its child exits (no exited
+        /// corpse row), rather than kept readable. Used for throwaway views like
+        /// the jj diff pane.
+        #[serde(default)]
+        ephemeral: bool,
     },
     PaneSplit {
         pane: PaneId,
@@ -67,6 +72,14 @@ pub enum Request {
     /// `Focused` state event, so a `Done` pane becomes `Idle` once looked at.
     PaneFocus {
         pane: PaneId,
+    },
+    /// Serve a workspace's jj diff, answered with `Response::Content`. `stat`
+    /// requests the `--stat` summary instead of the full diff. jj is the required
+    /// VCS: a workspace whose directory is not under a `.jj` repo answers Error.
+    WorkspaceDiff {
+        id: WorkspaceId,
+        #[serde(default)]
+        stat: bool,
     },
     /// Nudge the ratio of the nearest split enclosing `pane` whose axis is
     /// `direction`, by `delta` (clamped server-side). `h`/`l` drive a
@@ -116,6 +129,11 @@ pub struct WorkspaceView {
     /// The workspace's current git branch, when its directory is a git
     /// checkout. `None` when it is not a repo or HEAD is unreadable.
     pub branch: Option<String>,
+    /// A short pre-formatted jj change stat like `4 files +120 −33`, refreshed
+    /// as agents work. `None` when the workspace is not a jj repo, has no
+    /// changes, or has not been probed yet — the sidebar stays quiet then.
+    #[serde(default)]
+    pub changes: Option<String>,
     pub tabs: Vec<TabView>,
 }
 
@@ -220,6 +238,16 @@ mod tests {
         roundtrip(&Request::PaneRun {
             tab: Some(TabId(3)),
             cmd: vec!["claude".into(), "--dangerously".into()],
+            ephemeral: false,
+        });
+        roundtrip(&Request::PaneRun {
+            tab: None,
+            cmd: vec!["sh".into()],
+            ephemeral: true,
+        });
+        roundtrip(&Request::WorkspaceDiff {
+            id: WorkspaceId(2),
+            stat: true,
         });
         roundtrip(&Request::TabNew { workspace: None });
         roundtrip(&Request::PaneSplit {
@@ -260,6 +288,7 @@ mod tests {
             name: "api".into(),
             dir: PathBuf::from("/tmp/w"),
             branch: Some("main".into()),
+            changes: Some("4 files +120 −33".into()),
             tabs: vec![TabView {
                 id: TabId(1),
                 name: "main".into(),
@@ -357,5 +386,34 @@ mod tests {
             .unwrap(),
             r#"{"type":"state_changed","pane":1,"from":"working","to":"idle"}"#
         );
+    }
+
+    #[test]
+    fn additive_fields_default_when_omitted() {
+        // `pane_run` from before `ephemeral` existed still parses (non-ephemeral).
+        let run: Request =
+            serde_json::from_str(r#"{"type":"pane_run","tab":null,"cmd":["sh"]}"#).unwrap();
+        assert_eq!(
+            run,
+            Request::PaneRun {
+                tab: None,
+                cmd: vec!["sh".into()],
+                ephemeral: false,
+            }
+        );
+        // `workspace_diff` without `stat` defaults to the full diff.
+        let diff: Request = serde_json::from_str(r#"{"type":"workspace_diff","id":7}"#).unwrap();
+        assert_eq!(
+            diff,
+            Request::WorkspaceDiff {
+                id: WorkspaceId(7),
+                stat: false,
+            }
+        );
+        // A view serialized without `changes` (older server) parses as `None`.
+        let view: WorkspaceView =
+            serde_json::from_str(r#"{"id":1,"name":"api","dir":"/tmp/w","branch":null,"tabs":[]}"#)
+                .unwrap();
+        assert_eq!(view.changes, None);
     }
 }

@@ -20,6 +20,9 @@ pub struct WorkspaceRow {
     /// line rather than repeating the name (the workspace name is already the
     /// directory basename, so echoing it as a subtitle read as a bug).
     pub subtitle: Option<String>,
+    /// A short jj change stat (`4 files +120 −33`), right-aligned on the subtitle
+    /// line. `None` when the workspace is not a jj repo or has no changes.
+    pub changes: Option<String>,
     /// Whether this workspace owns the active tab (rendered bold).
     pub active: bool,
     /// The tab that selecting this workspace jumps to.
@@ -96,6 +99,7 @@ pub fn build(workspaces: &[WorkspaceView], active_tab: Option<TabId>) -> Sidebar
                     .branch
                     .clone()
                     .or_else(|| shorten_home(&w.dir, std::env::var_os("HOME").map(Into::into))),
+                changes: w.changes.clone(),
                 active: owns,
                 jump_tab,
             }));
@@ -225,6 +229,25 @@ mod tests {
             Some("/tmp/w"),
             "no branch falls back to the dir, never the name"
         );
+    }
+
+    #[test]
+    fn build_carries_the_workspace_change_stat() {
+        let mut view = two_workspace_view();
+        view[0].changes = Some("2 files +5 −0".into());
+        let sidebar = build(&view, Some(TabId(2)));
+        let SidebarEntry::Workspace(api) = &sidebar.entries[0] else {
+            panic!("expected workspace row");
+        };
+        let SidebarEntry::Workspace(web) = &sidebar.entries[1] else {
+            panic!("expected workspace row");
+        };
+        assert_eq!(
+            api.changes.as_deref(),
+            Some("2 files +5 −0"),
+            "the stat rides onto the row"
+        );
+        assert_eq!(web.changes, None, "a workspace without a stat stays quiet");
     }
 
     #[test]

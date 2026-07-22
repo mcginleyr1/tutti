@@ -26,6 +26,7 @@ const SIDEBAR_HINT: &[(&str, &str)] = &[
     ("j/k", "move"),
     ("enter", "jump"),
     ("n", "new"),
+    ("d", "diff"),
     ("esc", "back"),
 ];
 
@@ -146,7 +147,12 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
         if let SidebarEntry::Workspace(row) = entry {
             let sel = pop && selected == i;
             lines.push(workspace_line(row, sel, w));
-            lines.push(subtitle_line(row.subtitle.as_deref().unwrap_or(""), sel, w));
+            lines.push(workspace_subtitle(
+                row.subtitle.as_deref().unwrap_or(""),
+                row.changes.as_deref(),
+                sel,
+                w,
+            ));
         }
     }
     lines.push(Line::from(String::new()));
@@ -243,9 +249,29 @@ fn agent_subtitle(a: &AgentRow, sel: bool, notified: bool, width: u16) -> Line<'
     finish_row(spans, sel, width)
 }
 
-/// A dim indented second line (a workspace's branch, blank when unknown).
-fn subtitle_line(text: &str, sel: bool, width: u16) -> Line<'static> {
-    finish_row(vec![Span::styled(format!("  {text}"), dim())], sel, width)
+/// A workspace's dim subtitle line: the branch (or dir) on the left, and the jj
+/// change stat right-aligned against the sidebar's edge. The stat is dropped
+/// first when the two would collide, so a narrow sidebar still shows the branch.
+fn workspace_subtitle(branch: &str, changes: Option<&str>, sel: bool, width: u16) -> Line<'static> {
+    let left = format!("  {branch}");
+    // The gutter (drawn by `finish_row`) takes the first column.
+    let content = (width as usize).saturating_sub(1);
+    if let Some(changes) = changes {
+        let need = left.chars().count() + 1 + changes.chars().count();
+        if need <= content {
+            let gap = content - left.chars().count() - changes.chars().count();
+            return finish_row(
+                vec![
+                    Span::styled(left, dim()),
+                    Span::styled(" ".repeat(gap), dim()),
+                    Span::styled(changes.to_string(), dim()),
+                ],
+                sel,
+                width,
+            );
+        }
+    }
+    finish_row(vec![Span::styled(left, dim())], sel, width)
 }
 
 /// A dim placeholder line so an empty section never looks broken.
@@ -808,6 +834,39 @@ mod tests {
         assert!(text.contains("api"), "workspace name missing: {text:?}");
         assert!(text.contains("main"), "branch subtitle missing: {text:?}");
         assert!(text.contains("claude"), "agent kind missing: {text:?}");
+    }
+
+    #[test]
+    fn sidebar_renders_the_change_stat_beside_the_branch() {
+        let mut app = App::new();
+        let mut view = vec![workspace(
+            1,
+            "api",
+            Some("main"),
+            vec![tab(
+                1,
+                "1",
+                true,
+                leaf(1),
+                vec![pane(1, "zsh", None, AgentState::Idle)],
+            )],
+        )];
+        view[0].changes = Some("4 files +120 −33".into());
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Response::Attached {
+                session: "demo".into(),
+                workspaces: view,
+            })
+            .unwrap(),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("main"), "branch still shows: {text:?}");
+        assert!(
+            text.contains("4 files +120 −33"),
+            "change stat missing from the subtitle line: {text:?}"
+        );
     }
 
     #[test]

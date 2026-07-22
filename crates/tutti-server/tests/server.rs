@@ -140,6 +140,7 @@ async fn run_marker(conn: &mut Conn, cmd: &str) -> PaneId {
         conn.request(Request::PaneRun {
             tab: None,
             cmd: vec!["/bin/sh".into(), "-c".into(), cmd.into()],
+            ephemeral: false,
         })
         .await,
     )
@@ -199,6 +200,7 @@ async fn pane_send_echoes_into_grid() {
         conn.request(Request::PaneRun {
             tab: None,
             cmd: vec!["/bin/cat".into()],
+            ephemeral: false,
         })
         .await,
     );
@@ -232,6 +234,7 @@ async fn kill_removes_panes() {
         conn.request(Request::PaneRun {
             tab: None,
             cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+            ephemeral: false,
         })
         .await,
     );
@@ -239,6 +242,7 @@ async fn kill_removes_panes() {
         conn.request(Request::PaneRun {
             tab: None,
             cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+            ephemeral: false,
         })
         .await,
     );
@@ -280,6 +284,7 @@ async fn attach_receives_snapshot_then_delta() {
             .request(Request::PaneRun {
                 tab: None,
                 cmd: vec!["/bin/cat".into()],
+                ephemeral: false,
             })
             .await,
     );
@@ -330,6 +335,7 @@ async fn attach_resize_reseeds_at_new_size() {
             .request(Request::PaneRun {
                 tab: None,
                 cmd: vec!["/bin/cat".into()],
+                ephemeral: false,
             })
             .await,
     );
@@ -397,6 +403,7 @@ async fn resize_split_adjusts_ratio_and_broadcasts() {
             .request(Request::PaneRun {
                 tab: None,
                 cmd: vec!["/bin/cat".into()],
+                ephemeral: false,
             })
             .await,
     );
@@ -508,6 +515,7 @@ async fn wedged_client_is_dropped_but_others_keep_flowing() {
                      i=$((i+1)); done; sleep 0.02; done"
                         .into(),
                 ],
+                ephemeral: false,
             })
             .await,
     );
@@ -632,6 +640,7 @@ async fn detects_agent_process_by_name() {
         conn.request(Request::PaneRun {
             tab: None,
             cmd: vec![bin.display().to_string(), "30".into()],
+            ephemeral: false,
         })
         .await,
     );
@@ -687,6 +696,7 @@ async fn agent_state_changes_working_then_blocked() {
             .request(Request::PaneRun {
                 tab: None,
                 cmd: vec![bin.display().to_string()],
+                ephemeral: false,
             })
             .await,
     );
@@ -730,6 +740,187 @@ async fn agent_state_changes_working_then_blocked() {
     server.stop().await;
 }
 
+/// A fresh empty temp directory, unique per call.
+fn fresh_dir(prefix: &str) -> PathBuf {
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("tutti-{prefix}-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Initialize a real jj repo in a fresh temp dir with two added files, so a
+/// diff has real content and its `--stat` summary reads `2 files changed`.
+/// Returns `None` (test skips) when `jj` is not on PATH.
+fn init_jj_repo() -> Option<PathBuf> {
+    if std::process::Command::new("jj")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipping: jj is not on PATH");
+        return None;
+    }
+    let dir = fresh_dir("jjrepo");
+    let out = std::process::Command::new("jj")
+        .args(["git", "init"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "jj git init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(dir.join("tracked_file.txt"), "hello from tutti\n").unwrap();
+    std::fs::write(dir.join("second.txt"), "another line\n").unwrap();
+    Some(dir)
+}
+
+/// `workspace diff` shells out to jj: the full diff names the edited file and
+/// the `--stat` form carries the summary line. Skips cleanly without `jj`.
+#[tokio::test]
+async fn workspace_diff_serves_jj_content_and_stat() {
+    let Some(dir) = init_jj_repo() else {
+        return;
+    };
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let ws = workspace_id(
+        conn.request(Request::WorkspaceNew { dir: dir.clone() })
+            .await,
+    );
+
+    match conn
+        .request(Request::WorkspaceDiff {
+            id: ws,
+            stat: false,
+        })
+        .await
+    {
+        Response::Content { lines } => assert!(
+            lines.iter().any(|l| l.contains("tracked_file.txt")),
+            "diff should mention the edited file, got {lines:?}"
+        ),
+        other => panic!("expected Content, got {other:?}"),
+    }
+
+    match conn
+        .request(Request::WorkspaceDiff { id: ws, stat: true })
+        .await
+    {
+        Response::Content { lines } => assert!(
+            lines.iter().any(|l| l.contains("files changed")),
+            "stat should carry the summary line, got {lines:?}"
+        ),
+        other => panic!("expected Content, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+    server.stop().await;
+}
+
+/// A `workspace diff` on a directory that is not a jj repo answers Error.
+#[tokio::test]
+async fn workspace_diff_non_repo_errors() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let dir = fresh_dir("nonjj");
+    let ws = workspace_id(
+        conn.request(Request::WorkspaceNew { dir: dir.clone() })
+            .await,
+    );
+
+    match conn
+        .request(Request::WorkspaceDiff {
+            id: ws,
+            stat: false,
+        })
+        .await
+    {
+        Response::Error { message } => assert!(
+            message.contains("not a jj workspace"),
+            "expected a not-a-jj-workspace error, got {message:?}"
+        ),
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+    server.stop().await;
+}
+
+/// An ephemeral pane leaves no corpse: when its child exits it is removed from
+/// the pane list entirely, and an attached client sees a `LayoutChanged` that no
+/// longer carries it (rather than an exited-marked row).
+#[tokio::test]
+async fn ephemeral_pane_vanishes_on_child_exit() {
+    let server = TestServer::start();
+
+    let mut control = server.connect().await;
+    new_workspace(&mut control).await;
+
+    let mut viewer = server.connect().await;
+    viewer.send(&Request::Attach).await;
+    assert!(matches!(viewer.response().await, Response::Attached { .. }));
+
+    let pane = pane_id(
+        control
+            .request(Request::PaneRun {
+                tab: None,
+                cmd: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+                ephemeral: true,
+            })
+            .await,
+    );
+
+    assert!(
+        wait_gone(&mut control, pane).await,
+        "an ephemeral pane should be removed from the pane list on exit"
+    );
+    assert!(
+        layout_drops_pane(&mut viewer, pane).await,
+        "the removal should broadcast a LayoutChanged without the pane"
+    );
+
+    server.stop().await;
+}
+
+/// Poll `pane list` until `pane` is gone entirely.
+async fn wait_gone(conn: &mut Conn, pane: PaneId) -> bool {
+    timeout(DEADLINE, async {
+        loop {
+            if let Response::Panes { panes } = conn.request(Request::PaneList).await
+                && !panes.iter().any(|p| p.id == pane)
+            {
+                return true;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Read events until a `LayoutChanged` whose view no longer lists `pane`.
+async fn layout_drops_pane(viewer: &mut Conn, pane: PaneId) -> bool {
+    timeout(DEADLINE, async {
+        loop {
+            if let Frame::Control(json) = viewer.read_frame().await
+                && let Ok(Event::LayoutChanged { workspaces }) =
+                    serde_json::from_slice::<Event>(&json)
+                && !workspaces
+                    .iter()
+                    .flat_map(|w| &w.tabs)
+                    .flat_map(|t| &t.panes)
+                    .any(|p| p.id == pane)
+            {
+                return true;
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// Focusing a `Done` pane marks it seen: its state becomes `Idle`.
 #[tokio::test]
 async fn focus_transitions_done_pane_to_idle() {
@@ -741,6 +932,7 @@ async fn focus_transitions_done_pane_to_idle() {
         conn.request(Request::PaneRun {
             tab: None,
             cmd: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+            ephemeral: false,
         })
         .await,
     );

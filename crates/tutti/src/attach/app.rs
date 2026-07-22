@@ -679,6 +679,7 @@ impl App {
                 self.set_status("new workspace dir (enter to create, esc to cancel)".into());
                 Vec::new()
             }
+            KeyCode::Char('d') => self.open_diff_pane(&sidebar),
             KeyCode::Esc | KeyCode::Char('w') => {
                 self.mode = Mode::Terminal;
                 self.status = None;
@@ -709,6 +710,47 @@ impl App {
             }
             None => Vec::new(),
         }
+    }
+
+    /// Open the selected workspace's jj diff in an ephemeral pane — a real
+    /// terminal running `jj diff | less -R`, removed the moment `less` quits. A
+    /// workspace entry targets its own tab; an agent entry targets the tab it
+    /// lives in. A non-jj workspace shows a transient error instead of spawning,
+    /// since jj is the required VCS for workspace diffs.
+    fn open_diff_pane(&mut self, sidebar: &Sidebar) -> Vec<WireFrame> {
+        let tab = match sidebar.entries.get(self.sidebar_selected) {
+            Some(SidebarEntry::Workspace(w)) => w.jump_tab,
+            Some(SidebarEntry::Agent(a)) => a.tab,
+            None => return Vec::new(),
+        };
+        let Some(dir) = self.workspace_dir_of_tab(tab) else {
+            return Vec::new();
+        };
+        if !is_jj_workspace(&dir) {
+            self.set_status(format!("not a jj workspace: {}", dir.display()));
+            return Vec::new();
+        }
+        self.mode = Mode::Terminal;
+        self.status = None;
+        self.active_tab = Some(tab);
+        self.zoom = false;
+        vec![control(&Request::PaneRun {
+            tab: Some(tab),
+            cmd: vec![
+                "sh".into(),
+                "-lc".into(),
+                "jj --no-pager diff --color=always | less -R".into(),
+            ],
+            ephemeral: true,
+        })]
+    }
+
+    /// The directory of the workspace owning `tab`, from the current view.
+    fn workspace_dir_of_tab(&self, tab: TabId) -> Option<PathBuf> {
+        self.workspaces
+            .iter()
+            .find(|w| w.tabs.iter().any(|t| t.id == tab))
+            .map(|w| w.dir.clone())
     }
 
     fn on_key_prompt(&mut self, key: KeyEvent) -> Vec<WireFrame> {
@@ -754,6 +796,7 @@ impl App {
             control(&Request::PaneRun {
                 tab: None,
                 cmd: vec![shell],
+                ephemeral: false,
             }),
         ]
     }
@@ -1187,6 +1230,20 @@ fn inner_size(rect: Rect) -> (u16, u16) {
 
 pub(crate) fn control(request: &Request) -> WireFrame {
     WireFrame::Control(serde_json::to_vec(request).expect("serialize request"))
+}
+
+/// Whether `dir` or an ancestor holds a `.jj` directory. A local mirror of the
+/// server's jj probe so the sidebar diff key fails fast without a round-trip;
+/// jj is the required VCS for workspace diffs.
+fn is_jj_workspace(dir: &Path) -> bool {
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        if d.join(".jj").exists() {
+            return true;
+        }
+        cur = d.parent();
+    }
+    false
 }
 
 /// Flatten a notification's title/body into one human line: `title: body` when
@@ -1897,6 +1954,62 @@ mod tests {
     }
 
     #[test]
+    fn d_on_a_jj_workspace_opens_an_ephemeral_diff_pane() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        // A workspace dir that is a jj repo (holds a `.jj`).
+        let dir = std::env::temp_dir().join(format!("tutti-app-jj-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".jj")).unwrap();
+
+        let mut app = App::new();
+        let mut ws = workspace(
+            1,
+            "api",
+            Some("main"),
+            vec![tab(1, "1", true, leaf(1), vec![shell(1)])],
+        );
+        ws.dir = dir.clone();
+        attach_with(&mut app, vec![ws]);
+        focus_sidebar(&mut app);
+
+        let out = app.on_key(plain('d'));
+        assert_eq!(
+            out,
+            vec![control(&Request::PaneRun {
+                tab: Some(TabId(1)),
+                cmd: vec![
+                    "sh".into(),
+                    "-lc".into(),
+                    "jj --no-pager diff --color=always | less -R".into(),
+                ],
+                ephemeral: true,
+            })],
+            "d spawns the ephemeral jj-diff pane in the workspace's tab"
+        );
+        assert_eq!(app.mode, Mode::Terminal);
+        assert_eq!(app.active_tab, Some(TabId(1)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn d_on_a_non_jj_workspace_shows_a_transient_error() {
+        let mut app = App::new();
+        // view_two_workspaces roots workspaces at `/tmp/w`, which is not a jj repo.
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        let out = app.on_key(plain('d'));
+        assert!(out.is_empty(), "no pane is spawned for a non-jj workspace");
+        assert!(
+            app.transient()
+                .is_some_and(|t| t.contains("not a jj workspace")),
+            "a transient error names the missing jj repo"
+        );
+        assert_eq!(app.mode, Mode::Sidebar, "focus stays on the sidebar");
+    }
+
+    #[test]
     fn new_workspace_prompt_edits_then_submits_workspace_and_pane_run() {
         let mut app = App::new();
         attach_with(&mut app, view_two_workspaces());
@@ -1923,6 +2036,7 @@ mod tests {
                 control(&Request::PaneRun {
                     tab: None,
                     cmd: vec![shell],
+                    ephemeral: false,
                 }),
             ],
             "submit creates the workspace then bootstraps a shell pane"
@@ -1980,6 +2094,7 @@ mod tests {
                 control(&Request::PaneRun {
                     tab: None,
                     cmd: vec![shell],
+                    ephemeral: false,
                 }),
             ],
         );
