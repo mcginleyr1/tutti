@@ -1,12 +1,14 @@
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
-use tutti_core::{Direction, PaneId, Request, Response, TabId, WorkspaceId};
+use tutti_core::{AgentHookEvent, Direction, PaneId, Request, Response, TabId, WorkspaceId};
 
 use tutti::client::{self, Client, StopOutcome};
 use tutti::config::Config;
+use tutti::hooks;
 use tutti::render;
 
 #[derive(Parser)]
@@ -48,6 +50,27 @@ enum Command {
     },
     /// Attach the interactive TUI (alias for bare `tutti`).
     Attach,
+    /// Forward a Claude Code hook event to tutti (reads the hook JSON on stdin).
+    /// Wired up by `tutti hooks claude`; a silent no-op outside a tutti pane.
+    AgentEvent {
+        #[arg(value_enum)]
+        agent: HookAgent,
+    },
+    /// Print the settings.json hooks snippet wiring Claude Code to tutti.
+    Hooks {
+        #[arg(value_enum)]
+        agent: HookAgent,
+        /// Print only the JSON (omit the install instructions on stderr).
+        #[arg(long)]
+        raw: bool,
+    },
+}
+
+/// The agent whose hook schema `agent-event`/`hooks` speak. Only Claude Code is
+/// wired up today; the value-enum keeps room for more without changing the shape.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+enum HookAgent {
+    Claude,
 }
 
 #[derive(Subcommand)]
@@ -193,6 +216,16 @@ fn run(cli: Cli) -> Result<i32> {
         // Bare `tutti` and `tutti attach` both attach, mounting startup projects.
         None | Some(Command::Attach) => {
             attach_session(&cli.session)?;
+            Ok(0)
+        }
+        Some(Command::AgentEvent {
+            agent: HookAgent::Claude,
+        }) => run_agent_event(&cli.session),
+        Some(Command::Hooks {
+            agent: HookAgent::Claude,
+            raw,
+        }) => {
+            emit_hooks(raw);
             Ok(0)
         }
         Some(command) => {
@@ -409,7 +442,59 @@ fn to_request(command: Command) -> Result<Request> {
             },
             PaneAction::Focus { pane } => Request::PaneFocus { pane: PaneId(pane) },
         }),
-        Command::Server { .. } | Command::Attach => bail!("not a protocol request"),
+        Command::Server { .. }
+        | Command::Attach
+        | Command::AgentEvent { .. }
+        | Command::Hooks { .. } => bail!("not a protocol request"),
+    }
+}
+
+/// Forward one Claude Code hook event (read as JSON on stdin) to the daemon.
+/// Built to never break a Claude session: outside a tutti-spawned pane
+/// (`TUTTI_PANE` unset) it exits 0 silently; a malformed or irrelevant event
+/// sends nothing; a connect/send failure is a stderr note, never a failure exit.
+/// This is the one deliberately never-fail path in the CLI.
+fn run_agent_event(session: &str) -> Result<i32> {
+    let Some(pane) = std::env::var("TUTTI_PANE")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    else {
+        return Ok(0);
+    };
+    // The pane's own daemon owns the socket; the env var wins over the -s value.
+    let session = std::env::var("TUTTI_SESSION").unwrap_or_else(|_| session.to_string());
+    let mut input = String::new();
+    if std::io::stdin().read_to_string(&mut input).is_err() {
+        return Ok(0);
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&input) else {
+        return Ok(0);
+    };
+    let Some(event) = hooks::map_claude_event(&value) else {
+        return Ok(0);
+    };
+    if let Err(err) = send_agent_event(&session, PaneId(pane), event) {
+        eprintln!("tutti agent-event: {err:#}");
+    }
+    Ok(0)
+}
+
+/// Send an `AgentEvent` to the session's daemon. Never auto-starts a server — a
+/// hook firing with no daemon listening has nothing to report to.
+fn send_agent_event(session: &str, pane: PaneId, event: AgentHookEvent) -> Result<()> {
+    let mut client = Client::connect(session).context("connecting to tutti-server")?;
+    client.request(&Request::AgentEvent { pane, event })?;
+    Ok(())
+}
+
+/// Print the Claude Code hooks snippet: the JSON to stdout, plus — unless
+/// `--raw` — a few install lines to stderr so the JSON pipes cleanly on its own.
+fn emit_hooks(raw: bool) {
+    println!("{}", hooks::claude_hooks_snippet());
+    if !raw {
+        eprintln!("# Add the JSON above to the \"hooks\" object in ~/.claude/settings.json");
+        eprintln!("# (or .claude/settings.json in a project). Merge into any existing hooks.");
+        eprintln!("# Panes tutti launches then report exact agent state and live subagents.");
     }
 }
 
@@ -757,6 +842,38 @@ mod tests {
             Cli::try_parse_from(["tutti", "attach"]).unwrap().command,
             Some(Command::Attach)
         ));
+    }
+
+    #[test]
+    fn agent_event_and_hooks_parse() {
+        assert!(matches!(
+            Cli::try_parse_from(["tutti", "agent-event", "claude"])
+                .unwrap()
+                .command,
+            Some(Command::AgentEvent {
+                agent: HookAgent::Claude
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["tutti", "hooks", "claude"])
+                .unwrap()
+                .command,
+            Some(Command::Hooks {
+                agent: HookAgent::Claude,
+                raw: false,
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["tutti", "hooks", "claude", "--raw"])
+                .unwrap()
+                .command,
+            Some(Command::Hooks {
+                agent: HookAgent::Claude,
+                raw: true,
+            })
+        ));
+        // An unknown agent is rejected at parse time.
+        assert!(Cli::try_parse_from(["tutti", "agent-event", "codex"]).is_err());
     }
 
     #[test]

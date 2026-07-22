@@ -110,8 +110,42 @@ pub enum Request {
         direction: Direction,
         delta: f32,
     },
+    /// A ground-truth agent-lifecycle signal for `pane`, forwarded from a Claude
+    /// Code hook by `tutti agent-event`. Drives exact state + the subagent list,
+    /// replacing screen-heuristic guessing for that pane.
+    AgentEvent {
+        pane: PaneId,
+        event: AgentHookEvent,
+    },
     Attach,
     Detach,
+}
+
+/// A single agent-lifecycle signal mapped from a Claude Code hook event. Kept a
+/// small, tool-agnostic vocabulary so other agents' hooks can map onto it too.
+/// The parser that produces these tolerates unknown JSON fields (Claude Code's
+/// hook schema evolves), so this enum only names what tutti actually reacts to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentHookEvent {
+    /// A subagent/Task was launched: shown as an indented sidebar sub-row.
+    SubagentStarted { id: String, desc: String },
+    /// A subagent finished: its sub-row flips to "just-finished".
+    SubagentStopped { id: String },
+    /// Any tool use — a heartbeat that keeps the pane `Working`; `detail` names
+    /// the tool when known.
+    Activity {
+        #[serde(default)]
+        detail: Option<String>,
+    },
+    /// The agent is waiting on the user (a permission or idle prompt), carrying
+    /// the notification text when the hook provided one.
+    Blocked {
+        #[serde(default)]
+        message: Option<String>,
+    },
+    /// The agent finished responding.
+    Done,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +169,21 @@ pub struct PaneInfo {
     pub agent: Option<AgentKind>,
     pub state: AgentState,
     pub exited: Option<i32>,
+    /// Subagents this pane's agent has spawned, newest last, reported by hooks.
+    /// A finished subagent is kept (`running == false`) until the agent's next
+    /// `Done` so it visibly completes. Defaults empty for older servers and
+    /// non-hook panes.
+    #[serde(default)]
+    pub subagents: Vec<SubagentInfo>,
+}
+
+/// One subagent row under a hook-driven agent in the sidebar: a short
+/// description and whether it is still running. Display-only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentInfo {
+    pub id: String,
+    pub desc: String,
+    pub running: bool,
 }
 
 /// The full structure an attached client renders: every workspace, its tabs,
@@ -320,7 +369,49 @@ mod tests {
             direction: Direction::Horizontal,
             delta: 0.05,
         });
+        roundtrip(&Request::AgentEvent {
+            pane: PaneId(3),
+            event: AgentHookEvent::SubagentStarted {
+                id: "s1".into(),
+                desc: "write the tests".into(),
+            },
+        });
+        roundtrip(&Request::AgentEvent {
+            pane: PaneId(3),
+            event: AgentHookEvent::SubagentStopped { id: "s1".into() },
+        });
+        roundtrip(&Request::AgentEvent {
+            pane: PaneId(3),
+            event: AgentHookEvent::Activity {
+                detail: Some("Bash".into()),
+            },
+        });
+        roundtrip(&Request::AgentEvent {
+            pane: PaneId(3),
+            event: AgentHookEvent::Blocked {
+                message: Some("allow edit?".into()),
+            },
+        });
+        roundtrip(&Request::AgentEvent {
+            pane: PaneId(3),
+            event: AgentHookEvent::Done,
+        });
         roundtrip(&Request::Attach);
+    }
+
+    #[test]
+    fn agent_hook_event_is_kind_tagged_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&AgentHookEvent::Done).unwrap(),
+            r#"{"kind":"done"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentHookEvent::SubagentStopped { id: "a".into() }).unwrap(),
+            r#"{"kind":"subagent_stopped","id":"a"}"#
+        );
+        // A hook event serialized without the optional field still parses.
+        let activity: AgentHookEvent = serde_json::from_str(r#"{"kind":"activity"}"#).unwrap();
+        assert_eq!(activity, AgentHookEvent::Activity { detail: None });
     }
 
     fn sample_view() -> Vec<WorkspaceView> {
@@ -348,6 +439,7 @@ mod tests {
                     agent: None,
                     state: AgentState::Idle,
                     exited: None,
+                    subagents: Vec::new(),
                 }],
             }],
         }]
@@ -367,6 +459,11 @@ mod tests {
                 agent: Some("claude".into()),
                 state: AgentState::Working,
                 exited: None,
+                subagents: vec![SubagentInfo {
+                    id: "s1".into(),
+                    desc: "build the core".into(),
+                    running: true,
+                }],
             }],
         });
         roundtrip(&Response::Content {
@@ -458,6 +555,12 @@ mod tests {
                 .unwrap();
         assert_eq!(view.changes, None);
         assert!(!view.stale);
+        // A `pane_info` from before `subagents` existed defaults to an empty list.
+        let pane: PaneInfo = serde_json::from_str(
+            r#"{"id":1,"title":"shell","agent":null,"state":"idle","exited":null}"#,
+        )
+        .unwrap();
+        assert!(pane.subagents.is_empty());
         // `workspace_kill` from before `discard` existed still parses (keep).
         let kill: Request = serde_json::from_str(r#"{"type":"workspace_kill","id":2}"#).unwrap();
         assert_eq!(

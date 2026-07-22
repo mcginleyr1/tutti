@@ -9,11 +9,15 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use tutti_core::{
-    AgentKind, AgentState, Direction, Layout, Observation, PaneId, PaneInfo, StateEvent, TabId,
-    TabInfo, TabView, WorkspaceId, WorkspaceInfo, WorkspaceView,
+    AgentHookEvent, AgentKind, AgentState, Direction, Layout, Observation, PaneId, PaneInfo,
+    StateEvent, SubagentInfo, TabId, TabInfo, TabView, WorkspaceId, WorkspaceInfo, WorkspaceView,
 };
 
 use crate::pty::{PaneSize, PtyPane, PtySpec};
+
+/// The most subagent rows kept per pane before the oldest is dropped, bounding
+/// the list even for an agent that spawns many short-lived subagents.
+const SUBAGENT_CAP: usize = 16;
 
 struct TabEntry {
     id: TabId,
@@ -58,6 +62,10 @@ struct PaneSlot {
     /// An ephemeral pane is removed outright when its child exits (the reaper
     /// drops it from the layout) instead of being kept as an exited corpse.
     ephemeral: bool,
+    /// Set once this pane has reported an agent hook event. From then on the
+    /// screen-heuristic classifier skips it — the hooks are ground truth and
+    /// would otherwise fight the exact signals.
+    hook_seen: bool,
 }
 
 #[derive(Default)]
@@ -88,16 +96,20 @@ pub struct Session {
     current_tab: Option<TabId>,
     size: PaneSize,
     ids: Ids,
+    /// The session name, exported to every spawned pane as `TUTTI_SESSION` so a
+    /// Claude Code hook running inside it can reach this daemon's socket.
+    name: String,
 }
 
 impl Session {
-    pub fn new(size: PaneSize) -> Self {
+    pub fn new(size: PaneSize, name: impl Into<String>) -> Self {
         Self {
             workspaces: Vec::new(),
             panes: HashMap::new(),
             current_tab: None,
             size,
             ids: Ids::default(),
+            name: name.into(),
         }
     }
 
@@ -441,12 +453,15 @@ impl Session {
             .collect()
     }
 
-    /// Live panes that have been identified as agents, with their kind and pty —
-    /// the targets of the state-classification pass.
+    /// Live agent panes that are *not* hook-driven, with their kind and pty —
+    /// the targets of the screen-classification pass. A pane that has reported a
+    /// hook event is excluded: its state comes from exact hook signals, and the
+    /// screen heuristics would only fight them. Agent detection is unaffected (it
+    /// walks `live_panes`), so a hook-driven pane still shows its badge.
     pub fn agent_panes(&self) -> Vec<(PaneId, AgentKind, Arc<PtyPane>)> {
         self.panes
             .iter()
-            .filter(|(_, s)| s.meta.exited.is_none())
+            .filter(|(_, s)| s.meta.exited.is_none() && !s.hook_seen)
             .filter_map(|(id, s)| {
                 s.meta
                     .agent
@@ -454,6 +469,63 @@ impl Session {
                     .map(|agent| (*id, agent, Arc::clone(&s.pty)))
             })
             .collect()
+    }
+
+    /// Apply a Claude Code hook event to `pane`, marking it hook-driven. Returns
+    /// what moved so the caller broadcasts the right event(s): a state transition
+    /// (via the shared `AgentState::apply`) drives `StateChanged`; a subagent-list
+    /// change drives `LayoutChanged`. `None` for an unknown pane (a hook must
+    /// never fail because its pane has gone away).
+    pub fn apply_agent_event(
+        &mut self,
+        pane: PaneId,
+        event: AgentHookEvent,
+    ) -> Option<AgentEventOutcome> {
+        let slot = self.panes.get_mut(&pane)?;
+        slot.hook_seen = true;
+        let subs = &mut slot.meta.subagents;
+        let mut subagents_changed = false;
+        let mut classified = None;
+        match event {
+            AgentHookEvent::SubagentStarted { id, desc } => {
+                subs.push(SubagentInfo {
+                    id,
+                    desc,
+                    running: true,
+                });
+                if subs.len() > SUBAGENT_CAP {
+                    subs.remove(0);
+                }
+                subagents_changed = true;
+            }
+            AgentHookEvent::SubagentStopped { id } => {
+                subagents_changed = stop_subagent(subs, &id);
+            }
+            AgentHookEvent::Activity { .. } => {
+                classified = Some(Observation::Working);
+            }
+            AgentHookEvent::Blocked { .. } => {
+                classified = Some(Observation::Blocked);
+            }
+            AgentHookEvent::Done => {
+                classified = Some(Observation::Done);
+                // The turn ended: sweep the finished subagents that were kept
+                // around only to show their completion.
+                let before = subs.len();
+                subs.retain(|s| s.running);
+                subagents_changed = subs.len() != before;
+            }
+        }
+        let transition = classified.and_then(|obs| {
+            let from = slot.meta.state;
+            let to = from.apply(StateEvent::Classified(obs));
+            slot.meta.state = to;
+            (from != to).then_some((from, to))
+        });
+        Some(AgentEventOutcome {
+            transition,
+            subagents_changed,
+        })
     }
 
     /// Record the agent kind detected for a pane. Returns whether it changed.
@@ -586,13 +658,19 @@ impl Session {
     fn spawn_into_tab(
         &mut self,
         tab: TabId,
-        spec: PtySpec,
+        mut spec: PtySpec,
         title: String,
         split: Option<(PaneId, Direction)>,
         ephemeral: bool,
     ) -> Result<PaneId> {
-        let pty = Arc::new(PtyPane::spawn(spec, self.size).context("spawn pty")?);
+        // Allocate the id before spawning so it can be exported to the child:
+        // a Claude Code hook reads `TUTTI_PANE`/`TUTTI_SESSION` to address this
+        // exact pane on this daemon's socket. Every spawn path funnels here, so
+        // this is the one place the pane env is stamped.
         let id = self.ids.pane();
+        spec.env.push(("TUTTI_PANE".into(), id.0.to_string()));
+        spec.env.push(("TUTTI_SESSION".into(), self.name.clone()));
+        let pty = Arc::new(PtyPane::spawn(spec, self.size).context("spawn pty")?);
         let entry = self.tab_mut(tab).context("target tab vanished")?;
         entry.layout = Some(match (&entry.layout, split) {
             (None, _) => Layout::Leaf(id),
@@ -613,14 +691,40 @@ impl Session {
                     agent: None,
                     state: AgentState::default(),
                     exited: None,
+                    subagents: Vec::new(),
                 },
                 pty,
                 tab,
                 ephemeral,
+                hook_seen: false,
             },
         );
         Ok(id)
     }
+}
+
+/// What `apply_agent_event` changed, so the server broadcasts the right events.
+pub struct AgentEventOutcome {
+    /// The pane's `(from, to)` state transition, when the event moved it.
+    pub transition: Option<(AgentState, AgentState)>,
+    /// Whether the subagent list changed (so a fresh view must be broadcast).
+    pub subagents_changed: bool,
+}
+
+/// Mark a subagent stopped. Prefers the running entry whose id matches; failing
+/// that (a Claude `SubagentStop` carries no id that lines up with the `Task`
+/// tool_input) it finishes the oldest still-running subagent. Returns whether
+/// anything changed.
+fn stop_subagent(subs: &mut [SubagentInfo], id: &str) -> bool {
+    if let Some(s) = subs.iter_mut().find(|s| s.running && s.id == id) {
+        s.running = false;
+        return true;
+    }
+    if let Some(s) = subs.iter_mut().find(|s| s.running) {
+        s.running = false;
+        return true;
+    }
+    false
 }
 
 fn pane_info(slot: &PaneSlot) -> PaneInfo {
@@ -673,9 +777,42 @@ fn parse_head(contents: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{git_branch, parse_head};
+    use super::{git_branch, parse_head, stop_subagent};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use tutti_core::SubagentInfo;
+
+    fn sub(id: &str, running: bool) -> SubagentInfo {
+        SubagentInfo {
+            id: id.into(),
+            desc: id.into(),
+            running,
+        }
+    }
+
+    #[test]
+    fn stop_subagent_prefers_a_matching_running_id() {
+        let mut subs = vec![sub("a", true), sub("b", true)];
+        assert!(stop_subagent(&mut subs, "b"));
+        assert!(subs[0].running, "the unmatched entry keeps running");
+        assert!(!subs[1].running, "the id match is finished");
+    }
+
+    #[test]
+    fn stop_subagent_falls_back_to_the_oldest_running() {
+        // No id matches (the real SubagentStop id never lines up), so the oldest
+        // still-running subagent is finished.
+        let mut subs = vec![sub("a", false), sub("b", true), sub("c", true)];
+        assert!(stop_subagent(&mut subs, "no-such-id"));
+        assert!(!subs[1].running, "the oldest running entry is finished");
+        assert!(subs[2].running, "later running entries are untouched");
+    }
+
+    #[test]
+    fn stop_subagent_with_nothing_running_is_a_noop() {
+        let mut subs = vec![sub("a", false)];
+        assert!(!stop_subagent(&mut subs, "a"));
+    }
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 

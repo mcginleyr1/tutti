@@ -126,6 +126,7 @@ mod tests {
             agent: None,
             state: AgentState::Idle,
             exited: None,
+            subagents: Vec::new(),
         }]);
         assert_eq!(
             rendered,

@@ -1317,6 +1317,7 @@ fn placeholder_info(pane: PaneId) -> PaneInfo {
         agent: None::<AgentKind>,
         state: AgentState::Unknown,
         exited: None,
+        subagents: Vec::new(),
     }
 }
 

@@ -7,7 +7,8 @@ use std::path::PathBuf;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tutti_core::{
-    AgentState, Direction, Layout, PaneId, PaneInfo, TabId, TabView, WorkspaceId, WorkspaceView,
+    AgentState, Direction, Layout, PaneId, PaneInfo, SubagentInfo, TabId, TabView, WorkspaceId,
+    WorkspaceView,
 };
 
 /// A leaf layout holding pane `id`.
@@ -33,6 +34,16 @@ pub(crate) fn pane(id: u64, title: &str, agent: Option<&str>, state: AgentState)
         agent: agent.map(Into::into),
         state,
         exited: None,
+        subagents: Vec::new(),
+    }
+}
+
+/// A subagent row: `desc` and whether it is still running.
+pub(crate) fn sub(desc: &str, running: bool) -> SubagentInfo {
+    SubagentInfo {
+        id: desc.into(),
+        desc: desc.into(),
+        running,
     }
 }
 

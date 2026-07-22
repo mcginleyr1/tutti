@@ -3,7 +3,7 @@
 //! the row arithmetic mapping a click to an entry. No rendering, no state, so
 //! the sections, sort order, and hit-testing are unit-tested in isolation.
 
-use tutti_core::{AgentState, PaneId, TabId, WorkspaceView};
+use tutti_core::{AgentState, PaneId, SubagentInfo, TabId, WorkspaceView};
 
 /// One selectable sidebar row: a workspace (jumps to a tab) or an agent pane
 /// (jumps to a tab and focuses the pane).
@@ -39,6 +39,10 @@ pub struct AgentRow {
     pub title: String,
     pub state: AgentState,
     pub kind: String,
+    /// Hook-reported subagents, rendered as dim indented sub-rows under this
+    /// agent. Display-only: they are never selectable, but they add height, so
+    /// `entry_at_row` accounts for them.
+    pub subagents: Vec<SubagentInfo>,
 }
 
 /// The sidebar's contents: workspace rows then agent rows. `workspace_count`
@@ -60,10 +64,11 @@ impl Sidebar {
     }
 
     /// The entry a click at `row` (relative to the sidebar's inner top) selects,
-    /// or `None` for padding, a header, the section gap, or empty space. The
-    /// layout mirrors the renderer: a blank top-pad row, the workspaces header,
-    /// two rows per workspace, a blank, the agents header, then two rows per
-    /// agent (or one placeholder row when there are none).
+    /// or `None` for padding, a header, the section gap, a subagent sub-row, or
+    /// empty space. The layout mirrors the renderer: a blank top-pad row, the
+    /// workspaces header, two rows per workspace, a blank, the agents header,
+    /// then — per agent — its two rows plus one dim sub-row per subagent (a click
+    /// on which selects nothing). An empty agents section is one placeholder row.
     pub fn entry_at_row(&self, row: usize) -> Option<usize> {
         let ws_start = TOP_PAD + 1; // top pad + workspaces header
         let ws_end = ws_start + 2 * self.workspace_count;
@@ -71,9 +76,20 @@ impl Sidebar {
             return Some((row - ws_start) / 2);
         }
         let agents_start = ws_end + 2; // blank line + agents header
-        let agents_end = agents_start + 2 * (self.entries.len() - self.workspace_count);
-        if (agents_start..agents_end).contains(&row) {
-            return Some(self.workspace_count + (row - agents_start) / 2);
+        if row < agents_start {
+            return None;
+        }
+        // Each agent block is its two rows followed by its subagent sub-rows; a
+        // click on the two head rows selects the agent, one on a sub-row does not.
+        let mut cursor = agents_start;
+        for (idx, entry) in self.entries.iter().enumerate().skip(self.workspace_count) {
+            let SidebarEntry::Agent(a) = entry else {
+                continue;
+            };
+            if row == cursor || row == cursor + 1 {
+                return Some(idx);
+            }
+            cursor += 2 + a.subagents.len();
         }
         None
     }
@@ -117,6 +133,7 @@ pub fn build(workspaces: &[WorkspaceView], active_tab: Option<TabId>) -> Sidebar
                         title: pane.title.clone(),
                         state: pane.state,
                         kind: agent.to_string(),
+                        subagents: pane.subagents.clone(),
                     });
                 }
             }
@@ -158,8 +175,27 @@ fn shorten_home(dir: &std::path::Path, home: Option<std::path::PathBuf>) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::attach::fixtures::{agent, leaf, pane, split, tab, workspace};
+    use crate::attach::fixtures::{agent, leaf, pane, split, sub, tab, workspace};
     use tutti_core::Direction;
+
+    /// One workspace (active tab) with two agents; the first (Working, so sorted
+    /// ahead of the second's Done) carries two subagents — one running, one done.
+    fn view_with_subagents() -> Vec<WorkspaceView> {
+        let mut first = agent(1, "claude", AgentState::Working);
+        first.subagents = vec![sub("build core", true), sub("write tests", false)];
+        vec![workspace(
+            1,
+            "api",
+            Some("main"),
+            vec![tab(
+                1,
+                "1",
+                true,
+                split(Direction::Horizontal, leaf(1), leaf(2)),
+                vec![first, agent(2, "codex", AgentState::Done)],
+            )],
+        )]
+    }
 
     /// Two workspaces: `api` (tab 1) with a working agent and a plain shell;
     /// `web` (tab 2, the active tab) with a blocked agent and a done agent.
@@ -332,5 +368,34 @@ mod tests {
         assert_eq!(sidebar.entry_at_row(13), Some(4));
         // Past the last agent.
         assert_eq!(sidebar.entry_at_row(14), None);
+    }
+
+    #[test]
+    fn build_carries_subagents_onto_the_agent_row() {
+        let sidebar = build(&view_with_subagents(), Some(TabId(1)));
+        let SidebarEntry::Agent(a) = &sidebar.entries[1] else {
+            panic!("expected the first agent row");
+        };
+        assert_eq!(a.subagents.len(), 2);
+        assert_eq!(a.subagents[0].desc, "build core");
+        assert!(a.subagents[0].running, "the first subagent is running");
+        assert!(!a.subagents[1].running, "the second subagent has finished");
+    }
+
+    #[test]
+    fn entry_at_row_skips_subagent_rows_and_shifts_the_next_agent_down() {
+        let sidebar = build(&view_with_subagents(), Some(TabId(1)));
+        // One workspace: rows 2-3. Blank 4, agents header 5.
+        assert_eq!(sidebar.entry_at_row(2), Some(0), "the workspace row");
+        // Agent entry 1 (with two subagents) occupies rows 6-7 as its head.
+        assert_eq!(sidebar.entry_at_row(6), Some(1));
+        assert_eq!(sidebar.entry_at_row(7), Some(1));
+        // Its two subagent sub-rows (8-9) are display-only: not selectable.
+        assert_eq!(sidebar.entry_at_row(8), None);
+        assert_eq!(sidebar.entry_at_row(9), None);
+        // The next agent is pushed down past the sub-rows, to 10-11.
+        assert_eq!(sidebar.entry_at_row(10), Some(2));
+        assert_eq!(sidebar.entry_at_row(11), Some(2));
+        assert_eq!(sidebar.entry_at_row(12), None, "past the last agent");
     }
 }

@@ -10,6 +10,7 @@ pub use frame::{Frame, FrameError, MAX_FRAME_LEN, PaneData};
 pub use ids::{PaneId, TabId, WorkspaceId};
 pub use paths::{socket_dir, socket_path};
 pub use protocol::{
-    Event, PaneInfo, Request, Response, TabInfo, TabView, WorkspaceInfo, WorkspaceView,
+    AgentHookEvent, Event, PaneInfo, Request, Response, SubagentInfo, TabInfo, TabView,
+    WorkspaceInfo, WorkspaceView,
 };
 pub use state::{AgentState, Observation, StateEvent};

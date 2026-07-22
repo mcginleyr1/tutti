@@ -206,12 +206,13 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    (`jj workspace update-stale`). ✅ `tutti workspace diff [--stat]` serves
    per-workspace diffs (sidebar shows `N files +A −B` per workspace, refreshed on
    state transitions). Merging back stays a human decision.
-6. **Agent-event ingest + Claude Code hook integration**: panes get
-   `TUTTI_PANE`/`TUTTI_SESSION` in their env; a shipped hook config makes the
-   agent call `tutti agent-event` on subagent spawn/tool-use/stop and on
-   permission notifications. Server attaches live subagent rows to the pane
-   (shown indented under the agent in the sidebar) and upgrades Blocked/Done
-   detection from screen heuristics to exact hook signals. Display only — tutti
+6. **Agent-event ingest + Claude Code hook integration**: ✅ panes get
+   `TUTTI_PANE`/`TUTTI_SESSION` in their env; `tutti hooks claude` prints a hook
+   config that makes the agent call `tutti agent-event claude` on subagent
+   spawn/tool-use/stop and on permission notifications. Server attaches live
+   subagent rows to the pane (shown indented under the agent in the sidebar) and
+   upgrades Blocked/Done detection from screen heuristics to exact hook signals
+   (a hook-driven pane is skipped by the screen classifier). Display only — tutti
    does not manage a foreign agent's subagents.
 
 **Acceptance:** a script (or an agent) can: create 3 worktree workspaces, launch an

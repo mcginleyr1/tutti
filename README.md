@@ -251,6 +251,39 @@ they block or finish. The alpha registry detects `claude` and `codex`; adding an
 agent is one data-table row in `crates/tutti-agents` (codex screen patterns are
 seeds pending live tuning).
 
+## Claude Code integration
+
+Every pane tutti spawns exports `TUTTI_PANE` (the pane id) and `TUTTI_SESSION`
+(the session name) into its environment. A Claude Code instance running in such
+a pane can report ground-truth lifecycle events back to tutti through Claude
+Code's hooks, replacing the screen-heuristic guessing with exact signals.
+
+Print the hook config and add it to your Claude Code settings:
+
+```
+tutti hooks claude          # prints the settings.json snippet (install notes on stderr)
+tutti hooks claude --raw    # just the JSON, for piping
+```
+
+Merge the printed `hooks` object into `~/.claude/settings.json` (or a project's
+`.claude/settings.json`). Each wired event runs `tutti agent-event claude`, which
+reads the hook JSON on stdin, maps it, and forwards it to the pane's daemon:
+
+- a tool use keeps the agent **working**; a permission/idle **Notification**
+  marks it **blocked**; **Stop** marks it **done**;
+- a **Task** (subagent) spawn adds a dim indented sub-row under the agent in the
+  sidebar — a shared spinner while it runs, a `·` once it finishes — and
+  **SubagentStop** completes it; finished sub-rows clear when the turn ends.
+
+`agent-event` is deliberately fail-safe: outside a tutti pane (no `TUTTI_PANE`),
+on a malformed or irrelevant event, or when it cannot reach the daemon, it exits
+0 and sends nothing — a hook never breaks a Claude session.
+
+Hooks are ground truth: once a pane reports one, tutti stops classifying that
+pane's state from its screen (the heuristics would only fight the exact signals).
+Agent **detection** (which kind of agent runs there) is unaffected, so the badge
+still appears. Display only — tutti never manages a foreign agent's subagents.
+
 ## CLI surface
 
 Every TUI action is also a CLI verb over the daemon socket — if it isn't
@@ -268,6 +301,8 @@ tutti pane split <pane> right|down
 tutti pane list | kill | rename | focus <pane>
 tutti pane send <pane> --text <s> | --keys <s>
 tutti pane read <pane> [--lines N] [--unwrapped]
+tutti hooks claude [--raw]           # print the Claude Code hooks snippet to wire agent-event
+tutti agent-event claude             # forward a Claude Code hook event (JSON on stdin) — used by hooks
 tutti [attach]                       # bare `tutti` attaches; a fresh session asks where to start
 ```
 

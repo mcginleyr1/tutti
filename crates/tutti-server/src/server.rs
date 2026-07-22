@@ -21,8 +21,8 @@ use tokio::sync::mpsc;
 
 use tutti_agents::{ProcessTree, Registry};
 use tutti_core::{
-    AgentKind, Direction, Event, Frame, PaneData, PaneId, Request, Response, StateEvent,
-    WorkspaceId,
+    AgentHookEvent, AgentKind, Direction, Event, Frame, PaneData, PaneId, Request, Response,
+    StateEvent, WorkspaceId,
 };
 
 use crate::jj;
@@ -111,7 +111,7 @@ pub async fn serve(
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "tutti".to_string());
     let hub = Arc::new(Hub {
-        session: Mutex::new(Session::new(size)),
+        session: Mutex::new(Session::new(size, name.clone())),
         clients: Mutex::new(HashMap::new()),
         last: Mutex::new(HashMap::new()),
         next_client: AtomicU64::new(0),
@@ -443,6 +443,7 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             direction,
             delta,
         } => resize_split(hub, pane, direction, delta),
+        Request::AgentEvent { pane, event } => agent_event(hub, pane, event),
         // Handled in `handle_frame`; unreachable here.
         Request::Attach
         | Request::Detach
@@ -485,6 +486,28 @@ fn focus_pane(hub: &Arc<Hub>, pane: PaneId) -> Response {
     session.set_pane_state(pane, to);
     drop(session);
     if from != to {
+        broadcast_event(hub, Event::StateChanged { pane, from, to });
+    }
+    Response::Ok
+}
+
+/// Ingest a Claude Code hook event for `pane`: fold it onto the pane's exact
+/// state and subagent list, then broadcast what moved. A subagent-list change
+/// broadcasts the fresh view (`LayoutChanged`); a state move broadcasts
+/// `StateChanged` so a Blocked/Done still rings the client bell. Both can fire.
+/// An unknown pane is a silent `Ok` — the hook must never fail on tutti's side.
+/// The session guard is dropped before any broadcast (which re-locks `clients`).
+fn agent_event(hub: &Arc<Hub>, pane: PaneId, event: AgentHookEvent) -> Response {
+    let mut session = hub.session();
+    let Some(outcome) = session.apply_agent_event(pane, event) else {
+        return Response::Ok;
+    };
+    let view = outcome.subagents_changed.then(|| session.view());
+    drop(session);
+    if let Some(view) = view {
+        broadcast_event(hub, Event::LayoutChanged { workspaces: view });
+    }
+    if let Some((from, to)) = outcome.transition {
         broadcast_event(hub, Event::StateChanged { pane, from, to });
     }
     Response::Ok

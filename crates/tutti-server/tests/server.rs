@@ -13,7 +13,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
 use tutti_core::{
-    AgentState, Direction, Event, Frame, Layout, PaneData, PaneId, Request, Response, WorkspaceId,
+    AgentHookEvent, AgentState, Direction, Event, Frame, Layout, PaneData, PaneId, Request,
+    Response, SubagentInfo, WorkspaceId,
 };
 use tutti_server::{PaneSize, serve};
 
@@ -569,6 +570,207 @@ async fn wedged_client_is_dropped_but_others_keep_flowing() {
         .await
         .expect("well-behaved client round-trip timed out")
         .expect("good task panicked");
+
+    server.stop().await;
+}
+
+/// Every spawned pane carries `TUTTI_PANE` (its id) and `TUTTI_SESSION` (the
+/// socket's session name) in its environment, so a Claude Code hook running
+/// inside it can address this daemon. The test server's socket is `s.sock`, so
+/// the session name is `s`.
+#[tokio::test]
+async fn spawned_pane_carries_tutti_env() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let pane = run_marker(
+        &mut conn,
+        "printf 'ENV %s %s\\n' \"$TUTTI_PANE\" \"$TUTTI_SESSION\"; sleep 30",
+    )
+    .await;
+    assert!(
+        read_until(&mut conn, pane, &format!("ENV {pane} s")).await,
+        "the pane env should carry TUTTI_PANE=<id> and TUTTI_SESSION=<name>"
+    );
+    server.stop().await;
+}
+
+/// The subagents of `pane` from a fresh `pane list`.
+async fn pane_subagents(conn: &mut Conn, pane: PaneId) -> Vec<SubagentInfo> {
+    match conn.request(Request::PaneList).await {
+        Response::Panes { panes } => panes
+            .into_iter()
+            .find(|p| p.id == pane)
+            .map(|p| p.subagents)
+            .unwrap_or_default(),
+        other => panic!("expected Panes, got {other:?}"),
+    }
+}
+
+/// Run a plain (non-agent) sleeper pane and return its id.
+async fn run_sleeper(conn: &mut Conn) -> PaneId {
+    new_workspace(conn).await;
+    pane_id(
+        conn.request(Request::PaneRun {
+            tab: None,
+            cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+            ephemeral: false,
+        })
+        .await,
+    )
+}
+
+/// A `Blocked` hook event flips the pane's state and broadcasts `StateChanged`
+/// to an attached client within a tick — no screen classification involved.
+#[tokio::test]
+async fn agent_event_blocks_and_broadcasts() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let pane = run_sleeper(&mut control).await;
+
+    let mut viewer = server.connect().await;
+    viewer.send(&Request::Attach).await;
+    assert!(matches!(viewer.response().await, Response::Attached { .. }));
+
+    assert_eq!(
+        control
+            .request(Request::AgentEvent {
+                pane,
+                event: AgentHookEvent::Blocked {
+                    message: Some("allow edit?".into()),
+                },
+            })
+            .await,
+        Response::Ok
+    );
+
+    let mut order = Vec::new();
+    wait_state_event(&mut viewer, pane, AgentState::Blocked, &mut order).await;
+
+    server.stop().await;
+}
+
+/// Subagent hook events maintain the pane's subagent list: started rows are
+/// appended and capped at 16 (oldest dropped), a stop finishes a row, and a
+/// `Done` sweeps the finished rows out.
+#[tokio::test]
+async fn agent_event_maintains_subagent_list_with_cap() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let pane = run_sleeper(&mut conn).await;
+
+    // Twenty starts, list caps at 16 with the four oldest (s0..s3) dropped.
+    for i in 0..20 {
+        assert_eq!(
+            conn.request(Request::AgentEvent {
+                pane,
+                event: AgentHookEvent::SubagentStarted {
+                    id: format!("s{i}"),
+                    desc: format!("task {i}"),
+                },
+            })
+            .await,
+            Response::Ok
+        );
+    }
+    let subs = pane_subagents(&mut conn, pane).await;
+    assert_eq!(subs.len(), 16, "the subagent list caps at 16");
+    assert_eq!(
+        subs.first().unwrap().id,
+        "s4",
+        "the oldest four are dropped"
+    );
+    assert!(subs.iter().all(|s| s.running), "all still running");
+
+    // Stopping s4 (a matching id) finishes just that row.
+    assert_eq!(
+        conn.request(Request::AgentEvent {
+            pane,
+            event: AgentHookEvent::SubagentStopped { id: "s4".into() },
+        })
+        .await,
+        Response::Ok
+    );
+    let subs = pane_subagents(&mut conn, pane).await;
+    assert!(
+        !subs.iter().find(|s| s.id == "s4").unwrap().running,
+        "the stopped subagent is marked finished but kept"
+    );
+    assert_eq!(subs.len(), 16, "a finished subagent is kept until Done");
+
+    // Done sweeps the finished row, leaving only the running ones.
+    assert_eq!(
+        conn.request(Request::AgentEvent {
+            pane,
+            event: AgentHookEvent::Done,
+        })
+        .await,
+        Response::Ok
+    );
+    let subs = pane_subagents(&mut conn, pane).await;
+    assert_eq!(subs.len(), 15, "Done sweeps the finished subagent");
+    assert!(subs.iter().all(|s| s.running), "only running rows remain");
+
+    server.stop().await;
+}
+
+/// Once a pane reports a hook event it is hook-driven: the screen classifier
+/// stops touching it, so a working-pattern that would otherwise move a detected
+/// agent to `Working` leaves the hook-set `Blocked` state untouched.
+#[tokio::test]
+async fn hook_driven_pane_ignores_screen_classification() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    // A `cat` renamed `claude` is detected as an agent and echoes sent text onto
+    // its screen, so a working-pattern can be fed to the classifier.
+    let bin = copy_bin("claude", "/bin/cat");
+    new_workspace(&mut conn).await;
+    let pane = pane_id(
+        conn.request(Request::PaneRun {
+            tab: None,
+            cmd: vec![bin.display().to_string()],
+            ephemeral: false,
+        })
+        .await,
+    );
+    assert!(
+        wait_agent(&mut conn, pane, "claude").await,
+        "the pane should be detected as the claude agent first"
+    );
+
+    // A hook Blocked event sets the state and marks the pane hook-driven.
+    assert_eq!(
+        conn.request(Request::AgentEvent {
+            pane,
+            event: AgentHookEvent::Blocked { message: None },
+        })
+        .await,
+        Response::Ok
+    );
+    assert!(
+        wait_state(&mut conn, pane, AgentState::Blocked).await,
+        "the hook event should set the pane Blocked"
+    );
+
+    // Feed a working-pattern: it would move a non-hook agent to Working, but the
+    // classifier skips a hook-driven pane, so the state must stay Blocked.
+    assert_eq!(
+        conn.request(Request::PaneSend {
+            pane,
+            text: Some("esc to interrupt\n".into()),
+            keys: None,
+        })
+        .await,
+        Response::Ok
+    );
+    // Several classify passes (300ms each) go by; the state must not budge.
+    sleep(Duration::from_millis(900)).await;
+    assert!(
+        matches!(
+            conn.request(Request::PaneList).await,
+            Response::Panes { panes } if panes.iter().any(|p| p.id == pane && p.state == AgentState::Blocked)
+        ),
+        "a hook-driven pane must ignore the screen classifier and stay Blocked"
+    );
 
     server.stop().await;
 }

@@ -9,7 +9,7 @@ use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
-use tutti_core::{AgentState, PaneId, PaneInfo};
+use tutti_core::{AgentState, PaneId, PaneInfo, SubagentInfo};
 
 use super::app::{App, Mode};
 use super::sidebar::{AgentRow, SidebarEntry, WorkspaceRow};
@@ -171,6 +171,9 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
                 let sel = pop && selected == i;
                 lines.push(agent_line(a, sel, spinner, w));
                 lines.push(agent_subtitle(a, sel, app.is_notified(a.pane), w));
+                for subagent in &a.subagents {
+                    lines.push(subagent_line(subagent, spinner, w));
+                }
             }
         }
     }
@@ -286,6 +289,18 @@ fn workspace_subtitle(
         }
     }
     finish_row(vec![Span::styled(left, dim())], sel, width)
+}
+
+/// A subagent sub-row under its agent: dim and indented, a shared spinner while
+/// running so all live subagents animate in lockstep, a `·` once finished.
+/// Display-only — never selectable, so it takes no selection gutter.
+fn subagent_line(sub: &SubagentInfo, spinner: char, width: u16) -> Line<'static> {
+    let glyph = if sub.running { spinner } else { '·' };
+    finish_row(
+        vec![Span::styled(format!("  {glyph} {}", sub.desc), dim())],
+        false,
+        width,
+    )
 }
 
 /// A dim placeholder line so an empty section never looks broken.
@@ -958,6 +973,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sidebar_renders_subagent_rows_under_a_hook_driven_agent() {
+        use crate::attach::fixtures::{agent, leaf, sub};
+        let mut app = App::with_config(Config::parse("sidebar = \"on\"\n").unwrap());
+        let mut agent_pane = agent(1, "claude", AgentState::Working);
+        agent_pane.subagents = vec![sub("build the core", true), sub("write the tests", false)];
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Response::Attached {
+                session: "demo".into(),
+                workspaces: vec![workspace(
+                    1,
+                    "api",
+                    Some("main"),
+                    vec![tab(1, "1", true, leaf(1), vec![agent_pane])],
+                )],
+            })
+            .unwrap(),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("build the core"),
+            "a running subagent sub-row is missing: {text:?}"
+        );
+        assert!(
+            text.contains("write the tests"),
+            "a finished subagent sub-row is missing: {text:?}"
+        );
+    }
+
     fn accent_bar_row(buf: &Buffer) -> Option<u16> {
         let w = buf.area.width;
         buf.content()
@@ -1078,6 +1124,7 @@ mod tests {
             agent: Some("claude".into()),
             state: AgentState::Blocked,
             exited: None,
+            subagents: Vec::new(),
         };
         assert_eq!(title_text(&info), "claude · blocked");
     }
@@ -1090,6 +1137,7 @@ mod tests {
             agent: Some("claude".into()),
             state: AgentState::Working,
             exited: None,
+            subagents: Vec::new(),
         };
         assert_eq!(title_text(&info), "claude · ⠋ working");
     }
@@ -1102,6 +1150,7 @@ mod tests {
             agent: None,
             state: AgentState::Unknown,
             exited: None,
+            subagents: Vec::new(),
         };
         assert_eq!(title_text(&info), "zsh", "no `· unknown` suffix");
     }
@@ -1114,6 +1163,7 @@ mod tests {
             agent: None,
             state: AgentState::Done,
             exited: Some(0),
+            subagents: Vec::new(),
         };
         assert_eq!(title_text(&info), "zsh exited 0");
     }
