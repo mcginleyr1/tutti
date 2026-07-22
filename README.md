@@ -69,6 +69,7 @@ preset:
 | --- | --- |
 | `%` / `"` | split right / split down |
 | `n` / `p` / `c` | next / previous / new tab |
+| `w` | focus the workspace/agent sidebar |
 | `o`, arrows | focus next pane / directional focus |
 | `z` | zoom focused pane |
 | `x` | kill pane (confirms) |
@@ -96,6 +97,8 @@ the offending entry (nothing is silently ignored).
 prefix = "C-b"          # prefix chord
 mouse = true            # master mouse switch
 preset = "default"      # prefix keymap: "default" (emacs/tmux-flavored) or "vim"
+sidebar = "auto"        # workspace/agent sidebar: "auto", "on", or "off"
+notifications = true    # re-emit pane bells/notifications to your real terminal
 
 [keys]                  # direct bindings; every entry optional; "none" disables
 focus_left  = "C-h"
@@ -126,6 +129,45 @@ An unknown preset is a hard error. A dedicated `emacs` preset may land later; fo
 now `default` already covers that muscle memory. The `[keys]` direct bindings are
 shared across presets and override the defaults on top (e.g. set
 `focus_left = "none"` to reclaim `C-h` regardless of preset).
+
+## Sidebar
+
+A left column that turns the TUI into a control center for many projects and
+agents at once. It has two stacked sections:
+
+- **WORKSPACES** — one row per workspace: its name (bold when it owns the active
+  tab) over a dim line showing the git branch (read straight from `.git/HEAD`,
+  including worktrees) or the directory name. Selecting one jumps to its tab.
+- **AGENTS** — one row per agent pane across *every* workspace: a state-coloured
+  dot (blocked red, working yellow, done green, idle/unknown dim), the pane
+  title, and a dim `state · kind` line. Sorted blocked-first so whatever needs
+  you is at the top. Selecting one jumps to that pane, switching workspace and
+  tab as needed. A pane that rings a bell or fires a desktop notification while
+  in the background gets a 🔔 mark here that clears when you focus it.
+
+Press the prefix then `w` to focus the sidebar (revealing it if hidden). While
+focused, `j`/`k` (or the arrows) move the highlight across both sections, `Enter`
+jumps and hands focus back to the pane, `esc`/`w` unfocus, and `n` opens a
+one-line `dir:` prompt to create a new workspace (`~` expands to your home;
+relative paths resolve against the client's cwd; a bad directory surfaces the
+server's error). A mouse click focuses the sidebar, or jumps straight to the
+entry clicked.
+
+Visibility is set by the `sidebar` config value: `auto` (default) shows it once
+the session is worth surfacing — more than one workspace, or at least one agent
+pane — while `on` always shows it and `off` keeps it hidden until you focus it
+with `w`. It is suppressed on very narrow terminals so panes keep usable room;
+there, the blocked-first status-bar badges remain the fallback surface.
+
+### Notifications
+
+Agents inside panes emit terminal bells and desktop-notification escapes (OSC 9,
+OSC 777). Tutti captures these from each pane's output and, for a **background**
+(non-focused) pane, flashes the text in the status bar and re-emits a bell plus
+an OSC 9 to *your* real terminal — so wezterm/kitty/etc. raise an actual desktop
+notification naming the pane. The focused pane is left alone (you are already
+looking). The status flash and re-emit are gated by `notifications = true`
+(default); the sidebar 🔔 mark is always on regardless.
 
 ## Agent state badges
 

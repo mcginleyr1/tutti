@@ -4,7 +4,7 @@
 //! which panes it touched so the caller can drive the pty lifecycle.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -219,6 +219,7 @@ impl Session {
             .map(|w| WorkspaceView {
                 id: w.id,
                 name: w.name.clone(),
+                branch: git_branch(&w.dir),
                 tabs: w
                     .tabs
                     .iter()
@@ -534,4 +535,124 @@ fn pane_title(program: &str) -> String {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| program.to_string())
+}
+
+/// The current git branch of `dir`, read straight from `.git/HEAD` — no
+/// subprocess. Handles `.git` as a directory and as a worktree/submodule file
+/// (`gitdir: <path>`). Returns `None` when `dir` is not a checkout or HEAD is
+/// unreadable.
+fn git_branch(dir: &Path) -> Option<String> {
+    let git = dir.join(".git");
+    let head = if git.is_dir() {
+        git.join("HEAD")
+    } else {
+        let pointer = std::fs::read_to_string(&git).ok()?;
+        let target = pointer.trim().strip_prefix("gitdir:")?.trim();
+        let gitdir = Path::new(target);
+        let gitdir = if gitdir.is_absolute() {
+            gitdir.to_path_buf()
+        } else {
+            dir.join(gitdir)
+        };
+        gitdir.join("HEAD")
+    };
+    parse_head(&std::fs::read_to_string(head).ok()?)
+}
+
+/// A branch name from `HEAD` contents: `ref: refs/heads/<name>` yields `<name>`;
+/// a detached bare hash yields its first 8 chars; empty yields `None`.
+fn parse_head(contents: &str) -> Option<String> {
+    let line = contents.lines().next()?.trim();
+    if let Some(reference) = line.strip_prefix("ref:") {
+        let reference = reference.trim();
+        let name = reference.strip_prefix("refs/heads/").unwrap_or(reference);
+        Some(name.to_string())
+    } else if line.is_empty() {
+        None
+    } else {
+        Some(line.chars().take(8).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{git_branch, parse_head};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// A unique empty temp directory, cleaned up on drop. Avoids a dev-dep on a
+    /// tempdir crate (the workspace forbids new deps).
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("tutti-branch-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn parse_head_reads_ref_form() {
+        assert_eq!(
+            parse_head("ref: refs/heads/main\n").as_deref(),
+            Some("main")
+        );
+        assert_eq!(
+            parse_head("ref: refs/heads/feature/x\n").as_deref(),
+            Some("feature/x")
+        );
+    }
+
+    #[test]
+    fn parse_head_reads_detached_hash_as_prefix() {
+        assert_eq!(
+            parse_head("0123456789abcdef0123456789abcdef01234567\n").as_deref(),
+            Some("01234567")
+        );
+    }
+
+    #[test]
+    fn parse_head_empty_is_none() {
+        assert_eq!(parse_head(""), None);
+        assert_eq!(parse_head("\n"), None);
+    }
+
+    #[test]
+    fn git_branch_reads_ref_from_git_dir() {
+        let tmp = TempDir::new();
+        let git = tmp.path().join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/trunk\n").unwrap();
+        assert_eq!(git_branch(tmp.path()).as_deref(), Some("trunk"));
+    }
+
+    #[test]
+    fn git_branch_follows_gitdir_file_indirection() {
+        let tmp = TempDir::new();
+        // A worktree/submodule `.git` is a file pointing at the real git dir.
+        let real = tmp.path().join("real-git");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("HEAD"), "ref: refs/heads/wt\n").unwrap();
+        std::fs::write(tmp.path().join(".git"), "gitdir: real-git\n").unwrap();
+        assert_eq!(git_branch(tmp.path()).as_deref(), Some("wt"));
+    }
+
+    #[test]
+    fn git_branch_missing_head_is_none() {
+        let tmp = TempDir::new();
+        assert_eq!(git_branch(tmp.path()), None);
+    }
 }

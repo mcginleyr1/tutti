@@ -112,6 +112,9 @@ pub struct PaneInfo {
 pub struct WorkspaceView {
     pub id: WorkspaceId,
     pub name: String,
+    /// The workspace's current git branch, when its directory is a git
+    /// checkout. `None` when it is not a repo or HEAD is unreadable.
+    pub branch: Option<String>,
     pub tabs: Vec<TabView>,
 }
 
@@ -184,6 +187,14 @@ pub enum Event {
     LayoutChanged {
         workspaces: Vec<WorkspaceView>,
     },
+    /// A pane emitted a bell or desktop-notification escape (OSC 9 / 777). A
+    /// bare bell carries no text; OSC 9 fills `body`; OSC 777 fills `title`
+    /// and/or `body`. Purely an attention signal — it never drives pane state.
+    PaneNotification {
+        pane: PaneId,
+        title: Option<String>,
+        body: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -246,6 +257,7 @@ mod tests {
         vec![WorkspaceView {
             id: WorkspaceId(1),
             name: "api".into(),
+            branch: Some("main".into()),
             tabs: vec![TabView {
                 id: TabId(1),
                 name: "main".into(),
@@ -307,6 +319,16 @@ mod tests {
         });
         roundtrip(&Event::LayoutChanged {
             workspaces: sample_view(),
+        });
+        roundtrip(&Event::PaneNotification {
+            pane: PaneId(1),
+            title: None,
+            body: None,
+        });
+        roundtrip(&Event::PaneNotification {
+            pane: PaneId(2),
+            title: Some("agent".into()),
+            body: Some("ready to merge".into()),
         });
     }
 

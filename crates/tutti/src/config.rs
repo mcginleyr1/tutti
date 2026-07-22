@@ -61,8 +61,19 @@ pub enum PrefixAction {
     TabNext,
     TabPrev,
     TabNew,
+    Sidebar,
     Detach,
     Help,
+}
+
+/// Whether the workspace/agent sidebar is rendered. `Auto` shows it once the
+/// session is worth surfacing (more than one workspace, or any agent pane);
+/// focusing it with the sidebar key forces it visible regardless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarVisibility {
+    Auto,
+    On,
+    Off,
 }
 
 /// One prefix binding: the follow-up key, its action, and a short description
@@ -92,6 +103,7 @@ const DEFAULT_PREFIX_TABLE: &[PrefixBinding] = &[
     b(KeyCode::Char('n'), PrefixAction::TabNext, "next tab"),
     b(KeyCode::Char('p'), PrefixAction::TabPrev, "prev tab"),
     b(KeyCode::Char('c'), PrefixAction::TabNew, "new tab"),
+    b(KeyCode::Char('w'), PrefixAction::Sidebar, "workspaces"),
     b(
         KeyCode::Char('o'),
         PrefixAction::FocusCycle,
@@ -120,6 +132,7 @@ const VIM_PREFIX_TABLE: &[PrefixBinding] = &[
     b(KeyCode::Char('t'), PrefixAction::TabNew, "new tab"),
     b(KeyCode::Char('n'), PrefixAction::TabNext, "next tab"),
     b(KeyCode::Char('p'), PrefixAction::TabPrev, "prev tab"),
+    b(KeyCode::Char('w'), PrefixAction::Sidebar, "workspaces"),
     b(KeyCode::Char('z'), PrefixAction::Zoom, "zoom pane"),
     b(KeyCode::Char('['), PrefixAction::Scrollback, "scrollback"),
     b(KeyCode::Char('?'), PrefixAction::Help, "help"),
@@ -214,6 +227,10 @@ pub struct Config {
     pub mouse: bool,
     pub keys: Keys,
     pub preset: Preset,
+    pub sidebar: SidebarVisibility,
+    /// Whether pane notifications re-emit to the real terminal and flash the
+    /// status bar. The sidebar bell mark is unaffected — always on.
+    pub notifications: bool,
     prefix_bindings: Vec<PrefixBinding>,
 }
 
@@ -246,6 +263,7 @@ impl Config {
             }
         };
         let mouse = raw.mouse.unwrap_or(true);
+        let notifications = raw.notifications.unwrap_or(true);
 
         let preset = match raw.preset.as_deref() {
             None | Some("default") => Preset::Default,
@@ -259,6 +277,15 @@ impl Config {
             Preset::Vim => VIM_PREFIX_TABLE,
         }
         .to_vec();
+
+        let sidebar = match raw.sidebar.as_deref() {
+            None | Some("auto") => SidebarVisibility::Auto,
+            Some("on") => SidebarVisibility::On,
+            Some("off") => SidebarVisibility::Off,
+            Some(other) => {
+                bail!("sidebar: unknown value {other:?} (expected \"auto\", \"on\", or \"off\")")
+            }
+        };
 
         let mut overrides = raw.keys.into_map();
         let mut bindings = Vec::new();
@@ -280,6 +307,8 @@ impl Config {
             mouse,
             keys: Keys { bindings },
             preset,
+            sidebar,
+            notifications,
             prefix_bindings,
         })
     }
@@ -314,6 +343,8 @@ struct RawConfig {
     prefix: Option<String>,
     mouse: Option<bool>,
     preset: Option<String>,
+    sidebar: Option<String>,
+    notifications: Option<bool>,
     #[serde(default)]
     keys: RawKeys,
 }
@@ -573,5 +604,60 @@ kill_pane    = "A-x"
             err.to_string().contains("zap"),
             "error should name the preset: {err}"
         );
+    }
+
+    #[test]
+    fn sidebar_defaults_to_auto_and_parses_values() {
+        assert_eq!(Config::default().sidebar, SidebarVisibility::Auto);
+        assert_eq!(
+            Config::parse("sidebar = \"on\"\n").unwrap().sidebar,
+            SidebarVisibility::On
+        );
+        assert_eq!(
+            Config::parse("sidebar = \"off\"\n").unwrap().sidebar,
+            SidebarVisibility::Off
+        );
+        assert_eq!(
+            Config::parse("sidebar = \"auto\"\n").unwrap().sidebar,
+            SidebarVisibility::Auto
+        );
+    }
+
+    #[test]
+    fn unknown_sidebar_value_is_rejected() {
+        let err = Config::parse("sidebar = \"maybe\"\n").unwrap_err();
+        assert!(
+            err.to_string().contains("maybe"),
+            "error should name the offending value: {err}"
+        );
+    }
+
+    #[test]
+    fn notifications_default_on_and_toggle_off() {
+        assert!(Config::default().notifications);
+        assert!(
+            !Config::parse("notifications = false\n")
+                .unwrap()
+                .notifications
+        );
+        assert!(
+            Config::parse("notifications = true\n")
+                .unwrap()
+                .notifications
+        );
+    }
+
+    #[test]
+    fn both_presets_bind_the_sidebar_key() {
+        for cfg in [
+            Config::default(),
+            Config::parse("preset = \"vim\"\n").unwrap(),
+        ] {
+            assert_eq!(
+                cfg.prefix_action(KeyCode::Char('w')),
+                Some(PrefixAction::Sidebar),
+                "w should focus the sidebar in every preset"
+            );
+        }
     }
 }

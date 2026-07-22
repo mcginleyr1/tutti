@@ -84,6 +84,10 @@ pub struct PtyPane {
     size: Mutex<PaneSize>,
     exit_rx: watch::Receiver<Option<PaneExit>>,
     output_rx: watch::Receiver<u64>,
+    /// Bells and OSC 9 / 777 desktop notifications pulled from the raw output
+    /// stream, drained by the broadcast tick. A parallel attention channel that
+    /// never feeds state classification.
+    notifications: Arc<Mutex<Vec<Notification>>>,
     reader_thread: Option<JoinHandle<()>>,
     wait_thread: Option<JoinHandle<()>>,
 }
@@ -139,11 +143,13 @@ impl PtyPane {
 
         let (output_tx, output_rx) = watch::channel(0u64);
         let (exit_tx, exit_rx) = watch::channel(None);
+        let notifications = Arc::new(Mutex::new(Vec::new()));
 
         let reader_parser = Arc::clone(&parser);
+        let reader_notifications = Arc::clone(&notifications);
         let reader_thread = std::thread::Builder::new()
             .name("tutti-pty-reader".into())
-            .spawn(move || read_loop(reader, reader_parser, output_tx))
+            .spawn(move || read_loop(reader, reader_parser, output_tx, reader_notifications))
             .context("failed to spawn pty reader thread")?;
 
         let wait_thread = std::thread::Builder::new()
@@ -173,6 +179,7 @@ impl PtyPane {
             size: Mutex::new(size),
             exit_rx,
             output_rx,
+            notifications,
             reader_thread: Some(reader_thread),
             wait_thread: Some(wait_thread),
         })
@@ -317,6 +324,16 @@ impl PtyPane {
         self.output_rx.clone()
     }
 
+    /// Drain the bells and desktop notifications seen since the last call.
+    pub fn take_notifications(&self) -> Vec<Notification> {
+        std::mem::take(
+            &mut *self
+                .notifications
+                .lock()
+                .expect("pty notifications poisoned"),
+        )
+    }
+
     /// A receiver that resolves to `Some(exit)` when the child terminates.
     pub fn exit_receiver(&self) -> watch::Receiver<Option<PaneExit>> {
         self.exit_rx.clone()
@@ -367,12 +384,26 @@ fn read_loop(
     mut reader: Box<dyn Read + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
     output_tx: watch::Sender<u64>,
+    notifications: Arc<Mutex<Vec<Notification>>>,
 ) {
     let mut buf = [0u8; 8192];
+    let mut scanner = NotifyScanner::default();
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
+                // Scan the raw bytes for bells/notifications before the vt100
+                // parser swallows them, keeping scanner state across chunks.
+                let mut found = Vec::new();
+                scanner.feed(&buf[..n], &mut found);
+                if !found.is_empty() {
+                    let mut queue = notifications.lock().expect("pty notifications poisoned");
+                    queue.extend(found);
+                    let overflow = queue.len().saturating_sub(NOTIFY_QUEUE_CAP);
+                    if overflow > 0 {
+                        queue.drain(..overflow);
+                    }
+                }
                 parser
                     .lock()
                     .expect("pty parser poisoned")
@@ -385,7 +416,254 @@ fn read_loop(
     }
 }
 
+/// A desktop notification or bell surfaced from a pane's raw output. A bare
+/// bell carries no text (both fields `None`); OSC 9 fills `body`; OSC 777 fills
+/// `title` and/or `body`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notification {
+    pub title: Option<String>,
+    pub body: Option<String>,
+}
+
+/// Largest OSC payload buffered; a longer sequence is consumed but discarded so
+/// a runaway sequence cannot grow memory without bound.
+const OSC_CAP: usize = 4096;
+/// Cap on pending notifications per pane, bounding the queue when a burst
+/// arrives with no client draining it.
+const NOTIFY_QUEUE_CAP: usize = 256;
+
+#[derive(Default)]
+enum ScanState {
+    #[default]
+    Ground,
+    /// Saw `ESC`, awaiting the `]` OSC introducer.
+    Esc,
+    /// Inside an OSC string, accumulating the payload.
+    Osc,
+    /// Saw `ESC` inside an OSC string, awaiting the `\` of a String Terminator.
+    OscEsc,
+}
+
+/// Incremental scanner pulling bells and OSC 9 / OSC 777 desktop-notification
+/// sequences from a raw pty byte stream. State persists across `feed` calls, so
+/// a sequence split over read-chunk boundaries is still recognised.
+#[derive(Default)]
+struct NotifyScanner {
+    state: ScanState,
+    buf: Vec<u8>,
+    overflow: bool,
+}
+
+impl NotifyScanner {
+    fn feed(&mut self, bytes: &[u8], out: &mut Vec<Notification>) {
+        for &b in bytes {
+            self.step(b, out);
+        }
+    }
+
+    fn step(&mut self, b: u8, out: &mut Vec<Notification>) {
+        match self.state {
+            ScanState::Ground => match b {
+                0x07 => out.push(Notification {
+                    title: None,
+                    body: None,
+                }),
+                0x1b => self.state = ScanState::Esc,
+                _ => {}
+            },
+            ScanState::Esc => match b {
+                b']' => {
+                    self.state = ScanState::Osc;
+                    self.buf.clear();
+                    self.overflow = false;
+                }
+                0x1b => {} // a run of ESCs stays poised for the introducer
+                _ => self.state = ScanState::Ground,
+            },
+            ScanState::Osc => match b {
+                // A bare BEL here is the OSC terminator, not a bell.
+                0x07 => {
+                    self.finish_osc(out);
+                    self.state = ScanState::Ground;
+                }
+                0x1b => self.state = ScanState::OscEsc,
+                _ => {
+                    if self.buf.len() < OSC_CAP {
+                        self.buf.push(b);
+                    } else {
+                        self.overflow = true;
+                    }
+                }
+            },
+            ScanState::OscEsc => match b {
+                b'\\' => {
+                    self.finish_osc(out);
+                    self.state = ScanState::Ground;
+                }
+                other => {
+                    // ESC not completing an ST cancels the OSC string; drop it
+                    // and reinterpret this byte from ground.
+                    self.buf.clear();
+                    self.overflow = false;
+                    self.state = ScanState::Ground;
+                    self.step(other, out);
+                }
+            },
+        }
+    }
+
+    fn finish_osc(&mut self, out: &mut Vec<Notification>) {
+        let overflow = std::mem::take(&mut self.overflow);
+        let buf = std::mem::take(&mut self.buf);
+        if !overflow && let Some(note) = parse_osc(&buf) {
+            out.push(note);
+        }
+    }
+}
+
+/// Parse an OSC payload (the bytes between `ESC ]` and the terminator) for the
+/// two commands surfaced as notifications: `9;<body>` and
+/// `777;notify;<title>;<body>`. Anything else yields `None`.
+fn parse_osc(buf: &[u8]) -> Option<Notification> {
+    let text = std::str::from_utf8(buf).ok()?;
+    let (cmd, rest) = text.split_once(';')?;
+    match cmd {
+        "9" => non_empty(rest).map(|body| Notification {
+            title: None,
+            body: Some(body),
+        }),
+        "777" => {
+            let mut fields = rest.splitn(3, ';');
+            if fields.next()? != "notify" {
+                return None;
+            }
+            let title = fields.next().and_then(non_empty);
+            let body = fields.next().and_then(non_empty);
+            (title.is_some() || body.is_some()).then_some(Notification { title, body })
+        }
+        _ => None,
+    }
+}
+
+fn non_empty(s: &str) -> Option<String> {
+    (!s.is_empty()).then(|| s.to_string())
+}
+
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<PtyPane>();
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scan(input: &[u8]) -> Vec<Notification> {
+        let mut scanner = NotifyScanner::default();
+        let mut out = Vec::new();
+        scanner.feed(input, &mut out);
+        out
+    }
+
+    /// Feed `input` in two chunks split at `cut`, exercising cross-chunk state.
+    fn scan_split(input: &[u8], cut: usize) -> Vec<Notification> {
+        let mut scanner = NotifyScanner::default();
+        let mut out = Vec::new();
+        scanner.feed(&input[..cut], &mut out);
+        scanner.feed(&input[cut..], &mut out);
+        out
+    }
+
+    fn bell() -> Notification {
+        Notification {
+            title: None,
+            body: None,
+        }
+    }
+
+    #[test]
+    fn bare_bel_is_a_bell() {
+        assert_eq!(scan(b"\x07"), vec![bell()]);
+        assert_eq!(scan(b"ab\x07cd\x07"), vec![bell(), bell()]);
+    }
+
+    #[test]
+    fn osc9_with_bel_terminator() {
+        assert_eq!(
+            scan(b"\x1b]9;build done\x07"),
+            vec![Notification {
+                title: None,
+                body: Some("build done".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn osc9_with_st_terminator() {
+        assert_eq!(
+            scan(b"\x1b]9;hi\x1b\\"),
+            vec![Notification {
+                title: None,
+                body: Some("hi".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn osc777_carries_title_and_body() {
+        assert_eq!(
+            scan(b"\x1b]777;notify;Agent;ready to merge\x07"),
+            vec![Notification {
+                title: Some("Agent".into()),
+                body: Some("ready to merge".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn osc777_body_may_contain_semicolons() {
+        assert_eq!(
+            scan(b"\x1b]777;notify;T;a;b;c\x1b\\"),
+            vec![Notification {
+                title: Some("T".into()),
+                body: Some("a;b;c".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn bel_terminating_an_osc_is_not_also_a_bell() {
+        // One notification, and no spurious bell from the terminating BEL.
+        assert_eq!(scan(b"\x1b]9;x\x07").len(), 1);
+    }
+
+    #[test]
+    fn non_notification_osc_is_ignored() {
+        // OSC 0 (window title), and OSC 777 with a non-notify subcommand.
+        assert!(scan(b"\x1b]0;my title\x07").is_empty());
+        assert!(scan(b"\x1b]777;precmd\x07").is_empty());
+    }
+
+    #[test]
+    fn oversized_payload_is_discarded_but_the_stream_recovers() {
+        let mut input = b"\x1b]9;".to_vec();
+        input.resize(input.len() + OSC_CAP + 100, b'x');
+        input.push(0x07); // terminates the (overflowed, discarded) OSC
+        input.push(0x07); // a following bell still registers
+        assert_eq!(
+            scan(&input),
+            vec![bell()],
+            "the huge OSC is dropped, the trailing bell survives"
+        );
+    }
+
+    #[test]
+    fn scanning_is_incremental_across_every_cut_point() {
+        let input = b"pre\x07\x1b]9;done\x07mid\x1b]777;notify;A;B\x1b\\post\x07";
+        let whole = scan(input);
+        assert_eq!(whole.len(), 4, "bell, osc9, osc777, bell");
+        for cut in 0..=input.len() {
+            assert_eq!(scan_split(input, cut), whole, "mismatch cutting at {cut}");
+        }
+    }
+}

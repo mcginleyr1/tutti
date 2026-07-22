@@ -12,6 +12,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use tutti_core::{AgentState, PaneId, PaneInfo};
 
 use super::app::{App, Mode};
+use super::sidebar::{AgentRow, SidebarEntry, WorkspaceRow};
 use crate::config::{self, Config, PrefixAction};
 
 /// Render the whole UI: the active tab's panes and the status bar.
@@ -22,26 +23,147 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     let content = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
     let status = Rect::new(area.x, area.y + content.height, area.width, 1);
+    let (sidebar_rect, panes_area) = app.split_content(content);
 
     let rects = app.compute_rects(content);
     if rects.is_empty() {
         let hint = Paragraph::new("no panes — run `tutti pane run -- <cmd>` to start one")
             .style(Style::default().add_modifier(Modifier::DIM));
-        frame.render_widget(hint, content);
+        frame.render_widget(hint, panes_area);
     } else {
         for (pane, rect) in rects {
             draw_pane(frame, app, pane, rect);
         }
     }
 
+    if let Some(sidebar_rect) = sidebar_rect {
+        draw_sidebar(frame, app, sidebar_rect);
+    }
+
     draw_status(frame, app, status);
 
     if app.whichkey_visible() {
-        draw_whichkey(frame, app.config(), content);
+        draw_whichkey(frame, app.config(), panes_area);
     }
     if app.mode == Mode::Help {
         draw_help(frame, app.config(), area);
     }
+}
+
+/// The sidebar column: a WORKSPACES section over an AGENTS section, a right
+/// border separating it from the panes. The selection bar and the
+/// new-workspace prompt appear while the sidebar is focused.
+fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::RIGHT)
+        .border_style(Style::default().add_modifier(Modifier::DIM));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let sidebar = app.sidebar();
+    let focused = app.sidebar_focused();
+    let selected = app.sidebar_selected();
+    let selected_at = |i: usize| focused && selected == i;
+
+    let mut lines = vec![section_header("WORKSPACES")];
+    for (i, entry) in sidebar
+        .entries
+        .iter()
+        .take(sidebar.workspace_count)
+        .enumerate()
+    {
+        if let SidebarEntry::Workspace(w) = entry {
+            lines.push(workspace_line(w, selected_at(i)));
+            lines.push(sidebar_subtitle(&w.subtitle, selected_at(i)));
+        }
+    }
+    lines.push(Line::from(String::new()));
+    lines.push(section_header("AGENTS"));
+    for (i, entry) in sidebar
+        .entries
+        .iter()
+        .enumerate()
+        .skip(sidebar.workspace_count)
+    {
+        if let SidebarEntry::Agent(a) = entry {
+            lines.push(agent_line(a, selected_at(i), app.is_notified(a.pane)));
+            lines.push(sidebar_subtitle(
+                &format!("{} · {}", state_label(a.state), a.kind),
+                selected_at(i),
+            ));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    if app.sidebar_prompt_active() {
+        let row = Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(1),
+            inner.width,
+            1,
+        );
+        frame.render_widget(Clear, row);
+        frame.render_widget(
+            Paragraph::new(format!("dir: {}", app.sidebar_prompt()))
+                .style(Style::default().add_modifier(Modifier::REVERSED)),
+            row,
+        );
+    }
+}
+
+/// A dim section label heading a sidebar group.
+fn section_header(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        text.to_string(),
+        Style::default().add_modifier(Modifier::DIM),
+    ))
+}
+
+/// A workspace entry's title line: bold when it owns the active tab, the whole
+/// row reversed when it is the sidebar's selection.
+fn workspace_line(w: &WorkspaceRow, selected: bool) -> Line<'static> {
+    let mut style = Style::default();
+    if w.active {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if selected {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    Line::from(Span::styled(format!(" {}", w.name), style))
+}
+
+/// An agent entry's title line: a state-coloured dot, the pane title, and a
+/// trailing bell mark while the pane has an unseen notification.
+fn agent_line(a: &AgentRow, selected: bool, notified: bool) -> Line<'static> {
+    let mut dot = state_style(a.state);
+    let mut title = Style::default();
+    if selected {
+        dot = dot.add_modifier(Modifier::REVERSED);
+        title = title.add_modifier(Modifier::REVERSED);
+    }
+    let mut spans = vec![
+        Span::styled(" ● ", dot),
+        Span::styled(a.title.clone(), title),
+    ];
+    if notified {
+        spans.push(Span::styled(
+            " 🔔",
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// A dim second line under a sidebar entry (branch, or `state · kind`).
+fn sidebar_subtitle(text: &str, selected: bool) -> Line<'static> {
+    let mut style = Style::default().add_modifier(Modifier::DIM);
+    if selected {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    Line::from(Span::styled(format!("   {text}"), style))
 }
 
 fn draw_pane(frame: &mut Frame, app: &App, pane: PaneId, rect: Rect) {
@@ -314,6 +436,11 @@ fn status_message(app: &App) -> String {
         Mode::ConfirmKill(_) => app.transient().unwrap_or("confirm kill? (y/n)").to_string(),
         Mode::Scroll(_) => app.transient().unwrap_or("SCROLL (q to exit)").to_string(),
         Mode::Help => "HELP (any key closes)".to_string(),
+        Mode::Sidebar => app
+            .transient()
+            .unwrap_or("SIDEBAR (j/k move · enter jump · n new · esc back)")
+            .to_string(),
+        Mode::SidebarPrompt => app.transient().unwrap_or("new workspace dir").to_string(),
         Mode::Terminal => app.transient().unwrap_or("").to_string(),
     }
 }
@@ -406,6 +533,7 @@ mod tests {
                 workspaces: vec![WorkspaceView {
                     id: WorkspaceId(1),
                     name: "w".into(),
+                    branch: None,
                     tabs: vec![TabView {
                         id: TabId(1),
                         name: "main".into(),
@@ -447,6 +575,92 @@ mod tests {
         assert!(text.contains("HELLO"), "grid text missing: {text:?}");
         assert!(text.contains("demo"), "session name missing from status");
         assert!(text.contains("main"), "tab name missing from status");
+    }
+
+    fn app_two_workspaces() -> App {
+        let mut app = App::new();
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Response::Attached {
+                session: "demo".into(),
+                workspaces: vec![
+                    WorkspaceView {
+                        id: WorkspaceId(1),
+                        name: "api".into(),
+                        branch: Some("main".into()),
+                        tabs: vec![TabView {
+                            id: TabId(1),
+                            name: "1".into(),
+                            active: true,
+                            layout: Some(Layout::Leaf(PaneId(1))),
+                            active_pane: Some(PaneId(1)),
+                            panes: vec![PaneInfo {
+                                id: PaneId(1),
+                                title: "zsh".into(),
+                                agent: None,
+                                state: AgentState::Idle,
+                                exited: None,
+                            }],
+                        }],
+                    },
+                    WorkspaceView {
+                        id: WorkspaceId(2),
+                        name: "web".into(),
+                        branch: None,
+                        tabs: vec![TabView {
+                            id: TabId(2),
+                            name: "2".into(),
+                            active: false,
+                            layout: Some(Layout::Leaf(PaneId(2))),
+                            active_pane: Some(PaneId(2)),
+                            panes: vec![PaneInfo {
+                                id: PaneId(2),
+                                title: "agent".into(),
+                                agent: Some("claude".into()),
+                                state: AgentState::Blocked,
+                                exited: None,
+                            }],
+                        }],
+                    },
+                ],
+            })
+            .unwrap(),
+        ));
+        app
+    }
+
+    #[test]
+    fn sidebar_renders_both_sections_with_branch_and_agent() {
+        // Two workspaces trigger the auto sidebar; 100 cols clears the floor.
+        let app = app_two_workspaces();
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("WORKSPACES"),
+            "workspaces header missing: {text:?}"
+        );
+        assert!(text.contains("AGENTS"), "agents header missing: {text:?}");
+        assert!(text.contains("api"), "workspace name missing: {text:?}");
+        assert!(text.contains("main"), "branch subtitle missing: {text:?}");
+        assert!(text.contains("claude"), "agent kind missing: {text:?}");
+    }
+
+    #[test]
+    fn sidebar_shows_a_bell_mark_for_a_notified_agent() {
+        let mut app = app_two_workspaces();
+        // pane 2 (an agent, not the focused pane) raises a notification.
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&tutti_core::Event::PaneNotification {
+                pane: PaneId(2),
+                title: None,
+                body: Some("done".into()),
+            })
+            .unwrap(),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("🔔"), "bell mark missing: {text:?}");
     }
 
     #[test]

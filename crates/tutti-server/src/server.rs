@@ -536,14 +536,30 @@ fn spawn_reaper(hub: &Arc<Hub>, pane: PaneId, pty: Arc<PtyPane>) {
 }
 
 fn broadcast_tick(hub: &Hub) {
-    if hub.clients.lock().expect("clients poisoned").is_empty() {
-        return;
-    }
     let panes = hub
         .session
         .lock()
         .expect("session poisoned")
         .panes_with_pty();
+
+    // Drain each pane's bells/notifications every tick so the queues stay
+    // bounded even with nobody attached; `broadcast_event` is a no-op then.
+    for (pane, pty) in &panes {
+        for note in pty.take_notifications() {
+            broadcast_event(
+                hub,
+                Event::PaneNotification {
+                    pane: *pane,
+                    title: note.title,
+                    body: note.body,
+                },
+            );
+        }
+    }
+
+    if hub.clients.lock().expect("clients poisoned").is_empty() {
+        return;
+    }
     for (pane, pty) in panes {
         let cur = pty.screen();
         let (rows, cols) = cur.size();

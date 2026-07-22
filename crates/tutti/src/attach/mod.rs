@@ -7,6 +7,7 @@ mod connection;
 mod input;
 mod layout;
 mod render;
+mod sidebar;
 
 pub use app::App;
 
@@ -115,7 +116,12 @@ fn event_loop(terminal: &mut DefaultTerminal, conn: &mut Connection, config: Con
             let _ = conn.send(&frame);
         }
         if app.take_bell() {
-            ring_bell();
+            emit_terminal(b"\x07");
+        }
+        // Re-emit pane notifications (bell + OSC 9) to the user's real terminal
+        // so it raises a desktop notification for background panes.
+        for seq in app.take_terminal_out() {
+            emit_terminal(&seq);
         }
 
         if app.should_quit {
@@ -125,12 +131,12 @@ fn event_loop(terminal: &mut DefaultTerminal, conn: &mut Connection, config: Con
     Ok(())
 }
 
-/// Emit a terminal bell (BEL). Non-printing, so it does not disturb the grid the
-/// next draw restores.
-fn ring_bell() {
+/// Write raw bytes to the real terminal. Bells and OSC escapes are non-printing,
+/// so they do not disturb the grid the next draw restores.
+fn emit_terminal(bytes: &[u8]) {
     use std::io::Write;
     let mut out = io::stdout();
-    let _ = out.write_all(b"\x07");
+    let _ = out.write_all(bytes);
     let _ = out.flush();
 }
 
