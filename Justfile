@@ -7,11 +7,12 @@ default:
 build:
     cargo build --workspace
 
-# Build and (re)install both binaries into ~/.cargo/bin
+# Dev cycle: kill every running daemon, then (re)install both binaries —
+# so the next `tutti` always runs the code you just built.
 install:
+    -pkill -f tutti-server
     cargo install --path crates/tutti --force
     cargo install --path crates/tutti-server --force
-    @echo "note: running daemons keep the OLD build — run 'tutti server stop' per session to upgrade them (kills that session's panes)"
 
 # Run every test in the workspace
 test:
