@@ -13,6 +13,14 @@ pub enum SidebarEntry {
     Agent(AgentRow),
 }
 
+/// The two collapsible sections. Their headers live in the sidebar frame (the
+/// top border and the fused divider); clicking one toggles that section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Projects,
+    Agents,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceRow {
     pub name: String,
@@ -47,11 +55,14 @@ pub struct AgentRow {
 
 /// The sidebar's contents: workspace rows then agent rows. `workspace_count`
 /// records where the agents section begins so the renderer and the hit-test
-/// agree on row layout.
+/// agree on row layout. `projects_collapsed`/`agents_collapsed` hide a section's
+/// rows down to its header, set by the client from its collapse state.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Sidebar {
     pub entries: Vec<SidebarEntry>,
     pub workspace_count: usize,
+    pub projects_collapsed: bool,
+    pub agents_collapsed: bool,
 }
 
 impl Sidebar {
@@ -63,19 +74,57 @@ impl Sidebar {
         self.entries.len()
     }
 
-    /// The entry a click at `row` (relative to the sidebar's inner top) selects,
-    /// or `None` for padding, a header, the section gap, a subagent sub-row, or
-    /// empty space. The layout mirrors the renderer: a blank top-pad row, the
-    /// workspaces header, two rows per workspace, a blank, the agents header,
-    /// then — per agent — its two rows plus one dim sub-row per subagent (a click
-    /// on which selects nothing). An empty agents section is one placeholder row.
-    pub fn entry_at_row(&self, row: usize) -> Option<usize> {
-        let ws_start = TOP_PAD + 1; // top pad + workspaces header
-        let ws_end = ws_start + 2 * self.workspace_count;
-        if (ws_start..ws_end).contains(&row) {
-            return Some((row - ws_start) / 2);
+    /// Whether entry `idx` is currently visible (its section is expanded).
+    pub fn is_visible(&self, idx: usize) -> bool {
+        if idx < self.workspace_count {
+            !self.projects_collapsed
+        } else {
+            !self.agents_collapsed
         }
-        let agents_start = ws_end + 2; // blank line + agents header
+    }
+
+    /// The screen row (relative to the sidebar frame's top) of the agents
+    /// divider — the border-fused `agents` header. Row 0 is always the projects
+    /// header (the top border); the divider follows the workspace rows unless the
+    /// projects section is collapsed.
+    fn divider_row(&self) -> usize {
+        if self.projects_collapsed {
+            1
+        } else {
+            1 + 2 * self.workspace_count
+        }
+    }
+
+    /// The section header (if any) a click at `row` toggles. Row 0 is the
+    /// projects header in the top border; the agents header is the fused divider.
+    pub fn header_at_row(&self, row: usize) -> Option<Section> {
+        if row == 0 {
+            Some(Section::Projects)
+        } else if row == self.divider_row() {
+            Some(Section::Agents)
+        } else {
+            None
+        }
+    }
+
+    /// The entry a click at `row` (relative to the sidebar frame's top) selects,
+    /// or `None` for a border, a header, a subagent sub-row, a collapsed section,
+    /// or empty space. The layout mirrors the renderer: the projects header (top
+    /// border, row 0), two rows per workspace, the agents header (fused divider),
+    /// then — per agent — its two rows plus one dim sub-row per subagent (a click
+    /// on which selects nothing).
+    pub fn entry_at_row(&self, row: usize) -> Option<usize> {
+        if !self.projects_collapsed {
+            let ws_start = 1; // right below the projects header (top border)
+            let ws_end = ws_start + 2 * self.workspace_count;
+            if (ws_start..ws_end).contains(&row) {
+                return Some((row - ws_start) / 2);
+            }
+        }
+        if self.agents_collapsed {
+            return None;
+        }
+        let agents_start = self.divider_row() + 1;
         if row < agents_start {
             return None;
         }
@@ -94,10 +143,6 @@ impl Sidebar {
         None
     }
 }
-
-/// The blank padding row rendered above the first section header. The hit-test
-/// and the renderer both offset by this so clicks land on the right entry.
-pub const TOP_PAD: usize = 1;
 
 /// Build the sidebar from the client's view. `active_tab` decides which
 /// workspace is bold and where each workspace jump lands. Agents are gathered
@@ -145,6 +190,8 @@ pub fn build(workspaces: &[WorkspaceView], active_tab: Option<TabId>) -> Sidebar
     Sidebar {
         entries,
         workspace_count,
+        projects_collapsed: false,
+        agents_collapsed: false,
     }
 }
 
@@ -350,24 +397,52 @@ mod tests {
     }
 
     #[test]
-    fn entry_at_row_maps_clicks_past_padding_headers_and_the_gap() {
+    fn entry_at_row_maps_clicks_past_the_frame_headers() {
         let sidebar = build(&two_workspace_view(), Some(TabId(2)));
-        // Row 0 is the top pad, row 1 the workspaces header.
+        // Row 0 is the projects header (the top border) — a section toggle, not
+        // an entry.
         assert_eq!(sidebar.entry_at_row(0), None);
-        assert_eq!(sidebar.entry_at_row(1), None);
-        // Rows 2-3 are workspace 0, rows 4-5 workspace 1.
+        assert_eq!(sidebar.header_at_row(0), Some(Section::Projects));
+        // Rows 1-2 are workspace 0, rows 3-4 workspace 1.
+        assert_eq!(sidebar.entry_at_row(1), Some(0));
         assert_eq!(sidebar.entry_at_row(2), Some(0));
-        assert_eq!(sidebar.entry_at_row(3), Some(0));
+        assert_eq!(sidebar.entry_at_row(3), Some(1));
         assert_eq!(sidebar.entry_at_row(4), Some(1));
-        // Row 6 blank, row 7 agents header — neither selectable.
-        assert_eq!(sidebar.entry_at_row(6), None);
-        assert_eq!(sidebar.entry_at_row(7), None);
-        // Rows 8-9 first agent (entry index 2), 10-11 second, 12-13 third.
-        assert_eq!(sidebar.entry_at_row(8), Some(2));
-        assert_eq!(sidebar.entry_at_row(11), Some(3));
-        assert_eq!(sidebar.entry_at_row(13), Some(4));
+        // Row 5 is the agents divider (fused header) — a toggle, not an entry.
+        assert_eq!(sidebar.entry_at_row(5), None);
+        assert_eq!(sidebar.header_at_row(5), Some(Section::Agents));
+        // Rows 6-7 first agent (entry index 2), 8-9 second, 10-11 third.
+        assert_eq!(sidebar.entry_at_row(6), Some(2));
+        assert_eq!(sidebar.entry_at_row(9), Some(3));
+        assert_eq!(sidebar.entry_at_row(11), Some(4));
         // Past the last agent.
-        assert_eq!(sidebar.entry_at_row(14), None);
+        assert_eq!(sidebar.entry_at_row(12), None);
+    }
+
+    #[test]
+    fn collapsing_projects_shifts_the_agents_divider_up() {
+        let mut sidebar = build(&two_workspace_view(), Some(TabId(2)));
+        sidebar.projects_collapsed = true;
+        // With projects collapsed, no workspace rows: the divider is row 1 and
+        // the workspace rows are gone.
+        assert_eq!(sidebar.entry_at_row(1), None, "workspace rows are hidden");
+        assert_eq!(sidebar.header_at_row(1), Some(Section::Agents));
+        // Agents follow immediately after the divider.
+        assert_eq!(sidebar.entry_at_row(2), Some(2));
+        assert_eq!(sidebar.entry_at_row(3), Some(2));
+        assert_eq!(sidebar.entry_at_row(4), Some(3));
+    }
+
+    #[test]
+    fn collapsing_agents_hides_every_agent_row() {
+        let mut sidebar = build(&two_workspace_view(), Some(TabId(2)));
+        sidebar.agents_collapsed = true;
+        // Workspaces still map; agent rows past the divider select nothing.
+        assert_eq!(sidebar.entry_at_row(1), Some(0));
+        assert_eq!(sidebar.header_at_row(5), Some(Section::Agents));
+        assert_eq!(sidebar.entry_at_row(6), None, "agent rows are hidden");
+        assert!(!sidebar.is_visible(2), "an agent entry is not visible");
+        assert!(sidebar.is_visible(0), "a workspace entry stays visible");
     }
 
     #[test]
@@ -385,17 +460,19 @@ mod tests {
     #[test]
     fn entry_at_row_skips_subagent_rows_and_shifts_the_next_agent_down() {
         let sidebar = build(&view_with_subagents(), Some(TabId(1)));
-        // One workspace: rows 2-3. Blank 4, agents header 5.
-        assert_eq!(sidebar.entry_at_row(2), Some(0), "the workspace row");
-        // Agent entry 1 (with two subagents) occupies rows 6-7 as its head.
-        assert_eq!(sidebar.entry_at_row(6), Some(1));
-        assert_eq!(sidebar.entry_at_row(7), Some(1));
-        // Its two subagent sub-rows (8-9) are display-only: not selectable.
-        assert_eq!(sidebar.entry_at_row(8), None);
-        assert_eq!(sidebar.entry_at_row(9), None);
-        // The next agent is pushed down past the sub-rows, to 10-11.
-        assert_eq!(sidebar.entry_at_row(10), Some(2));
-        assert_eq!(sidebar.entry_at_row(11), Some(2));
-        assert_eq!(sidebar.entry_at_row(12), None, "past the last agent");
+        // One workspace: projects header row 0, workspace rows 1-2, agents
+        // divider row 3.
+        assert_eq!(sidebar.entry_at_row(1), Some(0), "the workspace row");
+        assert_eq!(sidebar.header_at_row(3), Some(Section::Agents));
+        // Agent entry 1 (with two subagents) occupies rows 4-5 as its head.
+        assert_eq!(sidebar.entry_at_row(4), Some(1));
+        assert_eq!(sidebar.entry_at_row(5), Some(1));
+        // Its two subagent sub-rows (6-7) are display-only: not selectable.
+        assert_eq!(sidebar.entry_at_row(6), None);
+        assert_eq!(sidebar.entry_at_row(7), None);
+        // The next agent is pushed down past the sub-rows, to 8-9.
+        assert_eq!(sidebar.entry_at_row(8), Some(2));
+        assert_eq!(sidebar.entry_at_row(9), Some(2));
+        assert_eq!(sidebar.entry_at_row(10), None, "past the last agent");
     }
 }

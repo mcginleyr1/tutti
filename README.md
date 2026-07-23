@@ -90,16 +90,22 @@ follow-up (press the key, or `esc` to back out). `Ctrl+B ?` opens the full help
 overlay — detach first, then the rest of the active keymap, the direct keys, and
 how to stop the daemon.
 
-A **top tab bar** runs above the panes: one chip per tab (the active one an
-accent block), plus a trailing ` + ` chip. Click a chip to select it, the `+` to
-open a tab. The **bottom bar** stays out of the way: the session name on the
-left with any transient/mode message, the standing hint on the right.
+A full-width **app bar** runs across the top: an accent bar and the bold
+`tutti — <session>` wordmark on the left, the tab segments right-aligned
+(`[1 main] [2 logs] [+]`, the active one an accent block, the `+` dim), over a
+dim rule. Click a segment to select its tab, the `[+]` to open one. Each pane
+carries its **title on its own line above its rounded frame** — an accent `❯`
+plus the agent/state for the focused pane, dim for the rest. The **footer**
+stays out of the way: a mode chip on the left when you leave terminal mode
+(`SIDEBAR`, `SCROLL`, …) and the standing hint on the right; a transient fires a
+one-line **notification band** just above it (accent for info, red for errors).
 
-Mouse: click focuses a pane, click a tab chip or sidebar entry to jump, wheel
+Mouse: click focuses a pane, click a tab segment or sidebar entry to jump, wheel
 scrolls a pane's history (disable with `mouse = false`). Colors come from your
 terminal — tutti has no theme of its own: everything renders dim, with one accent
 (terminal blue) marking the focused/active thing and the red/yellow/green state
-dots the only other colour.
+dots the only other colour. On truecolor terminals a subtle neutral shade sits
+behind the chrome (app bar, sidebar, footer, panels); see `chrome_background`.
 
 ## Configuration
 
@@ -113,6 +119,8 @@ prefix = "C-b"          # prefix chord
 mouse = true            # master mouse switch
 preset = "default"      # prefix keymap: "default" (emacs/tmux-flavored) or "vim"
 sidebar = "on"          # workspace/agent sidebar: "on" (default), "auto", or "off"
+chrome_background = true # subtle shade behind the chrome (truecolor only)
+icons = "unicode"       # sidebar glyph set: "unicode" (default) or "nerdfont"
 notifications = true    # re-emit pane bells/notifications to your real terminal
 
 [keys]                  # direct bindings; every entry optional; "none" disables
@@ -155,33 +163,55 @@ now `default` already covers that muscle memory. The `[keys]` direct bindings ar
 shared across presets and override the defaults on top (e.g. set
 `focus_left = "none"` to reclaim `C-h` regardless of preset).
 
+**Chrome background.** `chrome_background` (default `true`) paints a subtle
+neutral dark shade behind the chrome — the app bar, sidebar, footer, and the
+which-key/help/notification panels — so they read as one surface distinct from
+the pane interiors (which are never shaded; agent output always renders on your
+terminal's own background). The shade is only drawn on **truecolor** terminals
+(those advertising `COLORTERM=truecolor`/`24bit`); elsewhere it falls back to no
+background rather than approximating the shade in the 256-colour palette. Light-
+theme users, or anyone who prefers a flat look, may want `chrome_background =
+false`. An unknown value is a hard error.
+
+**Icons.** `icons` picks the sidebar glyph set. `unicode` (default) is the safe
+set every terminal renders — `●`/`○` workspace and state dots, a branch/fork
+marker. `nerdfont` swaps in private-use icons (folder, circles, powerline
+branch, code-fork) for users with a patched [Nerd Font](https://www.nerdfonts.com)
+installed; without one they render as tofu. The tree guides and the working
+spinner are box-drawing/braille and shared across both. An unknown value is a
+hard error.
+
 ## Sidebar
 
 A left column that turns the TUI into a control center for many projects and
-agents at once. It renders dim by default, with the focused row popping in the
-accent colour. Two stacked sections, each with a lowercase header and a
-right-aligned count:
+agents at once — one rounded frame whose top border carries the `projects`
+header and whose fused divider (`├ agents ── N ┤`) carries the `agents` header,
+each with a `▼`/`▶` collapse arrow and a right-aligned count. It renders dim by
+default, with the focused row popping in the accent colour. Two stacked sections:
 
-- **workspaces** — one row per workspace: an `●` (accent) when it owns the active
-  tab, else a dim `○`, then the bold name, over a dim line showing the git branch
-  (read straight from `.git/HEAD`, including worktrees) on the left and the jj
-  change stat (`4 files +120 −33`) right-aligned. No branch leaves the left blank
-  rather than echoing the name; a clean or non-jj workspace shows no stat. The
-  stat refreshes as agents work (on every state transition, on attach, and when a
-  workspace is created) and is dropped first when the column is too narrow for
-  both. A [forked](#forked-workspaces) workspace whose `@` was rewritten from
-  another workspace shows a dim-red `stale` tag in the stat's place until you run
-  `workspace update`. Selecting a workspace jumps to its tab.
+- **projects** — one row per workspace: an `●` (accent) when it owns the active
+  tab, else a dim `○`, then the bold name, over a dim line showing a branch
+  marker and the git branch (read straight from `.git/HEAD`, including worktrees)
+  on the left and the jj change stat (`4 files +120 −33`) right-aligned. No branch
+  leaves the left blank rather than echoing the name; a clean or non-jj workspace
+  shows no stat. The stat refreshes as agents work (on every state transition, on
+  attach, and when a workspace is created) and is dropped first when the column is
+  too narrow for both. A [forked](#forked-workspaces) workspace whose `@` was
+  rewritten from another workspace shows a dim-red fork `stale` tag in the stat's
+  place until you run `workspace update`. Selecting a workspace jumps to its tab.
 - **agents** — one row per agent pane across *every* workspace: a state dot
   (blocked red, working an animated spinner, done green, idle/unknown dim), the
-  pane title, and a dim `state · kind` line. Sorted blocked-first so whatever
-  needs you is at the top. Selecting one jumps to that pane, switching workspace
-  and tab as needed. A pane that rings a bell or fires a desktop notification
-  while in the background gets a 🔔 mark here that clears when you focus it. When
-  no agents are running the section shows a dim `no agents yet` placeholder.
+  pane title, and a dim `state · kind` line, with any hook-reported subagents
+  hanging below on `├`/`└` tree guides. Sorted blocked-first so whatever needs you
+  is at the top. Selecting one jumps to that pane, switching workspace and tab as
+  needed. A pane that rings a bell or fires a desktop notification while in the
+  background gets a 🔔 mark here that clears when you focus it. When no agents are
+  running the section shows a dim italic `no agents yet` placeholder.
 
-The selected row (while the sidebar is focused) carries a `▍` accent bar and a
-subtle full-row background, unmistakable even with a single entry.
+The selected row (while the sidebar is focused) takes a subtle full-row
+highlight with its name rendered as an accent chip, unmistakable even with a
+single entry. Click a section header (the top border or the divider) to collapse
+that section down to its header, or click again to expand it.
 
 Press the prefix then `w` to focus the sidebar (revealing it if hidden). While
 focused, `j`/`k` (or the arrows) move the highlight across both sections, `Enter`

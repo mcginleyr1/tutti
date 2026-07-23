@@ -23,6 +23,10 @@ use crate::config::{self, Action, Config, PrefixAction, RESIZE_DELTA, SidebarVis
 const SIDEBAR_WIDTH: u16 = 30;
 const SIDEBAR_MIN_TOTAL: u16 = 80;
 
+/// Rows the top chrome header claims: the full-width app bar plus the dim rule
+/// beneath it. The content region begins below them.
+const HEADER_ROWS: u16 = 2;
+
 const SCROLLBACK: usize = 10_000;
 const STATUS_TTL: Duration = Duration::from_secs(4);
 const MOUSE_SCROLL_STEP: usize = 3;
@@ -125,6 +129,13 @@ pub struct App {
     /// Panes that raised a notification while unfocused; their sidebar entry
     /// shows a bell mark until the pane is focused.
     notified: HashSet<PaneId>,
+    /// Whether the projects / agents sidebar sections are collapsed to their
+    /// header. Toggled by clicking a section header.
+    collapsed_projects: bool,
+    collapsed_agents: bool,
+    /// Whether the real terminal advertises truecolor (`COLORTERM`), gating the
+    /// chrome background shades. Resolved once at startup; `false` in tests.
+    truecolor: bool,
     /// Escape sequences queued for the real terminal (bell + OSC 9 re-emit), so
     /// the user's own terminal raises a desktop notification. Drained by the
     /// event loop.
@@ -171,6 +182,9 @@ impl App {
             adopt_active_view: false,
             notified: HashSet::new(),
             terminal_out: Vec::new(),
+            collapsed_projects: false,
+            collapsed_agents: false,
+            truecolor: false,
             config,
         }
     }
@@ -178,6 +192,18 @@ impl App {
     /// The active configuration, for the renderer (hint, which-key, help).
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Record whether the real terminal advertises truecolor. The chrome shades
+    /// are only drawn when this is set (and the config enables them).
+    pub fn set_truecolor(&mut self, on: bool) {
+        self.truecolor = on;
+    }
+
+    /// Whether the chrome background shades should be drawn: the config enables
+    /// them and the terminal can render a 24-bit colour.
+    pub fn chrome_shaded(&self) -> bool {
+        self.config.chrome_background && self.truecolor
     }
 
     /// Arm the first-run prompt: open the sidebar's new-project prompt prefilled
@@ -574,9 +600,13 @@ impl App {
     // ---- sidebar --------------------------------------------------------
 
     /// The sidebar as it currently renders — workspaces then agents — for the
-    /// renderer, hit-testing, and navigation.
+    /// renderer, hit-testing, and navigation. Carries the client's collapse state
+    /// so the frame headers and row math agree.
     pub fn sidebar(&self) -> Sidebar {
-        sidebar::build(&self.workspaces, self.active_tab)
+        let mut sidebar = sidebar::build(&self.workspaces, self.active_tab);
+        sidebar.projects_collapsed = self.collapsed_projects;
+        sidebar.agents_collapsed = self.collapsed_agents;
+        sidebar
     }
 
     /// Whether the sidebar currently holds keyboard focus.
@@ -645,27 +675,55 @@ impl App {
         (Some(sidebar), panes)
     }
 
-    /// The three regions a content area splits into: the sidebar column (when
-    /// shown, full height), the top tab-bar row, and the pane area below it.
-    /// Every rect the renderer, resize sync, and mouse hit-testing use flows
-    /// from here so they stay in agreement.
-    pub fn regions(&self, content: Rect) -> (Option<Rect>, Rect, Rect) {
-        let (sidebar, right) = self.split_content(content);
-        if right.height <= 1 {
-            return (sidebar, right, right);
-        }
-        let tabs = Rect::new(right.x, right.y, right.width, 1);
-        let panes = Rect::new(right.x, right.y + 1, right.width, right.height - 1);
-        (sidebar, tabs, panes)
+    /// The two regions a content area splits into: the sidebar column (when
+    /// shown, full height) and the pane area to its right. The tab list now lives
+    /// in the top app bar, so the content region no longer carries a tab-bar row.
+    /// Every rect the renderer, resize sync, and mouse hit-testing use flows from
+    /// here so they stay in agreement.
+    pub fn regions(&self, content: Rect) -> (Option<Rect>, Rect) {
+        self.split_content(content)
     }
 
-    /// Split the terminal `area` into the content region (everything above the
-    /// bottom bar) and the one-row bottom bar — the single source of truth for
-    /// that split, shared by the renderer and the resize sync.
+    /// Split the terminal `area` vertically into the content region (between the
+    /// top app-bar header and the footer) and the one-row footer — the single
+    /// source of truth for that split, shared by the renderer and the resize
+    /// sync. The app bar and its rule claim `HEADER_ROWS` at the top.
     pub fn content_rect(area: Rect) -> (Rect, Rect) {
-        let content = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
-        let bottom = Rect::new(area.x, area.y + content.height, area.width, 1);
-        (content, bottom)
+        let top = HEADER_ROWS.min(area.height);
+        let content_h = area.height.saturating_sub(HEADER_ROWS + 1);
+        let content = Rect::new(area.x, area.y + top, area.width, content_h);
+        let footer = Rect::new(
+            area.x,
+            area.y + area.height.saturating_sub(1),
+            area.width,
+            1,
+        );
+        (content, footer)
+    }
+
+    /// The top app-bar row (full width) and the dim rule beneath it. Derived from
+    /// the terminal `area`; the tab segments and the wordmark render onto the app
+    /// bar, the content region begins below the rule.
+    pub fn header_rects(area: Rect) -> (Rect, Rect) {
+        let app_bar = Rect::new(area.x, area.y, area.width, 1);
+        let rule = Rect::new(area.x, area.y + 1.min(area.height), area.width, 1);
+        (app_bar, rule)
+    }
+
+    /// The right-aligned tab-segment region on the app-bar row, sized to the tab
+    /// chips. Shared by the renderer and the click hit-test.
+    pub fn tab_bar_rect(&self, app_bar: Rect) -> Rect {
+        let w = self.tab_bar_width().min(app_bar.width);
+        Rect::new(app_bar.x + app_bar.width.saturating_sub(w), app_bar.y, w, 1)
+    }
+
+    /// The rendered width of the tab segments: the chip labels plus one-column
+    /// separators between them.
+    fn tab_bar_width(&self) -> u16 {
+        let chips = self.tab_chips();
+        let labels: usize = chips.iter().map(|(_, l)| l.chars().count()).sum();
+        let seps = chips.len().saturating_sub(1);
+        (labels + seps) as u16
     }
 
     /// Focus the sidebar, revealing it if hidden. Refuses when the terminal is
@@ -685,13 +743,11 @@ impl App {
         let sidebar = self.sidebar();
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                if !sidebar.is_empty() {
-                    self.sidebar_selected = (self.sidebar_selected + 1).min(sidebar.len() - 1);
-                }
+                self.sidebar_selected = next_visible(&sidebar, self.sidebar_selected);
                 Vec::new()
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.sidebar_selected = self.sidebar_selected.saturating_sub(1);
+                self.sidebar_selected = prev_visible(&sidebar, self.sidebar_selected);
                 Vec::new()
             }
             KeyCode::Enter => self.jump_to_selected(&sidebar),
@@ -922,21 +978,25 @@ impl App {
         self.sidebar_rect.is_some_and(|r| contains(r, col, row))
     }
 
-    /// The tab-bar chips, left to right: one per tab (carrying its id) then a
-    /// trailing `+` (a `None` target = new tab). Shared by the renderer and the
-    /// click hit-test so a click lands on exactly what is drawn.
+    /// The app-bar tab segments, left to right: one `[<n> <name>]` per tab
+    /// (carrying its id) then a trailing `[+]` (a `None` target = new tab).
+    /// Shared by the renderer and the click hit-test so a click lands on exactly
+    /// what is drawn; the renderer joins them with a one-column separator.
     pub fn tab_chips(&self) -> Vec<(Option<TabId>, String)> {
         let mut chips: Vec<(Option<TabId>, String)> = self
             .all_tabs()
             .iter()
-            .map(|t| (Some(t.id), format!(" {} ", t.name)))
+            .enumerate()
+            .map(|(i, t)| (Some(t.id), format!("[{} {}]", i + 1, t.name)))
             .collect();
-        chips.push((None, " + ".into()));
+        chips.push((None, "[+]".into()));
         chips
     }
 
-    /// A click on the tab bar: select the tab whose chip was hit, or create a
-    /// new tab when the trailing `+` chip was hit.
+    /// A click on the tab bar: select the tab whose segment was hit, or create a
+    /// new tab when the trailing `[+]` segment was hit. Segments are laid out from
+    /// the bar's left edge with a one-column separator between them, matching the
+    /// renderer.
     fn tab_bar_click(&mut self, col: u16) -> Vec<WireFrame> {
         let Some(rect) = self.tab_bar_rect else {
             return Vec::new();
@@ -955,13 +1015,14 @@ impl App {
                     None => self.new_tab(),
                 };
             }
-            x += w;
+            x += w + 1; // step past the segment and its separator column
         }
         Vec::new()
     }
 
-    /// A left-click inside the sidebar: focus it, and if the click landed on an
-    /// entry, select and jump to it.
+    /// A left-click inside the sidebar: focus it, then act on what the row is — a
+    /// section header toggles that section's collapse, an entry selects and jumps
+    /// to it, and a border/blank just focuses.
     fn sidebar_click(&mut self, row: u16) -> Vec<WireFrame> {
         if matches!(self.mode, Mode::SidebarPrompt) {
             return Vec::new();
@@ -975,12 +1036,24 @@ impl App {
         };
         let sidebar = self.sidebar();
         let rel = row.saturating_sub(rect.y) as usize;
+        if let Some(section) = sidebar.header_at_row(rel) {
+            self.toggle_section(section);
+            return Vec::new();
+        }
         match sidebar.entry_at_row(rel) {
             Some(idx) => {
                 self.sidebar_selected = idx;
                 self.jump_to_selected(&sidebar)
             }
             None => Vec::new(),
+        }
+    }
+
+    /// Collapse or expand a sidebar section (projects or agents).
+    fn toggle_section(&mut self, section: sidebar::Section) {
+        match section {
+            sidebar::Section::Projects => self.collapsed_projects = !self.collapsed_projects,
+            sidebar::Section::Agents => self.collapsed_agents = !self.collapsed_agents,
         }
     }
 
@@ -1009,13 +1082,16 @@ impl App {
 
     // ---- layout / sizing ------------------------------------------------
 
-    /// Recompute pane rectangles for `content` and emit resize requests for any
-    /// pane whose rendered size changed, so the server's ptys track the client.
-    pub fn sync_sizes(&mut self, content: Rect) -> Vec<WireFrame> {
+    /// Recompute pane rectangles for the terminal `area` and emit resize requests
+    /// for any pane whose rendered size changed, so the server's ptys track the
+    /// client. Records the sidebar and tab-bar rects for mouse hit-testing.
+    pub fn sync_sizes(&mut self, area: Rect) -> Vec<WireFrame> {
+        let (content, _footer) = App::content_rect(area);
+        let (app_bar, _rule) = App::header_rects(area);
         self.last_content_width = content.width;
-        let (sidebar_rect, tab_bar_rect, _) = self.regions(content);
+        let (sidebar_rect, _panes) = self.regions(content);
         self.sidebar_rect = sidebar_rect;
-        self.tab_bar_rect = Some(tab_bar_rect);
+        self.tab_bar_rect = Some(self.tab_bar_rect(app_bar));
         self.rects = self.compute_rects(content);
         let mut out = Vec::new();
         for (pane, rect) in &self.rects {
@@ -1033,7 +1109,7 @@ impl App {
     }
 
     pub fn compute_rects(&self, content: Rect) -> Vec<(PaneId, Rect)> {
-        let (_, _, panes) = self.regions(content);
+        let (_, panes) = self.regions(content);
         let Some(layout) = self.active_tab_view().and_then(|t| t.layout.as_ref()) else {
             return Vec::new();
         };
@@ -1309,10 +1385,12 @@ fn center(r: Rect) -> (u16, u16) {
 }
 
 /// Inner (borderless) size of a pane rect as `(rows, cols)`, clamped to at
-/// least 1 so a pty is never asked for a zero dimension.
+/// least 1 so a pty is never asked for a zero dimension. A pane rect reserves
+/// its top row for the title line drawn above the frame, so height loses that
+/// row plus the two border rows.
 fn inner_size(rect: Rect) -> (u16, u16) {
     (
-        rect.height.saturating_sub(2).max(1),
+        rect.height.saturating_sub(3).max(1),
         rect.width.saturating_sub(2).max(1),
     )
 }
@@ -1453,6 +1531,37 @@ fn common_parent(dirs: &[PathBuf]) -> Option<PathBuf> {
             Some(path)
         }
     }
+}
+
+/// The next selectable entry at or after `from`, skipping entries whose section
+/// is collapsed; stays on `from` when nothing visible lies ahead. With no
+/// section collapsed this is a plain `from + 1` clamped to the last entry.
+fn next_visible(sidebar: &Sidebar, from: usize) -> usize {
+    if sidebar.is_empty() {
+        return 0;
+    }
+    let last = sidebar.len() - 1;
+    let mut i = from;
+    while i < last {
+        i += 1;
+        if sidebar.is_visible(i) {
+            return i;
+        }
+    }
+    from
+}
+
+/// The previous visible entry before `from`, skipping collapsed sections; stays
+/// on `from` when nothing visible lies behind.
+fn prev_visible(sidebar: &Sidebar, from: usize) -> usize {
+    let mut i = from;
+    while i > 0 {
+        i -= 1;
+        if sidebar.is_visible(i) {
+            return i;
+        }
+    }
+    from
 }
 
 fn tab_infos(w: &WorkspaceView) -> impl Iterator<Item = &PaneInfo> {
@@ -1639,8 +1748,9 @@ mod tests {
 
     #[test]
     fn sync_sizes_requests_resize_once_per_size() {
-        // Sidebar off so the lone pane keeps the full width; the top tab bar
-        // still costs one row of height.
+        // Sidebar off so the lone pane keeps the full width. The chrome costs
+        // four rows of the pane's height: the two-row app-bar header, the footer,
+        // and the pane's own title line above its frame (plus the two borders).
         let mut app = App::with_config(Config::parse("sidebar = \"off\"\n").unwrap());
         attached(&mut app);
         let area = Rect::new(0, 0, 80, 24);
@@ -1649,7 +1759,7 @@ mod tests {
             first,
             vec![control(&Request::PaneResize {
                 pane: PaneId(1),
-                rows: 21,
+                rows: 18,
                 cols: 78,
             })]
         );
@@ -2340,8 +2450,10 @@ mod tests {
         let mut app = App::new();
         attach_with(&mut app, view_two_workspaces());
         app.sync_sizes(Rect::new(0, 0, 100, 24));
-        // Top pad row 0, header row 1, workspace 0 rows 2-3, workspace 1 rows 4-5.
-        let out = app.on_mouse(MouseEventKind::Down(MouseButton::Left), 2, 4);
+        // The sidebar frame starts at content row 2 (below the app-bar header).
+        // Within it: projects header (border) rel 0, workspace 0 rel 1-2,
+        // workspace 1 rel 3-4 — so screen row 2 + 3 = 5 hits the second workspace.
+        let out = app.on_mouse(MouseEventKind::Down(MouseButton::Left), 2, 5);
         assert_eq!(out, vec![control(&Request::TabSelect { id: TabId(2) })]);
         assert_eq!(app.active_tab, Some(TabId(2)));
     }
@@ -2351,10 +2463,30 @@ mod tests {
         let mut app = App::new();
         attach_with(&mut app, view_two_workspaces());
         app.sync_sizes(Rect::new(0, 0, 100, 24));
-        // Row 0 is the top pad — background, not an entry.
-        let out = app.on_mouse(MouseEventKind::Down(MouseButton::Left), 2, 0);
+        // A blank filler row deep in the frame (past the entries, above the
+        // bottom border) is background — not a header or an entry.
+        let out = app.on_mouse(MouseEventKind::Down(MouseButton::Left), 2, 20);
         assert!(out.is_empty(), "a background click jumps nowhere");
         assert!(app.sidebar_focused(), "but it does focus the sidebar");
+    }
+
+    #[test]
+    fn clicking_a_section_header_toggles_its_collapse() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        app.sync_sizes(Rect::new(0, 0, 100, 24));
+        // The projects header is the sidebar's top border, at screen row 2.
+        assert!(!app.sidebar().projects_collapsed);
+        let out = app.on_mouse(MouseEventKind::Down(MouseButton::Left), 2, 2);
+        assert!(out.is_empty(), "toggling a section jumps nowhere");
+        assert!(
+            app.sidebar().projects_collapsed,
+            "clicking the projects header collapses it"
+        );
+        assert!(app.sidebar_focused(), "and focuses the sidebar");
+        // Clicking it again expands.
+        app.on_mouse(MouseEventKind::Down(MouseButton::Left), 2, 2);
+        assert!(!app.sidebar().projects_collapsed);
     }
 
     #[test]
@@ -2362,19 +2494,20 @@ mod tests {
         let mut app = App::new();
         attach_with(&mut app, view_two_tabs());
         app.sync_sizes(Rect::new(0, 0, 100, 24));
-        // Tab bar sits right of the 30-wide sidebar on the top row: chips are
-        // " 1 " (x 30-33), " 2 " (33-36), " + " (36-39).
-        let out = app.on_mouse(MouseEventKind::Down(MouseButton::Left), 34, 0);
+        // The tab segments are right-aligned on the app-bar row (row 0). Labels
+        // "[1 1]" "[2 2]" "[+]" total 15 cols with separators, so they start at
+        // col 85: "[1 1]" 85-89, "[2 2]" 91-95, "[+]" 97-99.
+        let out = app.on_mouse(MouseEventKind::Down(MouseButton::Left), 93, 0);
         assert_eq!(out, vec![control(&Request::TabSelect { id: TabId(2) })]);
         assert_eq!(app.active_tab, Some(TabId(2)));
 
-        let out = app.on_mouse(MouseEventKind::Down(MouseButton::Left), 37, 0);
+        let out = app.on_mouse(MouseEventKind::Down(MouseButton::Left), 98, 0);
         assert_eq!(
             out,
             vec![control(&Request::TabNew {
                 workspace: Some(WorkspaceId(1)),
             })],
-            "the + chip creates a tab in the active workspace"
+            "the + segment creates a tab in the active workspace"
         );
     }
 

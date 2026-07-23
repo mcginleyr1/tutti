@@ -77,6 +77,16 @@ pub enum SidebarVisibility {
     Off,
 }
 
+/// The glyph set for the sidebar's dots and markers. `Unicode` (the default) is
+/// the safe set every terminal renders; `Nerdfont` swaps in private-use icons
+/// for users with a patched font. Tree guides and the braille spinner are shared
+/// across both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Icons {
+    Unicode,
+    Nerdfont,
+}
+
 /// One prefix binding: the follow-up key, its action, and a short description
 /// rendered in the which-key popup and help overlay.
 #[derive(Debug, Clone, Copy)]
@@ -229,6 +239,12 @@ pub struct Config {
     pub keys: Keys,
     pub preset: Preset,
     pub sidebar: SidebarVisibility,
+    /// Whether the chrome (app bar, sidebar, footer, floating panels) takes a
+    /// subtle neutral background shade. Only honoured on truecolor terminals;
+    /// pane interiors never take a shade. Default on.
+    pub chrome_background: bool,
+    /// The sidebar glyph set. Default `Unicode`.
+    pub icons: Icons,
     /// Whether pane notifications re-emit to the real terminal and flash the
     /// status bar. The sidebar bell mark is unaffected — always on.
     pub notifications: bool,
@@ -291,6 +307,15 @@ impl Config {
             }
         };
 
+        let chrome_background = raw.chrome_background.unwrap_or(true);
+        let icons = match raw.icons.as_deref() {
+            None | Some("unicode") => Icons::Unicode,
+            Some("nerdfont") => Icons::Nerdfont,
+            Some(other) => {
+                bail!("icons: unknown value {other:?} (expected \"unicode\" or \"nerdfont\")")
+            }
+        };
+
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let projects = raw
             .projects
@@ -319,6 +344,8 @@ impl Config {
             keys: Keys { bindings },
             preset,
             sidebar,
+            chrome_background,
+            icons,
             notifications,
             projects,
             prefix_bindings,
@@ -356,6 +383,8 @@ struct RawConfig {
     mouse: Option<bool>,
     preset: Option<String>,
     sidebar: Option<String>,
+    chrome_background: Option<bool>,
+    icons: Option<String>,
     notifications: Option<bool>,
     #[serde(default)]
     keys: RawKeys,
@@ -706,6 +735,39 @@ kill_pane    = "A-x"
             Config::parse("notifications = true\n")
                 .unwrap()
                 .notifications
+        );
+    }
+
+    #[test]
+    fn chrome_background_defaults_on_and_toggles_off() {
+        assert!(Config::default().chrome_background);
+        assert!(
+            !Config::parse("chrome_background = false\n")
+                .unwrap()
+                .chrome_background
+        );
+        assert!(
+            Config::parse("chrome_background = true\n")
+                .unwrap()
+                .chrome_background
+        );
+    }
+
+    #[test]
+    fn icons_default_unicode_parse_nerdfont_and_reject_unknown() {
+        assert_eq!(Config::default().icons, Icons::Unicode);
+        assert_eq!(
+            Config::parse("icons = \"unicode\"\n").unwrap().icons,
+            Icons::Unicode
+        );
+        assert_eq!(
+            Config::parse("icons = \"nerdfont\"\n").unwrap().icons,
+            Icons::Nerdfont
+        );
+        let err = Config::parse("icons = \"emoji\"\n").unwrap_err();
+        assert!(
+            err.to_string().contains("emoji"),
+            "error should name the offending value: {err}"
         );
     }
 
