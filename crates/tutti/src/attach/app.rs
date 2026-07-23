@@ -464,6 +464,13 @@ impl App {
         }
         match (self.focused, input::encode_key(key)) {
             (Some(pane), Some(bytes)) => vec![WireFrame::Input { pane, bytes }],
+            // No pane to type into: honor the dashboard's advertised key so
+            // `n → add a project` works without focusing the sidebar first.
+            (None, _) if key.code == KeyCode::Char('n') && key.modifiers.is_empty() => {
+                self.mode = Mode::Sidebar;
+                self.open_project_prompt();
+                Vec::new()
+            }
             _ => Vec::new(),
         }
     }
@@ -2333,6 +2340,17 @@ mod tests {
         assert!(
             app.has_working_agent(),
             "the working claude agent drives the spinner"
+        );
+    }
+
+    #[test]
+    fn n_opens_the_project_prompt_when_no_pane_can_take_input() {
+        let mut app = App::new();
+        assert_eq!(app.mode, Mode::Terminal);
+        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(
+            app.sidebar_prompt_active(),
+            "with no panes, the dashboard's `n` must work from terminal mode"
         );
     }
 
