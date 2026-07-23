@@ -12,6 +12,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use tutti_core::{AgentState, PaneId, PaneInfo, SubagentInfo};
 
 use super::app::{App, Mode};
+use super::launcher::LauncherRow;
 use super::sidebar::{AgentRow, SidebarEntry, WorkspaceRow};
 use crate::config::{self, Config, Icons, PrefixAction};
 use crate::render::state_label;
@@ -153,6 +154,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     if app.mode == Mode::Help {
         draw_help(frame, app, area);
+    }
+    if app.mode == Mode::Launcher {
+        draw_launcher(frame, app, area);
+    }
+    if app.mode == Mode::LauncherCommand {
+        draw_launcher_command(frame, app, area);
     }
 }
 
@@ -847,6 +854,7 @@ fn mode_label(mode: Mode) -> Option<&'static str> {
         Mode::Help => Some("HELP"),
         Mode::Sidebar => Some("SIDEBAR"),
         Mode::SidebarPrompt => Some("ADD PROJECT"),
+        Mode::Launcher | Mode::LauncherCommand => Some("RUN"),
     }
 }
 
@@ -977,6 +985,97 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(lines).block(popup_block(app, " help ")),
         popup,
     );
+}
+
+/// The agent launcher overlay: a centred rounded panel titled ` run ` listing
+/// what can start in a pane — the registry agents (dim-italic and
+/// `(not installed)` when their binary is absent), then the shell and command
+/// rows. The selected row takes an accent `❯` marker and accent name; each row
+/// shows its quick-select number.
+fn draw_launcher(frame: &mut Frame, app: &App, area: Rect) {
+    let selected = app.launcher_selected();
+    let mut lines: Vec<Line> = app
+        .launcher_rows()
+        .iter()
+        .enumerate()
+        .map(|(i, row)| launcher_line(i, row, i == selected))
+        .collect();
+    lines.push(popup_key_line("esc", "cancel"));
+    draw_centered_popup(frame, app, area, " run ", lines);
+}
+
+/// One launcher row: `<n>  <name>   <role>`, an accent `❯` marker and accent
+/// name when selected. An unavailable agent row is dim-italic and tagged
+/// ` (not installed)`.
+fn launcher_line(idx: usize, row: &LauncherRow, selected: bool) -> Line<'static> {
+    let num = Span::styled(format!(" {} ", idx + 1), dim());
+    if !row.available {
+        return Line::from(vec![
+            num,
+            Span::styled(
+                format!("  {}   {}  (not installed)", row.name, row.role),
+                dim().add_modifier(Modifier::ITALIC),
+            ),
+        ]);
+    }
+    let marker = if selected {
+        Span::styled(
+            "❯ ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw("  ")
+    };
+    let name_style = if selected {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    };
+    Line::from(vec![
+        num,
+        marker,
+        Span::styled(row.name.clone(), name_style),
+        Span::styled(format!("   {}", row.role), dim()),
+    ])
+}
+
+/// The launcher's free-form command input: a centred rounded panel titled
+/// ` run ` with a single `▍run: <text>█` line, mirroring the sidebar prompt's
+/// accent-bar input.
+fn draw_launcher_command(frame: &mut Frame, app: &App, area: Rect) {
+    let line = Line::from(vec![
+        Span::styled("▍", Style::default().fg(ACCENT)),
+        Span::styled("run: ", dim()),
+        Span::styled(app.launcher_command().to_string(), Style::default()),
+        Span::styled("█", Style::default().fg(ACCENT)),
+    ]);
+    // A minimum width so a short command still reads as an input field.
+    let width = (line.width() as u16 + 2).max(24).min(area.width);
+    let height = 3u16.min(area.height);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let popup = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(line).block(popup_block(app, " run ")), popup);
+}
+
+/// Render `lines` in a rounded, chrome-shaded panel titled `title`, centred over
+/// `area`. Shared by the launcher picker with the help/which-key panel look.
+fn draw_centered_popup(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    title: &'static str,
+    lines: Vec<Line>,
+) {
+    let inner_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let width = (inner_w + 2).min(area.width);
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let popup = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(lines).block(popup_block(app, title)), popup);
 }
 
 /// A floating panel's block: a rounded dim border carrying `title`, with the
@@ -1998,6 +2097,47 @@ mod tests {
         assert!(
             text.contains("add a project"),
             "the action list offers the first project: {text:?}"
+        );
+    }
+
+    #[test]
+    fn launcher_overlay_lists_the_run_choices() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = app_with_pane(b"hi");
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Launcher);
+
+        let mut terminal = Terminal::new(TestBackend::new(64, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("run"), "the panel title is missing: {text:?}");
+        assert!(text.contains("claude"), "an agent row is missing: {text:?}");
+        assert!(text.contains("shell"), "the shell row is missing: {text:?}");
+        assert!(
+            text.contains("command"),
+            "the command row is missing: {text:?}"
+        );
+    }
+
+    #[test]
+    fn launcher_command_input_shows_the_run_prompt() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = app_with_pane(b"hi");
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        // The command row is last; select it by its number to open the input.
+        let command_number = tutti_agents::Registry::default().specs().len() + 2;
+        let digit = char::from_digit(command_number as u32, 10).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char(digit), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::LauncherCommand);
+
+        let mut terminal = Terminal::new(TestBackend::new(64, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("run:"),
+            "the command input prompt is missing: {text:?}"
         );
     }
 }

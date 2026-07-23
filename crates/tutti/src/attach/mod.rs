@@ -5,6 +5,7 @@
 mod app;
 mod connection;
 mod input;
+mod launcher;
 mod layout;
 mod render;
 mod sidebar;

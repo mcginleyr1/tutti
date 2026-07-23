@@ -13,7 +13,10 @@ use tutti_core::{
     Response, TabId, TabView, WorkspaceId, WorkspaceView,
 };
 
+use tutti_agents::Registry;
+
 use super::input;
+use super::launcher::{self, LaunchKind, LauncherRow};
 use super::layout::pane_rects;
 use super::sidebar::{self, Sidebar, SidebarEntry};
 use crate::config::{self, Action, Config, PrefixAction, RESIZE_DELTA, SidebarVisibility};
@@ -79,6 +82,10 @@ pub enum Mode {
     Sidebar,
     /// Editing the add-project directory prompt at the sidebar's foot.
     SidebarPrompt,
+    /// The agent launcher overlay: pick what to run in a pane.
+    Launcher,
+    /// The launcher's free-form command input.
+    LauncherCommand,
 }
 
 pub struct App {
@@ -113,6 +120,16 @@ pub struct App {
     prompt_completions: Vec<String>,
     /// The highlighted completion row; `Tab` fills it, the arrows move it.
     prompt_selected: usize,
+    /// The launcher rows, built when the launcher opens so render and dispatch
+    /// read one list.
+    launcher: Vec<LauncherRow>,
+    /// The highlighted launcher row.
+    launcher_selected: usize,
+    /// Whether the launcher opened right after add-project — `esc` there spawns
+    /// the shell into the new workspace (the old outcome) rather than closing.
+    launcher_after_add: bool,
+    /// The command line typed in the launcher's `command…` input.
+    launcher_command: String,
     /// The sidebar column from the last size sync, for mouse hit-testing.
     sidebar_rect: Option<Rect>,
     /// The top tab-bar row from the last size sync, for mouse hit-testing.
@@ -175,6 +192,10 @@ impl App {
             sidebar_prompt: String::new(),
             prompt_completions: Vec::new(),
             prompt_selected: 0,
+            launcher: Vec::new(),
+            launcher_selected: 0,
+            launcher_after_add: false,
+            launcher_command: String::new(),
             sidebar_rect: None,
             tab_bar_rect: None,
             spinner_epoch: Instant::now(),
@@ -452,6 +473,8 @@ impl App {
             Mode::Scroll(pane) => self.on_key_scroll(key, pane),
             Mode::Sidebar => self.on_key_sidebar(key),
             Mode::SidebarPrompt => self.on_key_prompt(key),
+            Mode::Launcher => self.on_key_launcher(key),
+            Mode::LauncherCommand => self.on_key_launcher_command(key),
             Mode::Help => {
                 self.mode = Mode::Terminal;
                 Vec::new()
@@ -569,6 +592,10 @@ impl App {
             PrefixAction::TabNew => self.new_tab(),
             PrefixAction::Sidebar => {
                 self.focus_sidebar();
+                Vec::new()
+            }
+            PrefixAction::Run => {
+                self.open_launcher(false);
                 Vec::new()
             }
             PrefixAction::Detach => self.detach(),
@@ -754,6 +781,22 @@ impl App {
     }
 
     fn on_key_sidebar(&mut self, key: KeyEvent) -> Vec<WireFrame> {
+        // The directional direct bindings cross the sidebar↔pane edge:
+        // focus_right returns to the pane area (keeping its focus), focus_left
+        // steps to the previous tab — the same wrap the pane's left edge does.
+        match self.config.keys.action_for(key) {
+            Some(Action::FocusRight) => {
+                self.mode = Mode::Terminal;
+                self.status = None;
+                return Vec::new();
+            }
+            Some(Action::FocusLeft) => {
+                self.mode = Mode::Terminal;
+                self.status = None;
+                return self.switch_tab(-1);
+            }
+            _ => {}
+        }
         let sidebar = self.sidebar();
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
@@ -937,27 +980,145 @@ impl App {
     }
 
     /// Submit the add-project prompt: mount the typed directory as a workspace,
-    /// bootstrap a shell pane in it (matching bare `tutti`), and arm the jump to
-    /// the new tab.
+    /// arm the jump to the new tab, then open the launcher to pick its first
+    /// pane (esc there spawns the shell, preserving bare `tutti`'s outcome).
     fn submit_prompt(&mut self) -> Vec<WireFrame> {
         let input = self.sidebar_prompt.trim().to_string();
         self.clear_prompt();
         self.status = None;
-        self.mode = Mode::Terminal;
         if input.is_empty() {
+            self.mode = Mode::Terminal;
             return Vec::new();
         }
         let dir = expand_dir(&input);
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         self.adopt_active_view = true;
-        vec![
-            control(&Request::WorkspaceNew { dir }),
-            control(&Request::PaneRun {
-                tab: None,
-                cmd: vec![shell],
-                ephemeral: false,
-            }),
-        ]
+        self.open_launcher(true);
+        vec![control(&Request::WorkspaceNew { dir })]
+    }
+
+    /// Open the agent launcher — the "what should run here?" picker — building
+    /// its rows from the registry and the live PATH. `after_add` records that it
+    /// fired right after add-project, so `esc` still spawns the shell into the
+    /// new workspace (today's outcome); otherwise `esc` just closes.
+    fn open_launcher(&mut self, after_add: bool) {
+        self.launcher =
+            launcher::build_rows(&Registry::default(), std::env::var_os("PATH").as_deref());
+        self.launcher_selected = launcher::first_selectable(&self.launcher);
+        self.launcher_after_add = after_add;
+        self.launcher_command.clear();
+        self.mode = Mode::Launcher;
+        self.prefix_since = None;
+        self.status = None;
+    }
+
+    /// The launcher rows as they currently render, for the renderer.
+    pub fn launcher_rows(&self) -> &[LauncherRow] {
+        &self.launcher
+    }
+
+    /// The highlighted launcher row index.
+    pub fn launcher_selected(&self) -> usize {
+        self.launcher_selected
+    }
+
+    /// The text typed in the launcher's `command…` input.
+    pub fn launcher_command(&self) -> &str {
+        &self.launcher_command
+    }
+
+    fn on_key_launcher(&mut self, key: KeyEvent) -> Vec<WireFrame> {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.launcher_selected =
+                    launcher::next_selectable(&self.launcher, self.launcher_selected);
+                Vec::new()
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.launcher_selected =
+                    launcher::prev_selectable(&self.launcher, self.launcher_selected);
+                Vec::new()
+            }
+            // Quick-select launches the numbered row outright.
+            KeyCode::Char(c @ '1'..='9') => self.launch_index(c as usize - '1' as usize),
+            KeyCode::Enter => self.launch_index(self.launcher_selected),
+            KeyCode::Esc => {
+                if self.launcher_after_add {
+                    self.launch_shell_and_close()
+                } else {
+                    self.close_launcher();
+                    Vec::new()
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Launch the row at `idx` when it exists and is selectable; an out-of-range
+    /// or unavailable quick-select is ignored. An agent/shell spawns a pane and
+    /// closes the launcher; `command…` opens the free-form input instead.
+    fn launch_index(&mut self, idx: usize) -> Vec<WireFrame> {
+        let kind = match self.launcher.get(idx) {
+            Some(row) if row.selectable() => row.kind.clone(),
+            _ => return Vec::new(),
+        };
+        match kind {
+            LaunchKind::Agent(cmd) => {
+                self.close_launcher();
+                vec![run_pane(vec![cmd])]
+            }
+            LaunchKind::Shell => self.launch_shell_and_close(),
+            LaunchKind::Command => {
+                self.launcher_command.clear();
+                self.mode = Mode::LauncherCommand;
+                Vec::new()
+            }
+        }
+    }
+
+    fn launch_shell_and_close(&mut self) -> Vec<WireFrame> {
+        self.close_launcher();
+        vec![run_pane(vec![launcher::login_shell()])]
+    }
+
+    /// Dismiss the launcher back to terminal mode, dropping its transient state.
+    fn close_launcher(&mut self) {
+        self.mode = Mode::Terminal;
+        self.launcher.clear();
+        self.launcher_command.clear();
+        self.launcher_after_add = false;
+        self.status = None;
+    }
+
+    fn on_key_launcher_command(&mut self, key: KeyEvent) -> Vec<WireFrame> {
+        match key.code {
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.launcher_command.push(c);
+                Vec::new()
+            }
+            KeyCode::Backspace => {
+                self.launcher_command.pop();
+                Vec::new()
+            }
+            // Esc backs up to the picker rather than closing outright.
+            KeyCode::Esc => {
+                self.launcher_command.clear();
+                self.mode = Mode::Launcher;
+                Vec::new()
+            }
+            KeyCode::Enter => {
+                let input = self.launcher_command.trim().to_string();
+                if input.is_empty() {
+                    return Vec::new();
+                }
+                self.close_launcher();
+                vec![run_pane(vec![launcher::login_shell(), "-lc".into(), input])]
+            }
+            _ => Vec::new(),
+        }
     }
 
     // ---- mouse ----------------------------------------------------------
@@ -1262,15 +1423,23 @@ impl App {
         }
     }
 
-    /// Directional focus that falls through to the neighbouring tab when the
-    /// focused pane is at the left/right edge (zellij-nav parity). Vertical
-    /// edges are no-ops.
+    /// Directional focus that falls through at the left/right edge. Left steps
+    /// into the sidebar when it is on screen (nvim-explorer parity), else wraps
+    /// to the previous tab; right wraps to the next tab. Vertical edges are
+    /// no-ops.
     fn focus_or_tab(&mut self, dir: FocusDir) -> Vec<WireFrame> {
         if self.move_focus(dir) {
             return Vec::new();
         }
         match dir {
-            FocusDir::Left => self.switch_tab(-1),
+            FocusDir::Left => {
+                if self.sidebar_rect.is_some() {
+                    self.focus_sidebar();
+                    Vec::new()
+                } else {
+                    self.switch_tab(-1)
+                }
+            }
             FocusDir::Right => self.switch_tab(1),
             FocusDir::Up | FocusDir::Down => Vec::new(),
         }
@@ -1411,6 +1580,16 @@ fn inner_size(rect: Rect) -> (u16, u16) {
 
 pub(crate) fn control(request: &Request) -> WireFrame {
     WireFrame::Control(serde_json::to_vec(request).expect("serialize request"))
+}
+
+/// A `PaneRun` into the session's current tab (the just-created workspace after
+/// add-project, or the active tab for prefix-`r`), spawning a persistent pane.
+fn run_pane(cmd: Vec<String>) -> WireFrame {
+    control(&Request::PaneRun {
+        tab: None,
+        cmd,
+        ephemeral: false,
+    })
 }
 
 /// Whether `dir` or an ancestor holds a `.jj` directory. A local mirror of the
@@ -1950,12 +2129,62 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_h_on_leftmost_pane_switches_to_previous_tab() {
-        let mut app = App::new();
+    fn ctrl_h_on_leftmost_pane_switches_to_previous_tab_when_the_sidebar_is_hidden() {
+        // With the sidebar off, the left edge keeps its old wrap-to-previous-tab
+        // behaviour (the sidebar-visible path is covered separately below).
+        let mut app = App::with_config(Config::parse("sidebar = \"off\"\n").unwrap());
         attach_with(&mut app, view_two_tabs());
         app.sync_sizes(Rect::new(0, 0, 80, 24));
         let out = app.on_key(ctrl('h'));
         assert_eq!(out, vec![control(&Request::TabSelect { id: TabId(2) })]);
+        assert_eq!(app.active_tab, Some(TabId(2)));
+        assert_eq!(app.mode, Mode::Terminal, "no sidebar to step into");
+    }
+
+    #[test]
+    fn ctrl_h_at_the_left_edge_steps_into_the_sidebar_when_it_is_visible() {
+        // The default sidebar is on and wide enough here, so the left edge lands
+        // in the sidebar rather than wrapping to the previous tab.
+        let mut app = App::new();
+        attach_with(&mut app, view_two_tabs());
+        app.sync_sizes(Rect::new(0, 0, 100, 24));
+        assert_eq!(app.mode, Mode::Terminal);
+        let out = app.on_key(ctrl('h'));
+        assert!(
+            out.is_empty(),
+            "stepping into the sidebar emits no tab select"
+        );
+        assert_eq!(app.mode, Mode::Sidebar);
+        assert_eq!(app.active_tab, Some(TabId(1)), "the tab is unchanged");
+    }
+
+    #[test]
+    fn sidebar_ctrl_l_returns_to_the_pane_area_keeping_focus() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        let focused = app.focused;
+        let out = app.on_key(ctrl('l'));
+        assert!(out.is_empty(), "returning to the pane emits nothing");
+        assert_eq!(app.mode, Mode::Terminal);
+        assert_eq!(
+            app.focused, focused,
+            "the previously-focused pane is restored"
+        );
+    }
+
+    #[test]
+    fn sidebar_ctrl_h_wraps_to_the_previous_tab() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_tabs());
+        focus_sidebar(&mut app);
+        let out = app.on_key(ctrl('h'));
+        assert_eq!(
+            out,
+            vec![control(&Request::TabSelect { id: TabId(2) })],
+            "ctrl+h in the sidebar keeps the old previous-tab behaviour"
+        );
+        assert_eq!(app.mode, Mode::Terminal);
         assert_eq!(app.active_tab, Some(TabId(2)));
     }
 
@@ -2314,28 +2543,34 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         assert_eq!(app.sidebar_prompt(), "/tmp/w/api");
 
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(
             out,
-            vec![
-                control(&Request::WorkspaceNew {
-                    dir: PathBuf::from("/tmp/w/api"),
-                }),
-                control(&Request::PaneRun {
-                    tab: None,
-                    cmd: vec![shell],
-                    ephemeral: false,
-                }),
-            ],
-            "submit mounts the typed directory then bootstraps a shell pane"
+            vec![control(&Request::WorkspaceNew {
+                dir: PathBuf::from("/tmp/w/api"),
+            })],
+            "submit mounts the typed directory, then the launcher picks its first pane"
         );
-        assert_eq!(app.mode, Mode::Terminal);
+        assert_eq!(app.mode, Mode::Launcher);
         assert!(app.sidebar_prompt().is_empty());
         assert!(
             app.adopt_active_view,
             "the jump to the new workspace is armed"
         );
+
+        // esc in the launcher preserves the old outcome: a shell in the new workspace.
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let out = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            out,
+            vec![control(&Request::PaneRun {
+                tab: None,
+                cmd: vec![shell],
+                ephemeral: false,
+            })],
+            "esc after add-project spawns the shell into the new workspace"
+        );
+        assert_eq!(app.mode, Mode::Terminal);
     }
 
     #[test]
@@ -2398,30 +2633,36 @@ mod tests {
     }
 
     #[test]
-    fn first_run_prompt_enter_creates_workspace_and_shell() {
+    fn first_run_prompt_enter_creates_workspace_then_opens_the_launcher() {
         let mut app = App::new();
         app.start_first_run_prompt("/tmp/proj".into());
         attach_with(&mut app, vec![]);
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(
             out,
-            vec![
-                control(&Request::WorkspaceNew {
-                    dir: PathBuf::from("/tmp/proj"),
-                }),
-                control(&Request::PaneRun {
-                    tab: None,
-                    cmd: vec![shell],
-                    ephemeral: false,
-                }),
-            ],
+            vec![control(&Request::WorkspaceNew {
+                dir: PathBuf::from("/tmp/proj"),
+            })],
+            "the first-run prompt mounts the workspace, then the launcher picks its pane"
         );
-        assert_eq!(app.mode, Mode::Terminal);
+        assert_eq!(app.mode, Mode::Launcher);
         assert!(
             app.adopt_active_view,
             "the jump to the new workspace is armed"
         );
+
+        // esc launches the shell into the new workspace (the old first-run outcome).
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let out = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            out,
+            vec![control(&Request::PaneRun {
+                tab: None,
+                cmd: vec![shell],
+                ephemeral: false,
+            })],
+        );
+        assert_eq!(app.mode, Mode::Terminal);
     }
 
     #[test]
@@ -2781,21 +3022,15 @@ mod tests {
         assert_eq!(app.prompt_selected(), 1);
 
         let typed = app.sidebar_prompt().to_string();
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         // Enter mounts the *typed* directory (the tempdir), never the highlight.
         let dir = std::fs::canonicalize(&typed).unwrap();
         assert_eq!(
             out,
-            vec![
-                control(&Request::WorkspaceNew { dir }),
-                control(&Request::PaneRun {
-                    tab: None,
-                    cmd: vec![shell],
-                    ephemeral: false,
-                }),
-            ]
+            vec![control(&Request::WorkspaceNew { dir })],
+            "submit mounts the typed directory, then opens the launcher"
         );
+        assert_eq!(app.mode, Mode::Launcher);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2822,5 +3057,171 @@ mod tests {
         assert_eq!(app.prompt_completions(), &["gamma".to_string()]);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- agent launcher -------------------------------------------------
+
+    fn login_shell() -> String {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+    }
+
+    #[test]
+    fn prefix_r_opens_the_launcher_in_both_presets() {
+        for cfg in [Config::default(), vim_config()] {
+            let mut app = App::with_config(cfg);
+            attached(&mut app);
+            app.on_key(ctrl('b'));
+            let out = app.on_key(plain('r'));
+            assert!(out.is_empty(), "opening the launcher emits no frames");
+            assert_eq!(app.mode, Mode::Launcher);
+            // The rows are the registry agents plus the shell and command entries.
+            let names: Vec<&str> = app
+                .launcher_rows()
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect();
+            assert!(names.contains(&"claude"), "registry agents seed the rows");
+            assert!(names.contains(&"shell"), "the shell row is always present");
+            assert!(names.contains(&"command…"), "the command row too");
+        }
+    }
+
+    #[test]
+    fn launcher_enter_on_an_agent_row_emits_a_panerun() {
+        let mut app = App::new();
+        attached(&mut app);
+        // Drive the launcher into a known state with one available agent row.
+        app.launcher = vec![LauncherRow {
+            name: "claude".into(),
+            role: "Claude Code".into(),
+            kind: LaunchKind::Agent("claude".into()),
+            available: true,
+        }];
+        app.launcher_selected = 0;
+        app.mode = Mode::Launcher;
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            out,
+            vec![control(&Request::PaneRun {
+                tab: None,
+                cmd: vec!["claude".into()],
+                ephemeral: false,
+            })],
+            "enter launches the selected agent in a new pane"
+        );
+        assert_eq!(app.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn launcher_quick_select_number_launches_the_shell_row() {
+        let mut app = App::new();
+        attached(&mut app);
+        app.open_launcher(false);
+        // The shell row follows the registry agents; its number launches it.
+        let shell_number = Registry::default().specs().len() + 1;
+        let digit = char::from_digit(shell_number as u32, 10).unwrap();
+        let out = app.on_key(plain(digit));
+        assert_eq!(
+            out,
+            vec![control(&Request::PaneRun {
+                tab: None,
+                cmd: vec![login_shell()],
+                ephemeral: false,
+            })],
+            "the shell row's number launches it outright"
+        );
+        assert_eq!(app.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn launcher_command_row_opens_an_input_that_runs_via_shell_lc() {
+        let mut app = App::new();
+        attached(&mut app);
+        app.open_launcher(false);
+        // The command row is last; select it by number to open the input.
+        let command_number = Registry::default().specs().len() + 2;
+        let digit = char::from_digit(command_number as u32, 10).unwrap();
+        let out = app.on_key(plain(digit));
+        assert!(out.is_empty(), "opening the command input emits nothing");
+        assert_eq!(app.mode, Mode::LauncherCommand);
+
+        for c in "npm test".chars() {
+            app.on_key(plain(c));
+        }
+        assert_eq!(app.launcher_command(), "npm test");
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            out,
+            vec![control(&Request::PaneRun {
+                tab: None,
+                cmd: vec![login_shell(), "-lc".into(), "npm test".into()],
+                ephemeral: false,
+            })],
+            "the command runs through the login shell's -lc"
+        );
+        assert_eq!(app.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn launcher_command_esc_backs_up_to_the_picker() {
+        let mut app = App::new();
+        attached(&mut app);
+        app.open_launcher(false);
+        let command_number = Registry::default().specs().len() + 2;
+        let digit = char::from_digit(command_number as u32, 10).unwrap();
+        app.on_key(plain(digit));
+        app.on_key(plain('x'));
+        assert_eq!(app.mode, Mode::LauncherCommand);
+        let out = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(out.is_empty());
+        assert_eq!(app.mode, Mode::Launcher, "esc steps back to the picker");
+        assert!(app.launcher_command().is_empty());
+    }
+
+    #[test]
+    fn launcher_esc_from_prefix_r_closes_without_spawning() {
+        let mut app = App::new();
+        attached(&mut app);
+        app.on_key(ctrl('b'));
+        app.on_key(plain('r'));
+        assert_eq!(app.mode, Mode::Launcher);
+        let out = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            out.is_empty(),
+            "esc from a prefix-r launcher spawns nothing"
+        );
+        assert_eq!(app.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn launcher_jk_skips_unavailable_agent_rows() {
+        let mut app = App::new();
+        attached(&mut app);
+        app.launcher = vec![
+            LauncherRow {
+                name: "up".into(),
+                role: "".into(),
+                kind: LaunchKind::Agent("up".into()),
+                available: true,
+            },
+            LauncherRow {
+                name: "gone".into(),
+                role: "".into(),
+                kind: LaunchKind::Agent("gone".into()),
+                available: false,
+            },
+            LauncherRow {
+                name: "down".into(),
+                role: "".into(),
+                kind: LaunchKind::Agent("down".into()),
+                available: true,
+            },
+        ];
+        app.launcher_selected = 0;
+        app.mode = Mode::Launcher;
+        app.on_key(plain('j'));
+        assert_eq!(app.launcher_selected(), 2, "j skips the unavailable row");
+        app.on_key(plain('k'));
+        assert_eq!(app.launcher_selected(), 0, "k skips it too");
     }
 }

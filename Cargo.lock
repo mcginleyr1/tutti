@@ -1814,6 +1814,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+ "tutti-agents",
  "tutti-core",
  "tutti-server",
  "vt100",

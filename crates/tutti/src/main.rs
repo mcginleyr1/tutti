@@ -328,7 +328,9 @@ fn projects_to_create(
 /// Create a workspace + shell pane for each configured project not already
 /// mounted. A project whose dir cannot be started (e.g. it does not exist)
 /// yields a notice naming the path — surfaced as a transient message after
-/// attach — and the remaining projects still mount.
+/// attach — and the remaining projects still mount. Startup mounting always
+/// spawns a plain shell (never the agent launcher), so attaching a config with
+/// many `[[projects]]` does not open a launcher per project.
 fn mount_projects(
     projects: &[PathBuf],
     existing: &[PathBuf],

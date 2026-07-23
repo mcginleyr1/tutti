@@ -59,7 +59,8 @@ Direct keys work without the prefix (smart-splits / zellij-nav muscle memory):
 | Key | Action |
 | --- | --- |
 | `Ctrl+h/j/k/l` | focus the pane to the left/down/up/right |
-| `Ctrl+h`/`Ctrl+l` at the edge | move to the previous / next tab |
+| `Ctrl+h` at the left edge | step into the sidebar (when visible), then the previous tab |
+| `Ctrl+l` at the right edge | move to the next tab |
 | `Alt+h/j/k/l` | resize the focused split toward that direction |
 | `Alt+x` | kill the focused pane (confirms) |
 
@@ -76,6 +77,7 @@ preset:
 | `%` / `"` | split right / split down |
 | `n` / `p` / `c` | next / previous / new tab |
 | `w` | focus the workspace/agent sidebar |
+| `r` | run an agent / shell / command here (opens the launcher) |
 | `o`, arrows | focus next pane / directional focus |
 | `z` | zoom focused pane |
 | `x` | kill pane (confirms) |
@@ -99,6 +101,21 @@ plus the agent/state for the focused pane, dim for the rest. The **footer**
 stays out of the way: a mode chip on the left when you leave terminal mode
 (`SIDEBAR`, `SCROLL`, …) and the standing hint on the right; a transient fires a
 one-line **notification band** just above it (accent for info, red for errors).
+
+**Run launcher** (`Ctrl+B r`): a floating ` run ` panel that answers "what should
+start here?" — one row per detected agent (`claude`, `codex`, …; a missing binary
+shows dim as `(not installed)` and can't be picked), plus `shell` and `command…`.
+Move with `j/k`/arrows, press a row's number to launch it outright, `enter`
+launches the highlight, `esc` closes; `command…` opens a one-line input that runs
+whatever you type via your login shell. Adding a project (`n`) opens the launcher
+for the new workspace's first pane too — `esc` there just drops you into a shell,
+exactly as before. (Startup `[[projects]]` still mount plain shells, no launcher.)
+
+Sidebar edge-nav: at a pane's **left edge**, `Ctrl+h` steps into the sidebar when
+it is visible (nvim-explorer muscle memory) instead of jumping straight to the
+previous tab; from the sidebar, `Ctrl+l` returns to the pane you left and `Ctrl+h`
+goes on to the previous tab. With the sidebar hidden the left edge wraps to the
+previous tab as before.
 
 Mouse: click focuses a pane, click a tab segment or sidebar entry to jump, wheel
 scrolls a pane's history (disable with `mouse = false`). Colors come from your

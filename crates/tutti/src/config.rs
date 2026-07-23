@@ -62,6 +62,8 @@ pub enum PrefixAction {
     TabPrev,
     TabNew,
     Sidebar,
+    /// Open the agent launcher to run a choice in a new pane here.
+    Run,
     Detach,
     Help,
 }
@@ -115,6 +117,7 @@ const DEFAULT_PREFIX_TABLE: &[PrefixBinding] = &[
     b(KeyCode::Char('p'), PrefixAction::TabPrev, "prev tab"),
     b(KeyCode::Char('c'), PrefixAction::TabNew, "new tab"),
     b(KeyCode::Char('w'), PrefixAction::Sidebar, "workspaces"),
+    b(KeyCode::Char('r'), PrefixAction::Run, "run here"),
     b(
         KeyCode::Char('o'),
         PrefixAction::FocusCycle,
@@ -144,6 +147,7 @@ const VIM_PREFIX_TABLE: &[PrefixBinding] = &[
     b(KeyCode::Char('n'), PrefixAction::TabNext, "next tab"),
     b(KeyCode::Char('p'), PrefixAction::TabPrev, "prev tab"),
     b(KeyCode::Char('w'), PrefixAction::Sidebar, "workspaces"),
+    b(KeyCode::Char('r'), PrefixAction::Run, "run here"),
     b(KeyCode::Char('z'), PrefixAction::Zoom, "zoom pane"),
     b(KeyCode::Char('['), PrefixAction::Scrollback, "scrollback"),
     b(KeyCode::Char('?'), PrefixAction::Help, "help"),
@@ -781,6 +785,20 @@ kill_pane    = "A-x"
                 cfg.prefix_action(KeyCode::Char('w')),
                 Some(PrefixAction::Sidebar),
                 "w should focus the sidebar in every preset"
+            );
+        }
+    }
+
+    #[test]
+    fn both_presets_bind_the_run_key() {
+        for cfg in [
+            Config::default(),
+            Config::parse("preset = \"vim\"\n").unwrap(),
+        ] {
+            assert_eq!(
+                cfg.prefix_action(KeyCode::Char('r')),
+                Some(PrefixAction::Run),
+                "r should open the launcher in every preset"
             );
         }
     }
