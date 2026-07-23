@@ -56,13 +56,22 @@ enum Command {
         #[arg(value_enum)]
         agent: HookAgent,
     },
-    /// Print the settings.json hooks snippet wiring Claude Code to tutti.
+    /// Print or install the settings.json hooks wiring Claude Code to tutti.
     Hooks {
         #[arg(value_enum)]
         agent: HookAgent,
         /// Print only the JSON (omit the install instructions on stderr).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "install")]
         raw: bool,
+        /// Merge the hooks into settings.json (shows the change, asks first).
+        #[arg(long)]
+        install: bool,
+        /// Install into ./.claude/settings.json instead of ~/.claude/.
+        #[arg(long, requires = "install")]
+        project: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long, requires = "install")]
+        yes: bool,
     },
 }
 
@@ -224,9 +233,16 @@ fn run(cli: Cli) -> Result<i32> {
         Some(Command::Hooks {
             agent: HookAgent::Claude,
             raw,
+            install,
+            project,
+            yes,
         }) => {
-            emit_hooks(raw);
-            Ok(0)
+            if install {
+                install_hooks(project, yes)
+            } else {
+                emit_hooks(raw);
+                Ok(0)
+            }
         }
         Some(command) => {
             let request = to_request(command)?;
@@ -492,10 +508,79 @@ fn send_agent_event(session: &str, pane: PaneId, event: AgentHookEvent) -> Resul
 fn emit_hooks(raw: bool) {
     println!("{}", hooks::claude_hooks_snippet());
     if !raw {
-        eprintln!("# Add the JSON above to the \"hooks\" object in ~/.claude/settings.json");
-        eprintln!("# (or .claude/settings.json in a project). Merge into any existing hooks.");
-        eprintln!("# Panes tutti launches then report exact agent state and live subagents.");
+        eprintln!("# The object above already includes the \"hooks\" key: merge it into");
+        eprintln!("# ~/.claude/settings.json at the TOP level (or .claude/settings.json in");
+        eprintln!("# a project) — or let tutti do it: `tutti hooks claude --install`.");
+        eprintln!("# Outside a tutti pane the hook exits silently; if you ever uninstall");
+        eprintln!("# tutti, remove these entries or Claude will warn on every tool call.");
     }
+}
+
+/// Merge the hooks into settings.json: show before/after, ask (unless `--yes`),
+/// back up the old file, write atomically.
+fn install_hooks(project: bool, yes: bool) -> Result<i32> {
+    use std::io::Write;
+
+    let path = if project {
+        PathBuf::from(".claude/settings.json")
+    } else {
+        let home = std::env::var_os("HOME").context("HOME is not set")?;
+        PathBuf::from(home).join(".claude/settings.json")
+    };
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text)
+            .with_context(|| format!("{} is not valid JSON", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+
+    let Some((merged, added)) = hooks::merge_claude_hooks(&existing)? else {
+        println!("tutti hooks already installed in {}", path.display());
+        return Ok(0);
+    };
+
+    let before = existing
+        .get("hooks")
+        .map(|h| serde_json::to_string_pretty(h).expect("hooks serialize"))
+        .unwrap_or_else(|| "(no hooks yet)".into());
+    let after = serde_json::to_string_pretty(&merged["hooks"]).expect("hooks serialize");
+    println!(
+        "{}: adding tutti hooks for {}\n",
+        path.display(),
+        added.join(", ")
+    );
+    println!("--- hooks before ---\n{before}\n--- hooks after ---\n{after}\n");
+
+    if !yes {
+        eprint!("Write {}? [y/N] ", path.display());
+        std::io::stderr().flush().ok();
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            eprintln!("aborted; nothing written");
+            return Ok(1);
+        }
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    if path.exists() {
+        let backup = path.with_extension("json.bak");
+        std::fs::copy(&path, &backup)
+            .with_context(|| format!("backing up to {}", backup.display()))?;
+        eprintln!("backed up existing file to {}", backup.display());
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(
+        &tmp,
+        serde_json::to_string_pretty(&merged).expect("settings serialize"),
+    )
+    .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
+    println!("installed tutti hooks into {}", path.display());
+    Ok(0)
 }
 
 fn emit(response: Response, json: bool) -> i32 {
@@ -861,8 +946,24 @@ mod tests {
             Some(Command::Hooks {
                 agent: HookAgent::Claude,
                 raw: false,
+                install: false,
+                ..
             })
         ));
+        assert!(matches!(
+            Cli::try_parse_from(["tutti", "hooks", "claude", "--install", "--yes"])
+                .unwrap()
+                .command,
+            Some(Command::Hooks {
+                install: true,
+                yes: true,
+                project: false,
+                ..
+            })
+        ));
+        // --yes/--project require --install; --raw conflicts with --install.
+        assert!(Cli::try_parse_from(["tutti", "hooks", "claude", "--yes"]).is_err());
+        assert!(Cli::try_parse_from(["tutti", "hooks", "claude", "--raw", "--install"]).is_err());
         assert!(matches!(
             Cli::try_parse_from(["tutti", "hooks", "claude", "--raw"])
                 .unwrap()
@@ -870,6 +971,7 @@ mod tests {
             Some(Command::Hooks {
                 agent: HookAgent::Claude,
                 raw: true,
+                ..
             })
         ));
         // An unknown agent is rejected at parse time.

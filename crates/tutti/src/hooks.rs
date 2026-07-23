@@ -93,6 +93,61 @@ pub fn claude_hooks_snippet() -> String {
     serde_json::to_string_pretty(&claude_hooks_json()).expect("hooks snippet serializes")
 }
 
+/// Merge the tutti hook entries into an existing settings.json value. Returns
+/// `None` when every event already carries the tutti hook (nothing to do),
+/// otherwise the merged settings plus the events that were added. Existing
+/// settings keys and foreign hook entries are preserved untouched; a
+/// non-object `settings` or `hooks` value is a hard error rather than a guess.
+pub fn merge_claude_hooks(settings: &Value) -> anyhow::Result<Option<(Value, Vec<String>)>> {
+    use anyhow::bail;
+
+    let mut merged = match settings {
+        Value::Null => json!({}),
+        Value::Object(_) => settings.clone(),
+        other => bail!("settings.json root is not an object: {other}"),
+    };
+    let ours = claude_hooks_json();
+    let ours = ours["hooks"].as_object().expect("snippet has hooks");
+
+    let hooks_slot = merged
+        .as_object_mut()
+        .expect("merged is an object")
+        .entry("hooks")
+        .or_insert_with(|| json!({}));
+    let Value::Object(hooks) = hooks_slot else {
+        bail!("existing \"hooks\" value is not an object");
+    };
+
+    let mut added = Vec::new();
+    for (event, groups) in ours {
+        let slot = hooks.entry(event.clone()).or_insert_with(|| json!([]));
+        let Value::Array(existing) = slot else {
+            bail!("existing hooks entry for {event} is not an array");
+        };
+        if existing.iter().any(has_tutti_hook) {
+            continue;
+        }
+        existing.extend(groups.as_array().expect("snippet groups").iter().cloned());
+        added.push(event.clone());
+    }
+    if added.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((merged, added)))
+}
+
+/// Whether a hook group already runs the tutti command.
+fn has_tutti_hook(group: &Value) -> bool {
+    group
+        .get("hooks")
+        .and_then(Value::as_array)
+        .is_some_and(|hooks| {
+            hooks
+                .iter()
+                .any(|h| h.get("command").and_then(Value::as_str) == Some(HOOK_COMMAND))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,5 +280,54 @@ mod tests {
             assert!(hooks.get(event).is_some(), "missing {event}");
         }
         assert!(claude_hooks_snippet().contains(HOOK_COMMAND));
+    }
+
+    #[test]
+    fn merge_installs_into_empty_settings() {
+        let (merged, added) = merge_claude_hooks(&json!({})).unwrap().unwrap();
+        assert_eq!(added.len(), 5);
+        assert!(merged["hooks"]["Stop"][0]["hooks"][0]["command"] == HOOK_COMMAND);
+    }
+
+    #[test]
+    fn merge_preserves_foreign_settings_and_hooks() {
+        let existing = json!({
+            "model": "opus",
+            "hooks": { "PreToolUse": [{ "matcher": "Bash",
+                "hooks": [{ "type": "command", "command": "my-linter" }] }] }
+        });
+        let (merged, added) = merge_claude_hooks(&existing).unwrap().unwrap();
+        assert_eq!(merged["model"], "opus");
+        assert_eq!(
+            merged["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "my-linter"
+        );
+        assert_eq!(
+            merged["hooks"]["PreToolUse"][1]["hooks"][0]["command"],
+            HOOK_COMMAND
+        );
+        assert!(added.contains(&"PreToolUse".to_string()));
+    }
+
+    #[test]
+    fn merge_is_idempotent() {
+        let (merged, _) = merge_claude_hooks(&json!({})).unwrap().unwrap();
+        assert!(merge_claude_hooks(&merged).unwrap().is_none());
+    }
+
+    #[test]
+    fn merge_adds_only_missing_events_on_a_partial_install() {
+        let (full, _) = merge_claude_hooks(&json!({})).unwrap().unwrap();
+        let mut partial = full.clone();
+        partial["hooks"].as_object_mut().unwrap().remove("Stop");
+        let (_, added) = merge_claude_hooks(&partial).unwrap().unwrap();
+        assert_eq!(added, vec!["Stop".to_string()]);
+    }
+
+    #[test]
+    fn merge_rejects_non_object_shapes() {
+        assert!(merge_claude_hooks(&json!([])).is_err());
+        assert!(merge_claude_hooks(&json!({ "hooks": 3 })).is_err());
+        assert!(merge_claude_hooks(&json!({ "hooks": { "Stop": {} } })).is_err());
     }
 }

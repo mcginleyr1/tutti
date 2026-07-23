@@ -258,16 +258,22 @@ Every pane tutti spawns exports `TUTTI_PANE` (the pane id) and `TUTTI_SESSION`
 a pane can report ground-truth lifecycle events back to tutti through Claude
 Code's hooks, replacing the screen-heuristic guessing with exact signals.
 
-Print the hook config and add it to your Claude Code settings:
+Install the hook config (shows the before/after merge and asks first):
 
 ```
-tutti hooks claude          # prints the settings.json snippet (install notes on stderr)
-tutti hooks claude --raw    # just the JSON, for piping
+tutti hooks claude --install            # merge into ~/.claude/settings.json
+tutti hooks claude --install --project  # …into ./.claude/settings.json instead
+tutti hooks claude --install --yes      # skip the confirmation (scripts)
+tutti hooks claude                      # or just print the snippet…
+tutti hooks claude --raw                # …as bare JSON, for piping
 ```
 
-Merge the printed `hooks` object into `~/.claude/settings.json` (or a project's
-`.claude/settings.json`). Each wired event runs `tutti agent-event claude`, which
-reads the hook JSON on stdin, maps it, and forwards it to the pane's daemon:
+`--install` preserves everything already in the file (foreign hooks included),
+is idempotent, backs the old file up to `settings.json.bak`, and writes
+atomically. The printed snippet already includes the `"hooks"` key — merged by
+hand it goes at the settings.json **top level**. Each wired event runs
+`tutti agent-event claude`, which reads the hook JSON on stdin, maps it, and
+forwards it to the pane's daemon:
 
 - a tool use keeps the agent **working**; a permission/idle **Notification**
   marks it **blocked**; **Stop** marks it **done**;
@@ -277,7 +283,10 @@ reads the hook JSON on stdin, maps it, and forwards it to the pane's daemon:
 
 `agent-event` is deliberately fail-safe: outside a tutti pane (no `TUTTI_PANE`),
 on a malformed or irrelevant event, or when it cannot reach the daemon, it exits
-0 and sends nothing — a hook never breaks a Claude session.
+0 and sends nothing — a hook never breaks a Claude session, inside tutti or out.
+The one caveat: if you ever uninstall tutti while the hooks remain, Claude Code
+will surface a non-blocking "command not found" warning on every tool call —
+remove the entries (restore `settings.json.bak` or delete them) when you go.
 
 Hooks are ground truth: once a pane reports one, tutti stops classifying that
 pane's state from its screen (the heuristics would only fight the exact signals).
