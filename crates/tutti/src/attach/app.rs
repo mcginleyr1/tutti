@@ -76,12 +76,18 @@ pub enum Mode {
     Terminal,
     Prefix,
     ConfirmKill(PaneId),
+    /// Confirming a workspace kill raised from the sidebar (`y` kill, `D`
+    /// discard the fork's checkout, anything else cancels).
+    ConfirmKillWorkspace(WorkspaceId),
     Scroll(PaneId),
     Help,
     /// Navigating the sidebar; keys drive the selection instead of the pane.
     Sidebar,
     /// Editing the add-project directory prompt at the sidebar's foot.
     SidebarPrompt,
+    /// Editing the fork-name prompt at the sidebar's foot (fork the selected
+    /// workspace under the typed name).
+    SidebarForkPrompt,
     /// The agent launcher overlay: pick what to run in a pane.
     Launcher,
     /// The launcher's free-form command input.
@@ -143,6 +149,12 @@ pub struct App {
     /// Set after creating a workspace so the next view adopts the server's newly
     /// current tab — the "jump to it" that follows a new-workspace prompt.
     adopt_active_view: bool,
+    /// The workspace a pending fork prompt targets — the source of the
+    /// `WorkspaceFork` request submitted from `SidebarForkPrompt`.
+    fork_target: Option<WorkspaceId>,
+    /// Set while a `WorkspaceFork` is in flight so the `WorkspaceCreated` reply
+    /// (shared with add-project) knows to jump to the fork and open its launcher.
+    fork_pending: bool,
     /// Panes that raised a notification while unfocused; their sidebar entry
     /// shows a bell mark until the pane is focused.
     notified: HashSet<PaneId>,
@@ -201,6 +213,8 @@ impl App {
             spinner_epoch: Instant::now(),
             last_content_width: 0,
             adopt_active_view: false,
+            fork_target: None,
+            fork_pending: false,
             notified: HashSet::new(),
             terminal_out: Vec::new(),
             collapsed_projects: false,
@@ -426,9 +440,23 @@ impl App {
                 self.zoom = false;
                 self.refocus();
             }
+            Response::WorkspaceCreated { id } => {
+                // Add-project ignores this (it armed its jump + launcher up
+                // front); a fork waited for it: jump to the new workspace, then
+                // open the launcher to pick the agent that runs beside its shell.
+                if std::mem::take(&mut self.fork_pending) {
+                    if !self.jump_to_workspace(id) {
+                        // The fresh view has not landed yet; adopt on the next.
+                        self.adopt_active_view = true;
+                    }
+                    self.open_launcher(false);
+                }
+            }
             Response::Error { message } => {
-                // A failed new-workspace request must not later hijack the tab.
+                // A failed new-workspace or fork request must not later hijack
+                // the tab or the launcher.
                 self.adopt_active_view = false;
+                self.fork_pending = false;
                 self.set_status(format!("error: {message}"));
             }
             _ => {}
@@ -459,6 +487,11 @@ impl App {
         if !self.active_tab.is_some_and(|t| self.tab_exists(t)) {
             self.active_tab = self.flagged_active_tab().or_else(|| self.first_tab());
         }
+        // A killed workspace/agent shortens the sidebar; keep the selection in range.
+        let entries = self.sidebar().len();
+        if entries > 0 && self.sidebar_selected >= entries {
+            self.sidebar_selected = entries - 1;
+        }
         self.refocus();
     }
 
@@ -470,9 +503,11 @@ impl App {
             Mode::Terminal => self.on_key_terminal(key),
             Mode::Prefix => self.on_key_prefix(key),
             Mode::ConfirmKill(pane) => self.on_key_confirm(key, pane),
+            Mode::ConfirmKillWorkspace(id) => self.on_key_confirm_workspace(key, id),
             Mode::Scroll(pane) => self.on_key_scroll(key, pane),
             Mode::Sidebar => self.on_key_sidebar(key),
             Mode::SidebarPrompt => self.on_key_prompt(key),
+            Mode::SidebarForkPrompt => self.on_key_fork_prompt(key),
             Mode::Launcher => self.on_key_launcher(key),
             Mode::LauncherCommand => self.on_key_launcher_command(key),
             Mode::Help => {
@@ -622,6 +657,24 @@ impl App {
         }
     }
 
+    /// Resolve the sidebar workspace-kill confirm: `y` kills, `D` kills and
+    /// discards the fork's checkout, any other key cancels. Either way the
+    /// sidebar keeps focus; the view refresh drops a killed row.
+    fn on_key_confirm_workspace(&mut self, key: KeyEvent, id: WorkspaceId) -> Vec<WireFrame> {
+        let discard = match key.code {
+            KeyCode::Char('y') => false,
+            KeyCode::Char('D') => true,
+            _ => {
+                self.mode = Mode::Sidebar;
+                self.status = None;
+                return Vec::new();
+            }
+        };
+        self.mode = Mode::Sidebar;
+        self.status = None;
+        vec![control(&Request::WorkspaceKill { id, discard })]
+    }
+
     fn on_key_scroll(&mut self, key: KeyEvent, pane: PaneId) -> Vec<WireFrame> {
         let page = self.inner_rows(pane).max(1) as usize;
         let current = self.panes.get(&pane).and_then(|s| s.scroll).unwrap_or(0);
@@ -652,15 +705,26 @@ impl App {
 
     /// Whether the sidebar currently holds keyboard focus.
     pub fn sidebar_focused(&self) -> bool {
-        matches!(self.mode, Mode::Sidebar | Mode::SidebarPrompt)
+        matches!(
+            self.mode,
+            Mode::Sidebar | Mode::SidebarPrompt | Mode::SidebarForkPrompt
+        )
     }
 
     pub fn sidebar_selected(&self) -> usize {
         self.sidebar_selected
     }
 
+    /// Whether a foot-of-sidebar prompt (add-project or fork) is being edited —
+    /// either overlays the frame and suppresses the selection highlight.
     pub fn sidebar_prompt_active(&self) -> bool {
-        matches!(self.mode, Mode::SidebarPrompt)
+        matches!(self.mode, Mode::SidebarPrompt | Mode::SidebarForkPrompt)
+    }
+
+    /// Whether the fork-name prompt (rather than the add-project prompt) is the
+    /// one being edited, so the renderer picks its label and drops completions.
+    pub fn sidebar_fork_prompt_active(&self) -> bool {
+        matches!(self.mode, Mode::SidebarForkPrompt)
     }
 
     pub fn sidebar_prompt(&self) -> &str {
@@ -813,6 +877,15 @@ impl App {
                 Vec::new()
             }
             KeyCode::Char('d') => self.open_diff_pane(&sidebar),
+            KeyCode::Char('f') => {
+                self.open_fork_prompt(&sidebar);
+                Vec::new()
+            }
+            KeyCode::Char('u') => self.update_selected(&sidebar),
+            KeyCode::Char('x') => {
+                self.confirm_kill_workspace(&sidebar);
+                Vec::new()
+            }
             KeyCode::Esc | KeyCode::Char('w') => {
                 self.mode = Mode::Terminal;
                 self.status = None;
@@ -843,6 +916,25 @@ impl App {
             }
             None => Vec::new(),
         }
+    }
+
+    /// Jump to workspace `id`'s tab if the current view carries it, returning
+    /// whether it did. Selects the workspace's active-or-first tab and hands
+    /// focus to its pane, mirroring a workspace-row jump; used after a fork lands.
+    fn jump_to_workspace(&mut self, id: WorkspaceId) -> bool {
+        let Some(tab) = self
+            .workspaces
+            .iter()
+            .find(|w| w.id == id)
+            .and_then(|w| w.tabs.iter().find(|t| t.active).or_else(|| w.tabs.first()))
+            .map(|t| t.id)
+        else {
+            return false;
+        };
+        self.active_tab = Some(tab);
+        self.zoom = false;
+        self.refocus();
+        true
     }
 
     /// Open the selected workspace's jj diff in an ephemeral pane — a real
@@ -884,6 +976,66 @@ impl App {
             .iter()
             .find(|w| w.tabs.iter().any(|t| t.id == tab))
             .map(|w| w.dir.clone())
+    }
+
+    /// The `WorkspaceView` behind the selected entry — a workspace row's own, or
+    /// the workspace owning a selected agent row's tab. `None` when nothing is
+    /// selected or its workspace has left the view.
+    fn selected_workspace(&self, sidebar: &Sidebar) -> Option<&WorkspaceView> {
+        let tab = match sidebar.entries.get(self.sidebar_selected) {
+            Some(SidebarEntry::Workspace(w)) => w.jump_tab,
+            Some(SidebarEntry::Agent(a)) => a.tab,
+            None => return None,
+        };
+        self.workspaces
+            .iter()
+            .find(|w| w.tabs.iter().any(|t| t.id == tab))
+    }
+
+    /// Open the fork-name prompt for the selected entry's workspace at the
+    /// sidebar's foot: same machinery as add-project, but an empty `fork as:`
+    /// field whose name is validated on submit. A no-op with nothing selected.
+    fn open_fork_prompt(&mut self, sidebar: &Sidebar) {
+        let Some(id) = self.selected_workspace(sidebar).map(|w| w.id) else {
+            return;
+        };
+        self.fork_target = Some(id);
+        self.mode = Mode::SidebarForkPrompt;
+        self.sidebar_prompt.clear();
+        self.status = None;
+    }
+
+    /// Update the selected entry's workspace when its working copy is stale:
+    /// dispatch `WorkspaceUpdate` and flash `updating <name>…`. A non-stale row
+    /// just flashes `not stale`; the server broadcasts the cleared tag.
+    fn update_selected(&mut self, sidebar: &Sidebar) -> Vec<WireFrame> {
+        let Some((id, name, stale)) = self
+            .selected_workspace(sidebar)
+            .map(|w| (w.id, w.name.clone(), w.stale))
+        else {
+            return Vec::new();
+        };
+        if !stale {
+            self.set_status("not stale".into());
+            return Vec::new();
+        }
+        self.set_status(format!("updating {name}…"));
+        vec![control(&Request::WorkspaceUpdate { id })]
+    }
+
+    /// Open the kill confirm for the selected entry's workspace in the transient
+    /// line. `y` kills it, `D` also discards a fork's checkout (the server
+    /// refuses discard for a workspace it did not fork, surfacing that error),
+    /// any other key cancels. A no-op with nothing selected.
+    fn confirm_kill_workspace(&mut self, sidebar: &Sidebar) {
+        let Some((id, name)) = self
+            .selected_workspace(sidebar)
+            .map(|w| (w.id, w.name.clone()))
+        else {
+            return;
+        };
+        self.mode = Mode::ConfirmKillWorkspace(id);
+        self.set_status(format!("kill {name}? y · D discard checkout · N cancel"));
     }
 
     fn on_key_prompt(&mut self, key: KeyEvent) -> Vec<WireFrame> {
@@ -994,6 +1146,59 @@ impl App {
         self.adopt_active_view = true;
         self.open_launcher(true);
         vec![control(&Request::WorkspaceNew { dir })]
+    }
+
+    /// Edit the fork-name prompt: type the name, `esc` cancels back to the
+    /// sidebar, `Enter` submits. No directory completions — a fork name is a
+    /// bare identifier, not a path.
+    fn on_key_fork_prompt(&mut self, key: KeyEvent) -> Vec<WireFrame> {
+        match key.code {
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.sidebar_prompt.push(c);
+                Vec::new()
+            }
+            KeyCode::Backspace => {
+                self.sidebar_prompt.pop();
+                Vec::new()
+            }
+            KeyCode::Esc => {
+                self.mode = Mode::Sidebar;
+                self.sidebar_prompt.clear();
+                self.status = None;
+                Vec::new()
+            }
+            KeyCode::Enter => self.submit_fork(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Submit the fork-name prompt: validate the name client-side (fail fast
+    /// with a transient naming the rule, staying in the prompt to fix it), then
+    /// dispatch a `WorkspaceFork` for the target workspace and arm the post-fork
+    /// jump + launcher (`WorkspaceCreated` completes it). A non-jj source is left
+    /// to the server to reject — the single source of truth.
+    fn submit_fork(&mut self) -> Vec<WireFrame> {
+        let name = self.sidebar_prompt.trim().to_string();
+        if !is_valid_fork_name(&name) {
+            self.set_status("fork name: letters, digits, '-' or '_' only".into());
+            return Vec::new();
+        }
+        let Some(id) = self.fork_target else {
+            return Vec::new();
+        };
+        self.sidebar_prompt.clear();
+        self.mode = Mode::Sidebar;
+        self.status = None;
+        self.fork_pending = true;
+        vec![control(&Request::WorkspaceFork {
+            id,
+            name,
+            revision: None,
+        })]
     }
 
     /// Open the agent launcher — the "what should run here?" picker — building
@@ -1199,7 +1404,7 @@ impl App {
     /// section header toggles that section's collapse, an entry selects and jumps
     /// to it, and a border/blank just focuses.
     fn sidebar_click(&mut self, row: u16) -> Vec<WireFrame> {
-        if matches!(self.mode, Mode::SidebarPrompt) {
+        if self.sidebar_prompt_active() {
             return Vec::new();
         }
         if !self.sidebar_focused() {
@@ -1604,6 +1809,16 @@ fn is_jj_workspace(dir: &Path) -> bool {
         cur = d.parent();
     }
     false
+}
+
+/// Whether `name` is a legal fork name: a non-empty run of ASCII letters,
+/// digits, '-' or '_'. Mirrors the server's `valid_fork_name` so a bad name
+/// fails fast in the client without a round-trip.
+fn is_valid_fork_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Flatten a notification's title/body into one human line: `title: body` when
@@ -2522,6 +2737,298 @@ mod tests {
             "a transient error names the missing jj repo"
         );
         assert_eq!(app.mode, Mode::Sidebar, "focus stays on the sidebar");
+    }
+
+    // ---- fork / update stale --------------------------------------------
+
+    #[test]
+    fn f_on_a_workspace_row_opens_the_fork_prompt_and_submits_a_named_fork() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app); // selection rests on the api workspace (id 1)
+
+        let out = app.on_key(plain('f'));
+        assert!(out.is_empty(), "f opens the prompt, sending nothing yet");
+        assert_eq!(app.mode, Mode::SidebarForkPrompt);
+        assert!(app.sidebar_fork_prompt_active());
+
+        for c in "feature".chars() {
+            app.on_key(plain(c));
+        }
+        assert_eq!(app.sidebar_prompt(), "feature");
+
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            out,
+            vec![control(&Request::WorkspaceFork {
+                id: WorkspaceId(1),
+                name: "feature".into(),
+                revision: None,
+            })],
+            "submit forks the selected workspace under the typed name"
+        );
+        assert_eq!(
+            app.mode,
+            Mode::Sidebar,
+            "back to the sidebar awaiting the reply"
+        );
+        assert!(app.sidebar_prompt().is_empty());
+    }
+
+    #[test]
+    fn f_on_an_agent_row_forks_its_owning_workspace() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        app.on_key(plain('j')); // web workspace
+        app.on_key(plain('j')); // first agent (blocked pane 3, in tab 2 → workspace 2)
+        assert!(matches!(
+            app.sidebar().entries[app.sidebar_selected()],
+            SidebarEntry::Agent(_)
+        ));
+
+        app.on_key(plain('f'));
+        for c in "hotfix".chars() {
+            app.on_key(plain(c));
+        }
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            out,
+            vec![control(&Request::WorkspaceFork {
+                id: WorkspaceId(2),
+                name: "hotfix".into(),
+                revision: None,
+            })],
+            "an agent row forks the workspace that owns its tab"
+        );
+    }
+
+    #[test]
+    fn fork_prompt_rejects_a_bad_name_with_a_transient_and_no_request() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        app.on_key(plain('f'));
+        for c in "bad name".chars() {
+            app.on_key(plain(c)); // the space makes the name invalid
+        }
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(out.is_empty(), "an invalid fork name emits no request");
+        assert_eq!(
+            app.mode,
+            Mode::SidebarForkPrompt,
+            "the prompt stays open so the name can be fixed"
+        );
+        assert!(
+            app.transient()
+                .is_some_and(|t| t.contains("letters, digits")),
+            "the transient names the naming rule"
+        );
+    }
+
+    #[test]
+    fn fork_prompt_esc_cancels_back_to_the_sidebar() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        app.on_key(plain('f'));
+        app.on_key(plain('x'));
+        let out = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(out.is_empty(), "esc forks nothing");
+        assert_eq!(app.mode, Mode::Sidebar);
+        assert!(app.sidebar_prompt().is_empty());
+    }
+
+    #[test]
+    fn fork_created_jumps_to_the_new_workspace_and_opens_the_launcher() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        app.on_key(plain('f'));
+        for c in "feature".chars() {
+            app.on_key(plain(c));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // The server broadcasts the fresh view (carrying the fork and its tab)
+        // before the WorkspaceCreated reply — mirror that ordering here.
+        let mut view = view_two_workspaces();
+        view.push(workspace(
+            3,
+            "w-feature",
+            Some("main"),
+            vec![tab(3, "3", true, leaf(9), vec![shell(9)])],
+        ));
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Event::LayoutChanged { workspaces: view }).unwrap(),
+        ));
+        // The old tab is untouched until the reply lands.
+        assert_eq!(app.active_tab, Some(TabId(1)));
+
+        app.handle_response(Response::WorkspaceCreated { id: WorkspaceId(3) });
+        assert_eq!(
+            app.active_tab,
+            Some(TabId(3)),
+            "the WorkspaceCreated reply jumps to the fork's tab"
+        );
+        assert_eq!(
+            app.mode,
+            Mode::Launcher,
+            "and opens the launcher to pick the agent to run beside its shell"
+        );
+    }
+
+    #[test]
+    fn u_on_a_stale_workspace_row_emits_a_workspace_update() {
+        let mut app = App::new();
+        let mut view = view_two_workspaces();
+        view[0].stale = true; // the api workspace's working copy is stale
+        attach_with(&mut app, view);
+        focus_sidebar(&mut app);
+
+        let out = app.on_key(plain('u'));
+        assert_eq!(
+            out,
+            vec![control(&Request::WorkspaceUpdate { id: WorkspaceId(1) })],
+            "u updates the selected stale workspace"
+        );
+        assert!(
+            app.transient().is_some_and(|t| t.contains("updating")),
+            "the transient names the workspace being updated"
+        );
+    }
+
+    #[test]
+    fn u_on_a_non_stale_row_flashes_and_emits_nothing() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces()); // none stale
+        focus_sidebar(&mut app);
+        let out = app.on_key(plain('u'));
+        assert!(out.is_empty(), "a healthy workspace sends no update");
+        assert!(
+            app.transient().is_some_and(|t| t.contains("not stale")),
+            "a non-stale row flashes `not stale`"
+        );
+    }
+
+    #[test]
+    fn is_valid_fork_name_matches_the_server_rule() {
+        assert!(is_valid_fork_name("feature-1_x"));
+        assert!(is_valid_fork_name("ABC"));
+        assert!(!is_valid_fork_name(""));
+        assert!(!is_valid_fork_name("has space"));
+        assert!(!is_valid_fork_name("has/slash"));
+        assert!(!is_valid_fork_name("dots.bad"));
+    }
+
+    #[test]
+    fn x_on_a_workspace_row_opens_the_kill_confirm() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app); // selection rests on the api workspace (id 1)
+        let out = app.on_key(plain('x'));
+        assert!(out.is_empty(), "x opens the confirm, sending nothing yet");
+        assert_eq!(app.mode, Mode::ConfirmKillWorkspace(WorkspaceId(1)));
+        assert!(
+            app.transient().is_some_and(|t| t.contains("kill api?")),
+            "the confirm names the workspace and its options"
+        );
+    }
+
+    #[test]
+    fn kill_confirm_y_emits_a_plain_workspace_kill() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        app.on_key(plain('x'));
+        let out = app.on_key(plain('y'));
+        assert_eq!(
+            out,
+            vec![control(&Request::WorkspaceKill {
+                id: WorkspaceId(1),
+                discard: false,
+            })],
+            "y kills the workspace without discarding its checkout"
+        );
+        assert_eq!(app.mode, Mode::Sidebar, "focus returns to the sidebar");
+    }
+
+    #[test]
+    fn kill_confirm_shift_d_discards_the_forks_checkout() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        app.on_key(plain('x'));
+        let out = app.on_key(plain('D'));
+        assert_eq!(
+            out,
+            vec![control(&Request::WorkspaceKill {
+                id: WorkspaceId(1),
+                discard: true,
+            })],
+            "D kills and discards; the server refuses discard for a non-fork"
+        );
+    }
+
+    #[test]
+    fn kill_confirm_cancels_on_esc_or_any_other_key() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+
+        app.on_key(plain('x'));
+        let out = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(out.is_empty(), "esc kills nothing");
+        assert_eq!(app.mode, Mode::Sidebar);
+
+        app.on_key(plain('x'));
+        let out = app.on_key(plain('n'));
+        assert!(out.is_empty(), "any non-y/D key cancels");
+        assert_eq!(app.mode, Mode::Sidebar);
+    }
+
+    #[test]
+    fn x_on_an_agent_row_kills_its_owning_workspace() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        app.on_key(plain('j')); // web workspace
+        app.on_key(plain('j')); // first agent (blocked pane 3, tab 2 → workspace 2)
+        app.on_key(plain('x'));
+        assert_eq!(app.mode, Mode::ConfirmKillWorkspace(WorkspaceId(2)));
+        let out = app.on_key(plain('y'));
+        assert_eq!(
+            out,
+            vec![control(&Request::WorkspaceKill {
+                id: WorkspaceId(2),
+                discard: false,
+            })],
+            "an agent row kills the workspace that owns its tab"
+        );
+    }
+
+    #[test]
+    fn a_shorter_view_clamps_the_sidebar_selection() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        app.on_key(plain('j'));
+        app.on_key(plain('j'));
+        app.on_key(plain('j')); // the last entry (the working agent)
+        assert_eq!(app.sidebar_selected(), 3);
+
+        // A killed workspace shrinks the view to a single agentless row.
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Event::LayoutChanged {
+                workspaces: view_one_pane(),
+            })
+            .unwrap(),
+        ));
+        assert_eq!(
+            app.sidebar_selected(),
+            0,
+            "the selection clamps onto the surviving row"
+        );
     }
 
     #[test]

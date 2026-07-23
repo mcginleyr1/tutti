@@ -104,6 +104,9 @@ const SIDEBAR_HINT: &[(&str, &str)] = &[
     ("enter", "jump"),
     ("n", "add project"),
     ("d", "diff"),
+    ("f", "fork"),
+    ("u", "update"),
+    ("x", "kill"),
     ("esc", "back"),
 ];
 
@@ -382,18 +385,25 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
 
     if app.sidebar_prompt_active() {
         // The prompt overlays the frame's inner content column (inside the
-        // borders and padding), leaving the frame edges intact.
+        // borders and padding), leaving the frame edges intact. The fork prompt
+        // reuses the same field with an empty listing and its own label.
         let inner = Rect::new(
             area.x + 2,
             area.y + 1,
             content_w,
             area.height.saturating_sub(2),
         );
+        let (label, completions, selected) = if app.sidebar_fork_prompt_active() {
+            ("fork as: ", &[][..], 0)
+        } else {
+            ("open: ", app.prompt_completions(), app.prompt_selected())
+        };
         draw_sidebar_prompt(
             frame,
+            label,
             app.sidebar_prompt(),
-            app.prompt_completions(),
-            app.prompt_selected(),
+            completions,
+            selected,
             inner,
         );
     }
@@ -670,11 +680,13 @@ fn agent_dot(state: AgentState, spinner: char, glyphs: &Glyphs) -> (char, Style)
     (dot, state_style(state))
 }
 
-/// The add-project prompt on the sidebar's foot row — an accent bar, the `open:`
-/// prefix, the typed path, and a block cursor — with the live directory
-/// completions stacked dim directly above it, the highlighted row in the accent.
+/// A sidebar foot prompt — an accent bar, the `label` prefix, the typed text,
+/// and a block cursor — with any completions stacked dim directly above it, the
+/// highlighted row in the accent. Add-project passes `open:` and its directory
+/// completions; fork passes `fork as:` and an empty listing.
 fn draw_sidebar_prompt(
     frame: &mut Frame,
+    label: &str,
     text: &str,
     completions: &[String],
     selected: usize,
@@ -706,7 +718,7 @@ fn draw_sidebar_prompt(
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("▍", Style::default().fg(ACCENT)),
-            Span::styled("open: ", dim()),
+            Span::styled(label.to_string(), dim()),
             Span::styled(text.to_string(), Style::default()),
             Span::styled("█", Style::default().fg(ACCENT)),
         ])),
@@ -849,11 +861,12 @@ fn mode_label(mode: Mode) -> Option<&'static str> {
     match mode {
         Mode::Terminal => None,
         Mode::Prefix => Some("PREFIX"),
-        Mode::ConfirmKill(_) => Some("CONFIRM"),
+        Mode::ConfirmKill(_) | Mode::ConfirmKillWorkspace(_) => Some("CONFIRM"),
         Mode::Scroll(_) => Some("SCROLL"),
         Mode::Help => Some("HELP"),
         Mode::Sidebar => Some("SIDEBAR"),
         Mode::SidebarPrompt => Some("ADD PROJECT"),
+        Mode::SidebarForkPrompt => Some("FORK"),
         Mode::Launcher | Mode::LauncherCommand => Some("RUN"),
     }
 }
@@ -1129,6 +1142,11 @@ fn help_lines(cfg: &Config) -> Vec<Line<'static>> {
     lines.push(popup_key_line("  Ctrl+h/j/k/l", "focus by direction"));
     lines.push(popup_key_line("  Alt+h/j/k/l", "resize split"));
     lines.push(popup_key_line("  Alt+x", "kill pane"));
+    lines.push(Line::from(String::new()));
+    lines.push(Line::from("sidebar (after C-b w):".to_string()));
+    lines.push(popup_key_line("  n / d", "add project / diff"));
+    lines.push(popup_key_line("  f / u", "fork / update stale"));
+    lines.push(popup_key_line("  x", "kill workspace"));
     lines.push(Line::from(String::new()));
     lines.push(Line::from(
         "stop the daemon:  tutti server stop".to_string(),
@@ -1811,7 +1829,8 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
         assert_eq!(app.mode, Mode::Help);
 
-        let mut terminal = Terminal::new(TestBackend::new(64, 24)).unwrap();
+        // Tall enough to clear the whole panel, including the sidebar section.
+        let mut terminal = Terminal::new(TestBackend::new(64, 30)).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("detach"), "help missing detach: {text:?}");
@@ -1823,10 +1842,36 @@ mod tests {
             text.contains("direct keys"),
             "help missing direct keys section: {text:?}"
         );
+        // The sidebar section documents the fork, update-stale, and kill keys.
+        assert!(
+            text.contains("fork")
+                && text.contains("update stale")
+                && text.contains("kill workspace"),
+            "help missing the sidebar fork/update/kill keys: {text:?}"
+        );
         // Detach is listed before the split bindings.
         assert!(
             text.find("detach") < text.find("split"),
             "detach should be listed first: {text:?}"
+        );
+    }
+
+    #[test]
+    fn sidebar_fork_prompt_shows_the_fork_as_label() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = app_two_workspaces();
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        app.sync_sizes(Rect::new(0, 0, 100, 20));
+        // Focus the sidebar, then open the fork prompt on the first workspace.
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("fork as:"),
+            "the fork prompt label is missing: {text:?}"
         );
     }
 

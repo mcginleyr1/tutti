@@ -245,8 +245,19 @@ server's error. `d`
 opens the selected workspace's **jj diff** in an ephemeral pane — a real terminal
 running `jj diff | less -R`, coloured, that vanishes the moment you quit `less`
 (pressing `d` on an agent row opens the diff for the agent's workspace). A
-non-jj workspace shows a transient error instead of spawning. A mouse click
-focuses the sidebar, or jumps straight to the entry clicked.
+non-jj workspace shows a transient error instead of spawning. `f`
+[**forks**](#forked-workspaces) the selected workspace: it opens a `fork as:`
+field at the sidebar's foot for the fork name (`[A-Za-z0-9_-]+`; a bad name flashes
+the rule, `esc` cancels), and on success jumps to the new fork and opens the
+launcher to pick the agent to run beside its shell (pressing `f` on an
+agent row forks the agent's workspace; a non-jj source surfaces the server's
+error). `u` runs `jj workspace update-stale` on a fork whose row shows the
+**stale** tag, clearing it; on a healthy row it just flashes `not stale`. `x`
+**kills** the selected workspace after a one-line confirm — `y` removes it from
+tutti (leaving its checkout on disk), `D` also **discards** a fork's checkout
+(`jj workspace forget` + delete; the server refuses this for a workspace tutti
+did not fork, surfacing that error), and any other key cancels. A mouse
+click focuses the sidebar, or jumps straight to the entry clicked.
 
 Visibility is set by the `sidebar` config value: `on` (default) always shows it
 — the control column is the point — while `auto` reveals it only once the
@@ -276,6 +287,12 @@ specific revision; the name must be `[A-Za-z0-9_-]+` (it becomes both a path
 component and a jj workspace name). The source workspace must live under a `.jj`
 repo, and the destination must not already exist — neither is silently reused.
 
+From the TUI this is a five-keystroke flow off the sidebar: `C-b w` focuses the
+sidebar, `f` opens the `fork as:` field on the selected workspace (or the
+workspace owning a selected agent row), you type the name and press `Enter`, and
+tutti jumps to the fresh fork and opens the launcher so you immediately pick the
+agent to run beside its shell.
+
 Because several workspaces share one repo, a fork's working copy can go **stale**
 when its `@` is rewritten from elsewhere. Tutti surfaces this as a dim-red
 `stale` tag on the workspace's sidebar row and never fixes it for you;
@@ -291,6 +308,10 @@ Two ways to remove a fork, differing only in what happens on disk:
   for a workspace tutti forked; it is a hard error on any other workspace, so
   tutti never deletes a checkout it did not create. Merging a fork back is left a
   human decision.
+
+Both are reachable from the sidebar: focus it, select the workspace (or one of
+its agents), and press `x` — `y` is the plain kill, `D` is the `--discard`
+variant.
 
 ## Agent state badges
 
