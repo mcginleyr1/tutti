@@ -25,7 +25,7 @@ const ACCENT: Color = Color::Blue;
 const SIDEBAR_HINT: &[(&str, &str)] = &[
     ("j/k", "move"),
     ("enter", "jump"),
-    ("n", "new"),
+    ("n", "add project"),
     ("d", "diff"),
     ("esc", "back"),
 ];
@@ -180,7 +180,13 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
     frame.render_widget(Paragraph::new(lines), inner);
 
     if app.sidebar_prompt_active() {
-        draw_sidebar_prompt(frame, app.sidebar_prompt(), inner);
+        draw_sidebar_prompt(
+            frame,
+            app.sidebar_prompt(),
+            app.prompt_completions(),
+            app.prompt_selected(),
+            inner,
+        );
     }
 }
 
@@ -350,19 +356,43 @@ fn finish_row(mut content: Vec<Span<'static>>, sel: bool, width: u16) -> Line<'s
     Line::from(spans)
 }
 
-/// The new-project prompt on the sidebar's foot row: an accent bar, the typed
-/// path, and a visible block cursor.
-fn draw_sidebar_prompt(frame: &mut Frame, text: &str, inner: Rect) {
-    let row = Rect::new(
-        inner.x,
-        inner.y + inner.height.saturating_sub(1),
-        inner.width,
-        1,
-    );
+/// The add-project prompt on the sidebar's foot row — an accent bar, the `open:`
+/// prefix, the typed path, and a block cursor — with the live directory
+/// completions stacked dim directly above it, the highlighted row in the accent.
+fn draw_sidebar_prompt(
+    frame: &mut Frame,
+    text: &str,
+    completions: &[String],
+    selected: usize,
+    inner: Rect,
+) {
+    let foot = inner.y + inner.height.saturating_sub(1);
+    // The completions occupy the rows just above the input, newest listing on
+    // top; already capped at 8 by `complete_dirs`, clamped here to what fits.
+    let rows = (completions.len() as u16).min(inner.height.saturating_sub(1));
+    for i in 0..rows {
+        let style = if i as usize == selected {
+            Style::default().fg(ACCENT)
+        } else {
+            dim()
+        };
+        let row = Rect::new(inner.x, foot - rows + i, inner.width, 1);
+        frame.render_widget(Clear, row);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("  {}", completions[i as usize]),
+                style,
+            ))),
+            row,
+        );
+    }
+
+    let row = Rect::new(inner.x, foot, inner.width, 1);
     frame.render_widget(Clear, row);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("▍", Style::default().fg(ACCENT)),
+            Span::styled("open: ", dim()),
             Span::styled(text.to_string(), Style::default()),
             Span::styled("█", Style::default().fg(ACCENT)),
         ])),
@@ -669,7 +699,12 @@ fn status_message(app: &App) -> String {
         Mode::Scroll(_) => app.transient().unwrap_or("SCROLL (q to exit)").to_string(),
         Mode::Help => "HELP (any key closes)".to_string(),
         Mode::Sidebar => app.transient().unwrap_or_default().to_string(),
-        Mode::SidebarPrompt => app.transient().unwrap_or("new workspace dir").to_string(),
+        Mode::SidebarPrompt => app
+            .transient()
+            .unwrap_or(
+                "add project — path to an existing directory (enter to open · esc to cancel)",
+            )
+            .to_string(),
         Mode::Terminal => app.transient().unwrap_or("").to_string(),
     }
 }
@@ -1281,5 +1316,38 @@ mod tests {
             text.find("detach") < text.find("split"),
             "detach should be listed first: {text:?}"
         );
+    }
+
+    #[test]
+    fn sidebar_prompt_stacks_completions_above_the_open_input() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("tutti-render-complete-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(root.join("alpha")).unwrap();
+        std::fs::create_dir_all(root.join("beta")).unwrap();
+
+        let mut app = App::new();
+        // An absolute prefix keeps the listing independent of HOME/cwd.
+        app.start_first_run_prompt(format!("{}/a", root.display()));
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let w = buf.area.width as usize;
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+
+        assert!(text.contains("alpha"), "completion row missing: {text:?}");
+        assert!(text.contains("open:"), "prompt prefix missing: {text:?}");
+        // The completion sits on a row strictly above the input line.
+        let alpha_row = text.find("alpha").unwrap() / w;
+        let open_row = text.find("open:").unwrap() / w;
+        assert!(
+            alpha_row < open_row,
+            "completions should stack above the prompt: alpha@{alpha_row} open@{open_row}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

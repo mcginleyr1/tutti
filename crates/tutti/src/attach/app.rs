@@ -3,7 +3,7 @@
 //! owns no socket and no terminal, so it can be exercised headlessly in tests.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
@@ -28,6 +28,9 @@ const STATUS_TTL: Duration = Duration::from_secs(4);
 const MOUSE_SCROLL_STEP: usize = 3;
 /// How long the prefix can sit unanswered before the which-key popup appears.
 const WHICHKEY_DELAY: Duration = Duration::from_millis(500);
+
+/// Up to this many directory completions surface under the add-project prompt.
+const MAX_COMPLETIONS: usize = 8;
 
 /// The braille working-spinner frames and their advance interval, shared by
 /// every working agent so they animate in lockstep. Swap for ASCII by editing
@@ -70,7 +73,7 @@ pub enum Mode {
     Help,
     /// Navigating the sidebar; keys drive the selection instead of the pane.
     Sidebar,
-    /// Editing the new-workspace directory prompt at the sidebar's foot.
+    /// Editing the add-project directory prompt at the sidebar's foot.
     SidebarPrompt,
 }
 
@@ -99,8 +102,13 @@ pub struct App {
     prefix_since: Option<Instant>,
     /// The highlighted sidebar entry while the sidebar is focused.
     sidebar_selected: usize,
-    /// The new-workspace directory being typed while in `SidebarPrompt` mode.
+    /// The directory being typed while in `SidebarPrompt` mode (add project).
     sidebar_prompt: String,
+    /// Directory completions for the current `sidebar_prompt`, recomputed on
+    /// every edit so the render path only reads them (never touches the fs).
+    prompt_completions: Vec<String>,
+    /// The highlighted completion row; `Tab` fills it, the arrows move it.
+    prompt_selected: usize,
     /// The sidebar column from the last size sync, for mouse hit-testing.
     sidebar_rect: Option<Rect>,
     /// The top tab-bar row from the last size sync, for mouse hit-testing.
@@ -154,6 +162,8 @@ impl App {
             prefix_since: None,
             sidebar_selected: 0,
             sidebar_prompt: String::new(),
+            prompt_completions: Vec::new(),
+            prompt_selected: 0,
             sidebar_rect: None,
             tab_bar_rect: None,
             spinner_epoch: Instant::now(),
@@ -177,6 +187,8 @@ impl App {
     pub fn start_first_run_prompt(&mut self, dir: String) {
         self.mode = Mode::SidebarPrompt;
         self.sidebar_prompt = dir;
+        self.prompt_selected = 0;
+        self.refresh_completions();
     }
 
     /// Post a transient status line — e.g. a startup-project error surfaced once
@@ -584,6 +596,16 @@ impl App {
         &self.sidebar_prompt
     }
 
+    /// The directory completions shown under the add-project prompt.
+    pub fn prompt_completions(&self) -> &[String] {
+        &self.prompt_completions
+    }
+
+    /// The highlighted completion row index.
+    pub fn prompt_selected(&self) -> usize {
+        self.prompt_selected
+    }
+
     /// Whether the sidebar should be drawn for a content area of `total_width`.
     /// A focused sidebar always shows (so the sidebar key can reveal a hidden
     /// one); otherwise the config mode decides — `auto` showing it once the
@@ -674,9 +696,7 @@ impl App {
             }
             KeyCode::Enter => self.jump_to_selected(&sidebar),
             KeyCode::Char('n') => {
-                self.mode = Mode::SidebarPrompt;
-                self.sidebar_prompt.clear();
-                self.set_status("new workspace dir (enter to create, esc to cancel)".into());
+                self.open_project_prompt();
                 Vec::new()
             }
             KeyCode::Char('d') => self.open_diff_pane(&sidebar),
@@ -761,15 +781,37 @@ impl App {
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 self.sidebar_prompt.push(c);
+                self.prompt_selected = 0;
+                self.refresh_completions();
                 Vec::new()
             }
             KeyCode::Backspace => {
                 self.sidebar_prompt.pop();
+                self.prompt_selected = 0;
+                self.refresh_completions();
+                Vec::new()
+            }
+            // Tab fills in the highlighted directory; the arrows move the
+            // highlight. Enter always submits whatever is typed (never the
+            // completion), so a highlighted row is only ever taken via Tab.
+            KeyCode::Tab => {
+                self.complete_selection();
+                Vec::new()
+            }
+            KeyCode::Down => {
+                if !self.prompt_completions.is_empty() {
+                    self.prompt_selected =
+                        (self.prompt_selected + 1).min(self.prompt_completions.len() - 1);
+                }
+                Vec::new()
+            }
+            KeyCode::Up => {
+                self.prompt_selected = self.prompt_selected.saturating_sub(1);
                 Vec::new()
             }
             KeyCode::Esc => {
                 self.mode = Mode::Sidebar;
-                self.sidebar_prompt.clear();
+                self.clear_prompt();
                 self.status = None;
                 Vec::new()
             }
@@ -778,11 +820,58 @@ impl App {
         }
     }
 
-    /// Submit the new-workspace prompt: create the workspace, bootstrap a shell
-    /// pane in it (matching bare `tutti`), and arm the jump to the new tab.
+    /// Open the add-project prompt on the sidebar `n` path, prefilled with the
+    /// common parent of the existing workspaces so only the project name is left
+    /// to type — the directory-completion panel fills in the rest.
+    fn open_project_prompt(&mut self) {
+        self.mode = Mode::SidebarPrompt;
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let dirs: Vec<PathBuf> = self.workspaces.iter().map(|w| w.dir.clone()).collect();
+        self.sidebar_prompt = prompt_prefill(&dirs, home.as_deref());
+        self.prompt_selected = 0;
+        self.status = None;
+        self.refresh_completions();
+    }
+
+    /// Tab-complete the prompt to the highlighted directory, appending `/` so the
+    /// next component's listing opens immediately. A no-op with no completions.
+    fn complete_selection(&mut self) {
+        let Some(name) = self.prompt_completions.get(self.prompt_selected).cloned() else {
+            return;
+        };
+        let dir_part = match self.sidebar_prompt.rfind('/') {
+            Some(i) => &self.sidebar_prompt[..=i],
+            None => "",
+        };
+        self.sidebar_prompt = format!("{dir_part}{name}/");
+        self.prompt_selected = 0;
+        self.refresh_completions();
+    }
+
+    /// Recompute the directory completions for the current input against the live
+    /// environment. Kept off the render path: every edit calls this, and the
+    /// renderer only reads the cached result.
+    fn refresh_completions(&mut self) {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        self.prompt_completions = complete_dirs(&self.sidebar_prompt, home.as_deref(), &cwd);
+        if self.prompt_selected >= self.prompt_completions.len() {
+            self.prompt_selected = 0;
+        }
+    }
+
+    fn clear_prompt(&mut self) {
+        self.sidebar_prompt.clear();
+        self.prompt_completions.clear();
+        self.prompt_selected = 0;
+    }
+
+    /// Submit the add-project prompt: mount the typed directory as a workspace,
+    /// bootstrap a shell pane in it (matching bare `tutti`), and arm the jump to
+    /// the new tab.
     fn submit_prompt(&mut self) -> Vec<WireFrame> {
         let input = self.sidebar_prompt.trim().to_string();
-        self.sidebar_prompt.clear();
+        self.clear_prompt();
         self.status = None;
         self.mode = Mode::Terminal;
         if input.is_empty() {
@@ -1294,6 +1383,75 @@ fn resolve_dir(input: &str, home: Option<&Path>, cwd: &Path) -> PathBuf {
         path.to_path_buf()
     } else {
         cwd.join(path)
+    }
+}
+
+/// Directory completions for the add-project prompt: the sub-directories of the
+/// input's parent whose names begin with its final path component (an empty
+/// component lists every sub-directory). Directories only, dot-dirs hidden
+/// unless the component itself starts with `.`, alphabetical, capped at
+/// `MAX_COMPLETIONS`. An unreadable parent yields nothing, so a half-typed path
+/// never flashes an error. Tilde/relative resolution matches `resolve_dir`.
+fn complete_dirs(input: &str, home: Option<&Path>, cwd: &Path) -> Vec<String> {
+    let (dir_part, comp) = match input.rfind('/') {
+        Some(i) => (&input[..=i], &input[i + 1..]),
+        None => ("", input),
+    };
+    let base = resolve_dir(dir_part, home, cwd);
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+        .filter(|name| name.starts_with(comp) && (comp.starts_with('.') || !name.starts_with('.')))
+        .collect();
+    names.sort();
+    names.truncate(MAX_COMPLETIONS);
+    names
+}
+
+/// The `n` add-project prompt's prefill: the workspaces' common parent
+/// directory, home-shortened with a trailing slash so only the project name is
+/// left to type. Falls back to `~/` with no workspaces or when the sole shared
+/// ancestor is the filesystem root.
+fn prompt_prefill(dirs: &[PathBuf], home: Option<&Path>) -> String {
+    let Some(base) = common_parent(dirs).filter(|p| p.parent().is_some()) else {
+        return "~/".to_string();
+    };
+    let shown = match home.and_then(|h| base.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => base.display().to_string(),
+    };
+    format!("{shown}/")
+}
+
+/// The deepest directory containing every path in `dirs`: their longest common
+/// ancestor, or — for a single path — its parent. `None` for an empty slice or
+/// a path without a parent.
+fn common_parent(dirs: &[PathBuf]) -> Option<PathBuf> {
+    match dirs {
+        [] => None,
+        [single] => Some(single.parent()?.to_path_buf()),
+        [first, rest @ ..] => {
+            let mut common: Vec<Component> = first.components().collect();
+            for dir in rest {
+                let dcomps: Vec<Component> = dir.components().collect();
+                let shared = common
+                    .iter()
+                    .zip(&dcomps)
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                common.truncate(shared);
+            }
+            let mut path = PathBuf::new();
+            for c in &common {
+                path.push(c.as_os_str());
+            }
+            Some(path)
+        }
     }
 }
 
@@ -2011,20 +2169,23 @@ mod tests {
     }
 
     #[test]
-    fn new_workspace_prompt_edits_then_submits_workspace_and_pane_run() {
+    fn new_project_prompt_prefills_the_common_parent_then_submits() {
         let mut app = App::new();
         attach_with(&mut app, view_two_workspaces());
         focus_sidebar(&mut app);
         app.on_key(plain('n'));
         assert_eq!(app.mode, Mode::SidebarPrompt);
+        // Both fixture workspaces live at `/tmp/w`, so the prompt prefills their
+        // common parent with a trailing slash — the user types just the name.
+        assert_eq!(app.sidebar_prompt(), "/tmp/w/");
 
-        for c in "/tmp/api".chars() {
+        for c in "api".chars() {
             app.on_key(plain(c));
         }
         app.on_key(plain('x'));
-        assert_eq!(app.sidebar_prompt(), "/tmp/apix");
+        assert_eq!(app.sidebar_prompt(), "/tmp/w/apix");
         app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-        assert_eq!(app.sidebar_prompt(), "/tmp/api");
+        assert_eq!(app.sidebar_prompt(), "/tmp/w/api");
 
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -2032,7 +2193,7 @@ mod tests {
             out,
             vec![
                 control(&Request::WorkspaceNew {
-                    dir: PathBuf::from("/tmp/api"),
+                    dir: PathBuf::from("/tmp/w/api"),
                 }),
                 control(&Request::PaneRun {
                     tab: None,
@@ -2040,7 +2201,7 @@ mod tests {
                     ephemeral: false,
                 }),
             ],
-            "submit creates the workspace then bootstraps a shell pane"
+            "submit mounts the typed directory then bootstraps a shell pane"
         );
         assert_eq!(app.mode, Mode::Terminal);
         assert!(app.sidebar_prompt().is_empty());
@@ -2327,5 +2488,159 @@ mod tests {
     #[test]
     fn osc9_wraps_text_in_the_escape() {
         assert_eq!(osc9("hi"), b"\x1b]9;hi\x07".to_vec());
+    }
+
+    // ---- add-project prompt: prefill and completion -----------------------
+
+    /// A throwaway directory tree seeded with `subdirs`, uniquely named so
+    /// parallel test runs never collide.
+    fn temp_tree(subdirs: &[&str]) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("tutti-complete-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        for d in subdirs {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn complete_dirs_lists_matching_subdirs_only() {
+        let root = temp_tree(&["alpha", "altair", "beta", ".hidden"]);
+        std::fs::write(root.join("apple.txt"), b"x").unwrap();
+        let home = Path::new("/no-home");
+        let cwd = Path::new("/no-cwd");
+
+        // A prefix matches directories only — the `apple.txt` file is excluded.
+        let got = complete_dirs(&format!("{}/al", root.display()), Some(home), cwd);
+        assert_eq!(got, vec!["alpha".to_string(), "altair".to_string()]);
+
+        // An empty component lists every visible sub-directory, alphabetical.
+        let got = complete_dirs(&format!("{}/", root.display()), Some(home), cwd);
+        assert_eq!(got, vec!["alpha", "altair", "beta"]);
+
+        // A `.`-leading component reveals the dot-directory it would otherwise hide.
+        let got = complete_dirs(&format!("{}/.", root.display()), Some(home), cwd);
+        assert_eq!(got, vec![".hidden"]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn complete_dirs_caps_at_eight_and_treats_unreadable_as_empty() {
+        let many: Vec<String> = (0..12).map(|i| format!("d{i:02}")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let root = temp_tree(&refs);
+
+        let got = complete_dirs(&format!("{}/", root.display()), None, Path::new("/"));
+        assert_eq!(got.len(), 8, "capped at eight matches");
+        assert_eq!(got[0], "d00", "the first eight, alphabetical");
+        assert_eq!(got[7], "d07");
+
+        // A parent that cannot be read yields nothing rather than an error.
+        let missing = format!("{}/nope/x", root.display());
+        assert!(complete_dirs(&missing, None, Path::new("/")).is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prompt_prefill_uses_the_common_parent_of_the_workspaces() {
+        let home = Path::new("/Users/me");
+        // Two projects under ~/develop → their common parent, home-shortened.
+        let dirs = vec![
+            PathBuf::from("/Users/me/develop/tutti"),
+            PathBuf::from("/Users/me/develop/other"),
+        ];
+        assert_eq!(prompt_prefill(&dirs, Some(home)), "~/develop/");
+
+        // A single project: the common parent is its own parent.
+        let dirs = vec![PathBuf::from("/Users/me/develop/tutti")];
+        assert_eq!(prompt_prefill(&dirs, Some(home)), "~/develop/");
+
+        // No workspaces → the home fallback.
+        assert_eq!(prompt_prefill(&[], Some(home)), "~/");
+
+        // Projects whose only shared ancestor is the root fall back to home.
+        let dirs = vec![PathBuf::from("/foo/a"), PathBuf::from("/bar/b")];
+        assert_eq!(prompt_prefill(&dirs, Some(home)), "~/");
+
+        // A shared parent outside home is shown verbatim.
+        let dirs = vec![PathBuf::from("/srv/app/a"), PathBuf::from("/srv/app/b")];
+        assert_eq!(prompt_prefill(&dirs, Some(home)), "/srv/app/");
+    }
+
+    #[test]
+    fn tab_completes_to_the_selected_dir_and_opens_it() {
+        let root = temp_tree(&["alpha", "beta"]);
+        let mut app = App::new();
+        // An absolute prefix keeps the test independent of the real HOME/cwd.
+        app.start_first_run_prompt(format!("{}/a", root.display()));
+        assert_eq!(app.prompt_completions(), &["alpha".to_string()]);
+
+        let out = app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(out.is_empty(), "Tab sends nothing to the server");
+        assert_eq!(
+            app.sidebar_prompt(),
+            format!("{}/alpha/", root.display()),
+            "Tab fills the highlight and opens the directory with a trailing slash"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn enter_submits_the_typed_input_ignoring_the_selection() {
+        let root = temp_tree(&["alpha", "beta"]);
+        let mut app = App::new();
+        app.start_first_run_prompt(format!("{}/", root.display()));
+        // Two matches; move the highlight onto the second.
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.prompt_selected(), 1);
+
+        let typed = app.sidebar_prompt().to_string();
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // Enter mounts the *typed* directory (the tempdir), never the highlight.
+        let dir = std::fs::canonicalize(&typed).unwrap();
+        assert_eq!(
+            out,
+            vec![
+                control(&Request::WorkspaceNew { dir }),
+                control(&Request::PaneRun {
+                    tab: None,
+                    cmd: vec![shell],
+                    ephemeral: false,
+                }),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn arrow_keys_move_the_completion_selection_and_typing_resets_it() {
+        let root = temp_tree(&["alpha", "beta", "gamma"]);
+        let mut app = App::new();
+        app.start_first_run_prompt(format!("{}/", root.display()));
+        assert_eq!(app.prompt_completions().len(), 3);
+        assert_eq!(app.prompt_selected(), 0);
+
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.prompt_selected(), 2);
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.prompt_selected(), 2, "Down clamps at the last row");
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.prompt_selected(), 1);
+
+        // Typing filters and snaps the highlight back to the best match.
+        app.on_key(plain('g'));
+        assert_eq!(app.prompt_selected(), 0);
+        assert_eq!(app.prompt_completions(), &["gamma".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -31,7 +31,7 @@ cd ~/code/myproject && tutti     # auto-starts the daemon and asks where to star
 
 Bare `tutti` (no subcommand) attaches to the session, starting the daemon if
 needed. On a **fresh** session it does not assume anything: the sidebar opens
-focused on a new-project prompt prefilled with your current directory — press
+focused on an add-project prompt prefilled with your current directory — press
 Enter to take it as-is, edit it first, or `esc` to skip and add a project later
 with `n`. Configure `[[projects]]` (see below) and those mount automatically
 instead, skipping the prompt. `tutti attach` is an alias for the same thing.
@@ -185,10 +185,16 @@ subtle full-row background, unmistakable even with a single entry.
 
 Press the prefix then `w` to focus the sidebar (revealing it if hidden). While
 focused, `j`/`k` (or the arrows) move the highlight across both sections, `Enter`
-jumps and hands focus back to the pane, `esc`/`w` unfocus, and `n` opens a
-one-line prompt to create a new workspace (`~` expands to your home; relative
-paths resolve against the client's cwd and are canonicalized to an absolute path
-before the daemon sees them; a bad directory surfaces the server's error). `d`
+jumps and hands focus back to the pane, `esc`/`w` unfocus, and `n` opens the
+**add-project** prompt — a one-line field for the path to an *existing* directory
+to open (it mounts that directory as a workspace; it never creates one). The
+field prefills the common parent of your current projects, so you type just the
+project's name, and it completes directories as you type: `Tab` fills in the
+highlighted match and opens it (a trailing `/` reveals its contents), `↑`/`↓`
+move the highlight, and `Enter` always opens whatever is typed. `~` expands to
+your home; relative paths resolve against the client's cwd and are canonicalized
+to an absolute path before the daemon sees them; a bad directory surfaces the
+server's error. `d`
 opens the selected workspace's **jj diff** in an ephemeral pane — a real terminal
 running `jj diff | less -R`, coloured, that vanishes the moment you quit `less`
 (pressing `d` on an agent row opens the diff for the agent's workspace). A
