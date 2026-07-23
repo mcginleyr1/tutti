@@ -385,9 +385,16 @@ impl App {
             Response::Attached {
                 session,
                 workspaces,
+                wire_rev,
             } => {
                 self.session = session;
                 self.set_view(workspaces);
+                if wire_rev != tutti_core::WIRE_REV {
+                    self.note(format!(
+                        "daemon is running an older build (wire rev {wire_rev}, client {}) — `tutti server stop`, reinstall, and reattach",
+                        tutti_core::WIRE_REV
+                    ));
+                }
             }
             Response::PaneCreated { id } => {
                 self.focused = Some(id);
@@ -1614,6 +1621,7 @@ mod tests {
     fn attached(app: &mut App) {
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
+                wire_rev: tutti_core::WIRE_REV,
                 session: "tutti".into(),
                 workspaces: view_one_pane(),
             })
@@ -1823,6 +1831,7 @@ mod tests {
         let mut app = App::new();
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
+                wire_rev: tutti_core::WIRE_REV,
                 session: "t".into(),
                 workspaces: view_two_panes(),
             })
@@ -1872,6 +1881,7 @@ mod tests {
     fn attach_with(app: &mut App, workspaces: Vec<WorkspaceView>) {
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
+                wire_rev: tutti_core::WIRE_REV,
                 session: "t".into(),
                 workspaces,
             })
@@ -2340,6 +2350,25 @@ mod tests {
         assert!(
             app.has_working_agent(),
             "the working claude agent drives the spinner"
+        );
+    }
+
+    #[test]
+    fn attached_with_old_wire_rev_warns_to_restart_the_daemon() {
+        let mut app = App::new();
+        app.handle_response(Response::Attached {
+            session: "t".into(),
+            workspaces: Vec::new(),
+            wire_rev: 0,
+        });
+        let warning = app.transient().unwrap_or_default().to_string();
+        assert!(
+            warning.contains("older build"),
+            "expected skew warning, got {warning:?}"
+        );
+        assert!(
+            warning.contains("server stop"),
+            "warning must say how to fix: {warning:?}"
         );
     }
 

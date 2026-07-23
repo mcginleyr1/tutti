@@ -275,6 +275,7 @@ fn handle_frame(
                 let reply = encode_json(&Response::Attached {
                     session: hub.name.clone(),
                     workspaces,
+                    wire_rev: tutti_core::WIRE_REV,
                 });
                 let flow = send_reply(hub, cid, tx, reply);
                 if flow.is_continue()

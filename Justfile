@@ -11,6 +11,7 @@ build:
 install:
     cargo install --path crates/tutti --force
     cargo install --path crates/tutti-server --force
+    @echo "note: running daemons keep the OLD build — run 'tutti server stop' per session to upgrade them (kills that session's panes)"
 
 # Run every test in the workspace
 test:

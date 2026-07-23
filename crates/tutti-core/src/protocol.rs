@@ -6,6 +6,12 @@ use crate::domain::{AgentKind, Direction, Layout};
 use crate::ids::{PaneId, TabId, WorkspaceId};
 use crate::state::AgentState;
 
+/// The wire-protocol revision. BUMP THIS on ANY change to the Request /
+/// Response / Event shapes (including additive fields): the daemon reports it
+/// on attach and mismatched clients tell the user to restart the daemon —
+/// binaries upgrade on install, running daemons do not.
+pub const WIRE_REV: u32 = 1;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
@@ -255,9 +261,13 @@ pub enum Response {
     },
     /// The attach handshake reply: the session name and its full view. The
     /// pane snapshots that seed the client's parsers follow as pane frames.
+    /// `wire_rev` is the server's `WIRE_REV`; a client warns on mismatch (an
+    /// old daemon defaults to 0, which correctly reads as outdated).
     Attached {
         session: String,
         workspaces: Vec<WorkspaceView>,
+        #[serde(default)]
+        wire_rev: u32,
     },
 }
 
@@ -470,6 +480,7 @@ mod tests {
             lines: vec!["line one".into(), "line two".into()],
         });
         roundtrip(&Response::Attached {
+            wire_rev: WIRE_REV,
             session: "tutti".into(),
             workspaces: sample_view(),
         });

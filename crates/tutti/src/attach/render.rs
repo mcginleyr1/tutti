@@ -1180,6 +1180,7 @@ mod tests {
         let mut app = App::new();
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
+                wire_rev: tutti_core::WIRE_REV,
                 session: "demo".into(),
                 workspaces: vec![workspace(
                     1,
@@ -1230,6 +1231,7 @@ mod tests {
         let mut app = App::new();
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
+                wire_rev: tutti_core::WIRE_REV,
                 session: "demo".into(),
                 workspaces: vec![
                     workspace(
@@ -1298,6 +1300,7 @@ mod tests {
         view[0].changes = Some("4 files +120 −33".into());
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
+                wire_rev: tutti_core::WIRE_REV,
                 session: "demo".into(),
                 workspaces: view,
             })
@@ -1334,6 +1337,7 @@ mod tests {
         view[0].changes = None;
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
+                wire_rev: tutti_core::WIRE_REV,
                 session: "demo".into(),
                 workspaces: view,
             })
@@ -1363,6 +1367,7 @@ mod tests {
         let mut app = App::with_config(Config::parse("sidebar = \"on\"\n").unwrap());
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
+                wire_rev: tutti_core::WIRE_REV,
                 session: "demo".into(),
                 workspaces: vec![workspace(
                     1,
@@ -1396,6 +1401,7 @@ mod tests {
         agent_pane.subagents = vec![sub("build the core", true), sub("write the tests", false)];
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
+                wire_rev: tutti_core::WIRE_REV,
                 session: "demo".into(),
                 workspaces: vec![workspace(
                     1,
@@ -1914,6 +1920,7 @@ mod tests {
         app.set_truecolor(true);
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
+                wire_rev: tutti_core::WIRE_REV,
                 session: "demo".into(),
                 workspaces: vec![workspace(
                     1,
@@ -1950,6 +1957,7 @@ mod tests {
         agent_pane.subagents = vec![sub("build the core", true), sub("write the tests", false)];
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
+                wire_rev: tutti_core::WIRE_REV,
                 session: "demo".into(),
                 workspaces: vec![workspace(
                     1,
