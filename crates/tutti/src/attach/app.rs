@@ -127,6 +127,11 @@ pub struct App {
     prefix_since: Option<Instant>,
     /// The highlighted sidebar entry while the sidebar is focused.
     sidebar_selected: usize,
+    /// The project the sidebar cursor last landed on (a project/workspace row's
+    /// project, or a waiting row's), driving the agents-section filter while the
+    /// sidebar is focused. `None` — and always outside sidebar focus — falls
+    /// back to the project owning the active tab.
+    sidebar_project: Option<WorkspaceId>,
     /// The directory being typed while in `SidebarPrompt` mode (add project).
     sidebar_prompt: String,
     /// Directory completions for the current `sidebar_prompt`, recomputed on
@@ -148,6 +153,9 @@ pub struct App {
     /// so the choice's destination is never ambiguous. `None` renders a bare
     /// ` run ` title.
     launcher_target: Option<String>,
+    /// The root the resume harvest reads the agent tools' session stores under
+    /// — the real home directory, pointed at a fixture tree in tests.
+    resume_home: Option<PathBuf>,
     /// The sidebar column from the last size sync, for mouse hit-testing.
     sidebar_rect: Option<Rect>,
     /// The top tab-bar row from the last size sync, for mouse hit-testing.
@@ -177,10 +185,11 @@ pub struct App {
     /// Panes that raised a notification while unfocused; their sidebar entry
     /// shows a bell mark until the pane is focused.
     notified: HashSet<PaneId>,
-    /// Whether the projects / agents sidebar sections are collapsed to their
-    /// header. Toggled by clicking a section header.
+    /// Whether the projects / agents / waiting sidebar sections are collapsed to
+    /// their header. Toggled by clicking a section header.
     collapsed_projects: bool,
     collapsed_agents: bool,
+    collapsed_waiting: bool,
     /// Whether the real terminal advertises truecolor (`COLORTERM`), gating the
     /// chrome background shades. Resolved once at startup; `false` in tests.
     truecolor: bool,
@@ -220,6 +229,7 @@ impl App {
             bell: false,
             prefix_since: None,
             sidebar_selected: 0,
+            sidebar_project: None,
             sidebar_prompt: String::new(),
             prompt_completions: Vec::new(),
             prompt_selected: 0,
@@ -228,6 +238,7 @@ impl App {
             launcher_after_add: false,
             launcher_command: String::new(),
             launcher_target: None,
+            resume_home: std::env::var_os("HOME").map(PathBuf::from),
             sidebar_rect: None,
             tab_bar_rect: None,
             spinner_epoch: Instant::now(),
@@ -241,6 +252,7 @@ impl App {
             terminal_out: Vec::new(),
             collapsed_projects: false,
             collapsed_agents: false,
+            collapsed_waiting: false,
             truecolor: false,
             config,
         }
@@ -476,7 +488,11 @@ impl App {
                         // The fresh view has not landed yet; adopt on the next.
                         self.adopt_active_view = true;
                     }
-                    self.open_launcher(false, created.as_ref().map(|(name, _)| name.clone()));
+                    self.open_launcher(
+                        false,
+                        created.as_ref().map(|(name, _)| name.clone()),
+                        created.as_ref().map(|(_, dir)| dir.as_path()),
+                    );
                     if let Some((name, dir)) = created {
                         self.set_status(format!("workspace {name} → {}", dir.display()));
                     }
@@ -677,8 +693,15 @@ impl App {
                 Vec::new()
             }
             PrefixAction::Run => {
-                let target = self.active_workspace_name();
-                self.open_launcher(false, target);
+                let ws = self
+                    .active_workspace()
+                    .and_then(|id| self.workspaces.iter().find(|w| w.id == id))
+                    .map(|w| (w.name.clone(), w.dir.clone()));
+                self.open_launcher(
+                    false,
+                    ws.as_ref().map(|(name, _)| name.clone()),
+                    ws.as_ref().map(|(_, dir)| dir.as_path()),
+                );
                 Vec::new()
             }
             PrefixAction::Detach => self.detach(),
@@ -745,10 +768,67 @@ impl App {
     /// renderer, hit-testing, and navigation. Carries the client's collapse state
     /// so the frame headers and row math agree.
     pub fn sidebar(&self) -> Sidebar {
-        let mut sidebar = sidebar::build(&self.workspaces, self.active_tab);
+        let mut sidebar = sidebar::build(&self.workspaces, self.active_tab, self.current_project());
         sidebar.projects_collapsed = self.collapsed_projects;
         sidebar.agents_collapsed = self.collapsed_agents;
+        sidebar.waiting_collapsed = self.collapsed_waiting;
         sidebar
+    }
+
+    /// The project the agents section filters to: the sidebar cursor's project
+    /// while the sidebar is focused, else the project owning the active tab —
+    /// so an unfocused sidebar always tracks where the user actually is.
+    fn current_project(&self) -> Option<WorkspaceId> {
+        self.sidebar_project
+            .filter(|_| self.sidebar_focused())
+            .or_else(|| self.active_project())
+    }
+
+    /// The top-level project owning the active tab: the owning workspace's
+    /// parent when that parent is in the view, else the workspace itself.
+    fn active_project(&self) -> Option<WorkspaceId> {
+        let at = self.active_tab?;
+        let ws = self
+            .workspaces
+            .iter()
+            .find(|w| w.tabs.iter().any(|t| t.id == at))?;
+        Some(
+            ws.parent
+                .filter(|p| self.workspaces.iter().any(|o| o.id == *p))
+                .unwrap_or(ws.id),
+        )
+    }
+
+    /// After the sidebar cursor moves, retarget the agents filter to what it
+    /// landed on: a project/workspace row selects its project, a waiting row
+    /// selects the project its agent lives in. Landing inside the agents section
+    /// keeps the current filter (those rows are already the selected project's).
+    /// A waiting-row retarget re-filters the agents section, shifting every
+    /// waiting index, so the cursor is re-anchored to the same pane afterwards.
+    fn sync_sidebar_project(&mut self, sidebar: &Sidebar) {
+        match sidebar.entries.get(self.sidebar_selected) {
+            Some(SidebarEntry::Workspace(w)) => self.sidebar_project = Some(w.project),
+            Some(SidebarEntry::Agent(a))
+                if self.sidebar_selected >= sidebar.workspace_count + sidebar.agent_count =>
+            {
+                let pane = a.pane;
+                self.sidebar_project = Some(a.project);
+                let rebuilt = self.sidebar();
+                let waiting_start = rebuilt.workspace_count + rebuilt.agent_count;
+                if let Some(idx) = rebuilt
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .skip(waiting_start)
+                    .find_map(|(i, e)| {
+                        matches!(e, SidebarEntry::Agent(x) if x.pane == pane).then_some(i)
+                    })
+                {
+                    self.sidebar_selected = idx;
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Whether the sidebar currently holds keyboard focus.
@@ -905,6 +985,7 @@ impl App {
         }
         self.mode = Mode::Sidebar;
         self.sidebar_selected = 0;
+        self.sidebar_project = None;
         self.prefix_since = None;
         self.status = None;
     }
@@ -930,10 +1011,12 @@ impl App {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
                 self.sidebar_selected = next_visible(&sidebar, self.sidebar_selected);
+                self.sync_sidebar_project(&sidebar);
                 Vec::new()
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.sidebar_selected = prev_visible(&sidebar, self.sidebar_selected);
+                self.sync_sidebar_project(&sidebar);
                 Vec::new()
             }
             KeyCode::Enter => self.jump_to_selected(&sidebar),
@@ -993,19 +1076,19 @@ impl App {
     /// so one keystroke goes from the project list to picking what runs in a new
     /// pane in that tab. An agent row targets the workspace that owns it.
     fn run_in_selected(&mut self, sidebar: &Sidebar) -> Vec<WireFrame> {
-        let Some((tab, name)) = self.selected_workspace(sidebar).and_then(|w| {
+        let Some((tab, name, dir)) = self.selected_workspace(sidebar).and_then(|w| {
             w.tabs
                 .iter()
                 .find(|t| t.active)
                 .or_else(|| w.tabs.first())
-                .map(|t| (t.id, w.name.clone()))
+                .map(|t| (t.id, w.name.clone(), w.dir.clone()))
         }) else {
             return Vec::new();
         };
         self.active_tab = Some(tab);
         self.zoom = false;
         self.refocus();
-        self.open_launcher(false, Some(name));
+        self.open_launcher(false, Some(name), Some(&dir));
         vec![control(&Request::TabSelect { id: tab })]
     }
 
@@ -1259,7 +1342,9 @@ impl App {
         let dir = expand_dir(&input);
         self.adopt_active_view = true;
         let name = workspace_name_from_dir(&dir);
-        self.open_launcher(true, name);
+        // Harvest against the directory being added: an existing project often
+        // has conversations from before it was mounted in tutti.
+        self.open_launcher(true, name, Some(dir.as_path()));
         vec![control(&Request::WorkspaceNew { dir })]
     }
 
@@ -1425,10 +1510,20 @@ impl App {
     /// its rows from the registry and the live PATH. `after_add` records that it
     /// fired right after add-project, so `esc` still spawns the shell into the
     /// new workspace (today's outcome); otherwise `esc` just closes. `target`
-    /// names the workspace the choice will land in, shown in the panel title.
-    fn open_launcher(&mut self, after_add: bool, target: Option<String>) {
+    /// names the workspace the choice will land in, shown in the panel title;
+    /// `dir` is its directory — when known, conversations harvested from the
+    /// agent tools' own session stores append as resume rows at the foot.
+    fn open_launcher(&mut self, after_add: bool, target: Option<String>, dir: Option<&Path>) {
         self.launcher =
             launcher::build_rows(&Registry::default(), std::env::var_os("PATH").as_deref());
+        if let (Some(dir), Some(home)) = (dir, self.resume_home.as_deref()) {
+            let sessions = tutti_agents::resume_sessions(dir, home, 3);
+            self.launcher.extend(launcher::resume_rows(
+                &sessions,
+                &self.launcher,
+                std::time::SystemTime::now(),
+            ));
+        }
         self.launcher_selected = launcher::first_selectable(&self.launcher);
         self.launcher_after_add = after_add;
         self.launcher_command.clear();
@@ -1508,6 +1603,10 @@ impl App {
                 self.launcher_command.clear();
                 self.mode = Mode::LauncherCommand;
                 Vec::new()
+            }
+            LaunchKind::Resume(cmd) => {
+                self.close_launcher();
+                vec![run_pane(cmd)]
             }
         }
     }
@@ -1662,11 +1761,12 @@ impl App {
         }
     }
 
-    /// Collapse or expand a sidebar section (projects or agents).
+    /// Collapse or expand a sidebar section (projects, agents, or waiting).
     fn toggle_section(&mut self, section: sidebar::Section) {
         match section {
             sidebar::Section::Projects => self.collapsed_projects = !self.collapsed_projects,
             sidebar::Section::Agents => self.collapsed_agents = !self.collapsed_agents,
+            sidebar::Section::Waiting => self.collapsed_waiting = !self.collapsed_waiting,
         }
     }
 
@@ -1954,13 +2054,6 @@ impl App {
             .iter()
             .find(|w| w.id == id)
             .map(|w| w.name.clone())
-    }
-
-    /// The name of the workspace owning the active tab — the launcher's target
-    /// label when it opens over the current tab (prefix `r`).
-    fn active_workspace_name(&self) -> Option<String> {
-        self.active_workspace()
-            .and_then(|id| self.workspace_name(id))
     }
 
     fn tab_exists(&self, id: TabId) -> bool {
@@ -2943,21 +3036,76 @@ mod tests {
         assert_eq!(app.mode, Mode::Sidebar);
         assert_eq!(app.sidebar_selected(), 0);
 
-        app.on_key(plain('j')); // second workspace
+        app.on_key(plain('j')); // second workspace — the filter follows it
         assert_eq!(app.sidebar_selected(), 1);
         app.on_key(plain('j')); // crosses into the agents section
         assert_eq!(app.sidebar_selected(), 2);
         assert!(matches!(app.sidebar().entries[2], SidebarEntry::Agent(_)));
         app.on_key(plain('j')); // last agent
         assert_eq!(app.sidebar_selected(), 3);
+        app.on_key(plain('j')); // crosses into the waiting section
+        assert_eq!(app.sidebar_selected(), 4);
         app.on_key(plain('j')); // clamped at the end
+        assert_eq!(app.sidebar_selected(), 4);
+        app.on_key(plain('k')); // back up into the agents
         assert_eq!(app.sidebar_selected(), 3);
-        app.on_key(plain('k')); // back up into the workspaces
-        assert_eq!(app.sidebar_selected(), 2);
 
         // esc unfocuses; the pane keeps its own focus.
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn sidebar_filter_follows_the_cursor_and_reverts_on_unfocus() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        // The active tab's project (api) has no agents, so web's stay out of
+        // the agents section — they only surface in the waiting queue.
+        assert_eq!(app.sidebar().agent_count, 0);
+        app.on_key(plain('j')); // highlight web
+        assert_eq!(app.sidebar().agent_count, 2);
+        assert_eq!(app.sidebar().project.as_deref(), Some("web"));
+        // Unfocusing drops the preview: the filter tracks the active tab again.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.sidebar().agent_count, 0);
+        assert_eq!(app.sidebar().project.as_deref(), Some("api"));
+    }
+
+    #[test]
+    fn waiting_row_highlight_retargets_the_agents_filter() {
+        let mut view = view_two_workspaces();
+        view.push(workspace(
+            3,
+            "zed",
+            None,
+            vec![tab(
+                3,
+                "3",
+                false,
+                leaf(4),
+                vec![agent(4, "claude", AgentState::Blocked)],
+            )],
+        ));
+        let mut app = App::new();
+        attach_with(&mut app, view);
+        focus_sidebar(&mut app);
+        app.on_key(plain('j')); // web
+        app.on_key(plain('j')); // zed — now the filter
+        assert_eq!(app.sidebar().project.as_deref(), Some("zed"));
+        app.on_key(plain('j')); // zed's own agent
+        assert_eq!(app.sidebar_selected(), 3);
+        app.on_key(plain('j')); // first waiting row: web's blocked pane 3
+        // Landing there retargets the filter to web, which grows the agents
+        // section; the cursor re-anchors onto the same waiting row.
+        let sidebar = app.sidebar();
+        assert_eq!(sidebar.project.as_deref(), Some("web"));
+        assert_eq!(sidebar.agent_count, 2);
+        assert_eq!(app.sidebar_selected(), 5);
+        let SidebarEntry::Agent(a) = &sidebar.entries[5] else {
+            panic!("expected the waiting row");
+        };
+        assert_eq!(a.pane, PaneId(3));
     }
 
     #[test]
@@ -4188,10 +4336,70 @@ mod tests {
     }
 
     #[test]
+    fn launcher_enter_on_a_resume_row_emits_the_resume_argv() {
+        let mut app = App::new();
+        attached(&mut app);
+        app.launcher = vec![LauncherRow {
+            name: "resume".into(),
+            role: "claude · 2h · fix the sidebar".into(),
+            kind: LaunchKind::Resume(vec!["claude".into(), "--resume".into(), "abc".into()]),
+            available: true,
+        }];
+        app.launcher_selected = 0;
+        app.mode = Mode::Launcher;
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            out,
+            vec![control(&Request::PaneRun {
+                tab: None,
+                cmd: vec!["claude".into(), "--resume".into(), "abc".into()],
+                ephemeral: false,
+            })],
+            "enter resumes the conversation in a new pane"
+        );
+        assert_eq!(app.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn launcher_appends_harvested_resume_rows_for_the_target_workspace() {
+        // A fixture home holding one claude conversation for /tmp/w — the
+        // directory every workspace fixture uses.
+        let home = std::env::temp_dir().join(format!("tutti-app-resume-{}", std::process::id()));
+        let store = home.join(".claude/projects/-tmp-w");
+        std::fs::create_dir_all(&store).unwrap();
+        let line = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": "wire the resume rows"},
+            "cwd": "/tmp/w",
+        });
+        std::fs::write(store.join("sess-1.jsonl"), format!("{line}\n")).unwrap();
+
+        let mut app = App::new();
+        app.resume_home = Some(home.clone());
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        app.on_key(plain('r')); // run in the selected (first) workspace
+        assert_eq!(app.mode, Mode::Launcher);
+        let last = app.launcher_rows().last().unwrap();
+        assert_eq!(last.name, "resume", "the harvest appends at the foot");
+        assert!(
+            last.role.contains("wire the resume rows"),
+            "the row carries the conversation's first prompt: {}",
+            last.role
+        );
+        assert_eq!(
+            last.kind,
+            LaunchKind::Resume(vec!["claude".into(), "--resume".into(), "sess-1".into()])
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
     fn launcher_quick_select_number_launches_the_shell_row() {
         let mut app = App::new();
         attached(&mut app);
-        app.open_launcher(false, None);
+        app.open_launcher(false, None, None);
         // The shell row follows the registry agents; its number launches it.
         let shell_number = Registry::default().specs().len() + 1;
         let digit = char::from_digit(shell_number as u32, 10).unwrap();
@@ -4212,7 +4420,7 @@ mod tests {
     fn launcher_command_row_opens_an_input_that_runs_via_shell_lc() {
         let mut app = App::new();
         attached(&mut app);
-        app.open_launcher(false, None);
+        app.open_launcher(false, None, None);
         // The command row is last; select it by number to open the input.
         let command_number = Registry::default().specs().len() + 2;
         let digit = char::from_digit(command_number as u32, 10).unwrap();
@@ -4241,7 +4449,7 @@ mod tests {
     fn launcher_command_esc_backs_up_to_the_picker() {
         let mut app = App::new();
         attached(&mut app);
-        app.open_launcher(false, None);
+        app.open_launcher(false, None, None);
         let command_number = Registry::default().specs().len() + 2;
         let digit = char::from_digit(command_number as u32, 10).unwrap();
         app.on_key(plain(digit));

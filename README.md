@@ -11,41 +11,88 @@ for the wire protocol.
 
 ## Install
 
-Core multiplexing works anywhere. The workspace-level VCS features (per-workspace
-diffs, nested [workspaces](#workspaces) on isolated checkouts, merge-back, branch
-display) are prescriptive: they require [jj](https://jj-vcs.github.io) — there are
-no git/mercurial adapters.
+You need:
+
+- **A stable [Rust toolchain](https://rustup.rs)** — the workspace builds on
+  edition 2024, so rustc **1.85 or newer**. macOS and Linux.
+- **[jj](https://jj-vcs.github.io)** — optional. Core multiplexing works
+  anywhere; the workspace-level VCS features (per-workspace diffs, nested
+  [workspaces](#workspaces) on isolated checkouts, merge-back, branch display)
+  are prescriptive: they require jj — there are no git/mercurial adapters.
+- **The agents themselves** (`claude`, `codex`, …) on your `PATH`. Tutti
+  detects and drives them; it does not install them. A missing agent simply
+  shows dim in the launcher.
+
+From a checkout of this repository:
 
 ```sh
-cargo install --path crates/tutti
-cargo install --path crates/tutti-server
+cargo install --path crates/tutti          # the CLI + TUI client
+cargo install --path crates/tutti-server   # the daemon
 ```
 
-Both binaries land in `~/.cargo/bin`; the `tutti` CLI auto-starts the daemon on
-first use (one daemon per named session, `-s <name>`, default `tutti`).
+Both binaries land in `~/.cargo/bin` (make sure that is on your `PATH`). You
+never launch `tutti-server` yourself — the `tutti` CLI auto-starts the daemon
+on first use, one per named session (`-s <name>`, default `tutti`).
+
+Two optional finishing touches:
+
+- `tutti hooks claude --install` upgrades Claude Code state detection from
+  screen heuristics to exact hook signals — recommended; see
+  [Claude Code integration](#claude-code-integration). It shows the merge and
+  asks before touching `~/.claude/settings.json`.
+- Using a Nerd Font? Set `icons = "nerdfont"` in the config for crisper
+  sidebar glyphs (see [Configuration](#configuration)).
+
+### Upgrading
+
+Re-run the two `cargo install` commands. A daemon that is already running keeps
+executing the **old** binary until it is restarted — finish or detach your
+agents, `tutti server stop`, and the next `tutti` starts the new one. The
+attach handshake warns whenever client and daemon disagree on the wire
+protocol, so version skew is loud, never silent.
 
 ## Quickstart
 
-```sh
-cd ~/code/myproject && tutti     # auto-starts the daemon and asks where to start
-```
-
-Bare `tutti` (no subcommand) attaches to the session, starting the daemon if
-needed. On a **fresh** session it does not assume anything: the sidebar opens
-focused on an add-project prompt prefilled with your current directory — press
-Enter to take it as-is, edit it first, or `esc` to skip and add a project later
-with `n`. Configure `[[projects]]` (see below) and those mount automatically
-instead, skipping the prompt. `tutti attach` is an alias for the same thing.
-
-Inside, split (`Ctrl+B %`), run an agent, and move around:
+Your first session, end to end:
 
 ```sh
-tutti pane run -- claude                     # run an agent in a pane (current tab)
+cd ~/code/myproject && tutti
 ```
 
-Detach (`Ctrl+B d`) and everything keeps running. Reattach with `tutti`, or
-inspect headlessly: `tutti pane list`, `tutti pane read 1`,
-`tutti pane send 1 --text 'y'`.
+1. **Mount your project.** Bare `tutti` attaches, auto-starting the daemon
+   (`tutti attach` is the same thing). On a fresh session nothing is assumed:
+   the sidebar opens on an add-project prompt prefilled with your current
+   directory — `Enter` takes it, or edit the path first, or `esc` to skip and
+   add one later with `n`. (With `[[projects]]` configured — see
+   [Configuration](#configuration) — they mount automatically and the prompt
+   is skipped.)
+
+2. **Pick what runs.** The run launcher opens over the new project: one row
+   per agent (`claude`, `codex`, …), a plain `shell`, and a free-form
+   `command…` — press a row's number or `Enter`. Conversations you had in that
+   directory before tutti appear as **resume rows** at the foot; picking one
+   continues it in a new pane. Later, `Ctrl+B r` reopens the launcher over
+   whatever project you are in.
+
+3. **Split and move.** `Ctrl+B %` splits right, `Ctrl+B "` splits down;
+   `Ctrl+h/j/k/l` moves between panes, `Ctrl+B z` zooms one. Run more agents
+   in the splits, or leave a shell beside them.
+
+4. **Herd from the sidebar.** `Ctrl+B w` focuses the sidebar: your projects,
+   the selected project's agents (state dots: blocked red, working spinner,
+   done green), and the cross-project **waiting** queue of everything blocked
+   on you. `Enter` jumps to what you highlight; `r` runs another agent in the
+   selected project, `d` shows its jj diff, `w` creates a nested workspace,
+   `m` merges one back. See [Sidebar](#sidebar) and [Workspaces](#workspaces).
+
+5. **Detach and return.** `Ctrl+B d` detaches; every pane keeps running under
+   the daemon. `tutti` reattaches — state dots and the waiting queue catch you
+   up on what happened while you were away.
+
+6. **Or drive it headless.** The same daemon answers the CLI, so scripts (and
+   agents) work the panes without a screen: `tutti pane list`,
+   `tutti pane read 1`, `tutti pane send 1 --text 'y'`,
+   `tutti pane run -- claude`. See [CLI surface](#cli-surface).
 
 ### Stopping
 
@@ -113,6 +160,16 @@ launches the highlight, `esc` closes; `command…` opens a one-line input that r
 whatever you type via your login shell. Adding a project (`n`) opens the launcher
 for the new workspace's first pane too — `esc` there just drops you into a shell,
 exactly as before. (Startup `[[projects]]` still mount plain shells, no launcher.)
+
+At the foot of the panel sit up to three **resume rows** — `resume   claude ·
+2h · <first prompt>` — harvested from the agent tools' own on-disk session
+stores for the target workspace's directory (read-only; Claude Code today,
+`~/.claude/projects/…`, each candidate verified against the `cwd` its own
+transcript records). Picking one relaunches the conversation in a new pane via
+the tool's resume flag (`claude --resume <session-id>`), so a conversation
+orphaned by a daemon restart — or one from before the project was mounted in
+tutti — is one keystroke from continuing. A resume row for an uninstalled
+binary dims like any agent row.
 
 Sidebar edge-nav: at a pane's **left edge**, `Ctrl+h` steps into the sidebar when
 it is visible (nvim-explorer muscle memory) instead of jumping straight to the
@@ -206,9 +263,10 @@ hard error.
 
 A left column that turns the TUI into a control center for many projects and
 agents at once — one rounded frame whose top border carries the `projects`
-header and whose fused divider (`├ agents ── N ┤`) carries the `agents` header,
-each with a `▼`/`▶` collapse arrow and a right-aligned count. It renders dim by
-default, with the focused row popping in the accent colour. Two stacked sections:
+header and whose fused dividers (`├ agents · name ── N ┤`, `├ waiting ── N ┤`)
+carry the `agents` and `waiting` headers, each with a `▼`/`▶` collapse arrow
+and a right-aligned count. It renders dim by default, with the focused row
+popping in the accent colour. Three stacked sections:
 
 - **projects** — one row per top-level project, with any [nested
   workspaces](#workspaces) rendered **indented beneath it** on `├`/`└` tree
@@ -224,14 +282,24 @@ default, with the focused row popping in the accent colour. Two stacked sections
   dim-red `stale` tag in the stat's place until you run `workspace update`.
   Collapsing a project hides its nested workspaces too. Selecting a workspace
   jumps to its tab.
-- **agents** — one row per agent pane across *every* workspace: a state dot
-  (blocked red, working an animated spinner, done green, idle/unknown dim), the
-  pane title, and a dim `state · kind` line, with any hook-reported subagents
-  hanging below on `├`/`└` tree guides. Sorted blocked-first so whatever needs you
-  is at the top. Selecting one jumps to that pane, switching workspace and tab as
-  needed. A pane that rings a bell or fires a desktop notification while in the
-  background gets a 🔔 mark here that clears when you focus it. When no agents are
-  running the section shows a dim italic `no agents yet` placeholder.
+- **agents** — one row per agent pane in the **selected project** (the header
+  names it): a state dot (blocked red, working an animated spinner, done green,
+  idle/unknown dim), the pane title, and a dim `state · kind` line, with any
+  hook-reported subagents hanging below on `├`/`└` tree guides. Sorted
+  blocked-first, and a nested workspace's agents count as its parent project's.
+  The filter follows the sidebar highlight: land on a project (or one of its
+  workspaces) and this section shows its agents; outside the sidebar it tracks
+  the project that owns the active tab. Selecting an agent jumps to that pane,
+  switching workspace and tab as needed. A pane that rings a bell or fires a
+  desktop notification while in the background gets a 🔔 mark here that clears
+  when you focus it. When the selected project runs no agents the section shows
+  a dim italic `no agents here` placeholder.
+- **waiting** — the cross-project attention queue: every **blocked** or
+  **done** agent from *every* project, blocked first, each over a dim
+  `project · kind` line naming where it lives (subagent rows stay in the agents
+  section). Highlighting a row here re-points the agents section at that
+  agent's project; `Enter` (or a click) jumps to the agent itself, so a stuck
+  agent two projects away is never invisible and always one keystroke away.
 
 The selected row (while the sidebar is focused) takes a subtle full-row
 highlight with its name rendered as an accent chip, unmistakable even with a
@@ -239,7 +307,7 @@ single entry. Click a section header (the top border or the divider) to collapse
 that section down to its header, or click again to expand it.
 
 Press the prefix then `w` to focus the sidebar (revealing it if hidden). While
-focused, `j`/`k` (or the arrows) move the highlight across both sections, `Enter`
+focused, `j`/`k` (or the arrows) move the highlight across all three sections, `Enter`
 jumps and hands focus back to the pane, and `esc` unfocuses (esc is the back key
 throughout). `w` opens **guided [workspace](#workspaces) creation** on the
 selected project (below); `r` **runs** an agent (or shell/command) in the

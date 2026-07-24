@@ -5,8 +5,9 @@
 
 use std::ffi::OsStr;
 use std::path::Path;
+use std::time::SystemTime;
 
-use tutti_agents::Registry;
+use tutti_agents::{Registry, ResumeSession};
 
 /// What a launcher row runs when chosen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +18,9 @@ pub enum LaunchKind {
     Shell,
     /// Prompt for an arbitrary command line, run via `$SHELL -lc <input>`.
     Command,
+    /// Resume a harvested conversation — a `PaneRun` carrying the full argv
+    /// (e.g. `claude --resume <session-id>`).
+    Resume(Vec<String>),
 }
 
 /// One row in the launcher overlay: its two-tone label, what it runs, and
@@ -73,6 +77,57 @@ pub fn build_rows(registry: &Registry, path: Option<&OsStr>) -> Vec<LauncherRow>
         available: true,
     });
     rows
+}
+
+/// Rows for harvested conversations, appended below the fixed rows — the
+/// "pick up where you left off" foot of the picker. Each shows its agent, a
+/// compact age, and the conversation's first prompt, and is selectable only
+/// when its agent's own row is (resuming claude without claude installed
+/// cannot work). `now` is passed in so the age labels are testable.
+pub fn resume_rows(
+    sessions: &[ResumeSession],
+    rows: &[LauncherRow],
+    now: SystemTime,
+) -> Vec<LauncherRow> {
+    sessions
+        .iter()
+        .map(|s| {
+            let available = rows.iter().any(|r| r.name == s.agent && r.available);
+            let title = s.title.as_deref().unwrap_or("untitled");
+            LauncherRow {
+                name: "resume".into(),
+                role: format!(
+                    "{} · {} · {}",
+                    s.agent,
+                    age_label(s.last_active, now),
+                    truncate(title, 28)
+                ),
+                kind: LaunchKind::Resume(s.cmd.clone()),
+                available,
+            }
+        })
+        .collect()
+}
+
+/// A compact age for a resume row: `now`, `Nm`, `Nh`, or `Nd`.
+fn age_label(then: SystemTime, now: SystemTime) -> String {
+    let secs = now.duration_since(then).map(|d| d.as_secs()).unwrap_or(0);
+    match secs {
+        0..=59 => "now".into(),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
+/// `text` capped to `max` characters, the last one replaced by `…` when cut.
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.into();
+    }
+    let mut cut: String = text.chars().take(max.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
 }
 
 /// A human one-line role for an agent kind, prettifying the known agents and
@@ -214,6 +269,44 @@ mod tests {
         assert!(matches!(rows[3].kind, LaunchKind::Command));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resume_rows_label_age_and_gate_on_the_agents_availability() {
+        use std::time::Duration;
+        let now = SystemTime::now();
+        let sessions = vec![
+            ResumeSession {
+                agent: "claude".into(),
+                id: "abc".into(),
+                title: Some("fix the sidebar filtering because it is way too long".into()),
+                last_active: now - Duration::from_secs(2 * 3600),
+                cmd: vec!["claude".into(), "--resume".into(), "abc".into()],
+            },
+            ResumeSession {
+                agent: "codex".into(),
+                id: "def".into(),
+                title: None,
+                last_active: now - Duration::from_secs(30),
+                cmd: vec!["codex".into(), "resume".into()],
+            },
+        ];
+        let fixed = vec![agent_row("claude", true), agent_row("codex", false)];
+
+        let rows = resume_rows(&sessions, &fixed, now);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "resume");
+        assert_eq!(rows[0].role, "claude · 2h · fix the sidebar filtering b…");
+        assert_eq!(
+            rows[0].kind,
+            LaunchKind::Resume(vec!["claude".into(), "--resume".into(), "abc".into()])
+        );
+        assert!(rows[0].available, "claude is installed, so resumable");
+        assert_eq!(rows[1].role, "codex · now · untitled");
+        assert!(
+            !rows[1].available,
+            "a conversation for an absent binary cannot resume"
+        );
     }
 
     #[test]

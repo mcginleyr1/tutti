@@ -298,7 +298,8 @@ fn wordmark_lines() -> Vec<Line<'static>> {
 }
 
 /// The sidebar: one rounded frame whose top border carries the `projects`
-/// header and whose fused divider carries the `agents` header, each with a
+/// header and whose fused dividers carry the `agents` (filtered to the selected
+/// project) and `waiting` (cross-project blocked/done) headers, each with a
 /// collapse arrow and a count. Entries sit inside with one column of padding; a
 /// selected entry (only while the sidebar holds focus and is not prompting) gets
 /// a subtle full-row highlight and its name as an accent chip. Takes the deeper
@@ -313,7 +314,9 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
 
     let sidebar = app.sidebar();
     let ws_count = sidebar.workspace_count;
-    let agent_count = sidebar.entries.len() - ws_count;
+    let agent_count = sidebar.agent_count;
+    let waiting_start = ws_count + agent_count;
+    let waiting_count = sidebar.entries.len() - waiting_start;
     // A selection only pops while the sidebar holds focus and is not prompting.
     let pop = app.sidebar_focused() && !app.sidebar_prompt_active();
     let selected = app.sidebar_selected();
@@ -340,22 +343,34 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
             }
         }
     }
+    // The agents header carries the filter project's name, truncated so the
+    // frame's dashes and count always fit inside the fixed sidebar width.
+    let agents_title = match sidebar.project.as_deref() {
+        Some(name) => format!("agents · {}", truncate_chars(name, 10)),
+        None => "agents".into(),
+    };
     lines.push(header_border(
         '├',
         '┤',
         sidebar.agents_collapsed,
-        "agents",
+        &agents_title,
         agent_count,
         w,
     ));
     if !sidebar.agents_collapsed {
         if agent_count == 0 {
             lines.push(frame_row(
-                placeholder_inner("no agents yet", content_w),
+                placeholder_inner("no agents here", content_w),
                 false,
             ));
         } else {
-            for (i, entry) in sidebar.entries.iter().enumerate().skip(ws_count) {
+            for (i, entry) in sidebar
+                .entries
+                .iter()
+                .enumerate()
+                .skip(ws_count)
+                .take(agent_count)
+            {
                 if let SidebarEntry::Agent(a) = entry {
                     let sel = pop && selected == i;
                     lines.push(frame_row(
@@ -374,6 +389,29 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
                         ));
                     }
                 }
+            }
+        }
+    }
+    lines.push(header_border(
+        '├',
+        '┤',
+        sidebar.waiting_collapsed,
+        "waiting",
+        waiting_count,
+        w,
+    ));
+    if !sidebar.waiting_collapsed {
+        for (i, entry) in sidebar.entries.iter().enumerate().skip(waiting_start) {
+            if let SidebarEntry::Agent(a) = entry {
+                let sel = pop && selected == i;
+                lines.push(frame_row(
+                    agent_inner(a, sel, spinner, content_w, glyphs),
+                    sel,
+                ));
+                lines.push(frame_row(
+                    waiting_subtitle_inner(a, sel, app.is_notified(a.pane), content_w),
+                    sel,
+                ));
             }
         }
     }
@@ -639,6 +677,38 @@ fn agent_subtitle_inner(
         ));
     }
     pad_inner(spans, sel, content_w)
+}
+
+/// The dim `project · kind` second line for a waiting-section row — the rows
+/// are cross-project, so the project is the orienting fact — plus the bell mark
+/// when a notification is pending.
+fn waiting_subtitle_inner(
+    a: &AgentRow,
+    sel: bool,
+    notified: bool,
+    content_w: u16,
+) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(
+        format!("  {} · {}", a.project_name, a.kind),
+        dim(),
+    )];
+    if notified {
+        spans.push(Span::styled(
+            " 🔔",
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    }
+    pad_inner(spans, sel, content_w)
+}
+
+/// `text` capped to `max` characters, the last one replaced by `…` when cut.
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.into();
+    }
+    let mut cut: String = text.chars().take(max.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
 }
 
 /// A subagent sub-row under its agent: a box-drawing tree guide (`├`/`└`), a
@@ -1513,7 +1583,7 @@ mod tests {
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
         assert!(
-            text.contains("no agents yet"),
+            text.contains("no agents here"),
             "empty agents section needs a placeholder: {text:?}"
         );
     }
@@ -1635,7 +1705,9 @@ mod tests {
             })
             .unwrap(),
         ));
-        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        // 16 rows: the notified agent is another project's, so its bell rides
+        // the waiting-section row below the (empty) filtered agents section.
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("🔔"), "bell mark missing: {text:?}");

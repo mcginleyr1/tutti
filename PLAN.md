@@ -225,6 +225,17 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    upgrades Blocked/Done detection from screen heuristics to exact hook signals
    (a hook-driven pane is skipped by the screen classifier). Display only — tutti
    does not manage a foreign agent's subagents.
+7. **Conversation resume**: ✅ wave 1 — the launcher harvests resumable
+   conversations for its target workspace from the agent tools' own session
+   stores (read-only; Claude Code today: `~/.claude/projects/<munged-cwd>/
+   <session-id>.jsonl`, newest-first by mtime, each candidate verified against
+   the `cwd` its transcript records since the munge is lossy) and offers up to
+   three `resume` rows at the panel's foot; picking one spawns
+   `claude --resume <session-id>` in a new pane. Scripts get the same via
+   `tutti pane run -- claude --resume <id>` — no new verb needed. Wave 2
+   (open): capture `session_id` per pane from the hook payloads so a restarted
+   daemon can offer to revive the exact conversation each dead agent pane was
+   holding, not just the project's most recent ones.
 
 **Acceptance:** a script (or an agent) can: create 3 worktree workspaces, launch an
 agent in each, `wait --until done` on all three, read back each diff summary.

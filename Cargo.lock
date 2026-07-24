@@ -1825,6 +1825,7 @@ name = "tutti-agents"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "tutti-core",
 ]
 
