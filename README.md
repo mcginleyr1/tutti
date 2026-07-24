@@ -12,8 +12,9 @@ for the wire protocol.
 ## Install
 
 Core multiplexing works anywhere. The workspace-level VCS features (per-workspace
-diffs, `workspace fork` onto isolated checkouts, branch display) are prescriptive:
-they require [jj](https://jj-vcs.github.io) — there are no git/mercurial adapters.
+diffs, nested [workspaces](#workspaces) on isolated checkouts, merge-back, branch
+display) are prescriptive: they require [jj](https://jj-vcs.github.io) — there are
+no git/mercurial adapters.
 
 ```sh
 cargo install --path crates/tutti
@@ -193,9 +194,10 @@ theme users, or anyone who prefers a flat look, may want `chrome_background =
 false`. An unknown value is a hard error.
 
 **Icons.** `icons` picks the sidebar glyph set. `unicode` (default) is the safe
-set every terminal renders — `●`/`○` workspace and state dots, a branch/fork
-marker. `nerdfont` swaps in private-use icons (folder, circles, powerline
-branch, code-fork) for users with a patched [Nerd Font](https://www.nerdfonts.com)
+set every terminal renders — `●`/`○` workspace and state dots, a branch marker,
+and a `⑂` stale marker. `nerdfont` swaps in private-use icons (folder, circles,
+powerline branch, and the stale marker) for users with a patched
+[Nerd Font](https://www.nerdfonts.com)
 installed; without one they render as tofu. The tree guides and the working
 spinner are box-drawing/braille and shared across both. An unknown value is a
 hard error.
@@ -208,16 +210,20 @@ header and whose fused divider (`├ agents ── N ┤`) carries the `agents` 
 each with a `▼`/`▶` collapse arrow and a right-aligned count. It renders dim by
 default, with the focused row popping in the accent colour. Two stacked sections:
 
-- **projects** — one row per workspace: an `●` (accent) when it owns the active
-  tab, else a dim `○`, then the bold name, over a dim line showing a branch
-  marker and the git branch (read straight from `.git/HEAD`, including worktrees)
-  on the left and the jj change stat (`4 files +120 −33`) right-aligned. No branch
-  leaves the left blank rather than echoing the name; a clean or non-jj workspace
-  shows no stat. The stat refreshes as agents work (on every state transition, on
-  attach, and when a workspace is created) and is dropped first when the column is
-  too narrow for both. A [forked](#forked-workspaces) workspace whose `@` was
-  rewritten from another workspace shows a dim-red fork `stale` tag in the stat's
-  place until you run `workspace update`. Selecting a workspace jumps to its tab.
+- **projects** — one row per top-level project, with any [nested
+  workspaces](#workspaces) rendered **indented beneath it** on `├`/`└` tree
+  guides (same two-line row, name bold). Each row is an `●` (accent) when it owns
+  the active tab, else a dim `○`, then the bold name, over a dim line showing a
+  branch marker and the git branch (read straight from `.git/HEAD`, including
+  worktrees) on the left and the jj change stat (`4 files +120 −33`)
+  right-aligned. No branch leaves the left blank rather than echoing the name; a
+  clean or non-jj workspace shows no stat. The stat refreshes as agents work (on
+  every state transition, on attach, and when a workspace is created) and is
+  dropped first when the column is too narrow for both. A nested
+  [workspace](#workspaces) whose `@` was rewritten from another workspace shows a
+  dim-red `stale` tag in the stat's place until you run `workspace update`.
+  Collapsing a project hides its nested workspaces too. Selecting a workspace
+  jumps to its tab.
 - **agents** — one row per agent pane across *every* workspace: a state dot
   (blocked red, working an animated spinner, done green, idle/unknown dim), the
   pane title, and a dim `state · kind` line, with any hook-reported subagents
@@ -234,11 +240,13 @@ that section down to its header, or click again to expand it.
 
 Press the prefix then `w` to focus the sidebar (revealing it if hidden). While
 focused, `j`/`k` (or the arrows) move the highlight across both sections, `Enter`
-jumps and hands focus back to the pane, and `esc`/`w` unfocus. `r` **runs** an
-agent (or shell/command) in the selected project: it jumps to that workspace and
-opens the launcher over it, so the choice lands in a new pane in its tab (an
-agent row targets the workspace that owns it) — reach for `r`, not `f`, when you
-just want another agent in the checkout you already have. `n` opens the
+jumps and hands focus back to the pane, and `esc` unfocuses (esc is the back key
+throughout). `w` opens **guided [workspace](#workspaces) creation** on the
+selected project (below); `r` **runs** an agent (or shell/command) in the
+selected project: it jumps to that workspace and opens the launcher over it, so
+the choice lands in a new pane in its tab (an agent row targets the workspace
+that owns it) — reach for `r`, not `w`, when you just want another agent in the
+checkout you already have. `n` opens the
 **add-project** prompt — a one-line field for the path to an *existing* directory
 to open (it mounts that directory as a workspace; it never creates one). The
 field prefills the common parent of your current projects, so you type just the
@@ -251,19 +259,24 @@ server's error. `d`
 opens the selected workspace's **jj diff** in an ephemeral pane — a real terminal
 running `jj diff | less -R`, coloured, that vanishes the moment you quit `less`
 (pressing `d` on an agent row opens the diff for the agent's workspace). A
-non-jj workspace shows a transient error instead of spawning. `f`
-[**forks**](#forked-workspaces) the selected workspace onto a **new isolated
-checkout** (a separate directory, a distinct project entry — not another pane in
-this one): it opens a `fork as:` field at the sidebar's foot for the fork name
-(`[A-Za-z0-9_-]+`; a bad name flashes the rule, `esc` cancels), and on success
-jumps to the new fork, flashes what it made and where, and opens the launcher to
-pick the agent to run beside its shell (pressing `f` on an agent row forks the
-agent's workspace; a non-jj source surfaces the server's error). `u` runs `jj workspace update-stale` on a fork whose row shows the
-**stale** tag, clearing it; on a healthy row it just flashes `not stale`. `x`
+non-jj workspace shows a transient error instead of spawning. `w` starts a new
+[**workspace**](#workspaces) nested under the selected project: a two-step prompt
+— `workspace name:` (`[A-Za-z0-9_-]+`; a bad name flashes the rule) then `where:`,
+prefilled with the sibling default (`<repo-parent>/<repo>-<name>`) and editable
+with the same directory completion as add-project (`esc` steps back a step, then
+cancels). On success tutti jumps to the new workspace, flashes `workspace <name>
+→ <path>`, and opens the launcher to pick the agent to run beside its shell.
+`m` **merges** a child workspace back into its project's trunk (`main`, else
+`master`) after a `merge <name> into trunk? y/N` confirm: on success it flashes
+`merged into <bookmark>` (and `and pushed` when a remote took it) and offers to
+**clean up** (discard) the merged workspace; `m` on a top-level project just
+flashes `only workspaces merge`. `u` runs `jj workspace update-stale` on a
+workspace whose row shows the **stale** tag, clearing it; on a healthy row it
+just flashes `not stale`. `x`
 **kills** the selected workspace after a one-line confirm — `y` removes it from
-tutti (leaving its checkout on disk), `D` also **discards** a fork's checkout
+tutti (leaving its checkout on disk), `D` also **discards** a workspace's checkout
 (`jj workspace forget` + delete; the server refuses this for a workspace tutti
-did not fork, surfacing that error), and any other key cancels. A mouse
+did not create, surfacing that error), and any other key cancels. A mouse
 click focuses the sidebar, or jumps straight to the entry clicked.
 
 Visibility is set by the `sidebar` config value: `on` (default) always shows it
@@ -283,48 +296,65 @@ notification naming the pane. The focused pane is left alone (you are already
 looking). The status flash and re-emit are gated by `notifications = true`
 (default); the sidebar 🔔 mark is always on regardless.
 
-### Forked workspaces
+### Workspaces
 
-Tutti can fan an agent out onto its own isolated checkout with jj workspaces
-(jj is the required VCS — there are no git/hg adapters). `tutti workspace fork
-<id> --name <name>` runs `jj workspace add` to materialize a **sibling**
-directory next to the repo root (`<repo>-<name>`), mounts it as a tutti
-workspace, and drops a shell pane into it. Pass `-r <rev>` to check out a
-specific revision; the name must be `[A-Za-z0-9_-]+` (it becomes both a path
-component and a jj workspace name). The source workspace must live under a `.jj`
-repo, and the destination must not already exist — neither is silently reused.
+A **workspace** is a jj checkout nested under a **project** (a repo you opened) —
+tutti's unit for fanning an agent onto its own isolated copy of the tree, without
+touching the checkout you are working in (jj is the required VCS — there are no
+git/hg adapters). A workspace renders **indented beneath its project** in the
+sidebar and carries the project's own branch/changes/stale line.
 
-Fork creates a **new project entry** pointing at a **sibling checkout on disk** —
-it is not "run another agent in this project". When you just want a second agent
-in the checkout you already have, use `r` (run) on the sidebar row instead: it
-opens the launcher over that same workspace, no new directory.
+> **CLI vocabulary note.** The agent-facing CLI verb is still `tutti workspace
+> fork <id> --name <name>` (it runs `jj workspace add`) — the scriptable name has
+> not been renamed, only the TUI wording. Treat "fork" in a CLI verb as a synonym
+> for "create a workspace". `tutti workspace fork` places a **sibling** directory
+> next to the repo root (`<repo>-<name>`); pass `-r <rev>` to check out a specific
+> revision. The name must be `[A-Za-z0-9_-]+` (it becomes both a path component
+> and a jj workspace name); the source must live under a `.jj` repo and the
+> destination must not already exist. Merge is scriptable too — `tutti workspace
+> merge <id> [--push]` — keeping the "every TUI action is a CLI verb" invariant.
 
-From the TUI this is a five-keystroke flow off the sidebar: `C-b w` focuses the
-sidebar, `f` opens the `fork as:` field on the selected workspace (or the
-workspace owning a selected agent row), you type the name and press `Enter`, and
-tutti jumps to the fresh fork, flashes `forked <src> → <path> (isolated
-checkout)` so you can see what was created and where, and opens the launcher so
-you immediately pick the agent to run beside its shell.
+Creating a workspace is **not** "run another agent in this project". When you
+just want a second agent in the checkout you already have, use `r` (run) on the
+sidebar row instead: it opens the launcher over that same workspace, no new
+directory.
 
-Because several workspaces share one repo, a fork's working copy can go **stale**
-when its `@` is rewritten from elsewhere. Tutti surfaces this as a dim-red
-`stale` tag on the workspace's sidebar row and never fixes it for you;
+**Create (`w`).** Off the sidebar (`C-b w` to focus it), `w` on a project (or on
+an agent row → its project) opens a two-step prompt: `workspace name:` (validated
+`[A-Za-z0-9_-]+`), then `where:`, prefilled with the sibling default and editable
+with the same directory completion as add-project (`esc` steps back to the name,
+then cancels). On submit tutti materializes the checkout, jumps to it, flashes
+`workspace <name> → <path>`, and opens the launcher so you immediately pick the
+agent to run beside its shell.
+
+**Merge (`m`).** When a workspace's work is ready, `m` on its row merges it back
+into the project's trunk bookmark (`main`, else `master`) after a `merge <name>
+into trunk? y/N` confirm. The server rebases the workspace's branch onto trunk,
+**refuses and undoes** the merge if it would land a conflict (`merge would
+conflict — resolve manually in the workspace`), advances the bookmark to the
+workspace's real commit, and — if the origin has a remote — `jj git push`es it.
+On success it flashes `merged into <bookmark>` (adding `and pushed` when a push
+ran) and offers to **clean up**: `y` discards the now-merged workspace. `m` on a
+top-level project flashes `only workspaces merge`.
+
+Because several workspaces share one repo, a workspace's working copy can go
+**stale** when its `@` is rewritten from elsewhere. Tutti surfaces this as a
+dim-red `stale` tag on the sidebar row and never fixes it for you;
 `tutti workspace update <id>` runs `jj workspace update-stale` to reconcile it.
 
-Two ways to remove a fork, differing only in what happens on disk:
+Two ways to remove a workspace, differing only in what happens on disk:
 
 - `tutti workspace kill <id>` — the panes die and the workspace leaves tutti, but
   the jj workspace and its directory stay on disk. It is your checkout and your
   call; nothing is deleted.
 - `tutti workspace kill <id> --discard` — additionally `jj workspace forget`s the
-  fork at its origin and removes its directory. `--discard` is **only** honoured
-  for a workspace tutti forked; it is a hard error on any other workspace, so
-  tutti never deletes a checkout it did not create. Merging a fork back is left a
-  human decision.
+  checkout at its origin and removes its directory. `--discard` is **only**
+  honoured for a workspace tutti created; it is a hard error on any other
+  workspace, so tutti never deletes a checkout it did not create.
 
 Both are reachable from the sidebar: focus it, select the workspace (or one of
 its agents), and press `x` — `y` is the plain kill, `D` is the `--discard`
-variant.
+variant. (After a merge, the cleanup prompt is the `--discard` path.)
 
 ## Agent state badges
 
@@ -388,7 +418,8 @@ scriptable, it isn't done:
 ```
 tutti server start|stop [-s session]
 tutti workspace new --dir <path> | list | kill <id> [--discard]
-tutti workspace fork <id> --name <name> [-r <rev>]   # jj workspace add onto a sibling checkout
+tutti workspace fork <id> --name <name> [-r <rev>]   # create a workspace: jj workspace add onto a sibling checkout
+tutti workspace merge <id> [--push]  # merge a workspace back into its project's trunk (main/master)
 tutti workspace update <id>          # jj workspace update-stale (clears the sidebar's stale tag)
 tutti workspace diff <id> [--stat]   # the workspace's jj diff (jj is required; --json for raw lines)
 tutti tab new | list | select <id>

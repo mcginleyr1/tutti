@@ -295,9 +295,13 @@ fn handle_frame(
             Ok(Request::PaneScroll { pane, offset }) => scroll(hub, cid, tx, pane, offset),
             Ok(Request::WorkspaceDiff { id, stat }) => workspace_diff(hub, tx, id, stat),
             Ok(Request::WorkspaceKill { id, discard }) => workspace_kill(hub, cid, tx, id, discard),
-            Ok(Request::WorkspaceFork { id, name, revision }) => {
-                workspace_fork(hub, cid, tx, id, name, revision)
-            }
+            Ok(Request::WorkspaceFork {
+                id,
+                name,
+                revision,
+                dest,
+            }) => workspace_fork(hub, cid, tx, id, name, revision, dest),
+            Ok(Request::WorkspaceMerge { id, push }) => workspace_merge(hub, cid, tx, id, push),
             Ok(Request::WorkspaceUpdate { id }) => workspace_update(hub, tx, id),
             Ok(request) => {
                 let response = dispatch(hub, request);
@@ -452,6 +456,7 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
         | Request::WorkspaceDiff { .. }
         | Request::WorkspaceKill { .. }
         | Request::WorkspaceFork { .. }
+        | Request::WorkspaceMerge { .. }
         | Request::WorkspaceUpdate { .. } => Response::Ok,
     }
 }
@@ -635,7 +640,7 @@ fn workspace_kill(
             cid,
             tx,
             encode_json(&Response::Error {
-                message: "refusing to discard a workspace tutti did not fork".into(),
+                message: "refusing to discard a workspace tutti did not create".into(),
             }),
         );
     }
@@ -686,11 +691,14 @@ fn workspace_kill(
     }
 }
 
-/// Fork a jj workspace into a named sibling checkout and mount it. Validation
-/// (name shape, source is a jj repo, destination is free) is synchronous; the
-/// `jj workspace add` — which materializes a working copy — runs on a spawned
-/// task so it never stalls the frame loop, and the `WorkspaceCreated` reply
-/// lands on the requester's channel once the fork's shell pane is up.
+/// Fork a jj workspace into a named checkout and mount it. `dest`, when given, is
+/// the client-chosen absolute checkout directory (its parent already
+/// canonicalized client-side); when absent the server places a named sibling of
+/// the repo root. Validation (name shape, source is a jj repo, an absolute
+/// destination that does not yet exist) is synchronous; the `jj workspace add` —
+/// which materializes a working copy — runs on a spawned task so it never stalls
+/// the frame loop, and the `WorkspaceCreated` reply lands on the requester's
+/// channel once the checkout's shell pane is up.
 fn workspace_fork(
     hub: &Arc<Hub>,
     cid: u64,
@@ -698,6 +706,7 @@ fn workspace_fork(
     id: WorkspaceId,
     name: String,
     revision: Option<String>,
+    dest: Option<PathBuf>,
 ) -> ControlFlow<()> {
     if !jj::valid_fork_name(&name) {
         return send_reply(
@@ -705,7 +714,9 @@ fn workspace_fork(
             cid,
             tx,
             encode_json(&Response::Error {
-                message: format!("invalid fork name {name:?}: use letters, digits, '-' or '_'"),
+                message: format!(
+                    "invalid workspace name {name:?}: use letters, digits, '-' or '_'"
+                ),
             }),
         );
     }
@@ -732,15 +743,33 @@ fn workspace_fork(
             }),
         );
     };
-    let Some(dest) = jj::fork_dest(&repo_root, &name) else {
-        return send_reply(
-            hub,
-            cid,
-            tx,
-            encode_json(&Response::Error {
-                message: format!("cannot place a fork beside {}", repo_root.display()),
-            }),
-        );
+    // A client-chosen destination must be absolute (its parent is canonicalized
+    // client-side); with none given, place a named sibling of the repo root.
+    let dest = match dest {
+        Some(dest) if !dest.is_absolute() => {
+            return send_reply(
+                hub,
+                cid,
+                tx,
+                encode_json(&Response::Error {
+                    message: format!("workspace destination must be absolute: {}", dest.display()),
+                }),
+            );
+        }
+        Some(dest) => dest,
+        None => {
+            let Some(dest) = jj::fork_dest(&repo_root, &name) else {
+                return send_reply(
+                    hub,
+                    cid,
+                    tx,
+                    encode_json(&Response::Error {
+                        message: format!("cannot place a workspace beside {}", repo_root.display()),
+                    }),
+                );
+            };
+            dest
+        }
     };
     if dest.exists() {
         return send_reply(
@@ -748,7 +777,7 @@ fn workspace_fork(
             cid,
             tx,
             encode_json(&Response::Error {
-                message: format!("fork destination already exists: {}", dest.display()),
+                message: format!("workspace destination already exists: {}", dest.display()),
             }),
         );
     }
@@ -777,6 +806,63 @@ fn workspace_fork(
         let _ = tx
             .send(encode_json(&Response::WorkspaceCreated { id: ws_id }))
             .await;
+    });
+    ControlFlow::Continue(())
+}
+
+/// Merge a child workspace's work into its origin's trunk bookmark. Only a
+/// workspace tutti forked (one with fork metadata) can merge — a plain project
+/// answers Error. The jj sequence (rebase, conflict-guarded, bookmark advance,
+/// optional push) runs on a spawned task in the origin repo; on success it
+/// broadcasts the fresh view, refreshes the child's stat, and replies `Merged`
+/// (carrying the trunk it advanced and whether it pushed). A push failure is a
+/// note logged server-side — the merge still landed.
+fn workspace_merge(
+    hub: &Arc<Hub>,
+    cid: u64,
+    tx: &mpsc::Sender<Vec<u8>>,
+    id: WorkspaceId,
+    push: bool,
+) -> ControlFlow<()> {
+    // Bind both lookups before dropping the guard; neither re-locks the Mutex.
+    let session = hub.session();
+    let fork = session.workspace_fork_meta(id);
+    let dir = session.workspace_dir(id);
+    drop(session);
+    let (Some(fork), Some(dir)) = (fork, dir) else {
+        return send_reply(
+            hub,
+            cid,
+            tx,
+            encode_json(&Response::Error {
+                message: "only a workspace can merge (this is a top-level project)".into(),
+            }),
+        );
+    };
+    let hub = Arc::clone(hub);
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let response = match jj::merge(&fork.origin_root, &dir, &fork.jj_name, push).await {
+            Ok(outcome) => {
+                if let Some(note) = &outcome.push_error {
+                    eprintln!(
+                        "tutti: merge into {} landed but push failed: {note}",
+                        outcome.bookmark
+                    );
+                }
+                // The merge advanced the origin's trunk and rewrote the child's
+                // commits: rebroadcast the view and refresh the child's stat.
+                let view = hub.session().view();
+                broadcast_event(&hub, Event::LayoutChanged { workspaces: view });
+                refresh_changes(&hub, id);
+                Response::Merged {
+                    pushed: outcome.pushed,
+                    bookmark: outcome.bookmark,
+                }
+            }
+            Err(message) => Response::Error { message },
+        };
+        let _ = tx.send(encode_json(&response)).await;
     });
     ControlFlow::Continue(())
 }

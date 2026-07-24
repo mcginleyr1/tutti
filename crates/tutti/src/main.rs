@@ -122,6 +122,14 @@ enum WorkspaceAction {
     Update {
         id: u64,
     },
+    /// Merge a child workspace's work back into its origin's trunk bookmark
+    /// (`main`, else `master`). Only valid for a workspace tutti created.
+    Merge {
+        id: u64,
+        /// Also `jj git push` the advanced bookmark when the origin has a remote.
+        #[arg(long)]
+        push: bool,
+    },
     /// Show the workspace's jj diff (`--stat` for the summary only).
     Diff {
         id: u64,
@@ -406,9 +414,16 @@ fn to_request(command: Command) -> Result<Request> {
                 id: WorkspaceId(id),
                 name,
                 revision,
+                // The CLI keeps the sibling-default placement; the guided TUI flow
+                // is the only path that chooses a destination.
+                dest: None,
             },
             WorkspaceAction::Update { id } => Request::WorkspaceUpdate {
                 id: WorkspaceId(id),
+            },
+            WorkspaceAction::Merge { id, push } => Request::WorkspaceMerge {
+                id: WorkspaceId(id),
+                push,
             },
             WorkspaceAction::Diff { id, stat } => Request::WorkspaceDiff {
                 id: WorkspaceId(id),
@@ -609,6 +624,13 @@ fn emit(response: Response, json: bool) -> i32 {
             println!("workspace {id} created");
             0
         }
+        Response::Merged { pushed, bookmark } => {
+            println!(
+                "merged into {bookmark}{}",
+                if pushed { " and pushed" } else { "" }
+            );
+            0
+        }
         Response::TabCreated { id } => {
             println!("tab {id} created");
             0
@@ -710,6 +732,7 @@ mod tests {
                 id: WorkspaceId(2),
                 name: "feature".into(),
                 revision: None,
+                dest: None,
             }
         );
         assert_eq!(
@@ -727,11 +750,26 @@ mod tests {
                 id: WorkspaceId(2),
                 name: "feature".into(),
                 revision: Some("@-".into()),
+                dest: None,
             }
         );
         assert_eq!(
             request_of(&["tutti", "workspace", "update", "5"]),
             Request::WorkspaceUpdate { id: WorkspaceId(5) }
+        );
+        assert_eq!(
+            request_of(&["tutti", "workspace", "merge", "6"]),
+            Request::WorkspaceMerge {
+                id: WorkspaceId(6),
+                push: false,
+            }
+        );
+        assert_eq!(
+            request_of(&["tutti", "workspace", "merge", "6", "--push"]),
+            Request::WorkspaceMerge {
+                id: WorkspaceId(6),
+                push: true,
+            }
         );
     }
 

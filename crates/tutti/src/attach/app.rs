@@ -77,17 +77,25 @@ pub enum Mode {
     Prefix,
     ConfirmKill(PaneId),
     /// Confirming a workspace kill raised from the sidebar (`y` kill, `D`
-    /// discard the fork's checkout, anything else cancels).
+    /// discard the workspace's checkout, anything else cancels).
     ConfirmKillWorkspace(WorkspaceId),
+    /// Confirming a merge of a child workspace back into its project's trunk
+    /// (`y` sends the merge, anything else cancels).
+    ConfirmMerge(WorkspaceId),
+    /// After a merge lands, offering to clean up (discard) the merged workspace
+    /// (`y` discards it, anything else keeps it).
+    ConfirmCleanup(WorkspaceId),
     Scroll(PaneId),
     Help,
     /// Navigating the sidebar; keys drive the selection instead of the pane.
     Sidebar,
     /// Editing the add-project directory prompt at the sidebar's foot.
     SidebarPrompt,
-    /// Editing the fork-name prompt at the sidebar's foot (fork the selected
-    /// workspace under the typed name).
-    SidebarForkPrompt,
+    /// Guided workspace creation, step 1: the `workspace name:` field.
+    SidebarWorkspaceName,
+    /// Guided workspace creation, step 2: the `where:` destination field,
+    /// prefilled with the sibling default and offering directory completion.
+    SidebarWorkspaceDest,
     /// The agent launcher overlay: pick what to run in a pane.
     Launcher,
     /// The launcher's free-form command input.
@@ -153,12 +161,19 @@ pub struct App {
     /// Set after creating a workspace so the next view adopts the server's newly
     /// current tab — the "jump to it" that follows a new-workspace prompt.
     adopt_active_view: bool,
-    /// The workspace a pending fork prompt targets — the source of the
-    /// `WorkspaceFork` request submitted from `SidebarForkPrompt`.
+    /// The origin workspace a pending guided-create prompt forks from — the
+    /// source of the `WorkspaceFork` request submitted from the two-step prompt.
     fork_target: Option<WorkspaceId>,
+    /// The workspace name captured in step 1, carried while the `where:` step is
+    /// edited so submit can send both name and destination.
+    new_workspace_name: String,
     /// Set while a `WorkspaceFork` is in flight so the `WorkspaceCreated` reply
-    /// (shared with add-project) knows to jump to the fork and open its launcher.
+    /// (shared with add-project) knows to jump to the new workspace and open its
+    /// launcher.
     fork_pending: bool,
+    /// The child workspace a `WorkspaceMerge` is in flight for, so the `Merged`
+    /// reply knows which workspace the follow-up cleanup confirm targets.
+    merge_pending: Option<WorkspaceId>,
     /// Panes that raised a notification while unfocused; their sidebar entry
     /// shows a bell mark until the pane is focused.
     notified: HashSet<PaneId>,
@@ -219,7 +234,9 @@ impl App {
             last_content_width: 0,
             adopt_active_view: false,
             fork_target: None,
+            new_workspace_name: String::new(),
             fork_pending: false,
+            merge_pending: None,
             notified: HashSet::new(),
             terminal_out: Vec::new(),
             collapsed_projects: false,
@@ -447,10 +464,9 @@ impl App {
             }
             Response::WorkspaceCreated { id } => {
                 // Add-project ignores this (it armed its jump + launcher up
-                // front); a fork waited for it: jump to the new workspace, open
-                // the launcher over it, and flash what the fork made and where.
+                // front); guided create waited for it: jump to the new workspace,
+                // open the launcher over it, and flash what it made and where.
                 if std::mem::take(&mut self.fork_pending) {
-                    let src = self.fork_target.and_then(|sid| self.workspace_name(sid));
                     let created = self
                         .workspaces
                         .iter()
@@ -461,19 +477,30 @@ impl App {
                         self.adopt_active_view = true;
                     }
                     self.open_launcher(false, created.as_ref().map(|(name, _)| name.clone()));
-                    if let (Some(src), Some((_, dir))) = (src, created) {
-                        self.set_status(format!(
-                            "forked {src} → {} (isolated checkout)",
-                            dir.display()
-                        ));
+                    if let Some((name, dir)) = created {
+                        self.set_status(format!("workspace {name} → {}", dir.display()));
                     }
                 }
             }
+            Response::Merged { pushed, bookmark } => {
+                // The merge landed: report where, then offer to clean up (discard)
+                // the now-merged workspace.
+                if let Some(id) = self.merge_pending.take() {
+                    let mut msg = format!("merged into {bookmark}");
+                    if pushed {
+                        msg.push_str(" and pushed");
+                    }
+                    msg.push_str(" — clean up workspace? y/N");
+                    self.set_status(msg);
+                    self.mode = Mode::ConfirmCleanup(id);
+                }
+            }
             Response::Error { message } => {
-                // A failed new-workspace or fork request must not later hijack
-                // the tab or the launcher.
+                // A failed new-workspace, guided-create, or merge request must not
+                // later hijack the tab, the launcher, or the cleanup confirm.
                 self.adopt_active_view = false;
                 self.fork_pending = false;
+                self.merge_pending = None;
                 self.set_status(format!("error: {message}"));
             }
             _ => {}
@@ -521,10 +548,13 @@ impl App {
             Mode::Prefix => self.on_key_prefix(key),
             Mode::ConfirmKill(pane) => self.on_key_confirm(key, pane),
             Mode::ConfirmKillWorkspace(id) => self.on_key_confirm_workspace(key, id),
+            Mode::ConfirmMerge(id) => self.on_key_confirm_merge(key, id),
+            Mode::ConfirmCleanup(id) => self.on_key_confirm_cleanup(key, id),
             Mode::Scroll(pane) => self.on_key_scroll(key, pane),
             Mode::Sidebar => self.on_key_sidebar(key),
             Mode::SidebarPrompt => self.on_key_prompt(key),
-            Mode::SidebarForkPrompt => self.on_key_fork_prompt(key),
+            Mode::SidebarWorkspaceName => self.on_key_workspace_name(key),
+            Mode::SidebarWorkspaceDest => self.on_key_workspace_dest(key),
             Mode::Launcher => self.on_key_launcher(key),
             Mode::LauncherCommand => self.on_key_launcher_command(key),
             Mode::Help => {
@@ -725,7 +755,10 @@ impl App {
     pub fn sidebar_focused(&self) -> bool {
         matches!(
             self.mode,
-            Mode::Sidebar | Mode::SidebarPrompt | Mode::SidebarForkPrompt
+            Mode::Sidebar
+                | Mode::SidebarPrompt
+                | Mode::SidebarWorkspaceName
+                | Mode::SidebarWorkspaceDest
         )
     }
 
@@ -733,16 +766,30 @@ impl App {
         self.sidebar_selected
     }
 
-    /// Whether a foot-of-sidebar prompt (add-project or fork) is being edited —
-    /// either overlays the frame and suppresses the selection highlight.
+    /// Whether a foot-of-sidebar prompt (add-project or guided workspace create)
+    /// is being edited — either overlays the frame and suppresses the selection
+    /// highlight.
     pub fn sidebar_prompt_active(&self) -> bool {
-        matches!(self.mode, Mode::SidebarPrompt | Mode::SidebarForkPrompt)
+        matches!(
+            self.mode,
+            Mode::SidebarPrompt | Mode::SidebarWorkspaceName | Mode::SidebarWorkspaceDest
+        )
     }
 
-    /// Whether the fork-name prompt (rather than the add-project prompt) is the
-    /// one being edited, so the renderer picks its label and drops completions.
-    pub fn sidebar_fork_prompt_active(&self) -> bool {
-        matches!(self.mode, Mode::SidebarForkPrompt)
+    /// The label prefix for the active foot prompt.
+    pub fn sidebar_prompt_label(&self) -> &'static str {
+        match self.mode {
+            Mode::SidebarWorkspaceName => "workspace name: ",
+            Mode::SidebarWorkspaceDest => "where: ",
+            _ => "open: ",
+        }
+    }
+
+    /// Whether the active foot prompt shows directory completions — the
+    /// add-project prompt and the `where:` step do; the `workspace name:` step
+    /// (a bare identifier, not a path) does not.
+    pub fn sidebar_prompt_shows_completions(&self) -> bool {
+        matches!(self.mode, Mode::SidebarPrompt | Mode::SidebarWorkspaceDest)
     }
 
     pub fn sidebar_prompt(&self) -> &str {
@@ -896,8 +943,12 @@ impl App {
                 Vec::new()
             }
             KeyCode::Char('d') => self.open_diff_pane(&sidebar),
-            KeyCode::Char('f') => {
-                self.open_fork_prompt(&sidebar);
+            KeyCode::Char('w') => {
+                self.open_workspace_prompt(&sidebar);
+                Vec::new()
+            }
+            KeyCode::Char('m') => {
+                self.confirm_merge(&sidebar);
                 Vec::new()
             }
             KeyCode::Char('u') => self.update_selected(&sidebar),
@@ -905,7 +956,7 @@ impl App {
                 self.confirm_kill_workspace(&sidebar);
                 Vec::new()
             }
-            KeyCode::Esc | KeyCode::Char('w') => {
+            KeyCode::Esc => {
                 self.mode = Mode::Terminal;
                 self.status = None;
                 Vec::new()
@@ -1032,17 +1083,40 @@ impl App {
             .find(|w| w.tabs.iter().any(|t| t.id == tab))
     }
 
-    /// Open the fork-name prompt for the selected entry's workspace at the
-    /// sidebar's foot: same machinery as add-project, but an empty `fork as:`
-    /// field whose name is validated on submit. A no-op with nothing selected.
-    fn open_fork_prompt(&mut self, sidebar: &Sidebar) {
+    /// Open guided workspace creation for the selected entry's workspace: step 1,
+    /// the `workspace name:` field at the sidebar's foot. The origin is the
+    /// selected workspace (an agent row targets the workspace that owns it). A
+    /// no-op with nothing selected.
+    fn open_workspace_prompt(&mut self, sidebar: &Sidebar) {
         let Some(id) = self.selected_workspace(sidebar).map(|w| w.id) else {
             return;
         };
         self.fork_target = Some(id);
-        self.mode = Mode::SidebarForkPrompt;
+        self.new_workspace_name.clear();
+        self.mode = Mode::SidebarWorkspaceName;
         self.sidebar_prompt.clear();
         self.status = None;
+    }
+
+    /// Confirm merging the selected child workspace back into its project's trunk.
+    /// Only a nested (jj-workspace) row can merge; a top-level project flashes a
+    /// note. The bookmark is resolved server-side on `y`, so the confirm names a
+    /// generic `trunk`. A no-op with nothing selected.
+    fn confirm_merge(&mut self, sidebar: &Sidebar) {
+        let Some((id, name, is_child)) = self.selected_workspace(sidebar).map(|w| {
+            let is_child = w
+                .parent
+                .is_some_and(|p| self.workspaces.iter().any(|o| o.id == p));
+            (w.id, w.name.clone(), is_child)
+        }) else {
+            return;
+        };
+        if !is_child {
+            self.set_status("only workspaces merge".into());
+            return;
+        }
+        self.mode = Mode::ConfirmMerge(id);
+        self.set_status(format!("merge {name} into trunk? y/N"));
     }
 
     /// Update the selected entry's workspace when its working copy is stale:
@@ -1189,10 +1263,10 @@ impl App {
         vec![control(&Request::WorkspaceNew { dir })]
     }
 
-    /// Edit the fork-name prompt: type the name, `esc` cancels back to the
-    /// sidebar, `Enter` submits. No directory completions — a fork name is a
-    /// bare identifier, not a path.
-    fn on_key_fork_prompt(&mut self, key: KeyEvent) -> Vec<WireFrame> {
+    /// Guided create, step 1 (`workspace name:`): type the name, `esc` cancels
+    /// back to the sidebar, `Enter` validates it and advances to the `where:`
+    /// step. No directory completions — a workspace name is a bare identifier.
+    fn on_key_workspace_name(&mut self, key: KeyEvent) -> Vec<WireFrame> {
         match key.code {
             KeyCode::Char(c)
                 if !key
@@ -1212,26 +1286,98 @@ impl App {
                 self.status = None;
                 Vec::new()
             }
-            KeyCode::Enter => self.submit_fork(),
+            KeyCode::Enter => self.advance_to_dest_step(),
             _ => Vec::new(),
         }
     }
 
-    /// Submit the fork-name prompt: validate the name client-side (fail fast
-    /// with a transient naming the rule, staying in the prompt to fix it), then
-    /// dispatch a `WorkspaceFork` for the target workspace and arm the post-fork
-    /// jump + launcher (`WorkspaceCreated` completes it). A non-jj source is left
-    /// to the server to reject — the single source of truth.
-    fn submit_fork(&mut self) -> Vec<WireFrame> {
+    /// Validate the typed workspace name (fail fast, staying on step 1 with a
+    /// transient naming the rule) and, when valid, advance to step 2: prefill the
+    /// `where:` field with the sibling default and open its directory completion.
+    fn advance_to_dest_step(&mut self) -> Vec<WireFrame> {
         let name = self.sidebar_prompt.trim().to_string();
         if !is_valid_fork_name(&name) {
-            self.set_status("fork name: letters, digits, '-' or '_' only".into());
+            self.set_status("workspace name: letters, digits, '-' or '_' only".into());
             return Vec::new();
         }
+        let dir = self
+            .fork_target
+            .and_then(|id| self.workspaces.iter().find(|w| w.id == id))
+            .map(|w| w.dir.clone());
+        self.new_workspace_name = name.clone();
+        self.sidebar_prompt = dir
+            .map(|dir| sibling_dest_prefill(&dir, &name))
+            .unwrap_or_default();
+        self.prompt_selected = 0;
+        self.mode = Mode::SidebarWorkspaceDest;
+        self.status = None;
+        self.refresh_completions();
+        Vec::new()
+    }
+
+    /// Guided create, step 2 (`where:`): edit the destination with the same
+    /// directory completion the add-project prompt uses. `esc` steps back to the
+    /// name field (restoring it), `Enter` submits the `WorkspaceFork`.
+    fn on_key_workspace_dest(&mut self, key: KeyEvent) -> Vec<WireFrame> {
+        match key.code {
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.sidebar_prompt.push(c);
+                self.prompt_selected = 0;
+                self.refresh_completions();
+                Vec::new()
+            }
+            KeyCode::Backspace => {
+                self.sidebar_prompt.pop();
+                self.prompt_selected = 0;
+                self.refresh_completions();
+                Vec::new()
+            }
+            KeyCode::Tab => {
+                self.complete_selection();
+                Vec::new()
+            }
+            KeyCode::Down => {
+                if !self.prompt_completions.is_empty() {
+                    self.prompt_selected =
+                        (self.prompt_selected + 1).min(self.prompt_completions.len() - 1);
+                }
+                Vec::new()
+            }
+            KeyCode::Up => {
+                self.prompt_selected = self.prompt_selected.saturating_sub(1);
+                Vec::new()
+            }
+            KeyCode::Esc => {
+                // Back to step 1, restoring the name the user had typed.
+                self.sidebar_prompt = std::mem::take(&mut self.new_workspace_name);
+                self.prompt_completions.clear();
+                self.prompt_selected = 0;
+                self.mode = Mode::SidebarWorkspaceName;
+                self.status = None;
+                Vec::new()
+            }
+            KeyCode::Enter => self.submit_workspace(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Submit guided create: dispatch a `WorkspaceFork` for the origin workspace
+    /// carrying the chosen name and destination (an empty field falls back to the
+    /// server's sibling default), and arm the post-create jump + launcher
+    /// (`WorkspaceCreated` completes it). A non-jj source is left to the server to
+    /// reject — the single source of truth.
+    fn submit_workspace(&mut self) -> Vec<WireFrame> {
         let Some(id) = self.fork_target else {
             return Vec::new();
         };
-        self.sidebar_prompt.clear();
+        let name = std::mem::take(&mut self.new_workspace_name);
+        let input = self.sidebar_prompt.trim().to_string();
+        let dest = (!input.is_empty()).then(|| expand_dest(&input));
+        self.clear_prompt();
         self.mode = Mode::Sidebar;
         self.status = None;
         self.fork_pending = true;
@@ -1239,7 +1385,40 @@ impl App {
             id,
             name,
             revision: None,
+            dest,
         })]
+    }
+
+    /// Resolve the merge confirm: `y` dispatches the `WorkspaceMerge` (letting the
+    /// server pick the trunk bookmark and push if a remote exists) and arms the
+    /// cleanup confirm the `Merged` reply will raise; any other key cancels.
+    fn on_key_confirm_merge(&mut self, key: KeyEvent, id: WorkspaceId) -> Vec<WireFrame> {
+        match key.code {
+            KeyCode::Char('y') => {
+                self.merge_pending = Some(id);
+                self.mode = Mode::Sidebar;
+                let name = self.workspace_name(id).unwrap_or_default();
+                self.set_status(format!("merging {name}…"));
+                vec![control(&Request::WorkspaceMerge { id, push: true })]
+            }
+            _ => {
+                self.mode = Mode::Sidebar;
+                self.status = None;
+                Vec::new()
+            }
+        }
+    }
+
+    /// Resolve the post-merge cleanup confirm: `y` discards the merged workspace
+    /// (`WorkspaceKill --discard`), any other key keeps it on disk. Either way the
+    /// sidebar keeps focus.
+    fn on_key_confirm_cleanup(&mut self, key: KeyEvent, id: WorkspaceId) -> Vec<WireFrame> {
+        self.mode = Mode::Sidebar;
+        self.status = None;
+        match key.code {
+            KeyCode::Char('y') => vec![control(&Request::WorkspaceKill { id, discard: true })],
+            _ => Vec::new(),
+        }
     }
 
     /// Open the agent launcher — the "what should run here?" picker — building
@@ -1926,6 +2105,59 @@ fn expand_dir(input: &str) -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let resolved = resolve_dir(input, home.as_deref(), &cwd);
     std::fs::canonicalize(&resolved).unwrap_or(resolved)
+}
+
+/// Resolve a guided-create destination: expand `~`/relative like `expand_dir`,
+/// then canonicalize the *parent* while keeping the (not-yet-existing) leaf, so
+/// the daemon receives an absolute path whose parent is real. A missing parent is
+/// left as-is for the server to reject.
+fn expand_dest(input: &str) -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let resolved = resolve_dir(input, home.as_deref(), &cwd);
+    match (resolved.parent(), resolved.file_name()) {
+        (Some(parent), Some(leaf)) => std::fs::canonicalize(parent)
+            .unwrap_or_else(|_| parent.to_path_buf())
+            .join(leaf),
+        _ => resolved,
+    }
+}
+
+/// The `where:` prefill for guided create: the sibling default
+/// `<repo-parent>/<repo>-<name>`, home-shortened for display so the daemon still
+/// canonicalizes the parent on submit. Falls back to a sibling of `dir` itself
+/// when `dir` is not under a `.jj` repo (the server rejects a non-jj source).
+fn sibling_dest_prefill(dir: &Path, name: &str) -> String {
+    let root = jj_root(dir).unwrap_or_else(|| dir.to_path_buf());
+    let base = root
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let sibling = root
+        .parent()
+        .unwrap_or(&root)
+        .join(format!("{base}-{name}"));
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(home) = &home
+        && let Ok(rest) = sibling.strip_prefix(home)
+    {
+        return format!("~/{}", rest.display());
+    }
+    sibling.display().to_string()
+}
+
+/// The `.jj` repo root at or above `dir` — the client's mirror of the server's
+/// `workspace_root`, so the guided-create prefill can name a sibling of the repo
+/// without a round-trip.
+fn jj_root(dir: &Path) -> Option<PathBuf> {
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        if d.join(".jj").exists() {
+            return Some(d.to_path_buf());
+        }
+        cur = d.parent();
+    }
+    None
 }
 
 /// Pure directory resolution: `~`/`~/rest` against `home`, relative paths
@@ -2862,44 +3094,71 @@ mod tests {
         assert_eq!(app.mode, Mode::Sidebar, "focus stays on the sidebar");
     }
 
-    // ---- fork / update stale --------------------------------------------
+    // ---- guided workspace create / merge / update stale -----------------
+
+    /// Decode the single control frame in `out` into a request, for asserting the
+    /// shape of a submitted `WorkspaceFork` whose `dest` is environment-derived.
+    fn only_request(out: &[WireFrame]) -> Request {
+        match out {
+            [WireFrame::Control(bytes)] => serde_json::from_slice(bytes).unwrap(),
+            other => panic!("expected exactly one control frame, got {other:?}"),
+        }
+    }
 
     #[test]
-    fn f_on_a_workspace_row_opens_the_fork_prompt_and_submits_a_named_fork() {
+    fn w_guided_create_walks_name_then_dest_and_submits() {
         let mut app = App::new();
         attach_with(&mut app, view_two_workspaces());
         focus_sidebar(&mut app); // selection rests on the api workspace (id 1)
 
-        let out = app.on_key(plain('f'));
-        assert!(out.is_empty(), "f opens the prompt, sending nothing yet");
-        assert_eq!(app.mode, Mode::SidebarForkPrompt);
-        assert!(app.sidebar_fork_prompt_active());
-
+        // Step 1: `w` opens the name field, sending nothing yet.
+        let out = app.on_key(plain('w'));
+        assert!(out.is_empty(), "w opens the name prompt, sending nothing");
+        assert_eq!(app.mode, Mode::SidebarWorkspaceName);
         for c in "feature".chars() {
             app.on_key(plain(c));
         }
         assert_eq!(app.sidebar_prompt(), "feature");
 
+        // Enter validates the name and advances to the prefilled `where:` step.
         let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(
-            out,
-            vec![control(&Request::WorkspaceFork {
-                id: WorkspaceId(1),
-                name: "feature".into(),
-                revision: None,
-            })],
-            "submit forks the selected workspace under the typed name"
+        assert!(out.is_empty(), "advancing to the dest step sends nothing");
+        assert_eq!(app.mode, Mode::SidebarWorkspaceDest);
+        assert!(
+            app.sidebar_prompt().contains("w-feature"),
+            "the dest step prefills the sibling default: {:?}",
+            app.sidebar_prompt()
         );
+
+        // Submitting the dest step fires the fork request carrying name + dest.
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(
             app.mode,
             Mode::Sidebar,
-            "back to the sidebar awaiting the reply"
+            "back to the sidebar awaiting reply"
         );
         assert!(app.sidebar_prompt().is_empty());
+        match only_request(&out) {
+            Request::WorkspaceFork {
+                id,
+                name,
+                revision,
+                dest,
+            } => {
+                assert_eq!(id, WorkspaceId(1));
+                assert_eq!(name, "feature");
+                assert_eq!(revision, None);
+                assert!(
+                    dest.is_some(),
+                    "the guided destination rides on the request"
+                );
+            }
+            other => panic!("expected WorkspaceFork, got {other:?}"),
+        }
     }
 
     #[test]
-    fn f_on_an_agent_row_forks_its_owning_workspace() {
+    fn w_on_an_agent_row_creates_under_its_owning_workspace() {
         let mut app = App::new();
         attach_with(&mut app, view_two_workspaces());
         focus_sidebar(&mut app);
@@ -2910,37 +3169,59 @@ mod tests {
             SidebarEntry::Agent(_)
         ));
 
-        app.on_key(plain('f'));
+        app.on_key(plain('w'));
         for c in "hotfix".chars() {
             app.on_key(plain(c));
         }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // to dest step
         let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match only_request(&out) {
+            Request::WorkspaceFork { id, name, .. } => {
+                assert_eq!(id, WorkspaceId(2), "targets the workspace owning the tab");
+                assert_eq!(name, "hotfix");
+            }
+            other => panic!("expected WorkspaceFork, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn f_is_gone_from_the_sidebar_dispatch() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        let out = app.on_key(plain('f'));
+        assert!(out.is_empty(), "f sends nothing");
+        assert_eq!(app.mode, Mode::Sidebar, "f no longer opens any prompt");
+    }
+
+    #[test]
+    fn w_starts_create_rather_than_unfocusing_the_sidebar() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        app.on_key(plain('w'));
         assert_eq!(
-            out,
-            vec![control(&Request::WorkspaceFork {
-                id: WorkspaceId(2),
-                name: "hotfix".into(),
-                revision: None,
-            })],
-            "an agent row forks the workspace that owns its tab"
+            app.mode,
+            Mode::SidebarWorkspaceName,
+            "w opens guided create; esc is the back key, not w"
         );
     }
 
     #[test]
-    fn fork_prompt_rejects_a_bad_name_with_a_transient_and_no_request() {
+    fn workspace_name_step_rejects_a_bad_name() {
         let mut app = App::new();
         attach_with(&mut app, view_two_workspaces());
         focus_sidebar(&mut app);
-        app.on_key(plain('f'));
+        app.on_key(plain('w'));
         for c in "bad name".chars() {
             app.on_key(plain(c)); // the space makes the name invalid
         }
         let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(out.is_empty(), "an invalid fork name emits no request");
+        assert!(out.is_empty(), "an invalid name emits no request");
         assert_eq!(
             app.mode,
-            Mode::SidebarForkPrompt,
-            "the prompt stays open so the name can be fixed"
+            Mode::SidebarWorkspaceName,
+            "step 1 stays open so the name can be fixed"
         );
         assert!(
             app.transient()
@@ -2950,40 +3231,66 @@ mod tests {
     }
 
     #[test]
-    fn fork_prompt_esc_cancels_back_to_the_sidebar() {
+    fn workspace_name_step_esc_cancels_back_to_the_sidebar() {
         let mut app = App::new();
         attach_with(&mut app, view_two_workspaces());
         focus_sidebar(&mut app);
-        app.on_key(plain('f'));
+        app.on_key(plain('w'));
         app.on_key(plain('x'));
         let out = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(out.is_empty(), "esc forks nothing");
+        assert!(out.is_empty(), "esc creates nothing");
         assert_eq!(app.mode, Mode::Sidebar);
         assert!(app.sidebar_prompt().is_empty());
     }
 
     #[test]
-    fn fork_created_jumps_to_the_new_workspace_and_opens_the_launcher() {
+    fn workspace_dest_step_esc_steps_back_to_the_name() {
         let mut app = App::new();
         attach_with(&mut app, view_two_workspaces());
         focus_sidebar(&mut app);
-        app.on_key(plain('f'));
+        app.on_key(plain('w'));
         for c in "feature".chars() {
             app.on_key(plain(c));
         }
-        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // to dest step
+        assert_eq!(app.mode, Mode::SidebarWorkspaceDest);
+        let out = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(out.is_empty(), "esc sends nothing");
+        assert_eq!(
+            app.mode,
+            Mode::SidebarWorkspaceName,
+            "esc steps back a step"
+        );
+        assert_eq!(
+            app.sidebar_prompt(),
+            "feature",
+            "the name the user typed is restored"
+        );
+    }
 
-        // The server broadcasts the fresh view (carrying the fork and its tab)
-        // before the WorkspaceCreated reply — mirror that ordering here.
+    #[test]
+    fn workspace_created_jumps_to_it_and_opens_the_launcher() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        app.on_key(plain('w'));
+        for c in "feature".chars() {
+            app.on_key(plain(c));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // to dest step
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // submit
+
+        // The server broadcasts the fresh view (carrying the new workspace and its
+        // tab) before the WorkspaceCreated reply — mirror that ordering here.
         let mut view = view_two_workspaces();
-        let mut forked = workspace(
+        let mut created = workspace(
             3,
             "w-feature",
             Some("main"),
             vec![tab(3, "3", true, leaf(9), vec![shell(9)])],
         );
-        forked.dir = std::path::PathBuf::from("/tmp/repo-feature");
-        view.push(forked);
+        created.dir = std::path::PathBuf::from("/tmp/repo-feature");
+        view.push(created);
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Event::LayoutChanged { workspaces: view }).unwrap(),
         ));
@@ -2994,7 +3301,7 @@ mod tests {
         assert_eq!(
             app.active_tab,
             Some(TabId(3)),
-            "the WorkspaceCreated reply jumps to the fork's tab"
+            "the WorkspaceCreated reply jumps to the new workspace's tab"
         );
         assert_eq!(
             app.mode,
@@ -3004,18 +3311,139 @@ mod tests {
         assert_eq!(
             app.launcher_title(),
             " run in w-feature ",
-            "the launcher names the fork it will run in"
+            "the launcher names the workspace it will run in"
         );
-        // The transient explains what fork made and where, so a user who
-        // expected an in-place run sees the isolated checkout it created.
-        let transient = app.transient().expect("a post-fork transient is posted");
+        // The transient names what was made and where, in the new vocabulary.
+        let transient = app.transient().expect("a post-create transient is posted");
         assert!(
-            transient.contains("forked")
-                && transient.contains("api")
-                && transient.contains("/tmp/repo-feature")
-                && transient.contains("isolated checkout"),
-            "the transient names the source, destination path, and that it is a checkout: {transient:?}"
+            transient.contains("workspace")
+                && transient.contains("w-feature")
+                && transient.contains("/tmp/repo-feature"),
+            "the transient names the workspace and its path: {transient:?}"
         );
+    }
+
+    #[test]
+    fn m_on_a_child_workspace_confirms_merges_then_offers_cleanup() {
+        let mut app = App::new();
+        let mut view = view_two_workspaces();
+        view[1].parent = Some(WorkspaceId(1)); // web (id 2) nested under api
+        attach_with(&mut app, view);
+        focus_sidebar(&mut app);
+        app.on_key(plain('j')); // select the nested child (web, id 2)
+
+        // `m` raises the confirm, sending nothing yet.
+        let out = app.on_key(plain('m'));
+        assert!(out.is_empty(), "m opens the confirm, sending nothing");
+        assert_eq!(app.mode, Mode::ConfirmMerge(WorkspaceId(2)));
+        assert!(
+            app.transient().is_some_and(|t| t.contains("merge web")),
+            "the confirm names the workspace"
+        );
+
+        // `y` dispatches the merge (push requested; the server owns the bookmark).
+        let out = app.on_key(plain('y'));
+        assert_eq!(
+            out,
+            vec![control(&Request::WorkspaceMerge {
+                id: WorkspaceId(2),
+                push: true,
+            })],
+            "y sends the merge request"
+        );
+
+        // The Merged reply flashes the outcome and raises the cleanup confirm.
+        app.handle_response(Response::Merged {
+            pushed: false,
+            bookmark: "main".into(),
+        });
+        assert_eq!(app.mode, Mode::ConfirmCleanup(WorkspaceId(2)));
+        assert!(
+            app.transient()
+                .is_some_and(|t| t.contains("merged into main") && t.contains("clean up")),
+            "the transient reports the merge and offers cleanup"
+        );
+
+        // `y` discards the now-merged workspace.
+        let out = app.on_key(plain('y'));
+        assert_eq!(
+            out,
+            vec![control(&Request::WorkspaceKill {
+                id: WorkspaceId(2),
+                discard: true,
+            })],
+            "cleanup discards the merged workspace"
+        );
+        assert_eq!(app.mode, Mode::Sidebar);
+    }
+
+    #[test]
+    fn merged_reply_notes_a_push_when_it_happened() {
+        let mut app = App::new();
+        let mut view = view_two_workspaces();
+        view[1].parent = Some(WorkspaceId(1));
+        attach_with(&mut app, view);
+        focus_sidebar(&mut app);
+        app.on_key(plain('j'));
+        app.on_key(plain('m'));
+        app.on_key(plain('y'));
+        app.handle_response(Response::Merged {
+            pushed: true,
+            bookmark: "main".into(),
+        });
+        assert!(
+            app.transient().is_some_and(|t| t.contains("and pushed")),
+            "a pushed merge says so"
+        );
+    }
+
+    #[test]
+    fn merge_cleanup_declined_keeps_the_workspace() {
+        let mut app = App::new();
+        let mut view = view_two_workspaces();
+        view[1].parent = Some(WorkspaceId(1));
+        attach_with(&mut app, view);
+        focus_sidebar(&mut app);
+        app.on_key(plain('j'));
+        app.on_key(plain('m'));
+        app.on_key(plain('y'));
+        app.handle_response(Response::Merged {
+            pushed: false,
+            bookmark: "main".into(),
+        });
+        // `n` at the cleanup confirm keeps the workspace on disk.
+        let out = app.on_key(plain('n'));
+        assert!(out.is_empty(), "declining cleanup sends nothing");
+        assert_eq!(app.mode, Mode::Sidebar);
+    }
+
+    #[test]
+    fn m_on_a_project_row_flashes_only_workspaces_merge() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces()); // both top-level projects
+        focus_sidebar(&mut app); // selection rests on api (a project, no parent)
+        let out = app.on_key(plain('m'));
+        assert!(out.is_empty(), "a project row merges nothing");
+        assert_eq!(app.mode, Mode::Sidebar, "no confirm is raised");
+        assert!(
+            app.transient()
+                .is_some_and(|t| t.contains("only workspaces merge")),
+            "a project row flashes the guidance"
+        );
+    }
+
+    #[test]
+    fn merge_confirm_cancels_on_any_other_key() {
+        let mut app = App::new();
+        let mut view = view_two_workspaces();
+        view[1].parent = Some(WorkspaceId(1));
+        attach_with(&mut app, view);
+        focus_sidebar(&mut app);
+        app.on_key(plain('j'));
+        app.on_key(plain('m'));
+        let out = app.on_key(plain('n'));
+        assert!(out.is_empty(), "n merges nothing");
+        assert_eq!(app.mode, Mode::Sidebar);
     }
 
     #[test]

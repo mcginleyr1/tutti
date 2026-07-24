@@ -18,6 +18,10 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// copy on disk, so it needs more headroom than a read-only probe.
 const FORK_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Cap on each `jj` invocation in the merge sequence — rebase, conflict probe,
+/// bookmark move, optional push — each of which can touch the store or network.
+const MERGE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Cap on lines returned to a client. A larger diff is truncated with a final
 /// marker so the protocol frame — and the consumer rendering it — stay bounded.
 const MAX_LINES: usize = 10_000;
@@ -221,6 +225,198 @@ pub async fn update_stale(dir: &Path) -> Response {
         },
         Err(message) => Response::Error { message },
     }
+}
+
+/// The outcome of a successful `merge`: the trunk bookmark it advanced and
+/// whether a push ran and succeeded. `push_error` carries the push stderr when a
+/// push was attempted and failed — the merge itself still landed, so it is a note
+/// (surfaced to the operator), never a failure.
+pub struct MergeOutcome {
+    pub bookmark: String,
+    pub pushed: bool,
+    pub push_error: Option<String>,
+}
+
+/// Merge a child jj-workspace's work back into its origin's trunk bookmark and,
+/// when `push`, `jj git push` it if the origin has a remote. `origin_root` is the
+/// origin repo the child was forked from; `child_dir` its checkout; `jj_name` its
+/// `jj workspace add --name`. All subprocess, run from the origin root against
+/// explicit revsets so no cwd juggling is needed:
+///
+/// 1. snapshot the child's working copy (so `<name>@` reflects its on-disk work);
+/// 2. pick the trunk bookmark — `main`, else `master`, else Error;
+/// 3. `jj rebase -b <name>@ -d <trunk>` to replay the child's branch onto trunk;
+/// 4. if any rebased commit is conflicted, `jj undo` and Error — never land a
+///    conflict;
+/// 5. advance `<trunk>` to the child's real work: its `@` when non-empty, else its
+///    parent `@-` (the `@` is usually an empty working-copy commit on top);
+/// 6. optionally push.
+///
+/// `Ok(MergeOutcome)` on success; a jj stderr / spawn error otherwise.
+pub async fn merge(
+    origin_root: &Path,
+    child_dir: &Path,
+    jj_name: &str,
+    push: bool,
+) -> Result<MergeOutcome, String> {
+    // Snapshot the child so `<name>@` reflects its latest on-disk work — jj only
+    // records a working-copy commit when a command runs in that workspace.
+    snapshot(child_dir).await;
+
+    let trunk = trunk_bookmark(origin_root).await?;
+    let child = format!("{jj_name}@");
+
+    // Replay the child's branch onto the current trunk tip.
+    run_mutation(origin_root, &["rebase", "-b", &child, "-d", &trunk]).await?;
+
+    // A conflicted commit anywhere in the rebased range means the merge would
+    // land a conflict: undo the rebase and refuse.
+    let conflicts = log_template(
+        origin_root,
+        &format!("{trunk}..{child} & conflicts()"),
+        "commit_id ++ \"\\n\"",
+    )
+    .await?;
+    if !conflicts.trim().is_empty() {
+        let _ = run_mutation(origin_root, &["undo"]).await;
+        return Err("merge would conflict — resolve manually in the workspace".to_string());
+    }
+
+    // The child's `@` is typically an empty working-copy commit on top of the
+    // real work; advance the bookmark to `@` only when it carries changes, else
+    // to its parent `@-`.
+    let empty = log_template(origin_root, &child, "empty").await?;
+    let target = if empty.trim() == "true" {
+        format!("{jj_name}@-")
+    } else {
+        child.clone()
+    };
+    run_mutation(origin_root, &["bookmark", "set", &trunk, "-r", &target]).await?;
+
+    // Push only when asked and the origin actually has a remote; a push failure
+    // is a note on an already-landed merge, never a rollback.
+    let mut pushed = false;
+    let mut push_error = None;
+    if push && has_remote(origin_root).await {
+        match run_mutation(origin_root, &["git", "push", "--bookmark", &trunk]).await {
+            Ok(()) => pushed = true,
+            Err(message) => push_error = Some(message),
+        }
+    }
+
+    Ok(MergeOutcome {
+        bookmark: trunk,
+        pushed,
+        push_error,
+    })
+}
+
+/// Snapshot a workspace's working copy by running a no-op `jj log -r @` in it
+/// (without `--ignore-working-copy`, which would skip the snapshot). Best-effort:
+/// a failure just leaves the last recorded `@` in place.
+async fn snapshot(dir: &Path) {
+    let _ = run(
+        jj_cmd(dir, &["log", "-r", "@", "--no-graph", "-T", ""]),
+        MERGE_TIMEOUT,
+    )
+    .await;
+}
+
+/// The trunk bookmark to merge into: `main` if present, else `master`, else an
+/// Error naming the local bookmarks that do exist (never guessing further).
+/// Reads `jj bookmark list`, taking the name before the first `:`/space on each
+/// line and dropping remote-tracking (`name@remote`) entries.
+async fn trunk_bookmark(dir: &Path) -> Result<String, String> {
+    let output = run(
+        jj_cmd(dir, &["bookmark", "list", "--ignore-working-copy"]),
+        MERGE_TIMEOUT,
+    )
+    .await?;
+    if !output.status.success() {
+        return Err(stderr_or(&output, "jj bookmark list failed"));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let names: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.split(|c: char| c == ':' || c.is_whitespace()).next())
+        .filter(|name| !name.is_empty() && !name.contains('@'))
+        .collect();
+    if names.contains(&"main") {
+        Ok("main".to_string())
+    } else if names.contains(&"master") {
+        Ok("master".to_string())
+    } else {
+        let found = if names.is_empty() {
+            "none".to_string()
+        } else {
+            names.join(", ")
+        };
+        Err(format!(
+            "no main or master bookmark to merge into (found: {found})"
+        ))
+    }
+}
+
+/// Whether the origin has any git remote (`jj git remote list` non-empty).
+async fn has_remote(dir: &Path) -> bool {
+    match run(jj_cmd(dir, &["git", "remote", "list"]), MERGE_TIMEOUT).await {
+        Ok(output) if output.status.success() => {
+            !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+        }
+        _ => false,
+    }
+}
+
+/// Evaluate `template` over `revset` (read-only, `--ignore-working-copy` so it
+/// creates no operation that a later `jj undo` would target), returning stdout.
+async fn log_template(dir: &Path, revset: &str, template: &str) -> Result<String, String> {
+    let output = run(
+        jj_cmd(
+            dir,
+            &[
+                "log",
+                "-r",
+                revset,
+                "--no-graph",
+                "--ignore-working-copy",
+                "-T",
+                template,
+            ],
+        ),
+        MERGE_TIMEOUT,
+    )
+    .await?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(stderr_or(&output, "jj log failed"))
+    }
+}
+
+/// Run a mutating jj command, mapping a non-zero exit to its stderr.
+async fn run_mutation(dir: &Path, args: &[&str]) -> Result<(), String> {
+    let output = run(jj_cmd(dir, args), MERGE_TIMEOUT).await?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(stderr_or(&output, "jj command failed"))
+    }
+}
+
+/// A `jj --no-pager <args…>` command rooted at `dir`, stdout/stderr captured,
+/// stdin closed, child reaped on drop (so a timeout kills it).
+fn jj_cmd(dir: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("jj");
+    cmd.arg("--no-pager");
+    for arg in args {
+        cmd.arg(arg);
+    }
+    cmd.current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    cmd
 }
 
 /// The trimmed stderr of a failed jj command, or `fallback` (with the exit

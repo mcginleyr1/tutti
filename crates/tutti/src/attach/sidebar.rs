@@ -38,6 +38,11 @@ pub struct WorkspaceRow {
     pub active: bool,
     /// The tab that selecting this workspace jumps to.
     pub jump_tab: TabId,
+    /// The tree-guide glyph when this row is a jj-workspace child nested under a
+    /// project: `├` for a non-last sibling, `└` for the last. `None` for a
+    /// top-level project row (drawn flush-left, no guide). Its presence is what
+    /// tells the client this row can be merged.
+    pub guide: Option<char>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -145,30 +150,56 @@ impl Sidebar {
 }
 
 /// Build the sidebar from the client's view. `active_tab` decides which
-/// workspace is bold and where each workspace jump lands. Agents are gathered
-/// across every workspace and ordered blocked → working → done → idle →
-/// unknown, stable by pane id within a group.
+/// workspace is bold and where each workspace jump lands. Workspaces are ordered
+/// parent→children: each top-level project is followed immediately by its
+/// jj-workspace children (indented, `├`/`└` guides), so a child renders nested
+/// beneath its origin. Agents are gathered across every workspace and ordered
+/// blocked → working → done → idle → unknown, stable by pane id within a group.
 pub fn build(workspaces: &[WorkspaceView], active_tab: Option<TabId>) -> Sidebar {
-    let mut entries = Vec::new();
-    let mut agents = Vec::new();
-    for w in workspaces {
+    let present: std::collections::HashSet<_> = workspaces.iter().map(|w| w.id).collect();
+    // A workspace nests only when its parent is actually present; a child whose
+    // origin was killed renders as a top-level project.
+    let is_child = |w: &WorkspaceView| w.parent.is_some_and(|p| present.contains(&p));
+
+    let row = |w: &WorkspaceView, guide: Option<char>| -> Option<SidebarEntry> {
         let owns = active_tab.is_some_and(|at| w.tabs.iter().any(|t| t.id == at));
         let jump_tab = active_tab
             .filter(|at| w.tabs.iter().any(|t| t.id == *at))
-            .or_else(|| w.tabs.first().map(|t| t.id));
-        if let Some(jump_tab) = jump_tab {
-            entries.push(SidebarEntry::Workspace(WorkspaceRow {
-                name: w.name.clone(),
-                subtitle: w
-                    .branch
-                    .clone()
-                    .or_else(|| shorten_home(&w.dir, std::env::var_os("HOME").map(Into::into))),
-                changes: w.changes.clone(),
-                stale: w.stale,
-                active: owns,
-                jump_tab,
-            }));
+            .or_else(|| w.tabs.first().map(|t| t.id))?;
+        Some(SidebarEntry::Workspace(WorkspaceRow {
+            name: w.name.clone(),
+            subtitle: w
+                .branch
+                .clone()
+                .or_else(|| shorten_home(&w.dir, std::env::var_os("HOME").map(Into::into))),
+            changes: w.changes.clone(),
+            stale: w.stale,
+            active: owns,
+            jump_tab,
+            guide,
+        }))
+    };
+
+    let mut entries = Vec::new();
+    for w in workspaces {
+        if is_child(w) {
+            continue; // emitted under its parent below
         }
+        entries.extend(row(w, None));
+        let children: Vec<&WorkspaceView> = workspaces
+            .iter()
+            .filter(|c| c.parent == Some(w.id))
+            .collect();
+        let last = children.len();
+        for (i, child) in children.iter().enumerate() {
+            let glyph = if i + 1 == last { '└' } else { '├' };
+            entries.extend(row(child, Some(glyph)));
+        }
+    }
+    let workspace_count = entries.len();
+
+    let mut agents = Vec::new();
+    for w in workspaces {
         for tab in &w.tabs {
             for pane in &tab.panes {
                 if let Some(agent) = &pane.agent {
@@ -185,7 +216,6 @@ pub fn build(workspaces: &[WorkspaceView], active_tab: Option<TabId>) -> Sidebar
         }
     }
     agents.sort_by_key(|a| (state_rank(a.state), a.pane.0));
-    let workspace_count = entries.len();
     entries.extend(agents.into_iter().map(SidebarEntry::Agent));
     Sidebar {
         entries,
@@ -223,7 +253,7 @@ fn shorten_home(dir: &std::path::Path, home: Option<std::path::PathBuf>) -> Opti
 mod tests {
     use super::*;
     use crate::attach::fixtures::{agent, leaf, pane, split, sub, tab, workspace};
-    use tutti_core::Direction;
+    use tutti_core::{Direction, WorkspaceId};
 
     /// One workspace (active tab) with two agents; the first (Working, so sorted
     /// ahead of the second's Done) carries two subagents — one running, one done.
@@ -350,6 +380,137 @@ mod tests {
         };
         assert!(api.stale, "the stale flag rides onto the row");
         assert!(!web.stale, "a healthy workspace is not stale");
+    }
+
+    #[test]
+    fn build_nests_a_child_workspace_under_its_parent() {
+        let mut view = two_workspace_view();
+        // Make `web` (id 2) a jj-workspace child of `api` (id 1).
+        view[1].parent = Some(WorkspaceId(1));
+        let sidebar = build(&view, Some(TabId(2)));
+        // Both stay workspace entries, api then its child web, in that order.
+        assert_eq!(sidebar.workspace_count, 2);
+        let SidebarEntry::Workspace(api) = &sidebar.entries[0] else {
+            panic!("expected the parent workspace row");
+        };
+        let SidebarEntry::Workspace(web) = &sidebar.entries[1] else {
+            panic!("expected the nested child row");
+        };
+        assert_eq!(api.name, "api");
+        assert_eq!(api.guide, None, "the parent project is flush-left");
+        assert_eq!(web.name, "web");
+        assert_eq!(web.guide, Some('└'), "the only child gets the last guide");
+    }
+
+    #[test]
+    fn build_marks_all_but_the_last_child_with_the_mid_guide() {
+        let mut view = vec![
+            workspace(
+                1,
+                "api",
+                Some("main"),
+                vec![tab(
+                    1,
+                    "1",
+                    true,
+                    leaf(1),
+                    vec![pane(1, "sh", None, AgentState::Idle)],
+                )],
+            ),
+            workspace(
+                2,
+                "feat-a",
+                Some("main"),
+                vec![tab(
+                    2,
+                    "2",
+                    false,
+                    leaf(2),
+                    vec![pane(2, "sh", None, AgentState::Idle)],
+                )],
+            ),
+            workspace(
+                3,
+                "feat-b",
+                Some("main"),
+                vec![tab(
+                    3,
+                    "3",
+                    false,
+                    leaf(3),
+                    vec![pane(3, "sh", None, AgentState::Idle)],
+                )],
+            ),
+        ];
+        view[1].parent = Some(WorkspaceId(1));
+        view[2].parent = Some(WorkspaceId(1));
+        let sidebar = build(&view, Some(TabId(1)));
+        assert_eq!(sidebar.workspace_count, 3);
+        let guides: Vec<Option<char>> = sidebar.entries[..3]
+            .iter()
+            .map(|e| match e {
+                SidebarEntry::Workspace(w) => w.guide,
+                _ => panic!("expected workspace rows"),
+            })
+            .collect();
+        assert_eq!(
+            guides,
+            vec![None, Some('├'), Some('└')],
+            "parent flush-left, first child mid-guide, last child end-guide"
+        );
+    }
+
+    #[test]
+    fn build_renders_a_child_top_level_when_its_parent_is_gone() {
+        let mut view = vec![workspace(
+            2,
+            "web",
+            None,
+            vec![tab(
+                2,
+                "2",
+                true,
+                leaf(2),
+                vec![pane(2, "sh", None, AgentState::Idle)],
+            )],
+        )];
+        view[0].parent = Some(WorkspaceId(99)); // origin not present in the view
+        let sidebar = build(&view, Some(TabId(2)));
+        let SidebarEntry::Workspace(web) = &sidebar.entries[0] else {
+            panic!("expected a workspace row");
+        };
+        assert_eq!(
+            web.guide, None,
+            "a child whose origin was killed renders flush-left"
+        );
+    }
+
+    #[test]
+    fn entry_at_row_selects_nested_children_as_ordinary_rows() {
+        let mut view = two_workspace_view();
+        view[1].parent = Some(WorkspaceId(1)); // web nested under api
+        let sidebar = build(&view, Some(TabId(2)));
+        // Projects header row 0; api rows 1-2; child web rows 3-4; divider row 5.
+        assert_eq!(sidebar.entry_at_row(1), Some(0));
+        assert_eq!(
+            sidebar.entry_at_row(3),
+            Some(1),
+            "a nested child is an ordinary selectable entry"
+        );
+        assert_eq!(sidebar.entry_at_row(4), Some(1));
+        assert_eq!(sidebar.header_at_row(5), Some(Section::Agents));
+        // Collapsing the projects section hides the nested children too — the
+        // child entry (index 1, in the projects section) is no longer visible.
+        let mut collapsed = sidebar.clone();
+        collapsed.projects_collapsed = true;
+        assert!(
+            !collapsed.is_visible(1),
+            "collapsing projects hides the nested child"
+        );
+        assert!(
+            collapsed.is_visible(2),
+            "the agents section stays visible when projects collapse"
+        );
     }
 
     #[test]

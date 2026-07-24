@@ -91,6 +91,7 @@ pub(crate) fn workspace(
         branch: branch.map(Into::into),
         changes: None,
         stale: false,
+        parent: None,
         tabs,
     }
 }

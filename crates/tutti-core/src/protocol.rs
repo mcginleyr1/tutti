@@ -10,7 +10,7 @@ use crate::state::AgentState;
 /// Response / Event shapes (including additive fields): the daemon reports it
 /// on attach and mismatched clients tell the user to restart the daemon —
 /// binaries upgrade on install, running daemons do not.
-pub const WIRE_REV: u32 = 1;
+pub const WIRE_REV: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -27,20 +27,33 @@ pub enum Request {
         #[serde(default)]
         discard: bool,
     },
-    /// Fork a jj workspace: `jj workspace add` a sibling checkout named `name`
-    /// (optionally at `revision`), then mount it as a tutti workspace with a
-    /// shell pane. The source workspace must be under a `.jj` repo. Answered with
-    /// `Response::WorkspaceCreated`.
+    /// Fork a jj workspace: `jj workspace add` a checkout named `name` (optionally
+    /// at `revision`), then mount it as a tutti workspace with a shell pane. The
+    /// source workspace must be under a `.jj` repo. `dest`, when given, is the
+    /// absolute checkout directory (its parent already canonicalized by the
+    /// client, its leaf not yet existing); when absent the server places a sibling
+    /// `<repo-parent>/<repo>-<name>`. Answered with `Response::WorkspaceCreated`.
     WorkspaceFork {
         id: WorkspaceId,
         name: String,
         revision: Option<String>,
+        #[serde(default)]
+        dest: Option<PathBuf>,
     },
     /// Update a stale forked workspace by running `jj workspace update-stale` in
     /// its directory, then refreshing. The manual fix for the sidebar's `stale`
     /// tag. Answered with `Response::Ok` or `Response::Error`.
     WorkspaceUpdate {
         id: WorkspaceId,
+    },
+    /// Merge a child (jj-workspace) workspace's work back into its origin's trunk
+    /// bookmark (`main`, else `master`) and, when `push`, `jj git push` it if the
+    /// origin has a remote. Only valid for a workspace tutti forked. Answered with
+    /// `Response::Merged` on success or `Response::Error` (unmergeable, would
+    /// conflict — the merge is undone — or no trunk bookmark).
+    WorkspaceMerge {
+        id: WorkspaceId,
+        push: bool,
     },
     TabNew {
         workspace: Option<WorkspaceId>,
@@ -215,6 +228,12 @@ pub struct WorkspaceView {
     /// and older servers.
     #[serde(default)]
     pub stale: bool,
+    /// The workspace this one is nested under: for a jj-workspace child, its
+    /// origin project's id, so the sidebar renders it indented beneath the parent.
+    /// `None` for a top-level project (and when the origin has been killed — the
+    /// child then renders top-level). Defaults `None` for older servers.
+    #[serde(default)]
+    pub parent: Option<WorkspaceId>,
     pub tabs: Vec<TabView>,
 }
 
@@ -240,6 +259,12 @@ pub enum Response {
     },
     WorkspaceCreated {
         id: WorkspaceId,
+    },
+    /// A `WorkspaceMerge` landed: `bookmark` is the trunk it advanced (`main` or
+    /// `master`), `pushed` whether `jj git push` ran and succeeded.
+    Merged {
+        pushed: bool,
+        bookmark: String,
     },
     TabCreated {
         id: TabId,
@@ -342,13 +367,23 @@ mod tests {
             id: WorkspaceId(4),
             name: "feature".into(),
             revision: Some("@".into()),
+            dest: Some(PathBuf::from("/tmp/repo-feature")),
         });
         roundtrip(&Request::WorkspaceFork {
             id: WorkspaceId(4),
             name: "feature".into(),
             revision: None,
+            dest: None,
         });
         roundtrip(&Request::WorkspaceUpdate { id: WorkspaceId(5) });
+        roundtrip(&Request::WorkspaceMerge {
+            id: WorkspaceId(6),
+            push: true,
+        });
+        roundtrip(&Request::WorkspaceMerge {
+            id: WorkspaceId(6),
+            push: false,
+        });
         roundtrip(&Request::TabNew { workspace: None });
         roundtrip(&Request::PaneSplit {
             pane: PaneId(1),
@@ -432,6 +467,7 @@ mod tests {
             branch: Some("main".into()),
             changes: Some("4 files +120 −33".into()),
             stale: false,
+            parent: None,
             tabs: vec![TabView {
                 id: TabId(1),
                 name: "main".into(),
@@ -478,6 +514,14 @@ mod tests {
         });
         roundtrip(&Response::Content {
             lines: vec!["line one".into(), "line two".into()],
+        });
+        roundtrip(&Response::Merged {
+            pushed: true,
+            bookmark: "main".into(),
+        });
+        roundtrip(&Response::Merged {
+            pushed: false,
+            bookmark: "master".into(),
         });
         roundtrip(&Response::Attached {
             wire_rev: WIRE_REV,
@@ -560,12 +604,20 @@ mod tests {
                 stat: false,
             }
         );
-        // A view serialized without `changes`/`stale` (older server) defaults.
+        // A view serialized without `changes`/`stale`/`parent` (older server)
+        // defaults them.
         let view: WorkspaceView =
             serde_json::from_str(r#"{"id":1,"name":"api","dir":"/tmp/w","branch":null,"tabs":[]}"#)
                 .unwrap();
         assert_eq!(view.changes, None);
         assert!(!view.stale);
+        assert_eq!(view.parent, None);
+        // A `parent` present on the wire round-trips into a nested child.
+        let child: WorkspaceView = serde_json::from_str(
+            r#"{"id":2,"name":"feature","dir":"/tmp/w-feature","branch":null,"parent":1,"tabs":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(child.parent, Some(WorkspaceId(1)));
         // A `pane_info` from before `subagents` existed defaults to an empty list.
         let pane: PaneInfo = serde_json::from_str(
             r#"{"id":1,"title":"shell","agent":null,"state":"idle","exited":null}"#,
@@ -581,7 +633,7 @@ mod tests {
                 discard: false,
             }
         );
-        // `workspace_fork` without a revision defaults to `None`.
+        // `workspace_fork` without a revision or dest defaults both to `None`.
         let fork: Request =
             serde_json::from_str(r#"{"type":"workspace_fork","id":1,"name":"x"}"#).unwrap();
         assert_eq!(
@@ -590,6 +642,7 @@ mod tests {
                 id: WorkspaceId(1),
                 name: "x".into(),
                 revision: None,
+                dest: None,
             }
         );
     }

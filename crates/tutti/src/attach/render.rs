@@ -100,14 +100,15 @@ fn paint_bg(frame: &mut Frame, area: Rect, bg: Option<Color>) {
 
 /// The sidebar-mode key hint, rendered two-tone in the bottom bar. `j/k move` is
 /// dropped as table-stakes list navigation (the help overlay still documents it)
-/// to make room for `r run`; `f` is labelled `fork checkout` so the new-checkout
-/// cost reads at a glance.
+/// to make room for the workspace verbs: `w` creates a nested workspace and `m`
+/// merges one back into its project.
 const SIDEBAR_HINT: &[(&str, &str)] = &[
     ("enter", "jump"),
+    ("w", "workspace"),
     ("n", "add project"),
     ("d", "diff"),
     ("r", "run"),
-    ("f", "fork checkout"),
+    ("m", "merge"),
     ("u", "update"),
     ("x", "kill"),
     ("esc", "back"),
@@ -396,11 +397,12 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
             content_w,
             area.height.saturating_sub(2),
         );
-        let (label, completions, selected) = if app.sidebar_fork_prompt_active() {
-            ("fork as: ", &[][..], 0)
+        let (completions, selected) = if app.sidebar_prompt_shows_completions() {
+            (app.prompt_completions(), app.prompt_selected())
         } else {
-            ("open: ", app.prompt_completions(), app.prompt_selected())
+            (&[][..], 0)
         };
+        let label = app.sidebar_prompt_label();
         draw_sidebar_prompt(
             frame,
             label,
@@ -513,7 +515,8 @@ fn name_span(text: &str, sel: bool, base: Modifier) -> Span<'static> {
 }
 
 /// A workspace row: an active/inactive dot then the bold name (an accent chip
-/// when selected).
+/// when selected). A nested child (`w.guide` set) is prefixed with its dim tree
+/// guide so it reads as sitting beneath its project.
 fn workspace_inner(
     w: &WorkspaceRow,
     sel: bool,
@@ -525,28 +528,29 @@ fn workspace_inner(
     } else {
         (glyphs.ws_inactive, dim())
     };
-    pad_inner(
-        vec![
-            Span::styled(format!("{dot} "), dot_style),
-            name_span(&w.name, sel, Modifier::BOLD),
-        ],
-        sel,
-        content_w,
-    )
+    let mut spans = Vec::new();
+    if let Some(guide) = w.guide {
+        spans.push(Span::styled(format!("{guide} "), dim()));
+    }
+    spans.push(Span::styled(format!("{dot} "), dot_style));
+    spans.push(name_span(&w.name, sel, Modifier::BOLD));
+    pad_inner(spans, sel, content_w)
 }
 
 /// A workspace's dim subtitle: the branch marker and ref on the left, and a
 /// right-aligned tag — a dim-red fork `stale` marker when the working copy is
 /// stale, otherwise the dim jj change stat. The stale tag wins over the stat,
-/// and either is dropped when it would collide with the ref.
+/// and either is dropped when it would collide with the ref. A nested child's
+/// subtitle indents two extra columns so it aligns under the child's name.
 fn workspace_subtitle_inner(
     w: &WorkspaceRow,
     sel: bool,
     content_w: u16,
     glyphs: &Glyphs,
 ) -> Vec<Span<'static>> {
+    let indent = if w.guide.is_some() { "    " } else { "  " };
     let left = format!(
-        "  {} {}",
+        "{indent}{} {}",
         glyphs.branch,
         w.subtitle.as_deref().unwrap_or("")
     );
@@ -685,8 +689,9 @@ fn agent_dot(state: AgentState, spinner: char, glyphs: &Glyphs) -> (char, Style)
 
 /// A sidebar foot prompt — an accent bar, the `label` prefix, the typed text,
 /// and a block cursor — with any completions stacked dim directly above it, the
-/// highlighted row in the accent. Add-project passes `open:` and its directory
-/// completions; fork passes `fork as:` and an empty listing.
+/// highlighted row in the accent. Add-project passes `open:` and the new
+/// workspace's `where:` step pass directory completions; the `workspace name:`
+/// step passes an empty listing.
 fn draw_sidebar_prompt(
     frame: &mut Frame,
     label: &str,
@@ -864,12 +869,15 @@ fn mode_label(mode: Mode) -> Option<&'static str> {
     match mode {
         Mode::Terminal => None,
         Mode::Prefix => Some("PREFIX"),
-        Mode::ConfirmKill(_) | Mode::ConfirmKillWorkspace(_) => Some("CONFIRM"),
+        Mode::ConfirmKill(_)
+        | Mode::ConfirmKillWorkspace(_)
+        | Mode::ConfirmMerge(_)
+        | Mode::ConfirmCleanup(_) => Some("CONFIRM"),
         Mode::Scroll(_) => Some("SCROLL"),
         Mode::Help => Some("HELP"),
         Mode::Sidebar => Some("SIDEBAR"),
         Mode::SidebarPrompt => Some("ADD PROJECT"),
-        Mode::SidebarForkPrompt => Some("FORK"),
+        Mode::SidebarWorkspaceName | Mode::SidebarWorkspaceDest => Some("WORKSPACE"),
         Mode::Launcher | Mode::LauncherCommand => Some("RUN"),
     }
 }
@@ -1143,9 +1151,9 @@ fn help_lines(cfg: &Config) -> Vec<Line<'static>> {
     lines.push(Line::from(String::new()));
     lines.push(Line::from("sidebar (after C-b w):".to_string()));
     lines.push(popup_key_line("  j/k", "move"));
-    lines.push(popup_key_line("  r", "run in project"));
+    lines.push(popup_key_line("  w / r", "new workspace / run"));
     lines.push(popup_key_line("  n / d", "add project / diff"));
-    lines.push(popup_key_line("  f / u", "fork / update stale"));
+    lines.push(popup_key_line("  m / u", "merge / update stale"));
     lines.push(popup_key_line("  x", "kill workspace"));
     lines.push(Line::from(String::new()));
     lines.push(Line::from(
@@ -1842,12 +1850,14 @@ mod tests {
             text.contains("direct keys"),
             "help missing direct keys section: {text:?}"
         );
-        // The sidebar section documents the fork, update-stale, and kill keys.
+        // The sidebar section documents the workspace, merge, update-stale, and
+        // kill keys.
         assert!(
-            text.contains("fork")
+            text.contains("new workspace")
+                && text.contains("merge")
                 && text.contains("update stale")
                 && text.contains("kill workspace"),
-            "help missing the sidebar fork/update/kill keys: {text:?}"
+            "help missing the sidebar workspace/merge/update/kill keys: {text:?}"
         );
         // Detach is listed before the split bindings.
         assert!(
@@ -1857,21 +1867,84 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_fork_prompt_shows_the_fork_as_label() {
+    fn sidebar_workspace_prompt_walks_from_name_to_where() {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = app_two_workspaces();
         let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         app.sync_sizes(Rect::new(0, 0, 100, 20));
-        // Focus the sidebar, then open the fork prompt on the first workspace.
+        // `C-b w` focuses the sidebar; a second `w` opens the guided create —
+        // step 1 is the name field.
         app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
         app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
-        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
         assert!(
-            text.contains("fork as:"),
-            "the fork prompt label is missing: {text:?}"
+            text.contains("workspace name:"),
+            "step 1 shows the name prompt: {text:?}"
+        );
+
+        // A valid name advances to step 2, the prefilled `where:` field.
+        for c in "feature".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("where:"),
+            "step 2 shows the destination prompt: {text:?}"
+        );
+    }
+
+    #[test]
+    fn sidebar_renders_a_nested_child_with_its_guide() {
+        let mut app = App::with_config(Config::parse("sidebar = \"on\"\n").unwrap());
+        let mut view = vec![
+            workspace(
+                1,
+                "api",
+                Some("main"),
+                vec![tab(
+                    1,
+                    "1",
+                    true,
+                    leaf(1),
+                    vec![pane(1, "zsh", None, AgentState::Idle)],
+                )],
+            ),
+            workspace(
+                2,
+                "feature",
+                Some("main"),
+                vec![tab(
+                    2,
+                    "2",
+                    false,
+                    leaf(2),
+                    vec![pane(2, "zsh", None, AgentState::Idle)],
+                )],
+            ),
+        ];
+        view[1].parent = Some(tutti_core::WorkspaceId(1)); // feature nested under api
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Response::Attached {
+                wire_rev: tutti_core::WIRE_REV,
+                session: "demo".into(),
+                workspaces: view,
+            })
+            .unwrap(),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("feature"), "the child name renders: {text:?}");
+        // The child's row carries the end-guide glyph, scoped to the sidebar rows.
+        assert!(
+            text.contains('└'),
+            "the nested child shows a tree guide: {text:?}"
         );
     }
 
@@ -2186,7 +2259,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_footer_hint_offers_run_and_drops_move() {
+    fn sidebar_footer_hint_offers_workspace_and_merge_and_drops_move() {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = app_two_workspaces();
         // A wide terminal so the full-width footer hint renders untruncated.
@@ -2202,8 +2275,12 @@ mod tests {
             "the sidebar hint offers run: {footer:?}"
         );
         assert!(
-            footer.contains("fork checkout"),
-            "and labels fork as a new checkout: {footer:?}"
+            footer.contains("workspace") && footer.contains("merge"),
+            "and offers the workspace and merge verbs: {footer:?}"
+        );
+        assert!(
+            !footer.contains("fork"),
+            "and drops the banned `fork` word: {footer:?}"
         );
         assert!(
             !footer.contains("move"),

@@ -198,14 +198,25 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
 4. **Agent skill**: ship a `skills/tutti/SKILL.md` (Claude Code skill) documenting the
    CLI so any Claude instance inside a tutti pane can herd its own sub-agents.
 5. **jj workspace workflow** (first-class; jj is the required VCS for all
-   workspace-level VCS features — no git/hg adapters): ✅ `tutti workspace fork
-   <workspace> --name <name> [-r <rev>]` runs `jj workspace add` onto a sibling
-   checkout and points a tutti workspace at it; ✅ `workspace kill --discard`
-   forgets and removes a fork (refused for a non-fork); ✅ stale forks are
-   surfaced in the sidebar with a dim-red tag and cleared by `workspace update`
+   workspace-level VCS features — no git/hg adapters): a **workspace** is a jj
+   checkout nested under a **project** (its origin repo), rendered indented under
+   the project in the sidebar. ✅ Guided create: sidebar `w` (a project or agent
+   row) runs a two-step `workspace name:` → `where:` prompt (sibling default
+   prefilled, directory completion) and `WorkspaceFork` with the chosen
+   destination runs `jj workspace add`. ✅ `workspace kill --discard` forgets and
+   removes a workspace (refused for one tutti did not create). ✅ stale workspaces
+   are surfaced with a dim-red tag and cleared by `workspace update`
    (`jj workspace update-stale`). ✅ `tutti workspace diff [--stat]` serves
    per-workspace diffs (sidebar shows `N files +A −B` per workspace, refreshed on
-   state transitions). Merging back stays a human decision.
+   state transitions). ✅ Merge back: sidebar `m` (or `tutti workspace merge <id>
+   [--push]`) rebases the workspace onto trunk (`main`/`master`), refuses+undoes
+   on conflict, advances the bookmark, optionally pushes, then offers cleanup —
+   still a human-triggered decision.
+
+   **CLI-vocabulary debt:** the TUI banished "fork" (git baggage) for
+   project/workspace/merge wording, but the agent-facing CLI verb is still
+   `tutti workspace fork` (unchanged for scripts). Reconcile the CLI verb naming
+   in a later pass rather than half-renaming now.
 6. **Agent-event ingest + Claude Code hook integration**: ✅ panes get
    `TUTTI_PANE`/`TUTTI_SESSION` in their env; `tutti hooks claude` prints a hook
    config that makes the agent call `tutti agent-event claude` on subagent

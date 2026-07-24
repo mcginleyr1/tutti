@@ -954,29 +954,49 @@ fn fresh_dir(prefix: &str) -> PathBuf {
     dir
 }
 
+/// Whether `jj` is on PATH; the jj-dependent tests skip when it is not.
+fn jj_on_path() -> bool {
+    std::process::Command::new("jj")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+/// `jj git init` in a fresh temp dir, with commit signing disabled for the repo.
+/// A developer's global `signing.behavior = "own"` (GPG) makes every jj commit —
+/// init, `workspace add`, `commit` — invoke gpg, which flakes under the full
+/// suite's parallelism ("Signing error"/"Could not write object"); dropping
+/// signing for these throwaway repos removes that. The init itself is retried a
+/// few times against the same class of transient backend error, each attempt in
+/// a fresh directory. Panics only after repeated failures.
+fn jj_git_init(prefix: &str) -> PathBuf {
+    for _ in 0..8 {
+        let dir = fresh_dir(prefix);
+        if run_jj(&dir, &["git", "init"]).status.success()
+            && run_jj(
+                &dir,
+                &["config", "set", "--repo", "signing.behavior", "drop"],
+            )
+            .status
+            .success()
+        {
+            return dir;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("jj git init failed repeatedly");
+}
+
 /// Initialize a real jj repo in a fresh temp dir with two added files, so a
 /// diff has real content and its `--stat` summary reads `2 files changed`.
 /// Returns `None` (test skips) when `jj` is not on PATH.
 fn init_jj_repo() -> Option<PathBuf> {
-    if std::process::Command::new("jj")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
+    if !jj_on_path() {
         eprintln!("skipping: jj is not on PATH");
         return None;
     }
-    let dir = fresh_dir("jjrepo");
-    let out = std::process::Command::new("jj")
-        .args(["git", "init"])
-        .current_dir(&dir)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "jj git init failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let dir = jj_git_init("jjrepo");
     std::fs::write(dir.join("tracked_file.txt"), "hello from tutti\n").unwrap();
     std::fs::write(dir.join("second.txt"), "another line\n").unwrap();
     Some(dir)
@@ -1242,6 +1262,7 @@ async fn fork_creates_sibling_checkout_with_a_shell_pane() {
             id: ws,
             name: "feature".into(),
             revision: None,
+            dest: None,
         })
         .await,
     );
@@ -1301,6 +1322,7 @@ async fn fork_name_collision_errors() {
             id: ws,
             name: "dup".into(),
             revision: None,
+            dest: None,
         })
         .await,
     );
@@ -1310,6 +1332,7 @@ async fn fork_name_collision_errors() {
             id: ws,
             name: "dup".into(),
             revision: None,
+            dest: None,
         })
         .await
     {
@@ -1342,11 +1365,12 @@ async fn fork_invalid_name_errors() {
             id: ws,
             name: "bad name".into(),
             revision: None,
+            dest: None,
         })
         .await
     {
         Response::Error { message } => assert!(
-            message.contains("invalid fork name"),
+            message.contains("invalid workspace name"),
             "expected an invalid-name error, got {message:?}"
         ),
         other => panic!("expected Error, got {other:?}"),
@@ -1370,6 +1394,7 @@ async fn fork_of_non_jj_workspace_errors() {
             id: ws,
             name: "x".into(),
             revision: None,
+            dest: None,
         })
         .await
     {
@@ -1403,6 +1428,7 @@ async fn fork_goes_stale_then_update_clears_it() {
             id: ws,
             name: "stalefork".into(),
             revision: None,
+            dest: None,
         })
         .await,
     );
@@ -1465,6 +1491,7 @@ async fn discard_removes_and_forgets_a_fork() {
             id: ws,
             name: "gone".into(),
             revision: None,
+            dest: None,
         })
         .await,
     );
@@ -1515,7 +1542,7 @@ async fn discard_on_a_non_fork_is_refused_and_deletes_nothing() {
         .await
     {
         Response::Error { message } => assert!(
-            message.contains("did not fork"),
+            message.contains("did not create"),
             "expected a refusal error, got {message:?}"
         ),
         other => panic!("expected Error, got {other:?}"),
@@ -1530,6 +1557,285 @@ async fn discard_on_a_non_fork_is_refused_and_deletes_nothing() {
         "a refused discard must leave the workspace in place"
     );
 
+    let _ = std::fs::remove_dir_all(&dir);
+    server.stop().await;
+}
+
+/// Init a jj repo with a base commit and a `main` bookmark, so a fork has a trunk
+/// to merge back into. Returns `None` (test skips) when `jj` is not on PATH.
+fn init_trunk_repo() -> Option<PathBuf> {
+    if !jj_on_path() {
+        eprintln!("skipping: jj is not on PATH");
+        return None;
+    }
+    let dir = jj_git_init("trunk");
+    std::fs::write(dir.join("base.txt"), "base\n").unwrap();
+    assert!(run_jj(&dir, &["commit", "-m", "base"]).status.success());
+    assert!(
+        run_jj(&dir, &["bookmark", "create", "main", "-r", "@-"])
+            .status
+            .success()
+    );
+    Some(dir)
+}
+
+/// The stdout of a `jj` read against `dir`, for asserting post-merge state.
+fn jj_out(dir: &Path, args: &[&str]) -> String {
+    String::from_utf8_lossy(&run_jj(dir, args).stdout).into_owned()
+}
+
+/// A `WorkspaceFork` with a client-chosen `dest` materializes the checkout at
+/// exactly that directory rather than the sibling default. Skips without `jj`.
+#[tokio::test]
+async fn fork_with_a_custom_dest_places_the_checkout_there() {
+    let Some(origin) = init_jj_repo() else {
+        return;
+    };
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let ws = workspace_id(
+        conn.request(Request::WorkspaceNew {
+            dir: origin.clone(),
+        })
+        .await,
+    );
+    // A parent that exists with a leaf that does not — the guided-create shape.
+    let dest = fresh_dir("custom-parent").join("my-workspace");
+    let fork = workspace_id(
+        conn.request(Request::WorkspaceFork {
+            id: ws,
+            name: "feature".into(),
+            revision: None,
+            dest: Some(dest.clone()),
+        })
+        .await,
+    );
+    assert!(
+        dest.join(".jj").exists(),
+        "the checkout should materialize at the custom dest {}",
+        dest.display()
+    );
+    let ids = workspace_ids(&mut conn).await;
+    assert!(ids.contains(&fork), "the custom-dest workspace is mounted");
+
+    let _ = std::fs::remove_dir_all(&origin);
+    let _ = std::fs::remove_dir_all(dest.parent().unwrap());
+    server.stop().await;
+}
+
+/// Merge lands a child's non-empty working copy on trunk: the bookmark advances
+/// to the child's own commit and the origin's `main` gains the child's file. With
+/// no remote, `push: true` still reports `pushed: false`. Skips without `jj`.
+#[tokio::test]
+async fn merge_lands_a_non_empty_working_copy_on_trunk() {
+    let Some(origin) = init_trunk_repo() else {
+        return;
+    };
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let ws = workspace_id(
+        conn.request(Request::WorkspaceNew {
+            dir: origin.clone(),
+        })
+        .await,
+    );
+    let fork = workspace_id(
+        conn.request(Request::WorkspaceFork {
+            id: ws,
+            name: "feature".into(),
+            revision: None,
+            dest: None,
+        })
+        .await,
+    );
+    let dest = fork_sibling(&origin, "feature");
+    // The child leaves its work in the (non-empty) working copy.
+    std::fs::write(dest.join("childwork.txt"), "child\n").unwrap();
+
+    match conn
+        .request(Request::WorkspaceMerge {
+            id: fork,
+            push: true,
+        })
+        .await
+    {
+        Response::Merged { pushed, bookmark } => {
+            assert_eq!(bookmark, "main", "merged into the main trunk");
+            assert!(!pushed, "no remote, so push is a silent no-op");
+        }
+        other => panic!("expected Merged, got {other:?}"),
+    }
+    assert!(
+        jj_out(&origin, &["file", "list", "-r", "main"]).contains("childwork.txt"),
+        "main should now carry the child's work"
+    );
+
+    let _ = std::fs::remove_dir_all(&origin);
+    let _ = std::fs::remove_dir_all(&dest);
+    server.stop().await;
+}
+
+/// When the child's `@` is an empty working-copy commit on top of its real work
+/// (it committed), the bookmark advances to the parent `@-`, still landing the
+/// work on trunk. Skips without `jj`.
+#[tokio::test]
+async fn merge_advances_to_the_parent_when_the_working_copy_is_empty() {
+    let Some(origin) = init_trunk_repo() else {
+        return;
+    };
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let ws = workspace_id(
+        conn.request(Request::WorkspaceNew {
+            dir: origin.clone(),
+        })
+        .await,
+    );
+    let fork = workspace_id(
+        conn.request(Request::WorkspaceFork {
+            id: ws,
+            name: "feature".into(),
+            revision: None,
+            dest: None,
+        })
+        .await,
+    );
+    let dest = fork_sibling(&origin, "feature");
+    // Commit the work so the child's `@` becomes a fresh empty commit on top.
+    std::fs::write(dest.join("childwork.txt"), "child\n").unwrap();
+    assert!(
+        run_jj(&dest, &["commit", "-m", "child work"])
+            .status
+            .success()
+    );
+
+    match conn
+        .request(Request::WorkspaceMerge {
+            id: fork,
+            push: false,
+        })
+        .await
+    {
+        Response::Merged { bookmark, .. } => assert_eq!(bookmark, "main"),
+        other => panic!("expected Merged, got {other:?}"),
+    }
+    assert!(
+        jj_out(&origin, &["file", "list", "-r", "main"]).contains("childwork.txt"),
+        "the real work (under the empty @) still lands on main"
+    );
+
+    let _ = std::fs::remove_dir_all(&origin);
+    let _ = std::fs::remove_dir_all(&dest);
+    server.stop().await;
+}
+
+/// A merge that would conflict is refused and undone: the Error names the
+/// conflict, `main` is left where it was (the origin's change, not the child's),
+/// and no conflicted commit is reachable from `main`. Skips without `jj`.
+#[tokio::test]
+async fn merge_conflict_is_refused_and_undone() {
+    let Some(origin) = init_trunk_repo() else {
+        return;
+    };
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let ws = workspace_id(
+        conn.request(Request::WorkspaceNew {
+            dir: origin.clone(),
+        })
+        .await,
+    );
+    let fork = workspace_id(
+        conn.request(Request::WorkspaceFork {
+            id: ws,
+            name: "feature".into(),
+            revision: None,
+            dest: None,
+        })
+        .await,
+    );
+    let dest = fork_sibling(&origin, "feature");
+
+    // The origin advances main with its own edit to the shared line…
+    std::fs::write(origin.join("base.txt"), "origin-change\n").unwrap();
+    assert!(
+        run_jj(&origin, &["commit", "-m", "origin-change"])
+            .status
+            .success()
+    );
+    assert!(
+        run_jj(&origin, &["bookmark", "set", "main", "-r", "@-"])
+            .status
+            .success()
+    );
+    // …while the child edits the same line differently.
+    std::fs::write(dest.join("base.txt"), "child-change\n").unwrap();
+
+    match conn
+        .request(Request::WorkspaceMerge {
+            id: fork,
+            push: false,
+        })
+        .await
+    {
+        Response::Error { message } => assert!(
+            message.contains("conflict"),
+            "the error should name the conflict, got {message:?}"
+        ),
+        other => panic!("expected Error, got {other:?}"),
+    }
+    // The undo restored main: it still holds the origin's change, not the child's.
+    assert!(
+        jj_out(&origin, &["file", "show", "-r", "main", "base.txt"]).contains("origin-change"),
+        "main should be left at the origin's change after the abort"
+    );
+    assert!(
+        jj_out(
+            &origin,
+            &[
+                "log",
+                "-r",
+                "::main & conflicts()",
+                "--no-graph",
+                "--ignore-working-copy",
+                "-T",
+                "commit_id",
+            ],
+        )
+        .trim()
+        .is_empty(),
+        "no conflicted commit should be reachable from main"
+    );
+
+    let _ = std::fs::remove_dir_all(&origin);
+    let _ = std::fs::remove_dir_all(&dest);
+    server.stop().await;
+}
+
+/// Merging a workspace tutti did not fork is refused fail-fast, before any jj
+/// call — so this runs even without `jj` installed.
+#[tokio::test]
+async fn merge_on_a_non_child_errors() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let dir = fresh_dir("plain-merge");
+    let ws = workspace_id(
+        conn.request(Request::WorkspaceNew { dir: dir.clone() })
+            .await,
+    );
+    match conn
+        .request(Request::WorkspaceMerge {
+            id: ws,
+            push: false,
+        })
+        .await
+    {
+        Response::Error { message } => assert!(
+            message.contains("only a workspace can merge"),
+            "expected a non-child refusal, got {message:?}"
+        ),
+        other => panic!("expected Error, got {other:?}"),
+    }
     let _ = std::fs::remove_dir_all(&dir);
     server.stop().await;
 }

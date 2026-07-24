@@ -324,6 +324,14 @@ impl Session {
     /// The whole session as the attach protocol's view: workspaces, their tabs,
     /// each tab's layout tree and the `PaneInfo` for the panes it holds.
     pub fn view(&self) -> Vec<WorkspaceView> {
+        // Each workspace's jj repo root, computed once, so a forked child can be
+        // resolved to whichever workspace currently owns its origin repo (or None
+        // when that origin has been killed — the child then renders top-level).
+        let roots: Vec<(WorkspaceId, Option<PathBuf>)> = self
+            .workspaces
+            .iter()
+            .map(|w| (w.id, crate::jj::workspace_root(&w.dir)))
+            .collect();
         self.workspaces
             .iter()
             .map(|w| WorkspaceView {
@@ -333,6 +341,12 @@ impl Session {
                 branch: git_branch(&w.dir),
                 changes: w.changes.clone(),
                 stale: w.stale,
+                parent: w.fork.as_ref().and_then(|fork| {
+                    roots.iter().find_map(|(id, root)| {
+                        (*id != w.id && root.as_deref() == Some(fork.origin_root.as_path()))
+                            .then_some(*id)
+                    })
+                }),
                 tabs: w
                     .tabs
                     .iter()
