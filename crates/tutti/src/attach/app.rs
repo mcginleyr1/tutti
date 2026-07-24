@@ -136,6 +136,10 @@ pub struct App {
     launcher_after_add: bool,
     /// The command line typed in the launcher's `command…` input.
     launcher_command: String,
+    /// The name of the workspace the open launcher targets, shown in its title
+    /// so the choice's destination is never ambiguous. `None` renders a bare
+    /// ` run ` title.
+    launcher_target: Option<String>,
     /// The sidebar column from the last size sync, for mouse hit-testing.
     sidebar_rect: Option<Rect>,
     /// The top tab-bar row from the last size sync, for mouse hit-testing.
@@ -208,6 +212,7 @@ impl App {
             launcher_selected: 0,
             launcher_after_add: false,
             launcher_command: String::new(),
+            launcher_target: None,
             sidebar_rect: None,
             tab_bar_rect: None,
             spinner_epoch: Instant::now(),
@@ -442,14 +447,26 @@ impl App {
             }
             Response::WorkspaceCreated { id } => {
                 // Add-project ignores this (it armed its jump + launcher up
-                // front); a fork waited for it: jump to the new workspace, then
-                // open the launcher to pick the agent that runs beside its shell.
+                // front); a fork waited for it: jump to the new workspace, open
+                // the launcher over it, and flash what the fork made and where.
                 if std::mem::take(&mut self.fork_pending) {
+                    let src = self.fork_target.and_then(|sid| self.workspace_name(sid));
+                    let created = self
+                        .workspaces
+                        .iter()
+                        .find(|w| w.id == id)
+                        .map(|w| (w.name.clone(), w.dir.clone()));
                     if !self.jump_to_workspace(id) {
                         // The fresh view has not landed yet; adopt on the next.
                         self.adopt_active_view = true;
                     }
-                    self.open_launcher(false);
+                    self.open_launcher(false, created.as_ref().map(|(name, _)| name.clone()));
+                    if let (Some(src), Some((_, dir))) = (src, created) {
+                        self.set_status(format!(
+                            "forked {src} → {} (isolated checkout)",
+                            dir.display()
+                        ));
+                    }
                 }
             }
             Response::Error { message } => {
@@ -630,7 +647,8 @@ impl App {
                 Vec::new()
             }
             PrefixAction::Run => {
-                self.open_launcher(false);
+                let target = self.active_workspace_name();
+                self.open_launcher(false, target);
                 Vec::new()
             }
             PrefixAction::Detach => self.detach(),
@@ -872,6 +890,7 @@ impl App {
                 Vec::new()
             }
             KeyCode::Enter => self.jump_to_selected(&sidebar),
+            KeyCode::Char('r') => self.run_in_selected(&sidebar),
             KeyCode::Char('n') => {
                 self.open_project_prompt();
                 Vec::new()
@@ -916,6 +935,27 @@ impl App {
             }
             None => Vec::new(),
         }
+    }
+
+    /// Jump to the selected entry's workspace — its active-or-first tab, the
+    /// same routing a workspace-row Enter uses — and open the launcher over it,
+    /// so one keystroke goes from the project list to picking what runs in a new
+    /// pane in that tab. An agent row targets the workspace that owns it.
+    fn run_in_selected(&mut self, sidebar: &Sidebar) -> Vec<WireFrame> {
+        let Some((tab, name)) = self.selected_workspace(sidebar).and_then(|w| {
+            w.tabs
+                .iter()
+                .find(|t| t.active)
+                .or_else(|| w.tabs.first())
+                .map(|t| (t.id, w.name.clone()))
+        }) else {
+            return Vec::new();
+        };
+        self.active_tab = Some(tab);
+        self.zoom = false;
+        self.refocus();
+        self.open_launcher(false, Some(name));
+        vec![control(&Request::TabSelect { id: tab })]
     }
 
     /// Jump to workspace `id`'s tab if the current view carries it, returning
@@ -1144,7 +1184,8 @@ impl App {
         }
         let dir = expand_dir(&input);
         self.adopt_active_view = true;
-        self.open_launcher(true);
+        let name = workspace_name_from_dir(&dir);
+        self.open_launcher(true, name);
         vec![control(&Request::WorkspaceNew { dir })]
     }
 
@@ -1204,13 +1245,15 @@ impl App {
     /// Open the agent launcher — the "what should run here?" picker — building
     /// its rows from the registry and the live PATH. `after_add` records that it
     /// fired right after add-project, so `esc` still spawns the shell into the
-    /// new workspace (today's outcome); otherwise `esc` just closes.
-    fn open_launcher(&mut self, after_add: bool) {
+    /// new workspace (today's outcome); otherwise `esc` just closes. `target`
+    /// names the workspace the choice will land in, shown in the panel title.
+    fn open_launcher(&mut self, after_add: bool, target: Option<String>) {
         self.launcher =
             launcher::build_rows(&Registry::default(), std::env::var_os("PATH").as_deref());
         self.launcher_selected = launcher::first_selectable(&self.launcher);
         self.launcher_after_add = after_add;
         self.launcher_command.clear();
+        self.launcher_target = target;
         self.mode = Mode::Launcher;
         self.prefix_since = None;
         self.status = None;
@@ -1229,6 +1272,16 @@ impl App {
     /// The text typed in the launcher's `command…` input.
     pub fn launcher_command(&self) -> &str {
         &self.launcher_command
+    }
+
+    /// The launcher panel title, naming the workspace the choice will run in so
+    /// the target is never ambiguous — ` run in <name> `, or a bare ` run ` when
+    /// the target is unknown.
+    pub fn launcher_title(&self) -> String {
+        match &self.launcher_target {
+            Some(name) => format!(" run in {name} "),
+            None => " run ".into(),
+        }
     }
 
     fn on_key_launcher(&mut self, key: KeyEvent) -> Vec<WireFrame> {
@@ -1291,6 +1344,7 @@ impl App {
         self.launcher.clear();
         self.launcher_command.clear();
         self.launcher_after_add = false;
+        self.launcher_target = None;
         self.status = None;
     }
 
@@ -1715,6 +1769,21 @@ impl App {
             .map(|w| w.id)
     }
 
+    /// The name of the workspace with `id`, from the current view.
+    fn workspace_name(&self, id: WorkspaceId) -> Option<String> {
+        self.workspaces
+            .iter()
+            .find(|w| w.id == id)
+            .map(|w| w.name.clone())
+    }
+
+    /// The name of the workspace owning the active tab — the launcher's target
+    /// label when it opens over the current tab (prefix `r`).
+    fn active_workspace_name(&self) -> Option<String> {
+        self.active_workspace()
+            .and_then(|id| self.workspace_name(id))
+    }
+
     fn tab_exists(&self, id: TabId) -> bool {
         self.all_tabs().iter().any(|t| t.id == id)
     }
@@ -1785,6 +1854,12 @@ fn inner_size(rect: Rect) -> (u16, u16) {
 
 pub(crate) fn control(request: &Request) -> WireFrame {
     WireFrame::Control(serde_json::to_vec(request).expect("serialize request"))
+}
+
+/// The workspace name a directory mounts under — its final path component — for
+/// the launcher title shown before the new workspace's own view has landed.
+fn workspace_name_from_dir(dir: &Path) -> Option<String> {
+    dir.file_name().map(|n| n.to_string_lossy().into_owned())
 }
 
 /// A `PaneRun` into the session's current tab (the just-created workspace after
@@ -2684,6 +2759,54 @@ mod tests {
     }
 
     #[test]
+    fn r_on_a_workspace_row_jumps_to_it_and_opens_the_launcher_for_it() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        app.on_key(plain('j')); // select the second workspace (web, tab 2)
+        let out = app.on_key(plain('r'));
+        assert_eq!(
+            out,
+            vec![control(&Request::TabSelect { id: TabId(2) })],
+            "r jumps to the selected workspace's tab, the same routing as Enter"
+        );
+        assert_eq!(app.active_tab, Some(TabId(2)));
+        assert_eq!(
+            app.mode,
+            Mode::Launcher,
+            "and lands in the launcher so the next choice runs there"
+        );
+        assert_eq!(
+            app.launcher_title(),
+            " run in web ",
+            "the launcher title names the workspace it will run in"
+        );
+    }
+
+    #[test]
+    fn r_on_an_agent_row_runs_in_the_workspace_that_owns_it() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        app.on_key(plain('j'));
+        app.on_key(plain('j')); // first agent row, living in web's tab 2
+        assert!(matches!(app.sidebar().entries[2], SidebarEntry::Agent(_)));
+        let out = app.on_key(plain('r'));
+        assert_eq!(
+            out,
+            vec![control(&Request::TabSelect { id: TabId(2) })],
+            "an agent row targets the tab of the workspace that owns it"
+        );
+        assert_eq!(app.active_tab, Some(TabId(2)));
+        assert_eq!(app.mode, Mode::Launcher);
+        assert_eq!(
+            app.launcher_title(),
+            " run in web ",
+            "and names that owning workspace in the launcher title"
+        );
+    }
+
+    #[test]
     fn d_on_a_jj_workspace_opens_an_ephemeral_diff_pane() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
@@ -2853,12 +2976,14 @@ mod tests {
         // The server broadcasts the fresh view (carrying the fork and its tab)
         // before the WorkspaceCreated reply — mirror that ordering here.
         let mut view = view_two_workspaces();
-        view.push(workspace(
+        let mut forked = workspace(
             3,
             "w-feature",
             Some("main"),
             vec![tab(3, "3", true, leaf(9), vec![shell(9)])],
-        ));
+        );
+        forked.dir = std::path::PathBuf::from("/tmp/repo-feature");
+        view.push(forked);
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Event::LayoutChanged { workspaces: view }).unwrap(),
         ));
@@ -2875,6 +3000,21 @@ mod tests {
             app.mode,
             Mode::Launcher,
             "and opens the launcher to pick the agent to run beside its shell"
+        );
+        assert_eq!(
+            app.launcher_title(),
+            " run in w-feature ",
+            "the launcher names the fork it will run in"
+        );
+        // The transient explains what fork made and where, so a user who
+        // expected an in-place run sees the isolated checkout it created.
+        let transient = app.transient().expect("a post-fork transient is posted");
+        assert!(
+            transient.contains("forked")
+                && transient.contains("api")
+                && transient.contains("/tmp/repo-feature")
+                && transient.contains("isolated checkout"),
+            "the transient names the source, destination path, and that it is a checkout: {transient:?}"
         );
     }
 
@@ -3623,7 +3763,7 @@ mod tests {
     fn launcher_quick_select_number_launches_the_shell_row() {
         let mut app = App::new();
         attached(&mut app);
-        app.open_launcher(false);
+        app.open_launcher(false, None);
         // The shell row follows the registry agents; its number launches it.
         let shell_number = Registry::default().specs().len() + 1;
         let digit = char::from_digit(shell_number as u32, 10).unwrap();
@@ -3644,7 +3784,7 @@ mod tests {
     fn launcher_command_row_opens_an_input_that_runs_via_shell_lc() {
         let mut app = App::new();
         attached(&mut app);
-        app.open_launcher(false);
+        app.open_launcher(false, None);
         // The command row is last; select it by number to open the input.
         let command_number = Registry::default().specs().len() + 2;
         let digit = char::from_digit(command_number as u32, 10).unwrap();
@@ -3673,7 +3813,7 @@ mod tests {
     fn launcher_command_esc_backs_up_to_the_picker() {
         let mut app = App::new();
         attached(&mut app);
-        app.open_launcher(false);
+        app.open_launcher(false, None);
         let command_number = Registry::default().specs().len() + 2;
         let digit = char::from_digit(command_number as u32, 10).unwrap();
         app.on_key(plain(digit));

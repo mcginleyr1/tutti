@@ -102,9 +102,11 @@ stays out of the way: a mode chip on the left when you leave terminal mode
 (`SIDEBAR`, `SCROLL`, …) and the standing hint on the right; a transient fires a
 one-line **notification band** just above it (accent for info, red for errors).
 
-**Run launcher** (`Ctrl+B r`): a floating ` run ` panel that answers "what should
-start here?" — one row per detected agent (`claude`, `codex`, …; a missing binary
-shows dim as `(not installed)` and can't be picked), plus `shell` and `command…`.
+**Run launcher** (`Ctrl+B r`): a floating ` run in <project> ` panel that answers
+"what should start here?" — one row per detected agent (`claude`, `codex`, …; a
+missing binary shows dim as `(not installed)` and can't be picked), plus `shell`
+and `command…`. Its title names the workspace the choice lands in, so it is never
+ambiguous where a pane will spawn.
 Move with `j/k`/arrows, press a row's number to launch it outright, `enter`
 launches the highlight, `esc` closes; `command…` opens a one-line input that runs
 whatever you type via your login shell. Adding a project (`n`) opens the launcher
@@ -232,7 +234,11 @@ that section down to its header, or click again to expand it.
 
 Press the prefix then `w` to focus the sidebar (revealing it if hidden). While
 focused, `j`/`k` (or the arrows) move the highlight across both sections, `Enter`
-jumps and hands focus back to the pane, `esc`/`w` unfocus, and `n` opens the
+jumps and hands focus back to the pane, and `esc`/`w` unfocus. `r` **runs** an
+agent (or shell/command) in the selected project: it jumps to that workspace and
+opens the launcher over it, so the choice lands in a new pane in its tab (an
+agent row targets the workspace that owns it) — reach for `r`, not `f`, when you
+just want another agent in the checkout you already have. `n` opens the
 **add-project** prompt — a one-line field for the path to an *existing* directory
 to open (it mounts that directory as a workspace; it never creates one). The
 field prefills the common parent of your current projects, so you type just the
@@ -246,12 +252,13 @@ opens the selected workspace's **jj diff** in an ephemeral pane — a real termi
 running `jj diff | less -R`, coloured, that vanishes the moment you quit `less`
 (pressing `d` on an agent row opens the diff for the agent's workspace). A
 non-jj workspace shows a transient error instead of spawning. `f`
-[**forks**](#forked-workspaces) the selected workspace: it opens a `fork as:`
-field at the sidebar's foot for the fork name (`[A-Za-z0-9_-]+`; a bad name flashes
-the rule, `esc` cancels), and on success jumps to the new fork and opens the
-launcher to pick the agent to run beside its shell (pressing `f` on an
-agent row forks the agent's workspace; a non-jj source surfaces the server's
-error). `u` runs `jj workspace update-stale` on a fork whose row shows the
+[**forks**](#forked-workspaces) the selected workspace onto a **new isolated
+checkout** (a separate directory, a distinct project entry — not another pane in
+this one): it opens a `fork as:` field at the sidebar's foot for the fork name
+(`[A-Za-z0-9_-]+`; a bad name flashes the rule, `esc` cancels), and on success
+jumps to the new fork, flashes what it made and where, and opens the launcher to
+pick the agent to run beside its shell (pressing `f` on an agent row forks the
+agent's workspace; a non-jj source surfaces the server's error). `u` runs `jj workspace update-stale` on a fork whose row shows the
 **stale** tag, clearing it; on a healthy row it just flashes `not stale`. `x`
 **kills** the selected workspace after a one-line confirm — `y` removes it from
 tutti (leaving its checkout on disk), `D` also **discards** a fork's checkout
@@ -287,11 +294,17 @@ specific revision; the name must be `[A-Za-z0-9_-]+` (it becomes both a path
 component and a jj workspace name). The source workspace must live under a `.jj`
 repo, and the destination must not already exist — neither is silently reused.
 
+Fork creates a **new project entry** pointing at a **sibling checkout on disk** —
+it is not "run another agent in this project". When you just want a second agent
+in the checkout you already have, use `r` (run) on the sidebar row instead: it
+opens the launcher over that same workspace, no new directory.
+
 From the TUI this is a five-keystroke flow off the sidebar: `C-b w` focuses the
 sidebar, `f` opens the `fork as:` field on the selected workspace (or the
 workspace owning a selected agent row), you type the name and press `Enter`, and
-tutti jumps to the fresh fork and opens the launcher so you immediately pick the
-agent to run beside its shell.
+tutti jumps to the fresh fork, flashes `forked <src> → <path> (isolated
+checkout)` so you can see what was created and where, and opens the launcher so
+you immediately pick the agent to run beside its shell.
 
 Because several workspaces share one repo, a fork's working copy can go **stale**
 when its `@` is rewritten from elsewhere. Tutti surfaces this as a dim-red

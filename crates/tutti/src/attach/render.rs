@@ -98,13 +98,16 @@ fn paint_bg(frame: &mut Frame, area: Rect, bg: Option<Color>) {
     }
 }
 
-/// The sidebar-mode key hint, rendered two-tone in the bottom bar.
+/// The sidebar-mode key hint, rendered two-tone in the bottom bar. `j/k move` is
+/// dropped as table-stakes list navigation (the help overlay still documents it)
+/// to make room for `r run`; `f` is labelled `fork checkout` so the new-checkout
+/// cost reads at a glance.
 const SIDEBAR_HINT: &[(&str, &str)] = &[
-    ("j/k", "move"),
     ("enter", "jump"),
     ("n", "add project"),
     ("d", "diff"),
-    ("f", "fork"),
+    ("r", "run"),
+    ("f", "fork checkout"),
     ("u", "update"),
     ("x", "kill"),
     ("esc", "back"),
@@ -1000,11 +1003,11 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// The agent launcher overlay: a centred rounded panel titled ` run ` listing
-/// what can start in a pane — the registry agents (dim-italic and
-/// `(not installed)` when their binary is absent), then the shell and command
-/// rows. The selected row takes an accent `❯` marker and accent name; each row
-/// shows its quick-select number.
+/// The agent launcher overlay: a centred rounded panel titled
+/// ` run in <workspace> ` listing what can start in a pane — the registry agents
+/// (dim-italic and `(not installed)` when their binary is absent), then the
+/// shell and command rows. The selected row takes an accent `❯` marker and
+/// accent name; each row shows its quick-select number.
 fn draw_launcher(frame: &mut Frame, app: &App, area: Rect) {
     let selected = app.launcher_selected();
     let mut lines: Vec<Line> = app
@@ -1014,7 +1017,7 @@ fn draw_launcher(frame: &mut Frame, app: &App, area: Rect) {
         .map(|(i, row)| launcher_line(i, row, i == selected))
         .collect();
     lines.push(popup_key_line("esc", "cancel"));
-    draw_centered_popup(frame, app, area, " run ", lines);
+    draw_centered_popup(frame, app, area, &app.launcher_title(), lines);
 }
 
 /// One launcher row: `<n>  <name>   <role>`, an accent `❯` marker and accent
@@ -1053,8 +1056,8 @@ fn launcher_line(idx: usize, row: &LauncherRow, selected: bool) -> Line<'static>
 }
 
 /// The launcher's free-form command input: a centred rounded panel titled
-/// ` run ` with a single `▍run: <text>█` line, mirroring the sidebar prompt's
-/// accent-bar input.
+/// ` run in <workspace> ` with a single `▍run: <text>█` line, mirroring the
+/// sidebar prompt's accent-bar input.
 fn draw_launcher_command(frame: &mut Frame, app: &App, area: Rect) {
     let line = Line::from(vec![
         Span::styled("▍", Style::default().fg(ACCENT)),
@@ -1069,18 +1072,13 @@ fn draw_launcher_command(frame: &mut Frame, app: &App, area: Rect) {
     let y = area.y + area.height.saturating_sub(height) / 2;
     let popup = Rect::new(x, y, width, height);
     frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new(line).block(popup_block(app, " run ")), popup);
+    let title = app.launcher_title();
+    frame.render_widget(Paragraph::new(line).block(popup_block(app, &title)), popup);
 }
 
 /// Render `lines` in a rounded, chrome-shaded panel titled `title`, centred over
 /// `area`. Shared by the launcher picker with the help/which-key panel look.
-fn draw_centered_popup(
-    frame: &mut Frame,
-    app: &App,
-    area: Rect,
-    title: &'static str,
-    lines: Vec<Line>,
-) {
+fn draw_centered_popup(frame: &mut Frame, app: &App, area: Rect, title: &str, lines: Vec<Line>) {
     let inner_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
     let width = (inner_w + 2).min(area.width);
     let height = (lines.len() as u16 + 2).min(area.height);
@@ -1093,7 +1091,7 @@ fn draw_centered_popup(
 
 /// A floating panel's block: a rounded dim border carrying `title`, with the
 /// chrome shade when the terminal allows it.
-fn popup_block(app: &App, title: &'static str) -> Block<'static> {
+fn popup_block<'a>(app: &App, title: &'a str) -> Block<'a> {
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1144,6 +1142,8 @@ fn help_lines(cfg: &Config) -> Vec<Line<'static>> {
     lines.push(popup_key_line("  Alt+x", "kill pane"));
     lines.push(Line::from(String::new()));
     lines.push(Line::from("sidebar (after C-b w):".to_string()));
+    lines.push(popup_key_line("  j/k", "move"));
+    lines.push(popup_key_line("  r", "run in project"));
     lines.push(popup_key_line("  n / d", "add project / diff"));
     lines.push(popup_key_line("  f / u", "fork / update stale"));
     lines.push(popup_key_line("  x", "kill workspace"));
@@ -2162,6 +2162,52 @@ mod tests {
         assert!(
             text.contains("command"),
             "the command row is missing: {text:?}"
+        );
+    }
+
+    #[test]
+    fn launcher_title_names_the_target_workspace() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = app_two_workspaces();
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        app.sync_sizes(Rect::new(0, 0, 100, 20));
+        // Focus the sidebar and run in the selected (first) workspace, `api`.
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Launcher);
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("run in api"),
+            "the launcher panel title names the target workspace: {text:?}"
+        );
+    }
+
+    #[test]
+    fn sidebar_footer_hint_offers_run_and_drops_move() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = app_two_workspaces();
+        // A wide terminal so the full-width footer hint renders untruncated.
+        let mut terminal = Terminal::new(TestBackend::new(140, 16)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        app.sync_sizes(Rect::new(0, 0, 140, 16));
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let footer = row_text(terminal.backend().buffer(), 15);
+        assert!(
+            footer.contains("run"),
+            "the sidebar hint offers run: {footer:?}"
+        );
+        assert!(
+            footer.contains("fork checkout"),
+            "and labels fork as a new checkout: {footer:?}"
+        );
+        assert!(
+            !footer.contains("move"),
+            "and drops the table-stakes j/k move pair: {footer:?}"
         );
     }
 
