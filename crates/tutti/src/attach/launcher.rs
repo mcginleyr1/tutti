@@ -41,28 +41,40 @@ impl LauncherRow {
     }
 }
 
-/// Build the launcher rows: one per registry agent spec (bold name, dim role,
-/// dimmed and unselectable when its binary is absent from `path`), then the two
-/// fixed rows — the login shell and the free-form command entry.
+/// Build the launcher rows: the **installed** agents first (registry order,
+/// bold name, the product name as the dim role), then the two fixed rows —
+/// the login shell and the free-form command entry — then the rest of the
+/// catalog dim and unselectable at the foot, each showing its project link so
+/// the picker doubles as "what else is out there". Resume rows are inserted
+/// between the fixed rows and the catalog by the caller.
 pub fn build_rows(registry: &Registry, path: Option<&OsStr>) -> Vec<LauncherRow> {
+    let agent_row = |spec: &tutti_agents::AgentSpec, available: bool| {
+        let name = spec.kind.to_string();
+        let command = spec
+            .process_names
+            .first()
+            .cloned()
+            .unwrap_or_else(|| name.clone());
+        let role = if available {
+            spec.display.clone()
+        } else {
+            format!("{} · {}", spec.display, short_url(&spec.url))
+        };
+        LauncherRow {
+            name,
+            role,
+            kind: LaunchKind::Agent(command),
+            available,
+        }
+    };
+    let installed =
+        |spec: &&tutti_agents::AgentSpec| spec.process_names.iter().any(|n| on_path(n, path));
+
     let mut rows: Vec<LauncherRow> = registry
         .specs()
         .iter()
-        .map(|spec| {
-            let name = spec.kind.to_string();
-            let available = spec.process_names.iter().any(|n| on_path(n, path));
-            let command = spec
-                .process_names
-                .first()
-                .cloned()
-                .unwrap_or_else(|| name.clone());
-            LauncherRow {
-                role: role_label(&name),
-                name,
-                kind: LaunchKind::Agent(command),
-                available,
-            }
-        })
+        .filter(installed)
+        .map(|spec| agent_row(spec, true))
         .collect();
     rows.push(LauncherRow {
         name: "shell".into(),
@@ -76,7 +88,27 @@ pub fn build_rows(registry: &Registry, path: Option<&OsStr>) -> Vec<LauncherRow>
         kind: LaunchKind::Command,
         available: true,
     });
+    rows.extend(
+        registry
+            .specs()
+            .iter()
+            .filter(|spec| !installed(spec))
+            .map(|spec| agent_row(spec, false)),
+    );
     rows
+}
+
+/// Where the caller inserts rows that must stay above the dim uninstalled
+/// catalog (the resume rows): right before the first unavailable row, or the
+/// end when everything is installed.
+pub fn catalog_start(rows: &[LauncherRow]) -> usize {
+    rows.iter().position(|r| !r.available).unwrap_or(rows.len())
+}
+
+/// A URL shortened for a dim launcher row: scheme and `www.` stripped.
+fn short_url(url: &str) -> &str {
+    let url = url.strip_prefix("https://").unwrap_or(url);
+    url.strip_prefix("www.").unwrap_or(url)
 }
 
 /// Rows for harvested conversations, appended below the fixed rows — the
@@ -128,17 +160,6 @@ fn truncate(text: &str, max: usize) -> String {
     let mut cut: String = text.chars().take(max.saturating_sub(1)).collect();
     cut.push('…');
     cut
-}
-
-/// A human one-line role for an agent kind, prettifying the known agents and
-/// falling back to the bare kind for a config-added one.
-fn role_label(kind: &str) -> String {
-    match kind {
-        "claude" => "Claude Code",
-        "codex" => "Codex",
-        other => other,
-    }
-    .to_string()
 }
 
 /// The user's login shell, `$SHELL` or `/bin/sh`. Shared with the app so the
@@ -255,18 +276,41 @@ mod tests {
         let path = std::ffi::OsString::from(&dir);
 
         let rows = build_rows(&Registry::default(), Some(path.as_os_str()));
-        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, vec!["claude", "codex", "shell", "command…"]);
+        // Installed agents lead, the fixed rows follow, and the rest of the
+        // catalog sits dim at the foot with its project links.
+        assert_eq!(rows[0].name, "claude");
         assert!(rows[0].available, "claude is on the fake PATH");
-        assert!(!rows[1].available, "codex is absent");
-        assert_eq!(rows[0].role, "Claude Code", "the agent role is prettified");
+        assert_eq!(
+            rows[0].role, "Claude Code",
+            "an installed row shows the product name"
+        );
         assert_eq!(rows[0].kind, LaunchKind::Agent("claude".into()));
+        assert!(matches!(rows[1].kind, LaunchKind::Shell));
+        assert!(matches!(rows[2].kind, LaunchKind::Command));
         assert!(
-            rows[2].available && rows[3].available,
+            rows[1].available && rows[2].available,
             "the fixed rows are always selectable"
         );
-        assert!(matches!(rows[2].kind, LaunchKind::Shell));
-        assert!(matches!(rows[3].kind, LaunchKind::Command));
+        assert_eq!(
+            catalog_start(&rows),
+            3,
+            "the dim catalog starts after the fixed rows"
+        );
+        assert_eq!(
+            rows.len(),
+            Registry::default().specs().len() + 2,
+            "every catalog agent gets a row"
+        );
+        let codex = rows[3..].iter().find(|r| r.name == "codex").unwrap();
+        assert!(!codex.available, "codex is absent from the fake PATH");
+        assert_eq!(
+            codex.role, "Codex CLI · github.com/openai/codex",
+            "an uninstalled row links to the project, scheme stripped"
+        );
+        assert!(
+            rows[3..].iter().all(|r| !r.available),
+            "everything after the fixed rows is the uninstalled catalog"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -19,9 +19,25 @@ You need:
   anywhere; the workspace-level VCS features (per-workspace diffs, nested
   [workspaces](#workspaces) on isolated checkouts, merge-back, branch display)
   are prescriptive: they require jj — there are no git/mercurial adapters.
-- **The agents themselves** (`claude`, `codex`, …) on your `PATH`. Tutti
-  detects and drives them; it does not install them. A missing agent simply
-  shows dim in the launcher.
+- **The agents themselves** on your `PATH`. Tutti detects and drives them; it
+  does not install them. The recognized catalog: [Claude
+  Code](https://claude.com/claude-code), [Codex
+  CLI](https://github.com/openai/codex), [Gemini
+  CLI](https://github.com/google-gemini/gemini-cli),
+  [OpenCode](https://opencode.ai),
+  [Crush](https://github.com/charmbracelet/crush), [Aider](https://aider.chat),
+  [Goose](https://github.com/block/goose),
+  [Pi](https://github.com/badlogic/pi-mono), [Qwen
+  Code](https://github.com/QwenLM/qwen-code), [Cursor
+  CLI](https://cursor.com/cli), [Copilot
+  CLI](https://github.com/github/copilot-cli), [Amp](https://ampcode.com),
+  [Factory Droid](https://factory.ai), [Augment
+  Code](https://www.augmentcode.com), and [Amazon
+  Q](https://github.com/aws/amazon-q-developer-cli). A missing agent shows dim
+  in the launcher with its link, so the picker doubles as the install list.
+  Precise blocked/working/done detection is tuned per agent (Claude Code and
+  Codex today); the rest start from generic heuristics — see
+  `crates/tutti-agents/src/registry.rs`.
 
 From a checkout of this repository:
 
@@ -67,12 +83,12 @@ cd ~/code/myproject && tutti
    [Configuration](#configuration) — they mount automatically and the prompt
    is skipped.)
 
-2. **Pick what runs.** The run launcher opens over the new project: one row
-   per agent (`claude`, `codex`, …), a plain `shell`, and a free-form
+2. **Pick what runs.** The run launcher opens over the new project: your
+   installed agents first (`claude`, `crush`, …), a plain `shell`, a free-form
    `command…` — press a row's number or `Enter`. Conversations you had in that
-   directory before tutti appear as **resume rows** at the foot; picking one
-   continues it in a new pane. Later, `Ctrl+B r` reopens the launcher over
-   whatever project you are in.
+   directory before tutti appear as **resume rows**; below them, the rest of
+   the agent catalog sits dim with project links. Later, `Ctrl+B r` reopens
+   the launcher over whatever project you are in.
 
 3. **Split and move.** `Ctrl+B %` splits right, `Ctrl+B "` splits down;
    `Ctrl+h/j/k/l` moves between panes, `Ctrl+B z` zooms one. Run more agents
@@ -151,10 +167,13 @@ stays out of the way: a mode chip on the left when you leave terminal mode
 one-line **notification band** just above it (accent for info, red for errors).
 
 **Run launcher** (`Ctrl+B r`): a floating ` run in <project> ` panel that answers
-"what should start here?" — one row per detected agent (`claude`, `codex`, …; a
-missing binary shows dim as `(not installed)` and can't be picked), plus `shell`
-and `command…`. Its title names the workspace the choice lands in, so it is never
-ambiguous where a pane will spawn.
+"what should start here?" — the agents **installed on this machine** first
+(`claude`, `crush`, …), then `shell` and `command…`, then the rest of tutti's
+agent catalog dim and unselectable at the foot, each row naming the product and
+its project link (`gemini   Gemini CLI · github.com/google-gemini/gemini-cli`)
+so the picker doubles as "what else is out there". Its title names the
+workspace the choice lands in, so it is never ambiguous where a pane will
+spawn.
 Move with `j/k`/arrows, press a row's number to launch it outright, `enter`
 launches the highlight, `esc` closes; `command…` opens a one-line input that runs
 whatever you type via your login shell. Adding a project (`n`) opens the launcher

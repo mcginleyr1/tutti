@@ -1104,10 +1104,12 @@ fn draw_launcher(frame: &mut Frame, app: &App, area: Rect) {
 fn launcher_line(idx: usize, row: &LauncherRow, selected: bool) -> Line<'static> {
     let num = Span::styled(format!(" {} ", idx + 1), dim());
     if !row.available {
+        // The dim catalog foot: not selectable, the role already carries the
+        // product name and its project link.
         return Line::from(vec![
             num,
             Span::styled(
-                format!("  {}   {}  (not installed)", row.name, row.role),
+                format!("  {}   {}", row.name, row.role),
                 dim().add_modifier(Modifier::ITALIC),
             ),
         ]);
@@ -2366,8 +2368,14 @@ mod tests {
         let mut app = app_with_pane(b"hi");
         app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
         app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
-        // The command row is last; select it by its number to open the input.
-        let command_number = tutti_agents::Registry::default().specs().len() + 2;
+        // Find the command row, whatever this machine has on PATH.
+        use crate::attach::launcher::LaunchKind;
+        let command_number = app
+            .launcher_rows()
+            .iter()
+            .position(|r| matches!(r.kind, LaunchKind::Command))
+            .unwrap()
+            + 1;
         let digit = char::from_digit(command_number as u32, 10).unwrap();
         app.on_key(KeyEvent::new(KeyCode::Char(digit), KeyModifiers::NONE));
         assert_eq!(app.mode, Mode::LauncherCommand);

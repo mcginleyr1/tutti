@@ -1518,11 +1518,12 @@ impl App {
             launcher::build_rows(&Registry::default(), std::env::var_os("PATH").as_deref());
         if let (Some(dir), Some(home)) = (dir, self.resume_home.as_deref()) {
             let sessions = tutti_agents::resume_sessions(dir, home, 3);
-            self.launcher.extend(launcher::resume_rows(
-                &sessions,
-                &self.launcher,
-                std::time::SystemTime::now(),
-            ));
+            let resume =
+                launcher::resume_rows(&sessions, &self.launcher, std::time::SystemTime::now());
+            // Resume rows sit between the fixed rows and the dim uninstalled
+            // catalog, so the actionable part of the picker stays together.
+            let at = launcher::catalog_start(&self.launcher);
+            self.launcher.splice(at..at, resume);
         }
         self.launcher_selected = launcher::first_selectable(&self.launcher);
         self.launcher_after_add = after_add;
@@ -4380,16 +4381,23 @@ mod tests {
         focus_sidebar(&mut app);
         app.on_key(plain('r')); // run in the selected (first) workspace
         assert_eq!(app.mode, Mode::Launcher);
-        let last = app.launcher_rows().last().unwrap();
-        assert_eq!(last.name, "resume", "the harvest appends at the foot");
+        let rows = app.launcher_rows();
+        let idx = rows
+            .iter()
+            .position(|r| r.name == "resume")
+            .expect("a resume row for the harvested conversation");
         assert!(
-            last.role.contains("wire the resume rows"),
+            rows[idx].role.contains("wire the resume rows"),
             "the row carries the conversation's first prompt: {}",
-            last.role
+            rows[idx].role
         );
         assert_eq!(
-            last.kind,
+            rows[idx].kind,
             LaunchKind::Resume(vec!["claude".into(), "--resume".into(), "sess-1".into()])
+        );
+        assert!(
+            rows[idx + 1..].iter().all(|r| !r.available),
+            "resume sits above the dim uninstalled catalog"
         );
 
         std::fs::remove_dir_all(&home).ok();
@@ -4400,8 +4408,14 @@ mod tests {
         let mut app = App::new();
         attached(&mut app);
         app.open_launcher(false, None, None);
-        // The shell row follows the registry agents; its number launches it.
-        let shell_number = Registry::default().specs().len() + 1;
+        // The shell row follows the installed agents; find it, whatever this
+        // machine has on PATH, and launch it by number.
+        let shell_number = app
+            .launcher_rows()
+            .iter()
+            .position(|r| matches!(r.kind, LaunchKind::Shell))
+            .unwrap()
+            + 1;
         let digit = char::from_digit(shell_number as u32, 10).unwrap();
         let out = app.on_key(plain(digit));
         assert_eq!(
@@ -4421,8 +4435,13 @@ mod tests {
         let mut app = App::new();
         attached(&mut app);
         app.open_launcher(false, None, None);
-        // The command row is last; select it by number to open the input.
-        let command_number = Registry::default().specs().len() + 2;
+        // Find the command row, whatever this machine has on PATH.
+        let command_number = app
+            .launcher_rows()
+            .iter()
+            .position(|r| matches!(r.kind, LaunchKind::Command))
+            .unwrap()
+            + 1;
         let digit = char::from_digit(command_number as u32, 10).unwrap();
         let out = app.on_key(plain(digit));
         assert!(out.is_empty(), "opening the command input emits nothing");
@@ -4450,7 +4469,12 @@ mod tests {
         let mut app = App::new();
         attached(&mut app);
         app.open_launcher(false, None, None);
-        let command_number = Registry::default().specs().len() + 2;
+        let command_number = app
+            .launcher_rows()
+            .iter()
+            .position(|r| matches!(r.kind, LaunchKind::Command))
+            .unwrap()
+            + 1;
         let digit = char::from_digit(command_number as u32, 10).unwrap();
         app.on_key(plain(digit));
         app.on_key(plain('x'));

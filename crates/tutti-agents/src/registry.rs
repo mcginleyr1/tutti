@@ -38,6 +38,11 @@ impl ProcessTree {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSpec {
     pub kind: AgentKind,
+    /// The human product name, for the launcher rows (`Claude Code`, `Crush`).
+    pub display: String,
+    /// The project's home, shown on a dim launcher row when the binary is not
+    /// installed so the catalog doubles as a "where to get it" pointer.
+    pub url: String,
     pub process_names: Vec<String>,
     pub blocked_patterns: Vec<String>,
     pub working_patterns: Vec<String>,
@@ -52,8 +57,11 @@ impl AgentSpec {
     /// can appear anywhere, so they are matched against the whole screen.
     const TAIL_LINES: usize = 15;
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         kind: &str,
+        display: &str,
+        url: &str,
         process_names: &[&str],
         blocked_patterns: &[&str],
         working_patterns: &[&str],
@@ -61,6 +69,8 @@ impl AgentSpec {
     ) -> Self {
         AgentSpec {
             kind: kind.into(),
+            display: display.into(),
+            url: url.into(),
             process_names: owned(process_names),
             blocked_patterns: owned(blocked_patterns),
             working_patterns: owned(working_patterns),
@@ -147,12 +157,25 @@ impl Registry {
     }
 }
 
+/// The generic guess patterns newcomer agents ship with until someone tunes
+/// them against a live pane: permission-ish words for Blocked, spinner-ish
+/// words for Working, and — deliberately — no Done marker: an empty list never
+/// fires, which beats a generic prompt glyph misfiring. Detection by process
+/// name is the reliable part; states fall back to activity heuristics.
+const GUESS_BLOCKED: &[&str] = &["y/n", "Allow"];
+const GUESS_WORKING: &[&str] = &["esc to interrupt", "esc to cancel", "Working", "Thinking"];
+
 impl Default for Registry {
     fn default() -> Self {
+        let guess = |kind: &str, display: &str, url: &str, names: &[&str]| {
+            AgentSpec::new(kind, display, url, names, GUESS_BLOCKED, GUESS_WORKING, &[])
+        };
         Registry {
             specs: vec![
                 AgentSpec::new(
                     "claude",
+                    "Claude Code",
+                    "https://claude.com/claude-code",
                     &["claude"],
                     &["Do you want", "y/n", "Waiting for your input", "permission"],
                     &["esc to interrupt", "Thinking", "Running"],
@@ -160,10 +183,71 @@ impl Default for Registry {
                 ),
                 AgentSpec::new(
                     "codex",
+                    "Codex CLI",
+                    "https://github.com/openai/codex",
                     &["codex"],
                     &["Allow command", "approve", "y/n"],
                     &["esc to interrupt", "Working", "Thinking"],
                     &["»"],
+                ),
+                // The catalog: name-detection plus guess patterns only. crush
+                // resumes via `crush --session <id>`, but its store is sqlite,
+                // so the resume harvest stays claude-only for now.
+                guess(
+                    "gemini",
+                    "Gemini CLI",
+                    "https://github.com/google-gemini/gemini-cli",
+                    &["gemini"],
+                ),
+                guess("opencode", "OpenCode", "https://opencode.ai", &["opencode"]),
+                guess(
+                    "crush",
+                    "Crush",
+                    "https://github.com/charmbracelet/crush",
+                    &["crush"],
+                ),
+                guess("aider", "Aider", "https://aider.chat", &["aider"]),
+                guess(
+                    "goose",
+                    "Goose",
+                    "https://github.com/block/goose",
+                    &["goose"],
+                ),
+                guess("pi", "Pi", "https://github.com/badlogic/pi-mono", &["pi"]),
+                guess(
+                    "qwen",
+                    "Qwen Code",
+                    "https://github.com/QwenLM/qwen-code",
+                    &["qwen"],
+                ),
+                guess(
+                    "cursor",
+                    "Cursor CLI",
+                    "https://cursor.com/cli",
+                    &["cursor-agent"],
+                ),
+                guess(
+                    "copilot",
+                    "Copilot CLI",
+                    "https://github.com/github/copilot-cli",
+                    &["copilot"],
+                ),
+                guess("amp", "Amp", "https://ampcode.com", &["amp"]),
+                guess("droid", "Factory Droid", "https://factory.ai", &["droid"]),
+                guess(
+                    "auggie",
+                    "Augment Code",
+                    "https://www.augmentcode.com",
+                    &["auggie"],
+                ),
+                // Amazon Q's binary is literally `q`, which can collide with
+                // other tools of that name (kdb+); the cost of a false match is
+                // only a mislabelled badge, so it stays in.
+                guess(
+                    "amazon-q",
+                    "Amazon Q",
+                    "https://github.com/aws/amazon-q-developer-cli",
+                    &["q"],
                 ),
             ],
         }
@@ -356,16 +440,49 @@ mod tests {
     #[test]
     fn registry_is_extensible() {
         let mut reg = Registry::default();
+        let seeded = reg.specs().len();
         reg.add(AgentSpec::new(
-            "cursor",
-            &["cursor-agent"],
+            "myagent",
+            "My Agent",
+            "https://example.com/myagent",
+            &["myagent-cli"],
             &["Approve?"],
             &["Generating"],
             &["›"],
         ));
-        assert_eq!(reg.specs().len(), 3);
-        let spec = reg.match_process("/usr/bin/cursor-agent").unwrap();
-        assert_eq!(spec.kind, AgentKind::from("cursor"));
+        assert_eq!(reg.specs().len(), seeded + 1);
+        let spec = reg.match_process("/usr/bin/myagent-cli").unwrap();
+        assert_eq!(spec.kind, AgentKind::from("myagent"));
         assert_eq!(spec.classify("Generating code"), Some(Observation::Working));
+    }
+
+    #[test]
+    fn catalog_agents_match_by_process_name() {
+        let reg = Registry::default();
+        for (process, kind) in [
+            ("crush", "crush"),
+            ("opencode", "opencode"),
+            ("pi", "pi"),
+            ("gemini", "gemini"),
+            ("aider", "aider"),
+            ("goose", "goose"),
+            ("qwen", "qwen"),
+            ("cursor-agent", "cursor"),
+            ("copilot", "copilot"),
+            ("amp", "amp"),
+            ("droid", "droid"),
+            ("auggie", "auggie"),
+            ("q", "amazon-q"),
+        ] {
+            let spec = reg.match_process(process).unwrap_or_else(|| {
+                panic!("{process} should match a catalog entry");
+            });
+            assert_eq!(spec.kind, AgentKind::from(kind));
+            assert!(!spec.display.is_empty() && spec.url.starts_with("https://"));
+            assert!(
+                spec.done_patterns.is_empty(),
+                "catalog newcomers carry no done marker until tuned live"
+            );
+        }
     }
 }
