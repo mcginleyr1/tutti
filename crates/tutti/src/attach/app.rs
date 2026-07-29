@@ -153,6 +153,13 @@ pub struct App {
     launcher_after_add: bool,
     /// The command line typed in the launcher's `command…` input.
     launcher_command: String,
+    /// When set, the next launch first creates a fresh tab in this workspace
+    /// (`TabNew` then the run): the sidebar's new-agent flow, where an agent
+    /// gets its own tab rather than splitting an existing one.
+    launcher_new_tab: Option<WorkspaceId>,
+    /// When set, the next launch replaces this exited pane: run in the corpse's
+    /// tab, then kill the corpse. Armed by `r` on a focused exited pane.
+    launcher_replace: Option<PaneId>,
     /// The name of the workspace the open launcher targets, shown in its title
     /// so the choice's destination is never ambiguous. `None` renders a bare
     /// ` run ` title.
@@ -246,6 +253,8 @@ impl App {
             launcher_selected: 0,
             launcher_after_add: false,
             launcher_command: String::new(),
+            launcher_new_tab: None,
+            launcher_replace: None,
             launcher_target: None,
             resume_home: std::env::var_os("HOME").map(PathBuf::from),
             sidebar_rect: None,
@@ -606,11 +615,26 @@ impl App {
         if let Some(action) = self.config.keys.action_for(key) {
             return self.direct_action(action);
         }
+        // An exited pane has no child to type at; the two keys its title
+        // advertises act on the corpse instead: relaunch or close.
+        if let Some(pane) = self.focused
+            && key.modifiers.is_empty()
+            && self
+                .panes
+                .get(&pane)
+                .is_some_and(|s| s.info.exited.is_some())
+        {
+            match key.code {
+                KeyCode::Char('r') => return self.relaunch_exited(pane),
+                KeyCode::Char('x') => return vec![control(&Request::PaneKill { pane })],
+                _ => {}
+            }
+        }
         match (self.focused, input::encode_key(key)) {
             (Some(pane), Some(bytes)) => vec![WireFrame::Input { pane, bytes }],
             // No pane to type into: honor the dashboard's advertised key so
-            // `n → add a project` works without focusing the sidebar first.
-            (None, _) if key.code == KeyCode::Char('n') && key.modifiers.is_empty() => {
+            // `a → add a project` works without focusing the sidebar first.
+            (None, _) if key.code == KeyCode::Char('a') && key.modifiers.is_empty() => {
                 self.mode = Mode::Sidebar;
                 self.open_project_prompt();
                 Vec::new()
@@ -1057,8 +1081,8 @@ impl App {
                 Vec::new()
             }
             KeyCode::Enter => self.jump_to_selected(&sidebar),
-            KeyCode::Char('r') => self.run_in_selected(&sidebar),
-            KeyCode::Char('n') => {
+            KeyCode::Char('n') => self.new_agent_in_selected(&sidebar),
+            KeyCode::Char('a') => {
                 self.open_project_prompt();
                 Vec::new()
             }
@@ -1109,16 +1133,17 @@ impl App {
     }
 
     /// Jump to the selected entry's workspace — its active-or-first tab, the
-    /// same routing a workspace-row Enter uses — and open the launcher over it,
-    /// so one keystroke goes from the project list to picking what runs in a new
-    /// pane in that tab. An agent row targets the workspace that owns it.
-    fn run_in_selected(&mut self, sidebar: &Sidebar) -> Vec<WireFrame> {
-        let Some((tab, name, dir)) = self.selected_workspace(sidebar).and_then(|w| {
+    /// same routing a workspace-row Enter uses — and open the launcher armed to
+    /// start the choice in a fresh tab there: an agent is a tab-sized thing, so
+    /// it never splits whatever that tab already holds. Splits stay behind the
+    /// explicit prefix verbs. An agent row targets the workspace that owns it.
+    fn new_agent_in_selected(&mut self, sidebar: &Sidebar) -> Vec<WireFrame> {
+        let Some((workspace, tab, name, dir)) = self.selected_workspace(sidebar).and_then(|w| {
             w.tabs
                 .iter()
                 .find(|t| t.active)
                 .or_else(|| w.tabs.first())
-                .map(|t| (t.id, w.name.clone(), w.dir.clone()))
+                .map(|t| (w.id, t.id, w.name.clone(), w.dir.clone()))
         }) else {
             return Vec::new();
         };
@@ -1126,6 +1151,7 @@ impl App {
         self.zoom = false;
         self.refocus();
         self.open_launcher(false, Some(name), Some(&dir));
+        self.launcher_new_tab = Some(workspace);
         vec![control(&Request::TabSelect { id: tab })]
     }
 
@@ -1201,6 +1227,35 @@ impl App {
         self.workspaces
             .iter()
             .find(|w| w.tabs.iter().any(|t| t.id == tab))
+    }
+
+    /// The tab whose layout holds `pane`, if the current view carries it.
+    fn tab_of_pane(&self, pane: PaneId) -> Option<TabId> {
+        self.workspaces
+            .iter()
+            .flat_map(|w| &w.tabs)
+            .find(|t| t.layout.as_ref().is_some_and(|l| l.panes().contains(&pane)))
+            .map(|t| t.id)
+    }
+
+    /// Open the launcher over an exited pane's workspace, armed to replace the
+    /// corpse — resume rows surface first, so a dead agent is one `r` and an
+    /// enter from picking its conversation back up.
+    fn relaunch_exited(&mut self, pane: PaneId) -> Vec<WireFrame> {
+        let Some(tab) = self.tab_of_pane(pane) else {
+            return Vec::new();
+        };
+        let Some((name, dir)) = self
+            .workspaces
+            .iter()
+            .find(|w| w.tabs.iter().any(|t| t.id == tab))
+            .map(|w| (w.name.clone(), w.dir.clone()))
+        else {
+            return Vec::new();
+        };
+        self.open_launcher(false, Some(name), Some(&dir));
+        self.launcher_replace = Some(pane);
+        Vec::new()
     }
 
     /// Open guided workspace creation for the selected entry's workspace: step 1,
@@ -1580,6 +1635,8 @@ impl App {
         self.launcher_selected = launcher::first_selectable(&self.launcher);
         self.launcher_after_add = after_add;
         self.launcher_command.clear();
+        self.launcher_new_tab = None;
+        self.launcher_replace = None;
         self.launcher_target = target;
         self.mode = Mode::Launcher;
         self.prefix_since = None;
@@ -1647,26 +1704,52 @@ impl App {
             _ => return Vec::new(),
         };
         match kind {
-            LaunchKind::Agent(cmd) => {
-                self.close_launcher();
-                vec![run_pane(vec![cmd])]
-            }
+            LaunchKind::Agent(cmd) => self.launch_frames(vec![cmd]),
             LaunchKind::Shell => self.launch_shell_and_close(),
             LaunchKind::Command => {
                 self.launcher_command.clear();
                 self.mode = Mode::LauncherCommand;
                 Vec::new()
             }
-            LaunchKind::Resume(cmd) => {
-                self.close_launcher();
-                vec![run_pane(cmd)]
-            }
+            LaunchKind::Resume(cmd) => self.launch_frames(cmd),
         }
     }
 
     fn launch_shell_and_close(&mut self) -> Vec<WireFrame> {
+        self.launch_frames(vec![launcher::login_shell()])
+    }
+
+    /// Close the launcher and produce the frames that start `cmd` where it was
+    /// aimed: a `TabNew` first when armed to give the choice its own tab, a run
+    /// into an exited pane's tab followed by that corpse's kill when armed to
+    /// replace it, else a plain run into the current tab. Requests share one
+    /// ordered connection, so the run always lands after the tab exists and
+    /// before the corpse goes.
+    fn launch_frames(&mut self, cmd: Vec<String>) -> Vec<WireFrame> {
+        let new_tab = self.launcher_new_tab.take();
+        let replace = self.launcher_replace.take();
         self.close_launcher();
-        vec![run_pane(vec![launcher::login_shell()])]
+        if let Some(workspace) = new_tab {
+            return vec![
+                control(&Request::TabNew {
+                    workspace: Some(workspace),
+                }),
+                run_pane(cmd),
+            ];
+        }
+        if let Some(corpse) = replace
+            && let Some(tab) = self.tab_of_pane(corpse)
+        {
+            return vec![
+                control(&Request::PaneRun {
+                    tab: Some(tab),
+                    cmd,
+                    ephemeral: false,
+                }),
+                control(&Request::PaneKill { pane: corpse }),
+            ];
+        }
+        vec![run_pane(cmd)]
     }
 
     /// Dismiss the launcher back to terminal mode, dropping its transient state.
@@ -1675,6 +1758,8 @@ impl App {
         self.launcher.clear();
         self.launcher_command.clear();
         self.launcher_after_add = false;
+        self.launcher_new_tab = None;
+        self.launcher_replace = None;
         self.launcher_target = None;
         self.status = None;
     }
@@ -1704,8 +1789,7 @@ impl App {
                 if input.is_empty() {
                     return Vec::new();
                 }
-                self.close_launcher();
-                vec![run_pane(vec![launcher::login_shell(), "-lc".into(), input])]
+                self.launch_frames(vec![launcher::login_shell(), "-lc".into(), input])
             }
             _ => Vec::new(),
         }
@@ -1823,11 +1907,22 @@ impl App {
         }
     }
 
+    /// A wheel tick over a pane, routed by what the pane's program declared: a
+    /// program that switched on mouse reporting gets the encoded wheel event
+    /// itself; an alternate-screen program without mouse reporting has no
+    /// scrollback to browse, so the wheel becomes arrow keys it can act on
+    /// (the xterm "alternate scroll" convention); only a primary-screen pane
+    /// enters tutti's frozen scrollback browse.
     fn mouse_scroll(&mut self, col: u16, row: u16, up: bool) -> Vec<WireFrame> {
         let Some(pane) = self.pane_at(col, row) else {
             return Vec::new();
         };
         self.focused = Some(pane);
+        if self.panes.get(&pane).is_some_and(|s| s.scroll.is_none())
+            && let Some(bytes) = self.forwarded_wheel(pane, col, row, up)
+        {
+            return vec![WireFrame::Input { pane, bytes }];
+        }
         let current = self.panes.get(&pane).and_then(|s| s.scroll).unwrap_or(0);
         let offset = if up {
             current + MOUSE_SCROLL_STEP
@@ -1844,6 +1939,32 @@ impl App {
         self.set_scroll(pane, Some(offset));
         self.set_status(format!("scroll -{offset} (q to exit)"));
         vec![control(&Request::PaneScroll { pane, offset })]
+    }
+
+    /// The bytes a wheel tick sends straight to `pane`'s child, or `None` for
+    /// a primary-screen pane whose scrollback tutti browses itself.
+    fn forwarded_wheel(&self, pane: PaneId, col: u16, row: u16, up: bool) -> Option<Vec<u8>> {
+        let screen = self.panes.get(&pane)?.parser.screen();
+        if screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None {
+            let rect = self
+                .rects
+                .iter()
+                .find(|(p, _)| *p == pane)
+                .map(|(_, r)| *r)?;
+            // 1-based cell within the pane interior (the rect includes the
+            // border row/column).
+            let x = col.saturating_sub(rect.x).max(1);
+            let y = row.saturating_sub(rect.y).max(1);
+            return Some(input::encode_wheel(
+                screen.mouse_protocol_encoding(),
+                up,
+                x,
+                y,
+            ));
+        }
+        screen
+            .alternate_screen()
+            .then(|| input::encode_wheel_arrows(screen.application_cursor(), up, MOUSE_SCROLL_STEP))
     }
 
     // ---- layout / sizing ------------------------------------------------
@@ -3208,16 +3329,16 @@ mod tests {
     }
 
     #[test]
-    fn r_on_a_workspace_row_jumps_to_it_and_opens_the_launcher_for_it() {
+    fn n_on_a_workspace_row_jumps_to_it_and_opens_the_launcher_for_it() {
         let mut app = App::new();
         attach_with(&mut app, view_two_workspaces());
         focus_sidebar(&mut app);
         app.on_key(plain('j')); // select the second workspace (web, tab 2)
-        let out = app.on_key(plain('r'));
+        let out = app.on_key(plain('n'));
         assert_eq!(
             out,
             vec![control(&Request::TabSelect { id: TabId(2) })],
-            "r jumps to the selected workspace's tab, the same routing as Enter"
+            "n jumps to the selected workspace's tab, the same routing as Enter"
         );
         assert_eq!(app.active_tab, Some(TabId(2)));
         assert_eq!(
@@ -3233,14 +3354,14 @@ mod tests {
     }
 
     #[test]
-    fn r_on_an_agent_row_runs_in_the_workspace_that_owns_it() {
+    fn n_on_an_agent_row_targets_the_workspace_that_owns_it() {
         let mut app = App::new();
         attach_with(&mut app, view_two_workspaces());
         focus_sidebar(&mut app);
         app.on_key(plain('j'));
         app.on_key(plain('j')); // first agent row, living in web's tab 2
         assert!(matches!(app.sidebar().entries[2], SidebarEntry::Agent(_)));
-        let out = app.on_key(plain('r'));
+        let out = app.on_key(plain('n'));
         assert_eq!(
             out,
             vec![control(&Request::TabSelect { id: TabId(2) })],
@@ -3252,6 +3373,72 @@ mod tests {
             app.launcher_title(),
             " run in web ",
             "and names that owning workspace in the launcher title"
+        );
+    }
+
+    #[test]
+    fn sidebar_n_launch_creates_a_tab_first_so_the_agent_never_splits() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        app.on_key(plain('j')); // select web (workspace 2)
+        app.on_key(plain('n'));
+        assert_eq!(app.mode, Mode::Launcher);
+        // Pin the rows so the test is independent of what PATH carries.
+        app.launcher = vec![LauncherRow {
+            name: "claude".into(),
+            role: "Claude Code".into(),
+            kind: LaunchKind::Agent("claude".into()),
+            available: true,
+        }];
+        app.launcher_selected = 0;
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            out,
+            vec![
+                control(&Request::TabNew {
+                    workspace: Some(WorkspaceId(2)),
+                }),
+                control(&Request::PaneRun {
+                    tab: None,
+                    cmd: vec!["claude".into()],
+                    ephemeral: false,
+                }),
+            ],
+            "the run follows a TabNew on the same ordered connection, so it \
+             lands in the fresh tab instead of splitting the current one"
+        );
+        assert_eq!(app.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn escaping_the_new_agent_launcher_disarms_the_tab_creation() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        app.on_key(plain('n'));
+        assert_eq!(app.mode, Mode::Launcher);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Terminal);
+        // A later launch through another door runs plainly into the current tab.
+        app.on_key(ctrl('b'));
+        app.on_key(plain('r'));
+        app.launcher = vec![LauncherRow {
+            name: "claude".into(),
+            role: "Claude Code".into(),
+            kind: LaunchKind::Agent("claude".into()),
+            available: true,
+        }];
+        app.launcher_selected = 0;
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            out,
+            vec![control(&Request::PaneRun {
+                tab: None,
+                cmd: vec!["claude".into()],
+                ephemeral: false,
+            })],
+            "esc dropped the armed TabNew; C-b r still runs in place"
         );
     }
 
@@ -3840,7 +4027,7 @@ mod tests {
         let mut app = App::new();
         attach_with(&mut app, view_two_workspaces());
         focus_sidebar(&mut app);
-        app.on_key(plain('n'));
+        app.on_key(plain('a'));
         assert_eq!(app.mode, Mode::SidebarPrompt);
         // Both fixture workspaces live at `/tmp/w`, so the prompt prefills their
         // common parent with a trailing slash — the user types just the name.
@@ -3919,13 +4106,13 @@ mod tests {
     }
 
     #[test]
-    fn n_opens_the_project_prompt_when_no_pane_can_take_input() {
+    fn a_opens_the_project_prompt_when_no_pane_can_take_input() {
         let mut app = App::new();
         assert_eq!(app.mode, Mode::Terminal);
-        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         assert!(
             app.sidebar_prompt_active(),
-            "with no panes, the dashboard's `n` must work from terminal mode"
+            "with no panes, the dashboard's `a` must work from terminal mode"
         );
     }
 
@@ -3992,8 +4179,8 @@ mod tests {
         let mut app = App::new();
         attach_with(&mut app, view_two_workspaces());
         focus_sidebar(&mut app);
-        app.on_key(plain('n'));
         app.on_key(plain('a'));
+        app.on_key(plain('n'));
         let out = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(out.is_empty());
         assert_eq!(app.mode, Mode::Sidebar);
@@ -4107,6 +4294,153 @@ mod tests {
                 workspace: Some(WorkspaceId(1)),
             })],
             "the + segment creates a tab in the active workspace"
+        );
+    }
+
+    // ---- mouse wheel ----------------------------------------------------
+
+    /// Seed pane 1's parser with `bytes` so its declared modes (alt screen,
+    /// mouse reporting) drive the wheel routing, and return its rect.
+    fn wheel_fixture(app: &mut App, bytes: &[u8]) -> Rect {
+        attached(app);
+        app.sync_sizes(Rect::new(0, 0, 100, 24));
+        app.handle_frame(WireFrame::PaneSnapshot(PaneData {
+            pane: PaneId(1),
+            rows: 20,
+            cols: 60,
+            seq: 0,
+            bytes: bytes.to_vec(),
+        }));
+        app.rects
+            .iter()
+            .find(|(p, _)| *p == PaneId(1))
+            .map(|(_, r)| *r)
+            .expect("pane 1 has a rect")
+    }
+
+    #[test]
+    fn wheel_over_an_alt_screen_pane_sends_arrows_instead_of_freezing() {
+        let mut app = App::new();
+        let rect = wheel_fixture(&mut app, b"\x1b[?1049h");
+        let out = app.on_mouse(MouseEventKind::ScrollUp, rect.x + 5, rect.y + 3);
+        assert_eq!(
+            out,
+            vec![WireFrame::Input {
+                pane: PaneId(1),
+                bytes: b"\x1b[A".repeat(MOUSE_SCROLL_STEP),
+            }],
+            "a full-screen TUI has no scrollback; the wheel becomes arrows"
+        );
+        assert_eq!(
+            app.mode,
+            Mode::Terminal,
+            "and never freezes into scroll mode"
+        );
+        let out = app.on_mouse(MouseEventKind::ScrollDown, rect.x + 5, rect.y + 3);
+        assert_eq!(
+            out,
+            vec![WireFrame::Input {
+                pane: PaneId(1),
+                bytes: b"\x1b[B".repeat(MOUSE_SCROLL_STEP),
+            }]
+        );
+    }
+
+    #[test]
+    fn wheel_over_a_mouse_reporting_pane_forwards_the_event() {
+        let mut app = App::new();
+        // Mouse press reporting on, SGR encoding on.
+        let rect = wheel_fixture(&mut app, b"\x1b[?1000h\x1b[?1006h");
+        let out = app.on_mouse(MouseEventKind::ScrollUp, rect.x + 5, rect.y + 3);
+        assert_eq!(
+            out,
+            vec![WireFrame::Input {
+                pane: PaneId(1),
+                bytes: b"\x1b[<64;5;3M".to_vec(),
+            }],
+            "the program asked for mouse events, so it gets the wheel itself"
+        );
+        assert_eq!(app.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn wheel_over_a_primary_screen_pane_still_browses_scrollback() {
+        let mut app = App::new();
+        let rect = wheel_fixture(&mut app, b"plain shell output");
+        let out = app.on_mouse(MouseEventKind::ScrollUp, rect.x + 2, rect.y + 2);
+        assert_eq!(
+            out,
+            vec![control(&Request::PaneScroll {
+                pane: PaneId(1),
+                offset: MOUSE_SCROLL_STEP,
+            })]
+        );
+        assert_eq!(app.mode, Mode::Scroll(PaneId(1)));
+    }
+
+    // ---- exited panes ---------------------------------------------------
+
+    fn view_one_exited_agent() -> Vec<WorkspaceView> {
+        let mut view = view_one_pane();
+        view[0].tabs[0].panes[0].agent = Some("claude".into());
+        view[0].tabs[0].panes[0].exited = Some(0);
+        view
+    }
+
+    #[test]
+    fn r_on_an_exited_pane_relaunches_into_its_tab_and_drops_the_corpse() {
+        let mut app = App::new();
+        attach_with(&mut app, view_one_exited_agent());
+        assert_eq!(app.focused, Some(PaneId(1)));
+        let out = app.on_key(plain('r'));
+        assert!(out.is_empty(), "r opens the launcher, sending nothing yet");
+        assert_eq!(app.mode, Mode::Launcher);
+        app.launcher = vec![LauncherRow {
+            name: "resume".into(),
+            role: "claude · now · fix the thing".into(),
+            kind: LaunchKind::Resume(vec!["claude".into(), "--resume".into(), "abc".into()]),
+            available: true,
+        }];
+        app.launcher_selected = 0;
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            out,
+            vec![
+                control(&Request::PaneRun {
+                    tab: Some(TabId(1)),
+                    cmd: vec!["claude".into(), "--resume".into(), "abc".into()],
+                    ephemeral: false,
+                }),
+                control(&Request::PaneKill { pane: PaneId(1) }),
+            ],
+            "the pick runs in the corpse's tab, then the corpse goes"
+        );
+    }
+
+    #[test]
+    fn x_on_an_exited_pane_closes_it_outright() {
+        let mut app = App::new();
+        attach_with(&mut app, view_one_exited_agent());
+        let out = app.on_key(plain('x'));
+        assert_eq!(
+            out,
+            vec![control(&Request::PaneKill { pane: PaneId(1) })],
+            "a corpse needs no kill confirm"
+        );
+    }
+
+    #[test]
+    fn r_at_a_live_pane_still_types_into_it() {
+        let mut app = App::new();
+        attached(&mut app);
+        let out = app.on_key(plain('r'));
+        assert_eq!(
+            out,
+            vec![WireFrame::Input {
+                pane: PaneId(1),
+                bytes: b"r".to_vec(),
+            }],
+            "the corpse keys only intercept once the child is gone"
         );
     }
 
@@ -4466,7 +4800,7 @@ mod tests {
         app.resume_home = Some(home.clone());
         attach_with(&mut app, view_two_workspaces());
         focus_sidebar(&mut app);
-        app.on_key(plain('r')); // run in the selected (first) workspace
+        app.on_key(plain('n')); // new agent in the selected (first) workspace
         assert_eq!(app.mode, Mode::Launcher);
         let rows = app.launcher_rows();
         let idx = rows

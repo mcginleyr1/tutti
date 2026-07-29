@@ -85,6 +85,46 @@ fn csi_tilde(num: u32, param: u32) -> Vec<u8> {
     }
 }
 
+/// The wheel-tick bytes for a program that enabled mouse reporting. Buttons
+/// 64/65 are wheel-up/down; coordinates are 1-based cells within the pane.
+/// SGR spells everything out in decimal; the legacy encodings offset each
+/// value by 32 into one byte (UTF-8 mode encodes that byte as a codepoint).
+pub fn encode_wheel(encoding: vt100::MouseProtocolEncoding, up: bool, x: u16, y: u16) -> Vec<u8> {
+    let button: u16 = if up { 64 } else { 65 };
+    match encoding {
+        vt100::MouseProtocolEncoding::Sgr => format!("\x1b[<{button};{x};{y}M").into_bytes(),
+        vt100::MouseProtocolEncoding::Utf8 => {
+            let mut out = b"\x1b[M".to_vec();
+            for value in [button, x, y] {
+                let c = char::from_u32(u32::from(32 + value.min(2015))).unwrap_or(' ');
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+            out
+        }
+        vt100::MouseProtocolEncoding::Default => {
+            let mut out = b"\x1b[M".to_vec();
+            for value in [button, x, y] {
+                out.push((32 + value.min(223)) as u8);
+            }
+            out
+        }
+    }
+}
+
+/// A wheel tick for an alternate-screen program without mouse reporting:
+/// `n` arrow keys, honouring application-cursor mode — the xterm "alternate
+/// scroll" convention, which lets pagers and TUIs scroll under the wheel.
+pub fn encode_wheel_arrows(application_cursor: bool, up: bool, n: usize) -> Vec<u8> {
+    let seq: &[u8] = match (application_cursor, up) {
+        (true, true) => b"\x1bOA",
+        (true, false) => b"\x1bOB",
+        (false, true) => b"\x1b[A",
+        (false, false) => b"\x1b[B",
+    };
+    seq.repeat(n)
+}
+
 fn function_key(n: u8, param: u32) -> Option<Vec<u8>> {
     let bytes = match n {
         1..=4 => {
@@ -211,5 +251,46 @@ mod tests {
     fn unmapped_keys_return_none() {
         assert_eq!(encode_key(key(KeyCode::Null)), None);
         assert_eq!(encode_key(key(KeyCode::CapsLock)), None);
+    }
+
+    #[test]
+    fn wheel_encodings() {
+        use vt100::MouseProtocolEncoding as E;
+        assert_eq!(
+            encode_wheel(E::Sgr, true, 5, 3),
+            b"\x1b[<64;5;3M".to_vec(),
+            "SGR spells the button and 1-based cell in decimal"
+        );
+        assert_eq!(encode_wheel(E::Sgr, false, 1, 1), b"\x1b[<65;1;1M".to_vec());
+        assert_eq!(
+            encode_wheel(E::Default, true, 5, 3),
+            vec![0x1b, b'[', b'M', 32 + 64, 32 + 5, 32 + 3],
+            "the legacy encoding offsets each value by 32 into one byte"
+        );
+        assert_eq!(
+            encode_wheel(E::Default, true, 1000, 1000),
+            vec![0x1b, b'[', b'M', 32 + 64, 255, 255],
+            "legacy coordinates cap at what a byte can carry"
+        );
+        // UTF-8 mode encodes the offset value as a codepoint, so a coordinate
+        // past 95 becomes a two-byte sequence instead of clamping.
+        assert_eq!(
+            encode_wheel(E::Utf8, true, 200, 1),
+            [
+                b"\x1b[M".as_slice(),
+                "\u{60}".as_bytes(),
+                "\u{e8}".as_bytes(),
+                b"!"
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn wheel_arrows_honour_application_cursor_mode() {
+        assert_eq!(encode_wheel_arrows(false, true, 3), b"\x1b[A".repeat(3));
+        assert_eq!(encode_wheel_arrows(false, false, 3), b"\x1b[B".repeat(3));
+        assert_eq!(encode_wheel_arrows(true, true, 1), b"\x1bOA".to_vec());
+        assert_eq!(encode_wheel_arrows(true, false, 1), b"\x1bOB".to_vec());
     }
 }

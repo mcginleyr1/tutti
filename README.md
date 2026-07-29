@@ -79,7 +79,7 @@ cd ~/code/myproject && tutti
    (`tutti attach` is the same thing). On a fresh session nothing is assumed:
    the sidebar opens on an add-project prompt prefilled with your current
    directory — `Enter` takes it, or edit the path first, or `esc` to skip and
-   add one later with `n`. (With `[[projects]]` configured — see
+   add one later with `a`. (With `[[projects]]` configured — see
    [Configuration](#configuration) — they mount automatically and the prompt
    is skipped.)
 
@@ -97,9 +97,10 @@ cd ~/code/myproject && tutti
 4. **Herd from the sidebar.** `Ctrl+B w` focuses the sidebar: your projects,
    the selected project's agents (state dots: blocked red, working spinner,
    done green), and the cross-project **waiting** queue of everything blocked
-   on you. `Enter` jumps to what you highlight; `r` runs another agent in the
-   selected project, `d` shows its jj diff, `w` creates a nested workspace,
-   `m` merges one back. See [Sidebar](#sidebar) and [Workspaces](#workspaces).
+   on you. `Enter` jumps to what you highlight; `n` starts another agent in
+   the selected project (in its own tab), `d` shows its jj diff, `w` creates a
+   nested workspace, `m` merges one back. See [Sidebar](#sidebar) and
+   [Workspaces](#workspaces).
 
 5. **Detach and return.** `Ctrl+B d` detaches; every pane keeps running under
    the daemon. `tutti` reattaches — state dots and the waiting queue catch you
@@ -191,14 +192,25 @@ orphaned by a daemon restart — or one from before the project was mounted in
 tutti — is one keystroke from continuing. A resume row for an uninstalled
 binary dims like any agent row.
 
+An **exited** agent pane advertises the way back in its title — `exited 0 ·
+r resume · x close`. `r` opens the launcher over that pane's workspace (resume
+rows on top) armed to **replace the corpse**: the pick runs in the dead pane's
+tab and the corpse is dropped, so a finished or accidentally-quit agent is two
+keystrokes from its own conversation. `x` just closes the corpse.
+
 Sidebar edge-nav: at a pane's **left edge**, `Ctrl+h` steps into the sidebar when
 it is visible (nvim-explorer muscle memory) instead of jumping straight to the
 previous tab; from the sidebar, `Ctrl+l` returns to the pane you left and `Ctrl+h`
 goes on to the previous tab. With the sidebar hidden the left edge wraps to the
 previous tab as before.
 
-Mouse: click focuses a pane, click a tab segment or sidebar entry to jump, wheel
-scrolls a pane's history. Because tutti captures the mouse, your terminal's own
+Mouse: click focuses a pane, click a tab segment or sidebar entry to jump. The
+wheel routes by what the pane's program declared: a program that asked for mouse
+events (vim with `mouse=a`, htop) receives the wheel itself; a full-screen
+program without mouse reporting (Claude Code, less) gets arrow keys — the xterm
+"alternate scroll" convention — so it scrolls its own view; only a plain
+primary-screen pane (a shell) enters tutti's frozen scrollback browse
+(`q`/esc exits). Because tutti captures the mouse, your terminal's own
 drag-to-select can't see the drag — press the prefix then `m` to hand the mouse
 back, select and copy normally, and `m` again to re-grab it (most terminals also
 bypass capture while `Shift`/`Option` is held). `mouse = false` starts with the
@@ -335,11 +347,13 @@ Press the prefix then `w` to focus the sidebar (revealing it if hidden). While
 focused, `j`/`k` (or the arrows) move the highlight across all three sections, `Enter`
 jumps and hands focus back to the pane, and `esc` unfocuses (esc is the back key
 throughout). `w` opens **guided [workspace](#workspaces) creation** on the
-selected project (below); `r` **runs** an agent (or shell/command) in the
-selected project: it jumps to that workspace and opens the launcher over it, so
-the choice lands in a new pane in its tab (an agent row targets the workspace
-that owns it) — reach for `r`, not `w`, when you just want another agent in the
-checkout you already have. `n` opens the
+selected project (below); `n` starts a **new agent** (or shell/command) in the
+selected project: it jumps to that workspace and opens the launcher over it, and
+the choice lands in a **fresh tab** there rather than splitting whatever that
+tab already holds (an agent row targets the workspace that owns it) — reach for
+`n`, not `w`, when you just want another agent in the checkout you already
+have; splits stay behind `Ctrl+B %`/`"` and `Ctrl+B r` runs into the current
+tab. `a` opens the
 **add-project** prompt — a one-line field for the path to an *existing* directory
 to open (it mounts that directory as a workspace; it never creates one). The
 field prefills the common parent of your current projects, so you type just the

@@ -104,10 +104,10 @@ fn paint_bg(frame: &mut Frame, area: Rect, bg: Option<Color>) {
 /// merges one back into its project.
 const SIDEBAR_HINT: &[(&str, &str)] = &[
     ("enter", "jump"),
+    ("n", "new agent"),
     ("w", "workspace"),
-    ("n", "add project"),
+    ("a", "add project"),
     ("d", "diff"),
-    ("r", "run"),
     ("m", "merge"),
     ("u", "update"),
     ("x", "kill"),
@@ -243,7 +243,7 @@ fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
     let prefix = app.config().prefix.label();
     let actions: Vec<(String, &str)> = if app.workspaces.is_empty() {
         vec![
-            ("n".to_string(), "add a project"),
+            ("a".to_string(), "add a project"),
             (format!("{prefix} %"), "split"),
             (format!("{prefix} ?"), "help"),
         ]
@@ -1224,8 +1224,8 @@ fn help_lines(cfg: &Config) -> Vec<Line<'static>> {
     lines.push(Line::from(String::new()));
     lines.push(Line::from("sidebar (after C-b w):".to_string()));
     lines.push(popup_key_line("  j/k", "move"));
-    lines.push(popup_key_line("  w / r", "new workspace / run"));
-    lines.push(popup_key_line("  n / d", "add project / diff"));
+    lines.push(popup_key_line("  n / w", "new agent / new workspace"));
+    lines.push(popup_key_line("  a / d", "add project / diff"));
     lines.push(popup_key_line("  m / u", "merge / update stale"));
     lines.push(popup_key_line("  x", "kill workspace / agent"));
     lines.push(Line::from(String::new()));
@@ -1257,7 +1257,9 @@ fn identity(info: &PaneInfo) -> String {
 
 /// The border badge. The name is dim-bold; a detected agent adds a dim `·`
 /// then the state in its colour (a spinner precedes `working`); a plain shell
-/// shows just its name. An exited pane appends a dim `exited <code>`.
+/// shows just its name. An exited pane appends a dim `exited <code>` plus the
+/// two keys that act on the corpse, `r` in the accent so the way back to a
+/// dead agent's conversation is visible right where it died.
 fn border_title(info: &PaneInfo, spinner: char) -> Line<'static> {
     let mut spans = vec![Span::styled(
         identity(info),
@@ -1273,7 +1275,11 @@ fn border_title(info: &PaneInfo, spinner: char) -> Line<'static> {
         spans.push(Span::styled(label, state_style(info.state)));
     }
     if let Some(code) = info.exited {
-        spans.push(Span::styled(format!(" exited {code}"), dim()));
+        spans.push(Span::styled(format!(" exited {code} · "), dim()));
+        spans.push(Span::styled("r", Style::default().fg(ACCENT)));
+        spans.push(Span::styled(" resume · ", dim()));
+        spans.push(Span::styled("x", Style::default().fg(ACCENT)));
+        spans.push(Span::styled(" close", dim()));
     }
     Line::from(spans)
 }
@@ -1796,7 +1802,11 @@ mod tests {
             exited: Some(0),
             subagents: Vec::new(),
         };
-        assert_eq!(title_text(&info), "zsh exited 0");
+        assert_eq!(
+            title_text(&info),
+            "zsh exited 0 · r resume · x close",
+            "the corpse advertises its two keys next to the exit code"
+        );
     }
 
     #[test]
@@ -2320,10 +2330,11 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         app.sync_sizes(Rect::new(0, 0, 100, 20));
-        // Focus the sidebar and run in the selected (first) workspace, `api`.
+        // Focus the sidebar and start a new agent in the selected (first)
+        // workspace, `api`.
         app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
         app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
-        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         assert_eq!(app.mode, Mode::Launcher);
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
@@ -2346,8 +2357,8 @@ mod tests {
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let footer = row_text(terminal.backend().buffer(), 15);
         assert!(
-            footer.contains("run"),
-            "the sidebar hint offers run: {footer:?}"
+            footer.contains("new agent") && footer.contains("add project"),
+            "the sidebar hint offers the new-agent and add-project verbs: {footer:?}"
         );
         assert!(
             footer.contains("workspace") && footer.contains("merge"),
