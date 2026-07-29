@@ -49,18 +49,15 @@ pub fn run(
     conn.send(&control(&Request::Attach))
         .context("send attach request")?;
 
-    let mouse = config.mouse;
     let mut terminal = ratatui::init();
-    if mouse {
+    if config.mouse {
         let _ = execute!(io::stdout(), EnableMouseCapture);
     }
-    install_panic_hook(mouse);
+    install_panic_hook();
 
     let result = event_loop(&mut terminal, &mut conn, config, first_run, notice);
 
-    if mouse {
-        let _ = execute!(io::stdout(), DisableMouseCapture);
-    }
+    let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -72,6 +69,7 @@ fn event_loop(
     first_run: Option<String>,
     notice: Option<String>,
 ) -> Result<()> {
+    let mut captured = config.mouse;
     let mut app = App::with_config(config);
     app.set_truecolor(detect_truecolor());
     if let Some(prefill) = first_run {
@@ -144,6 +142,17 @@ fn event_loop(
             }
         }
 
+        // The mouse-toggle key releases/re-grabs capture so the terminal's own
+        // selection and copy work while released.
+        if app.mouse_capture() != captured {
+            captured = app.mouse_capture();
+            if captured {
+                let _ = execute!(io::stdout(), EnableMouseCapture);
+            } else {
+                let _ = execute!(io::stdout(), DisableMouseCapture);
+            }
+        }
+
         if let Some(frame) = app.focus_change() {
             let _ = conn.send(&frame);
         }
@@ -181,12 +190,12 @@ fn emit_terminal(bytes: &[u8]) {
     let _ = out.flush();
 }
 
-fn install_panic_hook(mouse: bool) {
+fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if mouse {
-            let _ = execute!(io::stdout(), DisableMouseCapture);
-        }
+        // Capture may have been toggled at runtime; releasing when it was never
+        // grabbed is harmless.
+        let _ = execute!(io::stdout(), DisableMouseCapture);
         previous(info);
     }));
 }

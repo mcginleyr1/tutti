@@ -79,6 +79,10 @@ pub enum Mode {
     /// Confirming a workspace kill raised from the sidebar (`y` kill, `D`
     /// discard the workspace's checkout, anything else cancels).
     ConfirmKillWorkspace(WorkspaceId),
+    /// Confirming an agent-pane kill raised from a sidebar agent row (`y` kills
+    /// the pane, anything else cancels). Only the pane dies — never the
+    /// workspace around it.
+    ConfirmKillAgent(PaneId),
     /// Confirming a merge of a child workspace back into its project's trunk
     /// (`y` sends the merge, anything else cancels).
     ConfirmMerge(WorkspaceId),
@@ -197,6 +201,11 @@ pub struct App {
     /// the user's own terminal raises a desktop notification. Drained by the
     /// event loop.
     terminal_out: Vec<Vec<u8>>,
+    /// Whether the terminal should be capturing mouse events. Starts at the
+    /// config's master switch; the mouse-toggle prefix key flips it so the
+    /// terminal's own drag-to-select and copy work while released. The event
+    /// loop syncs the real capture state to this.
+    mouse_capture: bool,
     /// Prefix chord, direct bindings, and the active prefix keymap.
     config: Config,
 }
@@ -254,8 +263,14 @@ impl App {
             collapsed_agents: false,
             collapsed_waiting: false,
             truecolor: false,
+            mouse_capture: config.mouse,
             config,
         }
+    }
+
+    /// Whether the terminal should be capturing mouse events right now.
+    pub fn mouse_capture(&self) -> bool {
+        self.mouse_capture
     }
 
     /// The active configuration, for the renderer (hint, which-key, help).
@@ -564,6 +579,7 @@ impl App {
             Mode::Prefix => self.on_key_prefix(key),
             Mode::ConfirmKill(pane) => self.on_key_confirm(key, pane),
             Mode::ConfirmKillWorkspace(id) => self.on_key_confirm_workspace(key, id),
+            Mode::ConfirmKillAgent(pane) => self.on_key_confirm_agent(key, pane),
             Mode::ConfirmMerge(id) => self.on_key_confirm_merge(key, id),
             Mode::ConfirmCleanup(id) => self.on_key_confirm_cleanup(key, id),
             Mode::Scroll(pane) => self.on_key_scroll(key, pane),
@@ -704,6 +720,15 @@ impl App {
                 );
                 Vec::new()
             }
+            PrefixAction::MouseToggle => {
+                self.mouse_capture = !self.mouse_capture;
+                self.set_status(if self.mouse_capture {
+                    "mouse on".into()
+                } else {
+                    "mouse off — select/copy with the terminal".into()
+                });
+                Vec::new()
+            }
             PrefixAction::Detach => self.detach(),
             PrefixAction::Help => {
                 self.mode = Mode::Help;
@@ -744,6 +769,18 @@ impl App {
         self.mode = Mode::Sidebar;
         self.status = None;
         vec![control(&Request::WorkspaceKill { id, discard })]
+    }
+
+    /// Resolve the sidebar agent-kill confirm: `y` kills the agent's pane, any
+    /// other key cancels. Either way the sidebar keeps focus; the view refresh
+    /// drops the killed row.
+    fn on_key_confirm_agent(&mut self, key: KeyEvent, pane: PaneId) -> Vec<WireFrame> {
+        self.mode = Mode::Sidebar;
+        self.status = None;
+        match key.code {
+            KeyCode::Char('y') => vec![control(&Request::PaneKill { pane })],
+            _ => Vec::new(),
+        }
     }
 
     fn on_key_scroll(&mut self, key: KeyEvent, pane: PaneId) -> Vec<WireFrame> {
@@ -1036,7 +1073,7 @@ impl App {
             }
             KeyCode::Char('u') => self.update_selected(&sidebar),
             KeyCode::Char('x') => {
-                self.confirm_kill_workspace(&sidebar);
+                self.confirm_kill_selected(&sidebar);
                 Vec::new()
             }
             KeyCode::Esc => {
@@ -1220,7 +1257,22 @@ impl App {
         vec![control(&Request::WorkspaceUpdate { id })]
     }
 
-    /// Open the kill confirm for the selected entry's workspace in the transient
+    /// Open the kill confirm for the selected row. An agent row targets only its
+    /// own pane — never the workspace around it, so a stray `x` on an agent can't
+    /// take a whole project down; a workspace row targets the workspace (with the
+    /// discard option). A no-op with nothing selected.
+    fn confirm_kill_selected(&mut self, sidebar: &Sidebar) {
+        match sidebar.entries.get(self.sidebar_selected) {
+            Some(SidebarEntry::Agent(a)) => {
+                self.mode = Mode::ConfirmKillAgent(a.pane);
+                self.set_status(format!("kill {}? y/N", a.kind));
+            }
+            Some(SidebarEntry::Workspace(_)) => self.confirm_kill_workspace(sidebar),
+            None => {}
+        }
+    }
+
+    /// Open the kill confirm for the selected workspace row in the transient
     /// line. `y` kills it, `D` also discards a fork's checkout (the server
     /// refuses discard for a workspace it did not fork, surfacing that error),
     /// any other key cancels. A no-op with nothing selected.
@@ -2519,6 +2571,22 @@ mod tests {
     }
 
     #[test]
+    fn prefix_m_toggles_mouse_capture() {
+        let mut app = App::new();
+        attached(&mut app);
+        assert!(app.mouse_capture(), "capture starts at the config default");
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert!(
+            app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
+                .is_empty()
+        );
+        assert!(!app.mouse_capture(), "prefix-m releases capture");
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert!(app.mouse_capture(), "prefix-m again re-grabs capture");
+    }
+
+    #[test]
     fn prefix_kill_confirms_then_sends() {
         let mut app = App::new();
         attached(&mut app);
@@ -3705,23 +3773,42 @@ mod tests {
     }
 
     #[test]
-    fn x_on_an_agent_row_kills_its_owning_workspace() {
+    fn x_on_an_agent_row_kills_only_that_pane() {
         let mut app = App::new();
         attach_with(&mut app, view_two_workspaces());
         focus_sidebar(&mut app);
         app.on_key(plain('j')); // web workspace
         app.on_key(plain('j')); // first agent (blocked pane 3, tab 2 → workspace 2)
         app.on_key(plain('x'));
-        assert_eq!(app.mode, Mode::ConfirmKillWorkspace(WorkspaceId(2)));
+        assert_eq!(
+            app.mode,
+            Mode::ConfirmKillAgent(PaneId(3)),
+            "x on an agent row confirms killing the pane, never the workspace"
+        );
+        assert!(
+            app.transient().is_some_and(|t| t.contains("kill claude?")),
+            "the confirm names the agent"
+        );
         let out = app.on_key(plain('y'));
         assert_eq!(
             out,
-            vec![control(&Request::WorkspaceKill {
-                id: WorkspaceId(2),
-                discard: false,
-            })],
-            "an agent row kills the workspace that owns its tab"
+            vec![control(&Request::PaneKill { pane: PaneId(3) })],
+            "y kills the agent's pane only"
         );
+        assert_eq!(app.mode, Mode::Sidebar, "focus returns to the sidebar");
+    }
+
+    #[test]
+    fn agent_kill_confirm_cancels_on_any_other_key() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        app.on_key(plain('j'));
+        app.on_key(plain('j'));
+        app.on_key(plain('x'));
+        let out = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(out.is_empty(), "esc kills nothing");
+        assert_eq!(app.mode, Mode::Sidebar);
     }
 
     #[test]

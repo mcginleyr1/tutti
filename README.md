@@ -146,6 +146,7 @@ preset:
 | `z` | zoom focused pane |
 | `x` | kill pane (confirms) |
 | `[` | scrollback for focused pane (`q`/esc exits) |
+| `m` | mouse on/off (off hands the mouse back to the terminal for select/copy) |
 | `d` or `q` | detach |
 | `?` | help |
 
@@ -197,7 +198,11 @@ goes on to the previous tab. With the sidebar hidden the left edge wraps to the
 previous tab as before.
 
 Mouse: click focuses a pane, click a tab segment or sidebar entry to jump, wheel
-scrolls a pane's history (disable with `mouse = false`). Colors come from your
+scrolls a pane's history. Because tutti captures the mouse, your terminal's own
+drag-to-select can't see the drag — press the prefix then `m` to hand the mouse
+back, select and copy normally, and `m` again to re-grab it (most terminals also
+bypass capture while `Shift`/`Option` is held). `mouse = false` starts with the
+mouse off. Colors come from your
 terminal — tutti has no theme of its own: everything renders dim, with one accent
 (terminal blue) marking the focused/active thing and the red/yellow/green state
 dots the only other colour. On truecolor terminals a subtle neutral shade sits
@@ -212,7 +217,7 @@ the offending entry (nothing is silently ignored).
 
 ```toml
 prefix = "C-b"          # prefix chord
-mouse = true            # master mouse switch
+mouse = true            # mouse capture at startup (prefix `m` toggles it live)
 preset = "default"      # prefix keymap: "default" (emacs/tmux-flavored) or "vim"
 sidebar = "on"          # workspace/agent sidebar: "on" (default), "auto", or "off"
 chrome_background = true # subtle shade behind the chrome (truecolor only)
@@ -252,7 +257,8 @@ help overlay always render whichever preset is active, so they stay accurate.
   `d`/`q` detach, …). The `C-b` prefix chord is itself already emacs-style.
 - `vim` — mnemonics vim users reach for: `v`/`s` split right/below, `h/j/k/l`
   directional focus, `q` kill pane (`:q` closes a window), `d` detach (so detach
-  stays reachable), `t` new tab, `n`/`p` next/prev tab, `z`/`[`/`?` unchanged.
+  stays reachable), `t` new tab, `n`/`p` next/prev tab, `z`/`[`/`m`/`?`
+  unchanged.
 
 An unknown preset is a hard error. A dedicated `emacs` preset may land later; for
 now `default` already covers that muscle memory. The `[keys]` direct bindings are
@@ -360,11 +366,13 @@ cancels). On success tutti jumps to the new workspace, flashes `workspace <name>
 flashes `only workspaces merge`. `u` runs `jj workspace update-stale` on a
 workspace whose row shows the **stale** tag, clearing it; on a healthy row it
 just flashes `not stale`. `x`
-**kills** the selected workspace after a one-line confirm — `y` removes it from
-tutti (leaving its checkout on disk), `D` also **discards** a workspace's checkout
-(`jj workspace forget` + delete; the server refuses this for a workspace tutti
-did not create, surfacing that error), and any other key cancels. A mouse
-click focuses the sidebar, or jumps straight to the entry clicked.
+**kills** the selected row after a one-line confirm. On a workspace row — `y`
+removes it from tutti (leaving its checkout on disk), `D` also **discards** a
+workspace's checkout (`jj workspace forget` + delete; the server refuses this
+for a workspace tutti did not create, surfacing that error), and any other key
+cancels. On an agent row, `x` kills **only that agent's pane** (`kill claude?
+y/N`) — never the workspace around it. A mouse click focuses the sidebar, or
+jumps straight to the entry clicked.
 
 Visibility is set by the `sidebar` config value: `on` (default) always shows it
 — the control column is the point — while `auto` reveals it only once the

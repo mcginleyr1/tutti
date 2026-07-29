@@ -941,6 +941,7 @@ fn mode_label(mode: Mode) -> Option<&'static str> {
         Mode::Prefix => Some("PREFIX"),
         Mode::ConfirmKill(_)
         | Mode::ConfirmKillWorkspace(_)
+        | Mode::ConfirmKillAgent(_)
         | Mode::ConfirmMerge(_)
         | Mode::ConfirmCleanup(_) => Some("CONFIRM"),
         Mode::Scroll(_) => Some("SCROLL"),
@@ -1226,7 +1227,7 @@ fn help_lines(cfg: &Config) -> Vec<Line<'static>> {
     lines.push(popup_key_line("  w / r", "new workspace / run"));
     lines.push(popup_key_line("  n / d", "add project / diff"));
     lines.push(popup_key_line("  m / u", "merge / update stale"));
-    lines.push(popup_key_line("  x", "kill workspace"));
+    lines.push(popup_key_line("  x", "kill workspace / agent"));
     lines.push(Line::from(String::new()));
     lines.push(Line::from(
         "stop the daemon:  tutti server stop".to_string(),
@@ -1930,7 +1931,7 @@ mod tests {
             text.contains("new workspace")
                 && text.contains("merge")
                 && text.contains("update stale")
-                && text.contains("kill workspace"),
+                && text.contains("kill workspace / agent"),
             "help missing the sidebar workspace/merge/update/kill keys: {text:?}"
         );
         // Detach is listed before the split bindings.

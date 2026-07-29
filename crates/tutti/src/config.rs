@@ -64,6 +64,9 @@ pub enum PrefixAction {
     Sidebar,
     /// Open the agent launcher to run a choice in a new pane here.
     Run,
+    /// Release/re-grab mouse capture so the terminal's own drag-to-select and
+    /// copy work while released.
+    MouseToggle,
     Detach,
     Help,
 }
@@ -113,6 +116,11 @@ const DEFAULT_PREFIX_TABLE: &[PrefixBinding] = &[
     b(KeyCode::Char('x'), PrefixAction::KillPane, "kill pane"),
     b(KeyCode::Char('z'), PrefixAction::Zoom, "zoom pane"),
     b(KeyCode::Char('['), PrefixAction::Scrollback, "scrollback"),
+    b(
+        KeyCode::Char('m'),
+        PrefixAction::MouseToggle,
+        "mouse on/off",
+    ),
     b(KeyCode::Char('n'), PrefixAction::TabNext, "next tab"),
     b(KeyCode::Char('p'), PrefixAction::TabPrev, "prev tab"),
     b(KeyCode::Char('c'), PrefixAction::TabNew, "new tab"),
@@ -150,6 +158,11 @@ const VIM_PREFIX_TABLE: &[PrefixBinding] = &[
     b(KeyCode::Char('r'), PrefixAction::Run, "run here"),
     b(KeyCode::Char('z'), PrefixAction::Zoom, "zoom pane"),
     b(KeyCode::Char('['), PrefixAction::Scrollback, "scrollback"),
+    b(
+        KeyCode::Char('m'),
+        PrefixAction::MouseToggle,
+        "mouse on/off",
+    ),
     b(KeyCode::Char('?'), PrefixAction::Help, "help"),
 ];
 
@@ -785,6 +798,20 @@ kill_pane    = "A-x"
                 cfg.prefix_action(KeyCode::Char('w')),
                 Some(PrefixAction::Sidebar),
                 "w should focus the sidebar in every preset"
+            );
+        }
+    }
+
+    #[test]
+    fn both_presets_bind_the_mouse_toggle_key() {
+        for cfg in [
+            Config::default(),
+            Config::parse("preset = \"vim\"\n").unwrap(),
+        ] {
+            assert_eq!(
+                cfg.prefix_action(KeyCode::Char('m')),
+                Some(PrefixAction::MouseToggle),
+                "m should toggle mouse capture in every preset"
             );
         }
     }
