@@ -24,8 +24,20 @@ pub enum Section {
     Waiting,
 }
 
+/// A selectable row's stable identity, independent of its position. The waiting
+/// copy of an agent is distinct from its agents-section row so a cursor in the
+/// queue re-anchors to the queue, not to the first duplicate, across rebuilds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryIdent {
+    Workspace(WorkspaceId),
+    Agent(PaneId),
+    Waiting(PaneId),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceRow {
+    /// The workspace this row is — the identity the cursor anchors to.
+    pub id: WorkspaceId,
     pub name: String,
     /// The git branch, when known — the dim second line. `None` renders a blank
     /// line rather than repeating the name (the workspace name is already the
@@ -96,6 +108,23 @@ impl Sidebar {
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// The stable identity of entry `idx`, or `None` past the end. Agent
+    /// entries at or past the waiting boundary identify as `Waiting`.
+    pub fn ident_at(&self, idx: usize) -> Option<EntryIdent> {
+        Some(match self.entries.get(idx)? {
+            SidebarEntry::Workspace(w) => EntryIdent::Workspace(w.id),
+            SidebarEntry::Agent(a) if idx >= self.workspace_count + self.agent_count => {
+                EntryIdent::Waiting(a.pane)
+            }
+            SidebarEntry::Agent(a) => EntryIdent::Agent(a.pane),
+        })
+    }
+
+    /// The index currently holding `ident`, if the entry is still in the view.
+    pub fn index_of(&self, ident: EntryIdent) -> Option<usize> {
+        (0..self.entries.len()).find(|&i| self.ident_at(i) == Some(ident))
     }
 
     /// Whether entry `idx` is currently visible (its section is expanded).
@@ -235,6 +264,7 @@ pub fn build(
             .filter(|at| w.tabs.iter().any(|t| t.id == *at))
             .or_else(|| w.tabs.first().map(|t| t.id))?;
         Some(SidebarEntry::Workspace(WorkspaceRow {
+            id: w.id,
             name: w.name.clone(),
             subtitle: w
                 .branch

@@ -131,6 +131,11 @@ pub struct App {
     prefix_since: Option<Instant>,
     /// The highlighted sidebar entry while the sidebar is focused.
     sidebar_selected: usize,
+    /// The selected row's identity and owning project, captured whenever the
+    /// selection moves. `set_view` re-anchors the cursor through this after
+    /// every layout change — same row, else its project's row, else a clamped
+    /// index — so a kill or state change never silently retargets the cursor.
+    sidebar_anchor: Option<(sidebar::EntryIdent, WorkspaceId)>,
     /// The project the sidebar cursor last landed on (a project/workspace row's
     /// project, or a waiting row's), driving the agents-section filter while the
     /// sidebar is focused. `None` — and always outside sidebar focus — falls
@@ -245,6 +250,7 @@ impl App {
             bell: false,
             prefix_since: None,
             sidebar_selected: 0,
+            sidebar_anchor: None,
             sidebar_project: None,
             sidebar_prompt: String::new(),
             prompt_completions: Vec::new(),
@@ -571,11 +577,18 @@ impl App {
         if !self.active_tab.is_some_and(|t| self.tab_exists(t)) {
             self.active_tab = self.flagged_active_tab().or_else(|| self.first_tab());
         }
-        // A killed workspace/agent shortens the sidebar; keep the selection in range.
-        let entries = self.sidebar().len();
-        if entries > 0 && self.sidebar_selected >= entries {
-            self.sidebar_selected = entries - 1;
-        }
+        // Re-anchor the cursor by identity, never by position: the same row if
+        // it survived, else its project's row (a killed agent falls to its
+        // project), else the old index clamped into range.
+        let sidebar = self.sidebar();
+        let resolved = self.sidebar_anchor.and_then(|(ident, project)| {
+            sidebar
+                .index_of(ident)
+                .or_else(|| sidebar.index_of(sidebar::EntryIdent::Workspace(project)))
+        });
+        self.sidebar_selected =
+            resolved.unwrap_or(self.sidebar_selected.min(sidebar.len().saturating_sub(1)));
+        self.sidebar_anchor = anchor_at(&sidebar, self.sidebar_selected);
         self.refocus();
     }
 
@@ -763,7 +776,7 @@ impl App {
 
     fn on_key_confirm(&mut self, key: KeyEvent, pane: PaneId) -> Vec<WireFrame> {
         match key.code {
-            KeyCode::Char('y') => {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
                 self.mode = Mode::Terminal;
                 self.status = None;
                 vec![control(&Request::PaneKill { pane })]
@@ -782,7 +795,7 @@ impl App {
     /// sidebar keeps focus; the view refresh drops a killed row.
     fn on_key_confirm_workspace(&mut self, key: KeyEvent, id: WorkspaceId) -> Vec<WireFrame> {
         let discard = match key.code {
-            KeyCode::Char('y') => false,
+            KeyCode::Char('y') | KeyCode::Char('Y') => false,
             KeyCode::Char('D') => true,
             _ => {
                 self.mode = Mode::Sidebar;
@@ -792,6 +805,12 @@ impl App {
         };
         self.mode = Mode::Sidebar;
         self.status = None;
+        // The target may have died between the confirm opening and the answer;
+        // re-resolve it rather than sending a kill for a stale id.
+        if !self.workspaces.iter().any(|w| w.id == id) {
+            self.set_status("that workspace is already gone".into());
+            return Vec::new();
+        }
         vec![control(&Request::WorkspaceKill { id, discard })]
     }
 
@@ -802,7 +821,15 @@ impl App {
         self.mode = Mode::Sidebar;
         self.status = None;
         match key.code {
-            KeyCode::Char('y') => vec![control(&Request::PaneKill { pane })],
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                // Re-resolve the pane before killing: it may have exited or
+                // been killed by another client since the confirm opened.
+                if self.tab_of_pane(pane).is_none() {
+                    self.set_status("that agent is already gone".into());
+                    return Vec::new();
+                }
+                vec![control(&Request::PaneKill { pane })]
+            }
             _ => Vec::new(),
         }
     }
@@ -885,14 +912,16 @@ impl App {
                         matches!(e, SidebarEntry::Agent(x) if x.pane == pane).then_some(i)
                     })
                 {
-                    self.sidebar_selected = idx;
+                    self.select_entry(&rebuilt, idx);
                 }
             }
             _ => {}
         }
     }
 
-    /// Whether the sidebar currently holds keyboard focus.
+    /// Whether the sidebar currently holds keyboard focus. The sidebar-raised
+    /// confirms count: while one is open the agents filter and the selection
+    /// highlight must not shift under the question being asked.
     pub fn sidebar_focused(&self) -> bool {
         matches!(
             self.mode,
@@ -900,6 +929,10 @@ impl App {
                 | Mode::SidebarPrompt
                 | Mode::SidebarWorkspaceName
                 | Mode::SidebarWorkspaceDest
+                | Mode::ConfirmKillWorkspace(_)
+                | Mode::ConfirmKillAgent(_)
+                | Mode::ConfirmMerge(_)
+                | Mode::ConfirmCleanup(_)
         )
     }
 
@@ -1047,8 +1080,16 @@ impl App {
         self.mode = Mode::Sidebar;
         self.sidebar_selected = 0;
         self.sidebar_project = None;
+        self.sidebar_anchor = anchor_at(&self.sidebar(), 0);
         self.prefix_since = None;
         self.status = None;
+    }
+
+    /// Move the sidebar cursor to `idx`, capturing its identity anchor so the
+    /// next layout change re-finds the same row rather than the same position.
+    fn select_entry(&mut self, sidebar: &Sidebar, idx: usize) {
+        self.sidebar_selected = idx;
+        self.sidebar_anchor = anchor_at(sidebar, idx);
     }
 
     fn on_key_sidebar(&mut self, key: KeyEvent) -> Vec<WireFrame> {
@@ -1071,12 +1112,12 @@ impl App {
         let sidebar = self.sidebar();
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                self.sidebar_selected = next_visible(&sidebar, self.sidebar_selected);
+                self.select_entry(&sidebar, next_visible(&sidebar, self.sidebar_selected));
                 self.sync_sidebar_project(&sidebar);
                 Vec::new()
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.sidebar_selected = prev_visible(&sidebar, self.sidebar_selected);
+                self.select_entry(&sidebar, prev_visible(&sidebar, self.sidebar_selected));
                 self.sync_sidebar_project(&sidebar);
                 Vec::new()
             }
@@ -1219,14 +1260,13 @@ impl App {
     /// the workspace owning a selected agent row's tab. `None` when nothing is
     /// selected or its workspace has left the view.
     fn selected_workspace(&self, sidebar: &Sidebar) -> Option<&WorkspaceView> {
-        let tab = match sidebar.entries.get(self.sidebar_selected) {
-            Some(SidebarEntry::Workspace(w)) => w.jump_tab,
-            Some(SidebarEntry::Agent(a)) => a.tab,
-            None => return None,
-        };
-        self.workspaces
-            .iter()
-            .find(|w| w.tabs.iter().any(|t| t.id == tab))
+        match sidebar.entries.get(self.sidebar_selected)? {
+            SidebarEntry::Workspace(w) => self.workspaces.iter().find(|ws| ws.id == w.id),
+            SidebarEntry::Agent(a) => self
+                .workspaces
+                .iter()
+                .find(|w| w.tabs.iter().any(|t| t.id == a.tab)),
+        }
     }
 
     /// The tab whose layout holds `pane`, if the current view carries it.
@@ -1320,10 +1360,10 @@ impl App {
         match sidebar.entries.get(self.sidebar_selected) {
             Some(SidebarEntry::Agent(a)) => {
                 self.mode = Mode::ConfirmKillAgent(a.pane);
-                self.set_status(format!("kill {}? y/N", a.kind));
+                self.set_status(format!("kill {} · {}? y/N", a.kind, a.project_name));
             }
             Some(SidebarEntry::Workspace(_)) => self.confirm_kill_workspace(sidebar),
-            None => {}
+            None => self.set_status("nothing selected".into()),
         }
     }
 
@@ -1336,6 +1376,7 @@ impl App {
             .selected_workspace(sidebar)
             .map(|w| (w.id, w.name.clone()))
         else {
+            self.set_status("nothing selected".into());
             return;
         };
         self.mode = Mode::ConfirmKillWorkspace(id);
@@ -1586,7 +1627,7 @@ impl App {
     /// cleanup confirm the `Merged` reply will raise; any other key cancels.
     fn on_key_confirm_merge(&mut self, key: KeyEvent, id: WorkspaceId) -> Vec<WireFrame> {
         match key.code {
-            KeyCode::Char('y') => {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
                 self.merge_pending = Some(id);
                 self.mode = Mode::Sidebar;
                 let name = self.workspace_name(id).unwrap_or_default();
@@ -1608,7 +1649,9 @@ impl App {
         self.mode = Mode::Sidebar;
         self.status = None;
         match key.code {
-            KeyCode::Char('y') => vec![control(&Request::WorkspaceKill { id, discard: true })],
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                vec![control(&Request::WorkspaceKill { id, discard: true })]
+            }
             _ => Vec::new(),
         }
     }
@@ -1879,6 +1922,7 @@ impl App {
         if !self.sidebar_focused() {
             self.mode = Mode::Sidebar;
             self.sidebar_selected = 0;
+            self.sidebar_anchor = None;
         }
         let Some(rect) = self.sidebar_rect else {
             return Vec::new();
@@ -1891,7 +1935,7 @@ impl App {
         }
         match sidebar.entry_at_row(rel) {
             Some(idx) => {
-                self.sidebar_selected = idx;
+                self.select_entry(&sidebar, idx);
                 self.jump_to_selected(&sidebar)
             }
             None => Vec::new(),
@@ -2518,6 +2562,18 @@ fn common_parent(dirs: &[PathBuf]) -> Option<PathBuf> {
 /// The next selectable entry at or after `from`, skipping entries whose section
 /// is collapsed; stays on `from` when nothing visible lies ahead. With no
 /// section collapsed this is a plain `from + 1` clamped to the last entry.
+/// The identity anchor for entry `idx`: its ident plus the project it belongs
+/// to (a workspace row's own project, an agent row's owner) — the fallback
+/// target when the row itself vanishes.
+fn anchor_at(sidebar: &Sidebar, idx: usize) -> Option<(sidebar::EntryIdent, WorkspaceId)> {
+    let ident = sidebar.ident_at(idx)?;
+    let project = match sidebar.entries.get(idx)? {
+        SidebarEntry::Workspace(w) => w.project,
+        SidebarEntry::Agent(a) => a.project,
+    };
+    Some((ident, project))
+}
+
 fn next_visible(sidebar: &Sidebar, from: usize) -> usize {
     if sidebar.is_empty() {
         return 0;
@@ -3973,8 +4029,9 @@ mod tests {
             "x on an agent row confirms killing the pane, never the workspace"
         );
         assert!(
-            app.transient().is_some_and(|t| t.contains("kill claude?")),
-            "the confirm names the agent"
+            app.transient()
+                .is_some_and(|t| t.contains("kill claude · web?")),
+            "the confirm names the agent and its project"
         );
         let out = app.on_key(plain('y'));
         assert_eq!(
@@ -3996,6 +4053,117 @@ mod tests {
         let out = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(out.is_empty(), "esc kills nothing");
         assert_eq!(app.mode, Mode::Sidebar);
+    }
+
+    #[test]
+    fn selection_follows_the_row_identity_across_a_view_change() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        app.on_key(plain('j')); // the web workspace row
+
+        // A new workspace lands ahead of web in the view; the cursor must stay
+        // on web, not on whatever now occupies its old index.
+        let mut view = view_two_workspaces();
+        view.insert(
+            1,
+            workspace(
+                3,
+                "mid",
+                None,
+                vec![tab(3, "3", false, leaf(9), vec![shell(9)])],
+            ),
+        );
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Event::LayoutChanged { workspaces: view }).unwrap(),
+        ));
+        let sidebar = app.sidebar();
+        let SidebarEntry::Workspace(w) = &sidebar.entries[app.sidebar_selected()] else {
+            panic!("expected a workspace row");
+        };
+        assert_eq!(w.name, "web", "the cursor followed the row's identity");
+    }
+
+    #[test]
+    fn a_killed_agents_cursor_falls_to_its_project_row() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        app.on_key(plain('j')); // web row
+        app.on_key(plain('j')); // web's blocked agent (pane 3)
+
+        // The agent dies: its row vanishes and the sidebar reshuffles. The
+        // cursor falls to the agent's project row — never to the unrelated row
+        // that now sits at the old index.
+        let mut view = view_two_workspaces();
+        view[1].tabs[0].layout = Some(leaf(2));
+        view[1].tabs[0].panes = vec![agent(2, "claude", AgentState::Working)];
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Event::LayoutChanged { workspaces: view }).unwrap(),
+        ));
+        let sidebar = app.sidebar();
+        let SidebarEntry::Workspace(w) = &sidebar.entries[app.sidebar_selected()] else {
+            panic!("expected the project row, got an agent row");
+        };
+        assert_eq!(
+            w.name, "web",
+            "the killed agent's cursor lands on its project"
+        );
+    }
+
+    #[test]
+    fn confirm_y_after_the_workspace_vanished_sends_nothing() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        app.on_key(plain('x')); // confirm kill of api (id 1)
+
+        // api dies under the confirm (another client, a crash) — y must not
+        // fire a kill at the stale id.
+        let mut view = view_two_workspaces();
+        view.remove(0);
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Event::LayoutChanged { workspaces: view }).unwrap(),
+        ));
+        let out = app.on_key(plain('y'));
+        assert!(out.is_empty(), "no kill is sent for a vanished workspace");
+        assert!(
+            app.transient().is_some_and(|t| t.contains("gone")),
+            "the miss is reported, not swallowed"
+        );
+    }
+
+    #[test]
+    fn the_agents_filter_holds_steady_during_a_kill_confirm() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        app.on_key(plain('j')); // web row: the agents section filters to web
+        assert_eq!(app.sidebar().project.as_deref(), Some("web"));
+        app.on_key(plain('x'));
+        assert!(matches!(app.mode, Mode::ConfirmKillWorkspace(_)));
+        assert_eq!(
+            app.sidebar().project.as_deref(),
+            Some("web"),
+            "opening the confirm must not flip the filter to the active project"
+        );
+    }
+
+    #[test]
+    fn capital_y_confirms_a_kill() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        focus_sidebar(&mut app);
+        app.on_key(plain('x'));
+        let out = app.on_key(plain('Y'));
+        assert_eq!(
+            out,
+            vec![control(&Request::WorkspaceKill {
+                id: WorkspaceId(1),
+                discard: false,
+            })],
+            "a shifted Y is a confirm, not a silent cancel"
+        );
     }
 
     #[test]
