@@ -143,7 +143,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         }
     }
 
-    draw_app_bar(frame, app, app_bar);
+    draw_app_bar(frame, app, app_bar, spinner);
     draw_rule(frame, app, rule);
     if let Some(sidebar_rect) = sidebar_rect {
         draw_sidebar(frame, app, sidebar_rect, spinner);
@@ -172,7 +172,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 /// The top app bar (full width): the accent bar and bold `tutti — <session>`
 /// wordmark on the left, the tab segments right-aligned. Takes the chrome shade.
-fn draw_app_bar(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_app_bar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -182,12 +182,38 @@ fn draw_app_bar(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         format!("tutti — {}", app.session)
     };
-    let left = Line::from(vec![
+    let mut spans = vec![
         Span::styled("▍", Style::default().fg(ACCENT)),
         Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
-    ]);
-    frame.render_widget(Paragraph::new(left), area);
+    ];
+    spans.extend(census_spans(app, spinner));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
     draw_tab_bar(frame, app, app.tab_bar_rect(area));
+}
+
+/// The agent-state census after the app-bar title: one `dot N label` chip per
+/// non-empty state, blocked first — the at-a-glance answer to "does anything
+/// need me" without opening the sidebar. Empty (no chips) when no agents run.
+fn census_spans(app: &App, spinner: char) -> Vec<Span<'static>> {
+    let glyphs = glyphs(app.config().icons);
+    let counts = app.agent_census();
+    let chips: [(usize, AgentState, &str); 3] = [
+        (counts.blocked, AgentState::Blocked, "blocked"),
+        (counts.working, AgentState::Working, "working"),
+        (counts.done, AgentState::Done, "done"),
+    ];
+    let mut spans = Vec::new();
+    for (count, state, label) in chips {
+        if count == 0 {
+            continue;
+        }
+        let (dot, style) = agent_dot(state, spinner, glyphs);
+        let sep = if spans.is_empty() { "   " } else { " · " };
+        spans.push(Span::styled(sep.to_string(), dim()));
+        spans.push(Span::styled(dot.to_string(), style));
+        spans.push(Span::styled(format!(" {count} {label}"), dim()));
+    }
+    spans
 }
 
 /// The full-width dim rule under the app bar.
@@ -313,10 +339,8 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
     let content_w = w.saturating_sub(4); // two borders + one column of padding each side
 
     let sidebar = app.sidebar();
-    let ws_count = sidebar.workspace_count;
-    let agent_count = sidebar.agent_count;
-    let waiting_start = ws_count + agent_count;
-    let waiting_count = sidebar.entries.len() - waiting_start;
+    let tree_count = sidebar.tree_count;
+    let waiting_count = sidebar.entries.len() - tree_count;
     // A selection only pops while the sidebar holds focus and is not prompting.
     let pop = app.sidebar_focused() && !app.sidebar_prompt_active();
     let selected = app.sidebar_selected();
@@ -328,51 +352,21 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
         '╮',
         sidebar.projects_collapsed,
         "projects",
-        ws_count,
+        sidebar.workspace_rows(),
         w,
     ));
     if !sidebar.projects_collapsed {
-        for (i, entry) in sidebar.entries.iter().take(ws_count).enumerate() {
-            if let SidebarEntry::Workspace(row) = entry {
-                let sel = pop && selected == i;
-                lines.push(frame_row(workspace_inner(row, sel, content_w, glyphs), sel));
-                lines.push(frame_row(
-                    workspace_subtitle_inner(row, sel, content_w, glyphs),
-                    sel,
-                ));
-            }
-        }
-    }
-    // The agents header carries the filter project's name, truncated so the
-    // frame's dashes and count always fit inside the fixed sidebar width.
-    let agents_title = match sidebar.project.as_deref() {
-        Some(name) => format!("agents · {}", truncate_chars(name, 10)),
-        None => "agents".into(),
-    };
-    lines.push(header_border(
-        '├',
-        '┤',
-        sidebar.agents_collapsed,
-        &agents_title,
-        agent_count,
-        w,
-    ));
-    if !sidebar.agents_collapsed {
-        if agent_count == 0 {
-            lines.push(frame_row(
-                placeholder_inner("no agents here", content_w),
-                false,
-            ));
-        } else {
-            for (i, entry) in sidebar
-                .entries
-                .iter()
-                .enumerate()
-                .skip(ws_count)
-                .take(agent_count)
-            {
-                if let SidebarEntry::Agent(a) = entry {
-                    let sel = pop && selected == i;
+        for (i, entry) in sidebar.entries.iter().take(tree_count).enumerate() {
+            let sel = pop && selected == i;
+            match entry {
+                SidebarEntry::Workspace(row) => {
+                    lines.push(frame_row(workspace_inner(row, sel, content_w, glyphs), sel));
+                    lines.push(frame_row(
+                        workspace_subtitle_inner(row, sel, content_w, glyphs),
+                        sel,
+                    ));
+                }
+                SidebarEntry::Agent(a) => {
                     lines.push(frame_row(
                         agent_inner(a, sel, spinner, content_w, glyphs),
                         sel,
@@ -384,7 +378,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
                     let last = a.subagents.len();
                     for (j, subagent) in a.subagents.iter().enumerate() {
                         lines.push(frame_row(
-                            subagent_inner(subagent, spinner, j + 1 == last, content_w),
+                            subagent_inner(subagent, a.depth, spinner, j + 1 == last, content_w),
                             false,
                         ));
                     }
@@ -401,7 +395,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
         w,
     ));
     if !sidebar.waiting_collapsed {
-        for (i, entry) in sidebar.entries.iter().enumerate().skip(waiting_start) {
+        for (i, entry) in sidebar.entries.iter().enumerate().skip(tree_count) {
             if let SidebarEntry::Agent(a) = entry {
                 let sel = pop && selected == i;
                 lines.push(frame_row(
@@ -572,6 +566,35 @@ fn workspace_inner(
     }
     spans.push(Span::styled(format!("{dot} "), dot_style));
     spans.push(name_span(&w.name, sel, Modifier::BOLD));
+    // Right-aligned roll-up chips (`● 2 ● 1`): the subtree's agent census, so a
+    // glance at the project row answers "anything of mine need me?".
+    if !w.census.is_empty() {
+        let chips = [
+            (w.census.blocked, AgentState::Blocked),
+            (w.census.working, AgentState::Working),
+            (w.census.done, AgentState::Done),
+        ];
+        let mut chip_spans = Vec::new();
+        for (count, state) in chips {
+            if count == 0 {
+                continue;
+            }
+            // A static dot even for working — the row chip counts, it does not
+            // animate; the animation budget belongs to the agent rows.
+            let (_, style) = agent_dot(state, '·', glyphs);
+            if !chip_spans.is_empty() {
+                chip_spans.push(Span::raw(" "));
+            }
+            chip_spans.push(Span::styled(glyphs.blocked.to_string(), style));
+            chip_spans.push(Span::styled(format!(" {count}"), dim()));
+        }
+        let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        let chip_w: usize = chip_spans.iter().map(|s| s.content.chars().count()).sum();
+        if used + 1 + chip_w <= content_w as usize {
+            spans.push(Span::raw(" ".repeat(content_w as usize - used - chip_w)));
+            spans.extend(chip_spans);
+        }
+    }
     pad_inner(spans, sel, content_w)
 }
 
@@ -648,17 +671,18 @@ fn agent_inner(
     glyphs: &Glyphs,
 ) -> Vec<Span<'static>> {
     let (dot, dot_style) = agent_dot(a.state, spinner, glyphs);
-    pad_inner(
-        vec![
-            Span::styled(format!("{dot} "), dot_style),
-            name_span(&a.title, sel, Modifier::empty()),
-        ],
-        sel,
-        content_w,
-    )
+    let mut spans = Vec::new();
+    if let Some(guide) = a.guide {
+        let indent = "  ".repeat(a.depth.saturating_sub(1) as usize);
+        spans.push(Span::styled(format!("{indent}{guide} "), dim()));
+    }
+    spans.push(Span::styled(format!("{dot} "), dot_style));
+    spans.push(name_span(&a.title, sel, Modifier::empty()));
+    pad_inner(spans, sel, content_w)
 }
 
-/// The dim `state · kind` second line for an agent, plus the bell mark when a
+/// The dim `state · kind` second line for an agent — indented under its title,
+/// which a tree row's guide pushes right — plus the bell mark when a
 /// notification is pending.
 fn agent_subtitle_inner(
     a: &AgentRow,
@@ -666,8 +690,9 @@ fn agent_subtitle_inner(
     notified: bool,
     content_w: u16,
 ) -> Vec<Span<'static>> {
+    let indent = "  ".repeat(a.depth as usize + 1);
     let mut spans = vec![Span::styled(
-        format!("  {} · {}", state_label(a.state), a.kind),
+        format!("{indent}{} · {}", state_label(a.state), a.kind),
         dim(),
     )];
     if notified {
@@ -701,43 +726,23 @@ fn waiting_subtitle_inner(
     pad_inner(spans, sel, content_w)
 }
 
-/// `text` capped to `max` characters, the last one replaced by `…` when cut.
-fn truncate_chars(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.into();
-    }
-    let mut cut: String = text.chars().take(max.saturating_sub(1)).collect();
-    cut.push('…');
-    cut
-}
-
 /// A subagent sub-row under its agent: a box-drawing tree guide (`├`/`└`), a
 /// shared spinner while running or a `·` once finished, then the description.
 /// Display-only — never selectable.
 fn subagent_inner(
     sub: &SubagentInfo,
+    depth: u8,
     spinner: char,
     last: bool,
     content_w: u16,
 ) -> Vec<Span<'static>> {
+    let indent = "  ".repeat(depth.max(1) as usize);
     let guide = if last { '└' } else { '├' };
     let glyph = if sub.running { spinner } else { '·' };
     pad_inner(
         vec![Span::styled(
-            format!("  {guide} {glyph} {}", sub.desc),
+            format!("{indent}{guide} {glyph} {}", sub.desc),
             dim(),
-        )],
-        false,
-        content_w,
-    )
-}
-
-/// A dim italic placeholder so an empty section never looks broken.
-fn placeholder_inner(text: &str, content_w: u16) -> Vec<Span<'static>> {
-    pad_inner(
-        vec![Span::styled(
-            format!("  {text}"),
-            dim().add_modifier(Modifier::ITALIC),
         )],
         false,
         content_w,
@@ -1470,7 +1475,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_renders_both_sections_with_branch_and_agent() {
+    fn sidebar_renders_the_tree_and_waiting_sections() {
         // 100 cols clears the width floor so the sidebar shows.
         let app = app_two_workspaces();
         let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
@@ -1480,9 +1485,13 @@ mod tests {
             text.contains("projects"),
             "projects header missing: {text:?}"
         );
-        assert!(text.contains("agents"), "agents header missing: {text:?}");
+        assert!(text.contains("waiting"), "waiting header missing: {text:?}");
         assert!(text.contains("api"), "workspace name missing: {text:?}");
         assert!(text.contains("main"), "branch subtitle missing: {text:?}");
+        assert!(
+            text.contains("└ ●"),
+            "the agent nests under its project on a tree guide: {text:?}"
+        );
         assert!(text.contains("claude"), "agent kind missing: {text:?}");
     }
 
@@ -1566,7 +1575,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_shows_a_placeholder_when_no_agents() {
+    fn an_agentless_project_shows_no_agent_rows() {
         // A single agentless workspace, sidebar forced on.
         let mut app = App::with_config(Config::parse("sidebar = \"on\"\n").unwrap());
         app.handle_frame(WireFrame::Control(
@@ -1592,8 +1601,12 @@ mod tests {
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
         assert!(
-            text.contains("no agents here"),
-            "empty agents section needs a placeholder: {text:?}"
+            !text.contains("agents"),
+            "no agents header, no placeholder — the tree shows reality: {text:?}"
+        );
+        assert!(
+            text.contains("waiting"),
+            "the waiting header still closes the tree: {text:?}"
         );
     }
 
@@ -2108,12 +2121,12 @@ mod tests {
             top.trim_end().ends_with("2 ╮"),
             "projects count in border: {top:?}"
         );
-        // The agents divider carries its own count somewhere below.
+        // The waiting divider carries its own count below (web's blocked agent).
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("agents"), "agents header: {text:?}");
+        assert!(text.contains("waiting"), "waiting header: {text:?}");
         assert!(
             text.contains("1 ┤"),
-            "agents count fused in the divider: {text:?}"
+            "waiting count fused in the divider: {text:?}"
         );
     }
 

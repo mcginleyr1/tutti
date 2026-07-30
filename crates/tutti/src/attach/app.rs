@@ -136,11 +136,6 @@ pub struct App {
     /// every layout change — same row, else its project's row, else a clamped
     /// index — so a kill or state change never silently retargets the cursor.
     sidebar_anchor: Option<(sidebar::EntryIdent, WorkspaceId)>,
-    /// The project the sidebar cursor last landed on (a project/workspace row's
-    /// project, or a waiting row's), driving the agents-section filter while the
-    /// sidebar is focused. `None` — and always outside sidebar focus — falls
-    /// back to the project owning the active tab.
-    sidebar_project: Option<WorkspaceId>,
     /// The directory being typed while in `SidebarPrompt` mode (add project).
     sidebar_prompt: String,
     /// Directory completions for the current `sidebar_prompt`, recomputed on
@@ -204,7 +199,6 @@ pub struct App {
     /// Whether the projects / agents / waiting sidebar sections are collapsed to
     /// their header. Toggled by clicking a section header.
     collapsed_projects: bool,
-    collapsed_agents: bool,
     collapsed_waiting: bool,
     /// Whether the real terminal advertises truecolor (`COLORTERM`), gating the
     /// chrome background shades. Resolved once at startup; `false` in tests.
@@ -251,7 +245,6 @@ impl App {
             prefix_since: None,
             sidebar_selected: 0,
             sidebar_anchor: None,
-            sidebar_project: None,
             sidebar_prompt: String::new(),
             prompt_completions: Vec::new(),
             prompt_selected: 0,
@@ -275,7 +268,6 @@ impl App {
             notified: HashSet::new(),
             terminal_out: Vec::new(),
             collapsed_projects: false,
-            collapsed_agents: false,
             collapsed_waiting: false,
             truecolor: false,
             mouse_capture: config.mouse,
@@ -852,24 +844,19 @@ impl App {
 
     // ---- sidebar --------------------------------------------------------
 
-    /// The sidebar as it currently renders — workspaces then agents — for the
-    /// renderer, hit-testing, and navigation. Carries the client's collapse state
-    /// so the frame headers and row math agree.
+    /// The sidebar as it currently renders — the project tree then the waiting
+    /// queue — for the renderer, hit-testing, and navigation. Carries the
+    /// client's collapse state so the frame headers and row math agree.
     pub fn sidebar(&self) -> Sidebar {
-        let mut sidebar = sidebar::build(&self.workspaces, self.active_tab, self.current_project());
+        let mut sidebar = sidebar::build(&self.workspaces, self.active_tab);
         sidebar.projects_collapsed = self.collapsed_projects;
-        sidebar.agents_collapsed = self.collapsed_agents;
         sidebar.waiting_collapsed = self.collapsed_waiting;
         sidebar
     }
 
-    /// The project the agents section filters to: the sidebar cursor's project
-    /// while the sidebar is focused, else the project owning the active tab —
-    /// so an unfocused sidebar always tracks where the user actually is.
-    fn current_project(&self) -> Option<WorkspaceId> {
-        self.sidebar_project
-            .filter(|_| self.sidebar_focused())
-            .or_else(|| self.active_project())
+    /// The agent-state census across every project — the app bar's chips.
+    pub fn agent_census(&self) -> sidebar::AgentCensus {
+        sidebar::census(&self.workspaces)
     }
 
     /// The top-level project owning the active tab: the owning workspace's
@@ -885,38 +872,6 @@ impl App {
                 .filter(|p| self.workspaces.iter().any(|o| o.id == *p))
                 .unwrap_or(ws.id),
         )
-    }
-
-    /// After the sidebar cursor moves, retarget the agents filter to what it
-    /// landed on: a project/workspace row selects its project, a waiting row
-    /// selects the project its agent lives in. Landing inside the agents section
-    /// keeps the current filter (those rows are already the selected project's).
-    /// A waiting-row retarget re-filters the agents section, shifting every
-    /// waiting index, so the cursor is re-anchored to the same pane afterwards.
-    fn sync_sidebar_project(&mut self, sidebar: &Sidebar) {
-        match sidebar.entries.get(self.sidebar_selected) {
-            Some(SidebarEntry::Workspace(w)) => self.sidebar_project = Some(w.project),
-            Some(SidebarEntry::Agent(a))
-                if self.sidebar_selected >= sidebar.workspace_count + sidebar.agent_count =>
-            {
-                let pane = a.pane;
-                self.sidebar_project = Some(a.project);
-                let rebuilt = self.sidebar();
-                let waiting_start = rebuilt.workspace_count + rebuilt.agent_count;
-                if let Some(idx) = rebuilt
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .skip(waiting_start)
-                    .find_map(|(i, e)| {
-                        matches!(e, SidebarEntry::Agent(x) if x.pane == pane).then_some(i)
-                    })
-                {
-                    self.select_entry(&rebuilt, idx);
-                }
-            }
-            _ => {}
-        }
     }
 
     /// Whether the sidebar currently holds keyboard focus. The sidebar-raised
@@ -1078,9 +1033,14 @@ impl App {
             return;
         }
         self.mode = Mode::Sidebar;
-        self.sidebar_selected = 0;
-        self.sidebar_project = None;
-        self.sidebar_anchor = anchor_at(&self.sidebar(), 0);
+        // Land on the active project's row — where the user actually is — not
+        // unconditionally on row 0.
+        let sidebar = self.sidebar();
+        let idx = self
+            .active_project()
+            .and_then(|p| sidebar.index_of(sidebar::EntryIdent::Workspace(p)))
+            .unwrap_or(0);
+        self.select_entry(&sidebar, idx);
         self.prefix_since = None;
         self.status = None;
     }
@@ -1113,12 +1073,10 @@ impl App {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
                 self.select_entry(&sidebar, next_visible(&sidebar, self.sidebar_selected));
-                self.sync_sidebar_project(&sidebar);
                 Vec::new()
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.select_entry(&sidebar, prev_visible(&sidebar, self.sidebar_selected));
-                self.sync_sidebar_project(&sidebar);
                 Vec::new()
             }
             KeyCode::Enter => self.jump_to_selected(&sidebar),
@@ -1946,7 +1904,6 @@ impl App {
     fn toggle_section(&mut self, section: sidebar::Section) {
         match section {
             sidebar::Section::Projects => self.collapsed_projects = !self.collapsed_projects,
-            sidebar::Section::Agents => self.collapsed_agents = !self.collapsed_agents,
             sidebar::Section::Waiting => self.collapsed_waiting = !self.collapsed_waiting,
         }
     }
@@ -3302,24 +3259,24 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_filter_follows_the_cursor_and_reverts_on_unfocus() {
+    fn every_projects_agents_stay_visible_regardless_of_the_cursor() {
         let mut app = App::new();
         attach_with(&mut app, view_two_workspaces());
         focus_sidebar(&mut app);
-        // The active tab's project (api) has no agents, so web's stay out of
-        // the agents section — they only surface in the waiting queue.
-        assert_eq!(app.sidebar().agent_count, 0);
+        // web's agents hang under web in the tree even while the cursor sits on
+        // api — there is no cursor-driven filter to reshuffle the rows.
+        let before = app.sidebar();
+        assert_eq!(before.tree_count, 4, "api, web, and web's two agents");
         app.on_key(plain('j')); // highlight web
-        assert_eq!(app.sidebar().agent_count, 2);
-        assert_eq!(app.sidebar().project.as_deref(), Some("web"));
-        // Unfocusing drops the preview: the filter tracks the active tab again.
-        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(app.sidebar().agent_count, 0);
-        assert_eq!(app.sidebar().project.as_deref(), Some("api"));
+        assert_eq!(
+            app.sidebar().entries,
+            before.entries,
+            "moving the cursor never changes the tree's shape"
+        );
     }
 
     #[test]
-    fn waiting_row_highlight_retargets_the_agents_filter() {
+    fn a_waiting_row_cursor_stays_in_the_queue_across_moves() {
         let mut view = view_two_workspaces();
         view.push(workspace(
             3,
@@ -3336,22 +3293,21 @@ mod tests {
         let mut app = App::new();
         attach_with(&mut app, view);
         focus_sidebar(&mut app);
-        app.on_key(plain('j')); // web
-        app.on_key(plain('j')); // zed — now the filter
-        assert_eq!(app.sidebar().project.as_deref(), Some("zed"));
-        app.on_key(plain('j')); // zed's own agent
-        assert_eq!(app.sidebar_selected(), 3);
-        app.on_key(plain('j')); // first waiting row: web's blocked pane 3
-        // Landing there retargets the filter to web, which grows the agents
-        // section; the cursor re-anchors onto the same waiting row.
+        // Tree: api, web, web's agents 2+3, zed, zed's agent 4; waiting:
+        // blocked panes 3 then 4.
         let sidebar = app.sidebar();
-        assert_eq!(sidebar.project.as_deref(), Some("web"));
-        assert_eq!(sidebar.agent_count, 2);
-        assert_eq!(app.sidebar_selected(), 5);
-        let SidebarEntry::Agent(a) = &sidebar.entries[5] else {
-            panic!("expected the waiting row");
+        assert_eq!(sidebar.tree_count, 6);
+        for _ in 0..6 {
+            app.on_key(plain('j'));
+        }
+        let SidebarEntry::Agent(a) = &sidebar.entries[app.sidebar_selected()] else {
+            panic!("expected the first waiting row");
         };
-        assert_eq!(a.pane, PaneId(3));
+        assert_eq!(
+            a.pane,
+            PaneId(3),
+            "blocked panes lead the queue in pane order"
+        );
     }
 
     #[test]
@@ -3372,15 +3328,15 @@ mod tests {
         attach_with(&mut app, view_two_workspaces());
         focus_sidebar(&mut app);
         app.on_key(plain('j'));
-        app.on_key(plain('j')); // first agent: blocked pane 3, in tab 2
+        app.on_key(plain('j')); // web's first agent in pane order: pane 2, tab 2
         let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(out, vec![control(&Request::TabSelect { id: TabId(2) })]);
         assert_eq!(app.active_tab, Some(TabId(2)));
-        assert_eq!(app.focused, Some(PaneId(3)));
+        assert_eq!(app.focused, Some(PaneId(2)));
         // The PaneFocus follows from the focus-change the event loop drains.
         assert_eq!(
             app.focus_change(),
-            Some(control(&Request::PaneFocus { pane: PaneId(3) })),
+            Some(control(&Request::PaneFocus { pane: PaneId(2) })),
         );
     }
 
@@ -4021,11 +3977,11 @@ mod tests {
         attach_with(&mut app, view_two_workspaces());
         focus_sidebar(&mut app);
         app.on_key(plain('j')); // web workspace
-        app.on_key(plain('j')); // first agent (blocked pane 3, tab 2 → workspace 2)
+        app.on_key(plain('j')); // web's first agent (pane 2, tab 2 → workspace 2)
         app.on_key(plain('x'));
         assert_eq!(
             app.mode,
-            Mode::ConfirmKillAgent(PaneId(3)),
+            Mode::ConfirmKillAgent(PaneId(2)),
             "x on an agent row confirms killing the pane, never the workspace"
         );
         assert!(
@@ -4036,7 +3992,7 @@ mod tests {
         let out = app.on_key(plain('y'));
         assert_eq!(
             out,
-            vec![control(&Request::PaneKill { pane: PaneId(3) })],
+            vec![control(&Request::PaneKill { pane: PaneId(2) })],
             "y kills the agent's pane only"
         );
         assert_eq!(app.mode, Mode::Sidebar, "focus returns to the sidebar");
@@ -4090,14 +4046,14 @@ mod tests {
         attach_with(&mut app, view_two_workspaces());
         focus_sidebar(&mut app);
         app.on_key(plain('j')); // web row
-        app.on_key(plain('j')); // web's blocked agent (pane 3)
+        app.on_key(plain('j')); // web's first agent (pane 2)
 
         // The agent dies: its row vanishes and the sidebar reshuffles. The
         // cursor falls to the agent's project row — never to the unrelated row
         // that now sits at the old index.
         let mut view = view_two_workspaces();
-        view[1].tabs[0].layout = Some(leaf(2));
-        view[1].tabs[0].panes = vec![agent(2, "claude", AgentState::Working)];
+        view[1].tabs[0].layout = Some(leaf(3));
+        view[1].tabs[0].panes = vec![agent(3, "claude", AgentState::Blocked)];
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Event::LayoutChanged { workspaces: view }).unwrap(),
         ));
@@ -4134,18 +4090,22 @@ mod tests {
     }
 
     #[test]
-    fn the_agents_filter_holds_steady_during_a_kill_confirm() {
+    fn the_sidebar_holds_steady_during_a_kill_confirm() {
         let mut app = App::new();
         attach_with(&mut app, view_two_workspaces());
         focus_sidebar(&mut app);
-        app.on_key(plain('j')); // web row: the agents section filters to web
-        assert_eq!(app.sidebar().project.as_deref(), Some("web"));
+        app.on_key(plain('j')); // web row
+        let before = app.sidebar();
         app.on_key(plain('x'));
         assert!(matches!(app.mode, Mode::ConfirmKillWorkspace(_)));
         assert_eq!(
-            app.sidebar().project.as_deref(),
-            Some("web"),
-            "opening the confirm must not flip the filter to the active project"
+            app.sidebar().entries,
+            before.entries,
+            "opening the confirm must not reshuffle the rows under the question"
+        );
+        assert!(
+            app.sidebar_focused(),
+            "the confirm keeps sidebar focus so the highlight stays visible"
         );
     }
 
@@ -4685,7 +4645,8 @@ mod tests {
 
         focus_sidebar(&mut app);
         app.on_key(plain('j'));
-        app.on_key(plain('j')); // first agent = blocked pane 3
+        app.on_key(plain('j')); // web's first agent (pane 2)
+        app.on_key(plain('j')); // its second: the blocked pane 3
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.focused, Some(PaneId(3)));
         let _ = app.focus_change();

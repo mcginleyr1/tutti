@@ -94,13 +94,13 @@ cd ~/code/myproject && tutti
    `Ctrl+h/j/k/l` moves between panes, `Ctrl+B z` zooms one. Run more agents
    in the splits, or leave a shell beside them.
 
-4. **Herd from the sidebar.** `Ctrl+B w` focuses the sidebar: your projects,
-   the selected project's agents (state dots: blocked red, working spinner,
-   done green), and the cross-project **waiting** queue of everything blocked
-   on you. `Enter` jumps to what you highlight; `n` starts another agent in
-   the selected project (in its own tab), `d` shows its jj diff, `w` creates a
-   nested workspace, `m` merges one back. See [Sidebar](#sidebar) and
-   [Workspaces](#workspaces).
+4. **Herd from the sidebar.** `Ctrl+B w` focuses the sidebar: a tree of your
+   projects with each one's agents nested beneath it (state dots: blocked red,
+   working spinner, done green), and the cross-project **waiting** queue of
+   everything blocked on you. `Enter` jumps to what you highlight; `n` starts
+   another agent in the selected project (in its own tab), `d` shows its jj
+   diff, `w` creates a nested workspace, `m` merges one back. See
+   [Sidebar](#sidebar) and [Workspaces](#workspaces).
 
 5. **Detach and return.** `Ctrl+B d` detaches; every pane keeps running under
    the daemon. `tutti` reattaches — state dots and the waiting queue catch you
@@ -300,51 +300,57 @@ hard error.
 
 A left column that turns the TUI into a control center for many projects and
 agents at once — one rounded frame whose top border carries the `projects`
-header and whose fused dividers (`├ agents · name ── N ┤`, `├ waiting ── N ┤`)
-carry the `agents` and `waiting` headers, each with a `▼`/`▶` collapse arrow
-and a right-aligned count. It renders dim by default, with the focused row
-popping in the accent colour. Three stacked sections:
+header and whose fused divider (`├ waiting ── N ┤`) carries the `waiting`
+header, each with a `▼`/`▶` collapse arrow and a right-aligned count. It
+renders dim by default, with the focused row popping in the accent colour. Two
+stacked sections:
 
-- **projects** — one row per top-level project, with any [nested
-  workspaces](#workspaces) rendered **indented beneath it** on `├`/`└` tree
-  guides (same two-line row, name bold). Each row is an `●` (accent) when it owns
-  the active tab, else a dim `○`, then the bold name, over a dim line showing a
-  branch marker and the git branch (read straight from `.git/HEAD`, including
-  worktrees) on the left and the jj change stat (`4 files +120 −33`)
-  right-aligned. No branch leaves the left blank rather than echoing the name; a
-  clean or non-jj workspace shows no stat. The stat refreshes as agents work (on
-  every state transition, on attach, and when a workspace is created) and is
-  dropped first when the column is too narrow for both. A nested
-  [workspace](#workspaces) whose `@` was rewritten from another workspace shows a
-  dim-red `stale` tag in the stat's place until you run `workspace update`.
-  Collapsing a project hides its nested workspaces too. Selecting a workspace
-  jumps to its tab.
-- **agents** — one row per agent pane in the **selected project** (the header
-  names it): a state dot (blocked red, working an animated spinner, done green,
+- **projects** — a tree. One row per top-level project with **its agents
+  nested beneath it** on `├`/`└` guides, then any [nested
+  workspaces](#workspaces) (indented, guided, same two-line row, name bold),
+  each followed by *its* agents one level deeper. A workspace row is an `●`
+  (accent) when it owns the active tab, else a dim `○`, then the bold name —
+  with right-aligned roll-up chips (`● 2 ● 1`) counting the subtree's
+  blocked/working/done agents — over a dim line showing a branch marker and
+  the git branch (read straight from `.git/HEAD`, including worktrees) on the
+  left and the jj change stat (`4 files +120 −33`) right-aligned. No branch
+  leaves the left blank rather than echoing the name; a clean or non-jj
+  workspace shows no stat. The stat refreshes as agents work (on every state
+  transition, on attach, and when a workspace is created) and is dropped first
+  when the column is too narrow for both. A nested [workspace](#workspaces)
+  whose `@` was rewritten from another workspace shows a dim-red `stale` tag
+  in the stat's place until you run `workspace update`. An agent row is a
+  state dot (blocked red, working an animated spinner, done green,
   idle/unknown dim), the pane title, and a dim `state · kind` line, with any
-  hook-reported subagents hanging below on `├`/`└` tree guides. Sorted
-  blocked-first, and a nested workspace's agents count as its parent project's.
-  The filter follows the sidebar highlight: land on a project (or one of its
-  workspaces) and this section shows its agents; outside the sidebar it tracks
-  the project that owns the active tab. Selecting an agent jumps to that pane,
-  switching workspace and tab as needed. A pane that rings a bell or fires a
-  desktop notification while in the background gets a 🔔 mark here that clears
-  when you focus it. When the selected project runs no agents the section shows
-  a dim italic `no agents here` placeholder.
+  hook-reported subagents hanging below on their own guides. Agent rows keep
+  **pane order** — a state change never reshuffles the tree under your cursor;
+  attention order lives in the waiting queue. Selecting a workspace jumps to
+  its tab; selecting an agent jumps to its pane, switching workspace and tab
+  as needed. A pane that rings a bell or fires a desktop notification while in
+  the background gets a 🔔 mark that clears when you focus it.
 - **waiting** — the cross-project attention queue: every **blocked** or
   **done** agent from *every* project, blocked first, each over a dim
-  `project · kind` line naming where it lives (subagent rows stay in the agents
-  section). Highlighting a row here re-points the agents section at that
-  agent's project; `Enter` (or a click) jumps to the agent itself, so a stuck
-  agent two projects away is never invisible and always one keystroke away.
+  `project · kind` line naming where it lives (subagent rows stay in the
+  tree). `Enter` (or a click) jumps to the agent itself, so a stuck agent two
+  projects away is never invisible and always one keystroke away.
+
+The app bar answers "does anything need me?" from across the room: after the
+session title it carries a state census (`● 1 blocked · ⠋ 2 working · ● 1
+done`) counting every agent in the session, empty when nothing runs.
 
 The selected row (while the sidebar is focused) takes a subtle full-row
 highlight with its name rendered as an accent chip, unmistakable even with a
-single entry. Click a section header (the top border or the divider) to collapse
-that section down to its header, or click again to expand it.
+single entry. The highlight follows the row's **identity**, not its position:
+when a kill or a state change reshapes the list, the cursor stays on the row
+it was on (falling back to the row's project when the row itself vanished),
+and a kill confirm re-checks its target before firing — a confirm can never
+land on the wrong workspace or agent. Click a section header (the top border
+or the divider) to collapse that section down to its header, or click again
+to expand it.
 
-Press the prefix then `w` to focus the sidebar (revealing it if hidden). While
-focused, `j`/`k` (or the arrows) move the highlight across all three sections, `Enter`
+Press the prefix then `w` to focus the sidebar (revealing it if hidden); the
+cursor lands on the active project's row. While focused, `j`/`k` (or the
+arrows) move the highlight across both sections, `Enter`
 jumps and hands focus back to the pane, and `esc` unfocuses (esc is the back key
 throughout). `w` opens **guided [workspace](#workspaces) creation** on the
 selected project (below); `n` starts a **new agent** (or shell/command) in the
@@ -468,10 +474,10 @@ variant. (After a merge, the cleanup prompt is the `--discard` path.)
 ## Agent state badges
 
 Panes running a detected agent show live state on the pane border and in the
-sidebar's agents section: **blocked** (red — needs your input; sorted first in
-the sidebar and reddening the pane border), **working** (yellow, an animated
-braille spinner), **done** (green — finished, not yet viewed; focusing it makes
-it **idle**). The pane's border title carries the same `agent · state` suffix;
+sidebar tree: **blocked** (red — needs your input; leading the waiting queue
+and reddening the pane border), **working** (yellow, an animated braille
+spinner), **done** (green — finished, not yet viewed; focusing it makes it
+**idle**). The pane's border title carries the same `agent · state` suffix;
 a plain shell shows just its name. Background panes ring the terminal bell when
 they block or finish. The alpha registry detects `claude` and `codex`; adding an
 agent is one data-table row in `crates/tutti-agents` (codex screen patterns are
