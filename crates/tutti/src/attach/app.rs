@@ -1367,8 +1367,10 @@ impl App {
                 Vec::new()
             }
             // Tab fills in the highlighted directory; the arrows move the
-            // highlight. Enter always submits whatever is typed (never the
-            // completion), so a highlighted row is only ever taken via Tab.
+            // highlight. Enter submits the typed path when it exists, and
+            // otherwise takes the highlighted completion — typing a prefix of
+            // the directory you want and hitting Enter must not mount the
+            // prefix as a dead project.
             KeyCode::Tab => {
                 self.complete_selection();
                 Vec::new()
@@ -1444,15 +1446,28 @@ impl App {
     /// Submit the add-project prompt: mount the typed directory as a workspace,
     /// arm the jump to the new tab, then open the launcher to pick its first
     /// pane (esc there spawns the shell, preserving bare `tutti`'s outcome).
+    /// A typed path that is not on disk falls back to the highlighted
+    /// completion; with no completion either, the prompt stays open with a
+    /// transient rather than mounting a dead directory.
     fn submit_prompt(&mut self) -> Vec<WireFrame> {
         let input = self.sidebar_prompt.trim().to_string();
-        self.clear_prompt();
-        self.status = None;
         if input.is_empty() {
+            self.clear_prompt();
+            self.status = None;
             self.mode = Mode::Terminal;
             return Vec::new();
         }
-        let dir = expand_dir(&input);
+        let mut dir = expand_dir(&input);
+        if !dir.is_dir() {
+            if self.prompt_completions.get(self.prompt_selected).is_none() {
+                self.set_status(format!("no such directory: {input}"));
+                return Vec::new();
+            }
+            self.complete_selection();
+            dir = expand_dir(self.sidebar_prompt.trim());
+        }
+        self.clear_prompt();
+        self.status = None;
         self.adopt_active_view = true;
         let name = workspace_name_from_dir(&dir);
         // Harvest against the directory being added: an existing project often
@@ -4169,12 +4184,14 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         assert_eq!(app.sidebar_prompt(), "/tmp/w/api");
 
+        // Enter only mounts a directory that exists on disk, so make it real.
+        std::fs::create_dir_all("/tmp/w/api").unwrap();
         let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let dir = std::fs::canonicalize("/tmp/w/api").unwrap();
+        let _ = std::fs::remove_dir_all("/tmp/w/api");
         assert_eq!(
             out,
-            vec![control(&Request::WorkspaceNew {
-                dir: PathBuf::from("/tmp/w/api"),
-            })],
+            vec![control(&Request::WorkspaceNew { dir })],
             "submit mounts the typed directory, then the launcher picks its first pane"
         );
         assert_eq!(app.mode, Mode::Launcher);
@@ -4260,15 +4277,17 @@ mod tests {
 
     #[test]
     fn first_run_prompt_enter_creates_workspace_then_opens_the_launcher() {
+        // A real directory: the prompt refuses to mount one missing on disk.
+        let root = temp_tree(&[]);
         let mut app = App::new();
-        app.start_first_run_prompt("/tmp/proj".into());
+        app.start_first_run_prompt(root.display().to_string());
         attach_with(&mut app, vec![]);
         let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let dir = std::fs::canonicalize(&root).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
         assert_eq!(
             out,
-            vec![control(&Request::WorkspaceNew {
-                dir: PathBuf::from("/tmp/proj"),
-            })],
+            vec![control(&Request::WorkspaceNew { dir })],
             "the first-run prompt mounts the workspace, then the launcher picks its pane"
         );
         assert_eq!(app.mode, Mode::Launcher);
@@ -4787,7 +4806,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_submits_the_typed_input_ignoring_the_selection() {
+    fn enter_submits_the_typed_input_when_it_is_a_real_dir() {
         let root = temp_tree(&["alpha", "beta"]);
         let mut app = App::new();
         app.start_first_run_prompt(format!("{}/", root.display()));
@@ -4797,7 +4816,8 @@ mod tests {
 
         let typed = app.sidebar_prompt().to_string();
         let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        // Enter mounts the *typed* directory (the tempdir), never the highlight.
+        // The typed path exists, so Enter mounts it (the tempdir), not the
+        // highlight — the highlight only wins when the typed path is missing.
         let dir = std::fs::canonicalize(&typed).unwrap();
         assert_eq!(
             out,
@@ -4805,6 +4825,47 @@ mod tests {
             "submit mounts the typed directory, then opens the launcher"
         );
         assert_eq!(app.mode, Mode::Launcher);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn enter_takes_the_highlight_when_the_typed_prefix_is_not_a_dir() {
+        // The trap: type "the", see "the-librarian" highlighted, hit Enter —
+        // it must mount the-librarian, not a dead "the" project.
+        let root = temp_tree(&["the-librarian"]);
+        let mut app = App::new();
+        app.start_first_run_prompt(format!("{}/the", root.display()));
+        assert_eq!(app.prompt_completions(), &["the-librarian".to_string()]);
+
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let dir = std::fs::canonicalize(root.join("the-librarian")).unwrap();
+        assert_eq!(
+            out,
+            vec![control(&Request::WorkspaceNew { dir })],
+            "enter completes to the highlighted directory and mounts it"
+        );
+        assert_eq!(app.mode, Mode::Launcher);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn enter_with_no_match_keeps_the_prompt_open() {
+        let root = temp_tree(&["alpha"]);
+        let mut app = App::new();
+        app.start_first_run_prompt(format!("{}/zzz", root.display()));
+        assert!(app.prompt_completions().is_empty());
+
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(out.is_empty(), "nothing is sent for a missing directory");
+        assert_eq!(app.mode, Mode::SidebarPrompt);
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|(m, _)| m.contains("no such directory")),
+            "the prompt explains why nothing was mounted"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

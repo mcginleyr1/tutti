@@ -1147,7 +1147,8 @@ mod tests {
 
     #[test]
     fn mount_projects_surfaces_a_failed_project_and_mounts_the_rest() {
-        // The server errors at pane-run when the dir does not exist on disk.
+        // The server errors at workspace-new for a dir missing on disk, and at
+        // pane-run for one that vanishes after mounting; this drives the latter.
         let mut sent = Vec::new();
         let mut last_dir: Option<PathBuf> = None;
         let notices = mount_projects(

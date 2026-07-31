@@ -190,6 +190,29 @@ async fn pane_survives_client_disconnect() {
     server.stop().await;
 }
 
+/// Mounting a directory that is not on disk is refused outright — otherwise
+/// every pane spawned in it would land in $HOME via portable-pty's fallback.
+#[tokio::test]
+async fn workspace_new_rejects_a_missing_dir() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+
+    let response = conn
+        .request(Request::WorkspaceNew {
+            dir: "/nonexistent/tutti-test-dir".into(),
+        })
+        .await;
+    match response {
+        Response::Error { message } => assert!(
+            message.contains("does not exist"),
+            "unexpected error message: {message}"
+        ),
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    server.stop().await;
+}
+
 /// Bytes sent with `pane send` reach the child and echo back onto its grid.
 #[tokio::test]
 async fn pane_send_echoes_into_grid() {

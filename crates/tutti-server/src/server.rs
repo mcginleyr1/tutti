@@ -345,6 +345,13 @@ fn send_reply(
 fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
     match request {
         Request::WorkspaceNew { dir } => {
+            // Refuse to mount a directory that is not on disk: every pane spawn
+            // in it would fail, leaving a dead sidebar entry.
+            if !dir.is_dir() {
+                return Response::Error {
+                    message: format!("directory does not exist: {}", dir.display()),
+                };
+            }
             let id = hub.session().workspace_new(dir);
             refresh_changes(hub, id);
             Response::WorkspaceCreated { id }

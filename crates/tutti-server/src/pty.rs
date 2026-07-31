@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::watch;
 
@@ -98,6 +98,13 @@ impl PtyPane {
     /// detached from any UI; output is accumulated into the vt100 grid by a
     /// background thread from the moment this returns.
     pub fn spawn(spec: PtySpec, size: PaneSize) -> Result<Self> {
+        // portable-pty silently substitutes $HOME when the requested cwd is not
+        // a directory, which would launch an agent against the wrong tree.
+        if let Some(cwd) = &spec.cwd
+            && !cwd.is_dir()
+        {
+            bail!("working directory does not exist: {}", cwd.display());
+        }
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -743,6 +750,21 @@ mod tests {
         assert_eq!(whole.len(), 4, "bell, osc9, osc777, bell");
         for cut in 0..=input.len() {
             assert_eq!(scan_split(input, cut), whole, "mismatch cutting at {cut}");
+        }
+    }
+
+    /// A missing cwd must fail the spawn: portable-pty would otherwise fall
+    /// back to $HOME and quietly run the child against the wrong tree.
+    #[test]
+    fn spawn_refuses_a_cwd_that_does_not_exist() {
+        let mut spec = PtySpec::new("/bin/sh");
+        spec.cwd = Some(PathBuf::from("/nonexistent/tutti-test-dir"));
+        match PtyPane::spawn(spec, PaneSize::new(24, 80)) {
+            Err(err) => assert!(
+                err.to_string().contains("does not exist"),
+                "unexpected error: {err}"
+            ),
+            Ok(_) => panic!("spawn accepted a missing cwd"),
         }
     }
 
