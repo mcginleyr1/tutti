@@ -159,14 +159,18 @@ overlay — detach first, then the rest of the active keymap, the direct keys, a
 how to stop the daemon.
 
 A full-width **app bar** runs across the top: an accent bar and the bold
-`tutti — <session>` wordmark on the left, the tab segments right-aligned
-(`[1 main] [2 logs] [+]`, the active one an accent block, the `+` dim), over a
-dim rule. Click a segment to select its tab, the `[+]` to open one. Each pane
-carries its **title on its own line above its rounded frame** — an accent `❯`
-plus the agent/state for the focused pane, dim for the rest. The **footer**
-stays out of the way: a mode chip on the left when you leave terminal mode
-(`SIDEBAR`, `SCROLL`, …) and the standing hint on the right; a transient fires a
-one-line **notification band** just above it (accent for info, red for errors).
+`tutti — <session>` wordmark on the left (just `tutti` when the session shares
+the name), the tab segments right-aligned (` 1 claude  2 logs  + `, the active
+one a bold accent block, the rest dim), over a dim rule. Click a segment to
+select its tab, the ` + ` to open one. A tab you haven't named borrows its
+active pane's title, so segments say what they hold, not just where they sit.
+Each pane carries its **title on its own line above its rounded frame** — an
+accent `❯` plus the agent/state for the focused pane, dim for the rest. The
+**footer** earns its row: in terminal mode it shows where you are (an accent
+dot, the active workspace's name, its branch and jj change stat); leaving
+terminal mode swaps in a mode chip (`SIDEBAR`, `SCROLL`, …) on the left, with
+the standing hint always on the right; a transient fires a one-line
+**notification band** just above it (accent for info, red for errors).
 
 **Run launcher** (`Ctrl+B r`): a floating ` run in <project> ` panel that answers
 "what should start here?" — the agents **installed on this machine** first
@@ -299,11 +303,11 @@ hard error.
 ## Sidebar
 
 A left column that turns the TUI into a control center for many projects and
-agents at once — one rounded frame whose top border carries the `projects`
-header and whose fused divider (`├ waiting ── N ┤`) carries the `waiting`
-header, each with a `▼`/`▶` collapse arrow and a right-aligned count. It
-renders dim by default, with the focused row popping in the accent colour. Two
-stacked sections:
+agents at once — a borderless panel on its own background layer, each section
+labelled by a quiet caps header (` ▾ PROJECTS`, ` ▾ WAITING`) with a `▾`/`▸`
+collapse arrow and a right-aligned count. Names render at full intensity and
+everything else recedes dim, so the eye lands on identity; the focused row
+pops in the accent colour. Two stacked sections:
 
 - **projects** — a tree. One row per top-level project with **its agents
   nested beneath it** on `├`/`└` guides, then any [nested
@@ -344,8 +348,8 @@ single entry. The highlight follows the row's **identity**, not its position:
 when a kill or a state change reshapes the list, the cursor stays on the row
 it was on (falling back to the row's project when the row itself vanished),
 and a kill confirm re-checks its target before firing — a confirm can never
-land on the wrong workspace or agent. Click a section header (the top border
-or the divider) to collapse that section down to its header, or click again
+land on the wrong workspace or agent. Click a section header (the `PROJECTS`
+or `WAITING` row) to collapse that section down to its header, or click again
 to expand it.
 
 Press the prefix then `w` to focus the sidebar (revealing it if hidden); the

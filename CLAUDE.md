@@ -63,8 +63,12 @@ cargo fmt --check
 
 - Dim by default; ONE accent (terminal blue) marks the focused/active thing;
   red/yellow/green only on state dots, the working spinner, and the blocked
-  border. Chrome backgrounds are truecolor-gated (`COLORTERM`) with a
-  `chrome_background = false` escape; **pane interiors are never themed**.
+  border. Names (projects, agents, the active workspace in the footer) stay at
+  full intensity — identity bright, metadata dim; don't re-dim them. Chrome
+  backgrounds are truecolor-gated (`COLORTERM`) with a `chrome_background =
+  false` escape; **pane interiors are never themed**. Chrome panels are
+  borderless (background layers + caps section headers, no box-drawing
+  frames); pane frames are the only boxes.
 - Glyphs: safe-unicode set by default, nerd-font set behind `icons =
   "nerdfont"`. No private-use codepoints in the default set.
 - Which-key, the help overlay, and the bottom-bar hints all render from the

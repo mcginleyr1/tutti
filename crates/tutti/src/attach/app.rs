@@ -740,7 +740,6 @@ impl App {
             PrefixAction::Run => {
                 let ws = self
                     .active_workspace()
-                    .and_then(|id| self.workspaces.iter().find(|w| w.id == id))
                     .map(|w| (w.name.clone(), w.dir.clone()));
                 self.open_launcher(
                     false,
@@ -857,6 +856,14 @@ impl App {
     /// The agent-state census across every project — the app bar's chips.
     pub fn agent_census(&self) -> sidebar::AgentCensus {
         sidebar::census(&self.workspaces)
+    }
+
+    /// The workspace owning the active tab — the footer's context segment.
+    pub fn active_workspace(&self) -> Option<&WorkspaceView> {
+        let at = self.active_tab?;
+        self.workspaces
+            .iter()
+            .find(|w| w.tabs.iter().any(|t| t.id == at))
     }
 
     /// The top-level project owning the active tab: the owning workspace's
@@ -1828,8 +1835,9 @@ impl App {
         self.sidebar_rect.is_some_and(|r| contains(r, col, row))
     }
 
-    /// The app-bar tab segments, left to right: one `[<n> <name>]` per tab
-    /// (carrying its id) then a trailing `[+]` (a `None` target = new tab).
+    /// The app-bar tab segments, left to right: one ` <n> <name> ` per tab
+    /// (carrying its id) then a trailing ` + ` (a `None` target = new tab) —
+    /// space-padded so the active segment's background reads as a filled block.
     /// Shared by the renderer and the click hit-test so a click lands on exactly
     /// what is drawn; the renderer joins them with a one-column separator.
     pub fn tab_chips(&self) -> Vec<(Option<TabId>, String)> {
@@ -1837,9 +1845,9 @@ impl App {
             .all_tabs()
             .iter()
             .enumerate()
-            .map(|(i, t)| (Some(t.id), format!("[{} {}]", i + 1, t.name)))
+            .map(|(i, t)| (Some(t.id), format!(" {} {} ", i + 1, t.name)))
             .collect();
-        chips.push((None, "[+]".into()));
+        chips.push((None, " + ".into()));
         chips
     }
 
@@ -2061,7 +2069,7 @@ impl App {
     }
 
     fn new_tab(&mut self) -> Vec<WireFrame> {
-        let workspace = self.active_workspace();
+        let workspace = self.active_workspace().map(|w| w.id);
         vec![control(&Request::TabNew { workspace })]
     }
 
@@ -2213,14 +2221,6 @@ impl App {
         self.active_tab_view()
             .and_then(|t| t.layout.as_ref().map(Layout::panes))
             .unwrap_or_default()
-    }
-
-    fn active_workspace(&self) -> Option<WorkspaceId> {
-        let id = self.active_tab?;
-        self.workspaces
-            .iter()
-            .find(|w| w.tabs.iter().any(|t| t.id == id))
-            .map(|w| w.id)
     }
 
     /// The name of the workspace with `id`, from the current view.

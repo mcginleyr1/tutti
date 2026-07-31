@@ -177,7 +177,9 @@ fn draw_app_bar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
         return;
     }
     paint_bg(frame, area, bar_bg(app));
-    let title = if app.session.is_empty() {
+    // A session named after the binary would read as a stutter ("tutti — tutti"),
+    // so the suffix only appears when it says something the wordmark doesn't.
+    let title = if app.session.is_empty() || app.session == "tutti" {
         "tutti".to_string()
     } else {
         format!("tutti — {}", app.session)
@@ -226,9 +228,10 @@ fn draw_rule(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(Span::styled(rule, dim()))), area);
 }
 
-/// The app-bar tab segments: one `[<n> <name>]` per tab (active = accent block,
-/// inactive = normal text, the trailing `[+]` dim), joined by a one-column
-/// separator. Segment widths match `App::tab_chips` so clicks land true.
+/// The app-bar tab segments: one padded ` <n> <name> ` per tab (active = bold
+/// black on the accent block, inactive dim, the trailing ` + ` dim), joined by
+/// a one-column separator. Segment widths match `App::tab_chips` so clicks
+/// land true.
 fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -239,23 +242,21 @@ fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
             spans.push(Span::raw(" "));
         }
         let active = matches!(target, Some(id) if app.active_tab == Some(id));
-        spans.push(Span::styled(
-            label,
-            tab_chip_style(active, target.is_none()),
-        ));
+        spans.push(Span::styled(label, tab_chip_style(active)));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// The style of a tab segment: the active tab is an accent block, an inactive
-/// tab is normal text on the chrome background, and the trailing `[+]` is dim.
-fn tab_chip_style(active: bool, is_new: bool) -> Style {
+/// The style of a tab segment: the active tab is a bold accent block; inactive
+/// tabs and the trailing ` + ` recede dim so the block is the one loud thing.
+fn tab_chip_style(active: bool) -> Style {
     if active {
-        Style::default().fg(Color::Black).bg(ACCENT)
-    } else if is_new {
-        dim()
-    } else {
         Style::default()
+            .fg(Color::Black)
+            .bg(ACCENT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        dim()
     }
 }
 
@@ -336,7 +337,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
     }
     paint_bg(frame, area, panel_bg(app));
     let w = area.width;
-    let content_w = w.saturating_sub(4); // two borders + one column of padding each side
+    let content_w = w.saturating_sub(2); // one column of padding each side
 
     let sidebar = app.sidebar();
     let tree_count = sidebar.tree_count;
@@ -347,9 +348,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
     let glyphs = glyphs(app.config().icons);
 
     let mut lines: Vec<Line> = Vec::new();
-    lines.push(header_border(
-        '╭',
-        '╮',
+    lines.push(section_header(
         sidebar.projects_collapsed,
         "projects",
         sidebar.workspace_rows(),
@@ -360,24 +359,24 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
             let sel = pop && selected == i;
             match entry {
                 SidebarEntry::Workspace(row) => {
-                    lines.push(frame_row(workspace_inner(row, sel, content_w, glyphs), sel));
-                    lines.push(frame_row(
+                    lines.push(bare_row(workspace_inner(row, sel, content_w, glyphs), sel));
+                    lines.push(bare_row(
                         workspace_subtitle_inner(row, sel, content_w, glyphs),
                         sel,
                     ));
                 }
                 SidebarEntry::Agent(a) => {
-                    lines.push(frame_row(
+                    lines.push(bare_row(
                         agent_inner(a, sel, spinner, content_w, glyphs),
                         sel,
                     ));
-                    lines.push(frame_row(
+                    lines.push(bare_row(
                         agent_subtitle_inner(a, sel, app.is_notified(a.pane), content_w),
                         sel,
                     ));
                     let last = a.subagents.len();
                     for (j, subagent) in a.subagents.iter().enumerate() {
-                        lines.push(frame_row(
+                        lines.push(bare_row(
                             subagent_inner(subagent, a.depth, spinner, j + 1 == last, content_w),
                             false,
                         ));
@@ -386,9 +385,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
             }
         }
     }
-    lines.push(header_border(
-        '├',
-        '┤',
+    lines.push(section_header(
         sidebar.waiting_collapsed,
         "waiting",
         waiting_count,
@@ -398,33 +395,25 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
         for (i, entry) in sidebar.entries.iter().enumerate().skip(tree_count) {
             if let SidebarEntry::Agent(a) = entry {
                 let sel = pop && selected == i;
-                lines.push(frame_row(
+                lines.push(bare_row(
                     agent_inner(a, sel, spinner, content_w, glyphs),
                     sel,
                 ));
-                lines.push(frame_row(
+                lines.push(bare_row(
                     waiting_subtitle_inner(a, sel, app.is_notified(a.pane), content_w),
                     sel,
                 ));
             }
         }
     }
-    // Fill to the foot, then close the frame with the bottom border.
-    let h = area.height as usize;
-    while lines.len() + 1 < h {
-        lines.push(frame_blank(w));
-    }
-    if lines.len() < h {
-        lines.push(bottom_border(w));
-    }
     frame.render_widget(Paragraph::new(lines), area);
 
     if app.sidebar_prompt_active() {
-        // The prompt overlays the frame's inner content column (inside the
-        // borders and padding), leaving the frame edges intact. The fork prompt
-        // reuses the same field with an empty listing and its own label.
+        // The prompt overlays the panel's content column (inside the padding).
+        // The fork prompt reuses the same field with an empty listing and its
+        // own label.
         let inner = Rect::new(
-            area.x + 2,
+            area.x + 1,
             area.y + 1,
             content_w,
             area.height.saturating_sub(2),
@@ -446,60 +435,35 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
     }
 }
 
-/// A frame header line — the top border (`╭ ▼ projects ── N ╮`) or the fused
-/// divider (`├ ▼ agents ── N ┤`) — with a collapse arrow, the section title, and
-/// a right-aligned count, filled to `width` with dashes. All dim but the title.
-fn header_border(
-    left: char,
-    right: char,
-    collapsed: bool,
-    title: &str,
-    count: usize,
-    width: u16,
-) -> Line<'static> {
-    let arrow = if collapsed { '▶' } else { '▼' };
+/// A section header row (` ▾ PROJECTS      N `): a collapse arrow, the caps
+/// title, and the count right-aligned to the panel edge. Kept quiet — the rows
+/// carry the brightness, the header just labels the group.
+fn section_header(collapsed: bool, title: &str, count: usize, width: u16) -> Line<'static> {
+    let arrow = if collapsed { '▸' } else { '▾' };
+    let label = title.to_uppercase();
     let count = count.to_string();
-    let title_w = title.chars().count();
-    // left ' ' arrow ' ' title ' ' <dashes> ' ' count ' ' right
-    let fixed = 8 + title_w + count.chars().count();
-    let dashes = (width as usize).saturating_sub(fixed);
+    // ' ' arrow ' ' label <gap> count ' '
+    let used = 4 + label.chars().count() + count.chars().count();
+    let gap = (width as usize).saturating_sub(used);
     Line::from(vec![
-        Span::styled(format!("{left} {arrow} "), dim()),
-        Span::styled(title.to_string(), Style::default()),
-        Span::styled(format!(" {} ", "─".repeat(dashes)), dim()),
-        Span::styled(count, dim()),
-        Span::styled(format!(" {right}"), dim()),
+        Span::styled(format!(" {arrow} "), dim()),
+        Span::styled(label, dim().add_modifier(Modifier::BOLD)),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(format!("{count} "), dim()),
     ])
 }
 
-/// The frame's bottom border (`╰────╯`).
-fn bottom_border(width: u16) -> Line<'static> {
-    let mid = "─".repeat((width as usize).saturating_sub(2));
-    Line::from(Span::styled(format!("╰{mid}╯"), dim()))
-}
-
-/// A blank interior row — the left and right frame edges over empty space.
-fn frame_blank(width: u16) -> Line<'static> {
-    Line::from(vec![
-        Span::styled("│", dim()),
-        Span::raw(" ".repeat((width as usize).saturating_sub(2))),
-        Span::styled("│", dim()),
-    ])
-}
-
-/// Wrap an interior content row (already padded to the content width) in the
-/// frame's `│ … │` edges with one column of padding, shading the padding when
-/// the row is selected so the highlight reads as one bar between the borders.
-fn frame_row(inner: Vec<Span<'static>>, sel: bool) -> Line<'static> {
+/// A content row: one column of padding each side, the selection background
+/// carried across both so the highlight reads as one full-width bar.
+fn bare_row(inner: Vec<Span<'static>>, sel: bool) -> Line<'static> {
     let pad = if sel {
         Style::default().bg(SELECT_BG)
     } else {
         Style::default()
     };
-    let mut spans = vec![Span::styled("│", dim()), Span::styled(" ", pad)];
+    let mut spans = vec![Span::styled(" ", pad)];
     spans.extend(inner);
     spans.push(Span::styled(" ", pad));
-    spans.push(Span::styled("│", dim()));
     Line::from(spans)
 }
 
@@ -528,7 +492,8 @@ fn pad_inner(mut spans: Vec<Span<'static>>, sel: bool, content_w: u16) -> Vec<Sp
 }
 
 /// A name span: the accent chip (black on accent) when selected, else `base`
-/// modifiers plus dim.
+/// modifiers at full intensity — names are the one thing in the panel that
+/// stays bright, so the eye lands on identity and the metadata recedes.
 fn name_span(text: &str, sel: bool, base: Modifier) -> Span<'static> {
     if sel {
         Span::styled(
@@ -539,10 +504,7 @@ fn name_span(text: &str, sel: bool, base: Modifier) -> Span<'static> {
                 .add_modifier(base),
         )
     } else {
-        Span::styled(
-            text.to_string(),
-            Style::default().add_modifier(base | Modifier::DIM),
-        )
+        Span::styled(text.to_string(), Style::default().add_modifier(base))
     }
 }
 
@@ -925,6 +887,24 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             format!(" {label} "),
             Style::default().fg(Color::Black).bg(ACCENT),
         ));
+    } else if let Some(ws) = app.active_workspace() {
+        // Terminal mode has no chip, so the bar earns its row with context:
+        // where am I (dot + workspace), on what (branch), how dirty (stat).
+        let glyphs = glyphs(app.config().icons);
+        spans.push(Span::styled(
+            format!(" {} ", glyphs.ws_active),
+            Style::default().fg(ACCENT),
+        ));
+        spans.push(Span::styled(
+            ws.name.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        if let Some(branch) = &ws.branch {
+            spans.push(Span::styled(format!(" · {branch}"), dim()));
+        }
+        if let Some(changes) = &ws.changes {
+            spans.push(Span::styled(format!(" · {changes}"), dim()));
+        }
     }
     if app.mode == Mode::Sidebar {
         spans.push(Span::raw("  "));
@@ -1482,10 +1462,10 @@ mod tests {
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
         assert!(
-            text.contains("projects"),
+            text.contains("PROJECTS"),
             "projects header missing: {text:?}"
         );
-        assert!(text.contains("waiting"), "waiting header missing: {text:?}");
+        assert!(text.contains("WAITING"), "waiting header missing: {text:?}");
         assert!(text.contains("api"), "workspace name missing: {text:?}");
         assert!(text.contains("main"), "branch subtitle missing: {text:?}");
         assert!(
@@ -1601,11 +1581,11 @@ mod tests {
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
         assert!(
-            !text.contains("agents"),
+            !text.contains("AGENTS"),
             "no agents header, no placeholder — the tree shows reality: {text:?}"
         );
         assert!(
-            text.contains("waiting"),
+            text.contains("WAITING"),
             "the waiting header still closes the tree: {text:?}"
         );
     }
@@ -1862,17 +1842,12 @@ mod tests {
 
     #[test]
     fn tab_segment_marks_active_and_dims_new() {
-        // The active tab is an accent block; an inactive tab is normal text on
-        // the chrome background; the trailing `[+]` segment is dim.
-        assert_eq!(tab_chip_style(true, false).bg, Some(ACCENT));
-        assert_eq!(tab_chip_style(true, false).fg, Some(Color::Black));
-        assert_eq!(tab_chip_style(false, false), Style::default());
-        assert!(
-            tab_chip_style(false, true)
-                .add_modifier
-                .contains(Modifier::DIM)
-        );
-        assert_eq!(tab_chip_style(false, true).bg, None);
+        // The active tab is a bold accent block; everything else recedes dim.
+        assert_eq!(tab_chip_style(true).bg, Some(ACCENT));
+        assert_eq!(tab_chip_style(true).fg, Some(Color::Black));
+        assert!(tab_chip_style(true).add_modifier.contains(Modifier::BOLD));
+        assert!(tab_chip_style(false).add_modifier.contains(Modifier::DIM));
+        assert_eq!(tab_chip_style(false).bg, None);
     }
 
     #[test]
@@ -2113,20 +2088,20 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let buf = terminal.backend().buffer();
-        // The projects header is the sidebar's top border, on content row 2 —
+        // The projects header is the sidebar's first row, on content row 2 —
         // scoped to the 30-column sidebar (the pane area sits to its right).
         let top: String = row_text(buf, 2).chars().take(30).collect();
-        assert!(top.contains("projects"), "projects header: {top:?}");
+        assert!(top.contains("PROJECTS"), "projects header: {top:?}");
         assert!(
-            top.trim_end().ends_with("2 ╮"),
-            "projects count in border: {top:?}"
+            top.trim_end().ends_with('2'),
+            "projects count right-aligned in the header: {top:?}"
         );
-        // The waiting divider carries its own count below (web's blocked agent).
+        // The waiting header carries its own count below (web's blocked agent).
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("waiting"), "waiting header: {text:?}");
+        assert!(text.contains("WAITING"), "waiting header: {text:?}");
         assert!(
-            text.contains("1 ┤"),
-            "waiting count fused in the divider: {text:?}"
+            text.contains("WAITING                  1"),
+            "waiting count right-aligned in the header: {text:?}"
         );
     }
 
