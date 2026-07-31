@@ -1839,3 +1839,43 @@ async fn merge_on_a_non_child_errors() {
     let _ = std::fs::remove_dir_all(&dir);
     server.stop().await;
 }
+
+/// A tab keeps its default numeric name only while empty: once it holds a
+/// pane, views borrow the active pane's title (and follow a later rename), so
+/// tab chips describe content instead of repeating their position.
+#[tokio::test]
+async fn tab_name_follows_active_pane_title() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+
+    new_workspace(&mut conn).await;
+    let pane = pane_id(
+        conn.request(Request::PaneRun {
+            tab: None,
+            cmd: vec!["/bin/cat".into()],
+            ephemeral: false,
+        })
+        .await,
+    );
+    assert_eq!(tab_names(&mut conn).await, ["cat"]);
+
+    conn.request(Request::PaneRename {
+        pane,
+        title: "claude".into(),
+    })
+    .await;
+    assert_eq!(tab_names(&mut conn).await, ["claude"]);
+
+    // A fresh tab has no pane to borrow a title from; it stays numeric.
+    conn.request(Request::TabNew { workspace: None }).await;
+    assert_eq!(tab_names(&mut conn).await, ["claude", "2"]);
+
+    server.stop().await;
+}
+
+async fn tab_names(conn: &mut Conn) -> Vec<String> {
+    match conn.request(Request::TabList { workspace: None }).await {
+        Response::Tabs { tabs } => tabs.into_iter().map(|t| t.name).collect(),
+        other => panic!("expected Tabs, got {other:?}"),
+    }
+}

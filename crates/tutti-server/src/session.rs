@@ -267,7 +267,7 @@ impl Session {
             .iter()
             .map(|t| TabInfo {
                 id: t.id,
-                name: t.name.clone(),
+                name: self.tab_display_name(t),
                 active: self.current_tab == Some(t.id),
             })
             .collect())
@@ -352,7 +352,7 @@ impl Session {
                     .iter()
                     .map(|t| TabView {
                         id: t.id,
-                        name: t.name.clone(),
+                        name: self.tab_display_name(t),
                         active: self.current_tab == Some(t.id),
                         layout: t.layout.clone(),
                         active_pane: t.active_pane,
@@ -619,6 +619,20 @@ impl Session {
             let _ = slot.pty.kill();
         }
         self.panes.clear();
+    }
+
+    /// The name a tab presents: one still carrying its default numeric name
+    /// borrows its active pane's title (tmux-style automatic naming), so the
+    /// app-bar chip says what the tab holds instead of repeating its position.
+    fn tab_display_name(&self, tab: &TabEntry) -> String {
+        if tab.name != tab.id.to_string() {
+            return tab.name.clone();
+        }
+        tab.active_pane
+            .or_else(|| tab.layout.as_ref().map(|l| l.panes()[0]))
+            .and_then(|id| self.panes.get(&id))
+            .map(|slot| slot.meta.title.clone())
+            .unwrap_or_else(|| tab.name.clone())
     }
 
     fn new_tab_entry(&mut self) -> TabEntry {
