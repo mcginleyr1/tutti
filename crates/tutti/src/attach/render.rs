@@ -22,14 +22,10 @@ use crate::render::state_label;
 /// colours (red/yellow/green) appear only on state dots and the blocked border.
 const ACCENT: Color = Color::Blue;
 
-/// The neutral chrome background shades, drawn only on truecolor terminals (see
-/// `App::chrome_shaded`). `CHROME_BAR` shades the bars (app bar, rule, footer,
-/// floating panels); `CHROME_PANEL` is the slightly deeper sidebar shade. Both
-/// are kept quiet so the accent stays the loud thing.
-const CHROME_BAR: Color = Color::Rgb(30, 34, 42);
-const CHROME_PANEL: Color = Color::Rgb(22, 26, 34);
-
-/// The subtle full-row background under the selected sidebar entry.
+/// The subtle full-row background under the selected sidebar entry. An ANSI
+/// palette colour (never truecolor RGB), so it is drawn by the terminal from its
+/// own scheme and repaints on the fly when the terminal flips light/dark — the
+/// same mechanism that keeps pane interiors in step with the terminal.
 const SELECT_BG: Color = Color::DarkGray;
 
 /// A resolved glyph set: the concrete characters for the sidebar's dots and
@@ -80,24 +76,6 @@ fn glyphs(icons: Icons) -> &'static Glyphs {
     }
 }
 
-/// The chrome bar shade when the terminal and config allow it, else `None`.
-fn bar_bg(app: &App) -> Option<Color> {
-    app.chrome_shaded().then_some(CHROME_BAR)
-}
-
-/// The deeper sidebar-panel shade when allowed, else `None`.
-fn panel_bg(app: &App) -> Option<Color> {
-    app.chrome_shaded().then_some(CHROME_PANEL)
-}
-
-/// Flood `area` with `bg` when a shade is active; a no-op otherwise so a
-/// non-truecolor terminal keeps its own background.
-fn paint_bg(frame: &mut Frame, area: Rect, bg: Option<Color>) {
-    if let Some(bg) = bg {
-        frame.render_widget(Block::default().style(Style::default().bg(bg)), area);
-    }
-}
-
 /// The sidebar-mode key hint, rendered two-tone in the bottom bar. `j/k move` is
 /// dropped as table-stakes list navigation (the help overlay still documents it)
 /// to make room for the workspace verbs: `w` creates a nested workspace and `m`
@@ -144,7 +122,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 
     draw_app_bar(frame, app, app_bar, spinner);
-    draw_rule(frame, app, rule);
+    draw_rule(frame, rule);
     if let Some(sidebar_rect) = sidebar_rect {
         draw_sidebar(frame, app, sidebar_rect, spinner);
     }
@@ -171,12 +149,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 /// The top app bar (full width): the accent bar and bold `tutti — <session>`
-/// wordmark on the left, the tab segments right-aligned. Takes the chrome shade.
+/// wordmark on the left, the tab segments right-aligned. Draws over the
+/// terminal's own background so it tracks the terminal's light/dark scheme.
 fn draw_app_bar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    paint_bg(frame, area, bar_bg(app));
     // A session named after the binary would read as a stutter ("tutti — tutti"),
     // so the suffix only appears when it says something the wordmark doesn't.
     let title = if app.session.is_empty() || app.session == "tutti" {
@@ -219,11 +197,10 @@ fn census_spans(app: &App, spinner: char) -> Vec<Span<'static>> {
 }
 
 /// The full-width dim rule under the app bar.
-fn draw_rule(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_rule(frame: &mut Frame, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    paint_bg(frame, area, bar_bg(app));
     let rule = "─".repeat(area.width as usize);
     frame.render_widget(Paragraph::new(Line::from(Span::styled(rule, dim()))), area);
 }
@@ -324,18 +301,18 @@ fn wordmark_lines() -> Vec<Line<'static>> {
         .collect()
 }
 
-/// The sidebar: one rounded frame whose top border carries the `projects`
-/// header and whose fused dividers carry the `agents` (filtered to the selected
-/// project) and `waiting` (cross-project blocked/done) headers, each with a
-/// collapse arrow and a count. Entries sit inside with one column of padding; a
-/// selected entry (only while the sidebar holds focus and is not prompting) gets
-/// a subtle full-row highlight and its name as an accent chip. Takes the deeper
-/// chrome panel shade. The new-project prompt overlays the foot when active.
+/// The sidebar: a borderless panel led by a `projects` caps header, then the
+/// `agents` (filtered to the selected project) and `waiting` (cross-project
+/// blocked/done) caps headers, each with a collapse arrow and a count. Entries
+/// sit inside with one column of padding; a selected entry (only while the
+/// sidebar holds focus and is not prompting) gets a subtle full-row highlight and
+/// its name as an accent chip. Draws over the terminal's own background — no
+/// shade of its own — so it tracks the terminal's light/dark scheme. The
+/// new-project prompt overlays the foot when active.
 fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
     if area.width < 3 || area.height < 2 {
         return;
     }
-    paint_bg(frame, area, panel_bg(app));
     let w = area.width;
     let content_w = w.saturating_sub(2); // one column of padding each side
 
@@ -798,7 +775,7 @@ fn draw_pane(frame: &mut Frame, app: &App, pane: PaneId, rect: Rect, spinner: ch
 
     if let Some(state) = state {
         let screen = state.parser.screen();
-        draw_screen(frame.buffer_mut(), inner, screen);
+        draw_screen(frame.buffer_mut(), inner, screen, app.selection_span(pane));
         if focused && state.scroll.is_none() && !screen.hide_cursor() {
             let (row, col) = screen.cursor_position();
             if col < inner.width && row < inner.height {
@@ -810,8 +787,16 @@ fn draw_pane(frame: &mut Frame, app: &App, pane: PaneId, rect: Rect, spinner: ch
 
 /// Blit a vt100 screen into `area`, one cell at a time, mapping colours and
 /// attributes. Wide-character continuation cells are cleared so a glyph is not
-/// drawn twice.
-fn draw_screen(buf: &mut Buffer, area: Rect, screen: &vt100::Screen) {
+/// drawn twice. `selection`, when set, is the inclusive `(start, end)` span of a
+/// live mouse selection in screen coordinates; cells inside it take the
+/// `SELECT_BG` highlight — an ANSI palette colour, so it repaints with the
+/// terminal's scheme like the sidebar selection.
+fn draw_screen(
+    buf: &mut Buffer,
+    area: Rect,
+    screen: &vt100::Screen,
+    selection: Option<((u16, u16), (u16, u16))>,
+) {
     let (rows, cols) = screen.size();
     let height = area.height.min(rows);
     let width = area.width.min(cols);
@@ -820,6 +805,7 @@ fn draw_screen(buf: &mut Buffer, area: Rect, screen: &vt100::Screen) {
             let Some(buf_cell) = buf.cell_mut((area.x + col, area.y + row)) else {
                 continue;
             };
+            let selected = selection.is_some_and(|(s, e)| in_span(s, e, cols, row, col));
             match screen.cell(row, col) {
                 Some(cell) if cell.is_wide_continuation() => {
                     buf_cell.set_symbol("");
@@ -830,14 +816,35 @@ fn draw_screen(buf: &mut Buffer, area: Rect, screen: &vt100::Screen) {
                     } else {
                         buf_cell.set_char(' ');
                     }
-                    buf_cell.set_style(cell_style(cell));
+                    let style = cell_style(cell);
+                    buf_cell.set_style(if selected { style.bg(SELECT_BG) } else { style });
                 }
                 None => {
                     buf_cell.set_char(' ');
+                    if selected {
+                        buf_cell.set_style(Style::default().bg(SELECT_BG));
+                    }
                 }
             }
         }
     }
+}
+
+/// Whether cell `(row, col)` falls inside the inclusive stream selection from
+/// `start` to `end` (top-to-bottom, then left-to-right): the first row runs from
+/// its start column, the last to its end column, and whole rows between span the
+/// full `cols` width.
+fn in_span(start: (u16, u16), end: (u16, u16), cols: u16, row: u16, col: u16) -> bool {
+    if row < start.0 || row > end.0 {
+        return false;
+    }
+    let c0 = if row == start.0 { start.1 } else { 0 };
+    let c1 = if row == end.0 {
+        end.1
+    } else {
+        cols.saturating_sub(1)
+    };
+    col >= c0 && col <= c1
 }
 
 /// The ratatui style for a vt100 cell: colours passed straight through, no
@@ -874,13 +881,13 @@ pub fn map_color(color: vt100::Color) -> Color {
     }
 }
 
-/// The footer bar (full width, chrome shade): a mode chip on the left in the
-/// accent block when not in terminal mode — plus the two-tone sidebar hint in
-/// sidebar mode — and the standing help/detach hint pinned to the right. The tab
-/// list and per-pane state chips are gone: the app bar and sidebar own those,
-/// and transients fire the notification band above.
+/// The footer bar (full width): a mode chip on the left in the accent block when
+/// not in terminal mode — plus the two-tone sidebar hint in sidebar mode — and
+/// the standing help/detach hint pinned to the right. Draws over the terminal's
+/// own background so it tracks the terminal's light/dark scheme. The tab list and
+/// per-pane state chips are gone: the app bar and sidebar own those, and
+/// transients fire the notification band above.
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    paint_bg(frame, area, bar_bg(app));
     let mut spans: Vec<Span> = Vec::new();
     if let Some(label) = mode_label(app.mode) {
         spans.push(Span::styled(
@@ -1028,7 +1035,7 @@ fn two_tone<S: AsRef<str>>(pairs: &[(S, &str)]) -> (Vec<Span<'static>>, u16) {
 
 /// The which-key popup: one `key description` row per active prefix binding (the
 /// same table dispatch reads), plus `esc close`. Pinned bottom-right in a
-/// rounded, chrome-shaded panel titled ` keys `, key letters in the accent.
+/// rounded panel titled ` keys `, key letters in the accent.
 fn draw_whichkey(frame: &mut Frame, app: &App, area: Rect) {
     let cfg = app.config();
     let mut lines: Vec<Line> = cfg
@@ -1046,10 +1053,7 @@ fn draw_whichkey(frame: &mut Frame, app: &App, area: Rect) {
     let popup = Rect::new(x, y, width, height);
 
     frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(lines).block(popup_block(app, " keys ")),
-        popup,
-    );
+    frame.render_widget(Paragraph::new(lines).block(popup_block(" keys ")), popup);
 }
 
 fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
@@ -1061,10 +1065,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect::new(x, y, width, height);
     frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(lines).block(popup_block(app, " help ")),
-        popup,
-    );
+    frame.render_widget(Paragraph::new(lines).block(popup_block(" help ")), popup);
 }
 
 /// The agent launcher overlay: a centred rounded panel titled
@@ -1081,7 +1082,7 @@ fn draw_launcher(frame: &mut Frame, app: &App, area: Rect) {
         .map(|(i, row)| launcher_line(i, row, i == selected))
         .collect();
     lines.push(popup_key_line("esc", "cancel"));
-    draw_centered_popup(frame, app, area, &app.launcher_title(), lines);
+    draw_centered_popup(frame, area, &app.launcher_title(), lines);
 }
 
 /// One launcher row: `<n>  <name>   <role>`, an accent `❯` marker and accent
@@ -1139,12 +1140,12 @@ fn draw_launcher_command(frame: &mut Frame, app: &App, area: Rect) {
     let popup = Rect::new(x, y, width, height);
     frame.render_widget(Clear, popup);
     let title = app.launcher_title();
-    frame.render_widget(Paragraph::new(line).block(popup_block(app, &title)), popup);
+    frame.render_widget(Paragraph::new(line).block(popup_block(&title)), popup);
 }
 
-/// Render `lines` in a rounded, chrome-shaded panel titled `title`, centred over
-/// `area`. Shared by the launcher picker with the help/which-key panel look.
-fn draw_centered_popup(frame: &mut Frame, app: &App, area: Rect, title: &str, lines: Vec<Line>) {
+/// Render `lines` in a rounded panel titled `title`, centred over `area`. Shared
+/// by the launcher picker with the help/which-key panel look.
+fn draw_centered_popup(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line>) {
     let inner_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
     let width = (inner_w + 2).min(area.width);
     let height = (lines.len() as u16 + 2).min(area.height);
@@ -1152,21 +1153,19 @@ fn draw_centered_popup(frame: &mut Frame, app: &App, area: Rect, title: &str, li
     let y = area.y + area.height.saturating_sub(height) / 2;
     let popup = Rect::new(x, y, width, height);
     frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new(lines).block(popup_block(app, title)), popup);
+    frame.render_widget(Paragraph::new(lines).block(popup_block(title)), popup);
 }
 
-/// A floating panel's block: a rounded dim border carrying `title`, with the
-/// chrome shade when the terminal allows it.
-fn popup_block<'a>(app: &App, title: &'a str) -> Block<'a> {
-    let mut block = Block::default()
+/// A floating panel's block: a rounded dim border carrying `title`. The panel is
+/// cleared to the terminal's own background before it draws (see the `Clear`
+/// each caller renders), so it stays opaque over the pane and tracks the
+/// terminal's light/dark scheme.
+fn popup_block(title: &str) -> Block<'_> {
+    Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(dim())
-        .title(title);
-    if let Some(bg) = bar_bg(app) {
-        block = block.style(Style::default().bg(bg));
-    }
-    block
+        .title(title)
 }
 
 /// The help overlay content, generated from the active keymap so it always
@@ -1414,6 +1413,34 @@ mod tests {
             "session name missing from the app bar"
         );
         assert!(text.contains("main"), "tab name missing from the app bar");
+    }
+
+    #[test]
+    fn a_drag_selection_highlights_its_cells() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = app_with_pane(b"HELLO");
+        let area = Rect::new(0, 0, 40, 8);
+        app.sync_sizes(area);
+        // At 40 cols the sidebar is hidden, so pane 1 fills the width and its
+        // interior top-left sits at (1, 4); drag the five cells of "HELLO".
+        app.on_mouse(MouseEventKind::Down(MouseButton::Left), 1, 4);
+        app.on_mouse(MouseEventKind::Drag(MouseButton::Left), 5, 4);
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        for x in 1..=5u16 {
+            assert_eq!(
+                buf.cell((x, 4)).unwrap().bg,
+                SELECT_BG,
+                "selected cell {x} carries the highlight",
+            );
+        }
+        assert_ne!(
+            buf.cell((6, 4)).unwrap().bg,
+            SELECT_BG,
+            "the cell past the selection is not highlighted",
+        );
     }
 
     fn app_two_workspaces() -> App {
@@ -2173,69 +2200,36 @@ mod tests {
     }
 
     #[test]
-    fn chrome_shade_paints_bars_only_on_truecolor() {
-        // Truecolor on + the default config → the footer takes the bar shade.
+    fn selection_highlight_uses_an_ansi_palette_colour() {
+        // The chrome carries no background of its own — it draws over the
+        // terminal's default so it tracks the terminal's light/dark scheme. The
+        // one background it does paint, the selected sidebar row, must be an ANSI
+        // palette colour (here DarkGray) and never truecolor RGB, so it too is
+        // repainted by the terminal when the scheme flips.
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = app_two_workspaces();
-        app.set_truecolor(true);
-        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
+        app.sync_sizes(Rect::new(0, 0, 100, 20));
+        // Prefix then `w` focuses the sidebar, popping the selection highlight.
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let cells = terminal.backend().buffer().content();
+        assert!(
+            cells.iter().any(|c| c.bg == SELECT_BG),
+            "the selected sidebar row should carry the ANSI selection highlight"
+        );
+        // The app bar is pure chrome across its full width: it must paint no
+        // background of its own (terminal default) — never a truecolor shade — so
+        // it tracks the terminal's scheme.
         let w = 100usize;
-        let shaded = terminal.backend().buffer().content()[11 * w..12 * w]
-            .iter()
-            .any(|c| c.bg == CHROME_BAR);
         assert!(
-            shaded,
-            "the footer should take the chrome shade on truecolor"
-        );
-    }
-
-    #[test]
-    fn chrome_shade_absent_without_truecolor_or_when_disabled() {
-        // No truecolor → no shade anywhere.
-        let app = app_two_workspaces();
-        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
-        assert!(
-            !terminal
-                .backend()
-                .buffer()
-                .content()
+            cells[0..w]
                 .iter()
-                .any(|c| c.bg == CHROME_BAR || c.bg == CHROME_PANEL),
-            "no chrome shade without a truecolor terminal"
-        );
-
-        // Truecolor but chrome_background = false → still no shade.
-        let mut app = App::with_config(Config::parse("chrome_background = false\n").unwrap());
-        app.set_truecolor(true);
-        app.handle_frame(WireFrame::Control(
-            serde_json::to_vec(&Response::Attached {
-                wire_rev: tutti_core::WIRE_REV,
-                session: "demo".into(),
-                workspaces: vec![workspace(
-                    1,
-                    "api",
-                    Some("main"),
-                    vec![tab(
-                        1,
-                        "1",
-                        true,
-                        leaf(1),
-                        vec![pane(1, "zsh", None, AgentState::Idle)],
-                    )],
-                )],
-            })
-            .unwrap(),
-        ));
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
-        assert!(
-            !terminal
-                .backend()
-                .buffer()
-                .content()
-                .iter()
-                .any(|c| c.bg == CHROME_BAR || c.bg == CHROME_PANEL),
-            "chrome_background = false suppresses the shade even on truecolor"
+                .all(|c| !matches!(c.bg, Color::Rgb(_, _, _))),
+            "the app bar must not paint a truecolor background shade"
         );
     }
 

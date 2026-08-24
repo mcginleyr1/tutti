@@ -350,6 +350,46 @@ async fn attach_receives_snapshot_then_delta() {
     server.stop().await;
 }
 
+/// A snapshot carries the pane's input modes, not just its cell grid. A
+/// full-screen agent like Claude Code turns on mouse reporting; if that state
+/// never reaches the client, the client's mirror parser misreads the pane as a
+/// plain shell and swallows the wheel into tutti's own (empty) scrollback
+/// instead of forwarding it to the child.
+#[tokio::test]
+async fn snapshot_carries_mouse_reporting_mode() {
+    let server = TestServer::start();
+
+    let mut control = server.connect().await;
+    // Turn on button/any-event mouse tracking with SGR encoding, then print a
+    // visible marker so we can wait until those escapes have been parsed.
+    let pane = run_marker(
+        &mut control,
+        "printf '\\033[?1000h\\033[?1002h\\033[?1003h\\033[?1006hREADY'; sleep 30",
+    )
+    .await;
+    assert!(
+        read_until(&mut control, pane, "READY").await,
+        "pane never produced its readiness marker"
+    );
+
+    let mut viewer = server.connect().await;
+    viewer.send(&Request::Attach).await;
+    let _ = viewer.response().await;
+
+    let bytes = expect_pane_frame(&mut viewer, pane, true).await.bytes;
+    let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+    assert!(
+        has(b"\x1b[?1003h"),
+        "snapshot dropped the mouse-reporting mode"
+    );
+    assert!(
+        has(b"\x1b[?1006h"),
+        "snapshot dropped the SGR mouse encoding"
+    );
+
+    server.stop().await;
+}
+
 /// A `PaneResize` resizes the server-side pty and grid and pushes a fresh
 /// snapshot at the new dimensions to the attached client.
 #[tokio::test]

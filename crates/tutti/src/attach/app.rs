@@ -69,6 +69,20 @@ impl PaneState {
     }
 }
 
+/// An in-progress or just-finished mouse text selection within one pane. `anchor`
+/// is where the drag began, `head` where it currently is — both 0-based `(row,
+/// col)` cells of the pane's visible vt100 grid (so it tracks scrollback). A
+/// selection is only meaningful inside the single pane it started in; `dragged`
+/// stays false for a plain click (head never left the anchor cell) so a focus
+/// click copies nothing.
+#[derive(Clone, Copy)]
+struct Selection {
+    pane: PaneId,
+    anchor: (u16, u16),
+    head: (u16, u16),
+    dragged: bool,
+}
+
 /// The input mode the client is in. Terminal mode forwards keys to the focused
 /// pane; the others intercept keys for multiplexer control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,9 +214,6 @@ pub struct App {
     /// their header. Toggled by clicking a section header.
     collapsed_projects: bool,
     collapsed_waiting: bool,
-    /// Whether the real terminal advertises truecolor (`COLORTERM`), gating the
-    /// chrome background shades. Resolved once at startup; `false` in tests.
-    truecolor: bool,
     /// Escape sequences queued for the real terminal (bell + OSC 9 re-emit), so
     /// the user's own terminal raises a desktop notification. Drained by the
     /// event loop.
@@ -212,6 +223,9 @@ pub struct App {
     /// terminal's own drag-to-select and copy work while released. The event
     /// loop syncs the real capture state to this.
     mouse_capture: bool,
+    /// The live mouse text selection, set on a left-drag inside a pane and kept
+    /// highlighted until the next click. `None` when nothing is selected.
+    selection: Option<Selection>,
     /// Prefix chord, direct bindings, and the active prefix keymap.
     config: Config,
 }
@@ -269,8 +283,8 @@ impl App {
             terminal_out: Vec::new(),
             collapsed_projects: false,
             collapsed_waiting: false,
-            truecolor: false,
             mouse_capture: config.mouse,
+            selection: None,
             config,
         }
     }
@@ -283,18 +297,6 @@ impl App {
     /// The active configuration, for the renderer (hint, which-key, help).
     pub fn config(&self) -> &Config {
         &self.config
-    }
-
-    /// Record whether the real terminal advertises truecolor. The chrome shades
-    /// are only drawn when this is set (and the config enables them).
-    pub fn set_truecolor(&mut self, on: bool) {
-        self.truecolor = on;
-    }
-
-    /// Whether the chrome background shades should be drawn: the config enables
-    /// them and the terminal can render a 24-bit colour.
-    pub fn chrome_shaded(&self) -> bool {
-        self.config.chrome_background && self.truecolor
     }
 
     /// Arm the first-run prompt: open the sidebar's new-project prompt prefilled
@@ -751,7 +753,7 @@ impl App {
             PrefixAction::MouseToggle => {
                 self.mouse_capture = !self.mouse_capture;
                 self.set_status(if self.mouse_capture {
-                    "mouse on".into()
+                    "mouse on — drag to select & copy".into()
                 } else {
                     "mouse off — select/copy with the terminal".into()
                 });
@@ -1824,11 +1826,22 @@ impl App {
     pub fn on_mouse(&mut self, kind: MouseEventKind, col: u16, row: u16) -> Vec<WireFrame> {
         match kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                // Any press drops a prior selection's highlight before starting
+                // fresh, wherever it lands.
+                self.selection = None;
                 if let Some(pane) = self.pane_at(col, row) {
                     self.focused = Some(pane);
                     if matches!(self.mode, Mode::Prefix) {
                         self.mode = Mode::Terminal;
                         self.prefix_since = None;
+                    }
+                    if let Some((pane, r, c)) = self.pane_cell_at(col, row) {
+                        self.selection = Some(Selection {
+                            pane,
+                            anchor: (r, c),
+                            head: (r, c),
+                            dragged: false,
+                        });
                     }
                     return Vec::new();
                 }
@@ -1840,10 +1853,123 @@ impl App {
                 }
                 Vec::new()
             }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.extend_selection(col, row);
+                Vec::new()
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.finish_selection();
+                Vec::new()
+            }
             MouseEventKind::ScrollUp => self.mouse_scroll(col, row, true),
             MouseEventKind::ScrollDown => self.mouse_scroll(col, row, false),
             _ => Vec::new(),
         }
+    }
+
+    /// Extend the live selection's head to the cell under `(col, row)`, clamped
+    /// to the interior of the pane the drag began in — so dragging past the pane
+    /// edge selects to the edge rather than jumping panes. Marks the selection
+    /// `dragged` once the head leaves the anchor cell.
+    fn extend_selection(&mut self, col: u16, row: u16) {
+        let Some(sel) = self.selection else {
+            return;
+        };
+        let Some((r, c)) = self.clamp_to_pane(sel.pane, col, row) else {
+            return;
+        };
+        if let Some(sel) = self.selection.as_mut() {
+            sel.head = (r, c);
+            if sel.head != sel.anchor {
+                sel.dragged = true;
+            }
+        }
+    }
+
+    /// Finish a drag: copy the selected text to the system clipboard (an OSC 52
+    /// write re-emitted to the real terminal) and flash a confirmation. A plain
+    /// click — no drag — leaves nothing selected. The highlight is kept after a
+    /// copy so the user sees what was taken, until the next press clears it.
+    fn finish_selection(&mut self) {
+        let Some(text) = self.selected_text() else {
+            self.selection = None;
+            return;
+        };
+        let chars = text.chars().count();
+        self.terminal_out.push(osc52(&text));
+        self.set_status(format!("copied {chars} chars"));
+    }
+
+    /// The inclusive selected-cell span `(start, end)` for `pane` in screen
+    /// coordinates, if a dragged selection is live there — for the renderer to
+    /// paint the highlight. Ordered so `start` precedes `end` in reading order.
+    pub fn selection_span(&self, pane: PaneId) -> Option<((u16, u16), (u16, u16))> {
+        let sel = self.selection?;
+        (sel.pane == pane && sel.dragged).then(|| ordered(sel.anchor, sel.head))
+    }
+
+    /// The currently selected text, read from the pane's visible grid as a
+    /// stream selection: the first row from its start column to end-of-line, any
+    /// whole rows between, and the last row to its end column, each row's
+    /// trailing blanks trimmed. `None` unless a drag is live.
+    fn selected_text(&self) -> Option<String> {
+        let sel = self.selection?;
+        if !sel.dragged {
+            return None;
+        }
+        let screen = self.panes.get(&sel.pane)?.parser.screen();
+        let (rows, cols) = screen.size();
+        let (start, end) = ordered(sel.anchor, sel.head);
+        let mut out = String::new();
+        for r in start.0..=end.0.min(rows.saturating_sub(1)) {
+            let c0 = if r == start.0 { start.1 } else { 0 };
+            let c1 = if r == end.0 {
+                end.1
+            } else {
+                cols.saturating_sub(1)
+            };
+            let mut line = String::new();
+            for c in c0..=c1.min(cols.saturating_sub(1)) {
+                match screen.cell(r, c) {
+                    Some(cell) if cell.is_wide_continuation() => {}
+                    Some(cell) if cell.has_contents() => line.push_str(cell.contents()),
+                    _ => line.push(' '),
+                }
+            }
+            out.push_str(line.trim_end_matches(' '));
+            if r != end.0 {
+                out.push('\n');
+            }
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// Map an absolute terminal point to the pane and 0-based grid cell beneath
+    /// it, or `None` when the point is over a pane's border/title rather than its
+    /// interior. Used to seed a selection on the exact cell clicked.
+    fn pane_cell_at(&self, col: u16, row: u16) -> Option<(PaneId, u16, u16)> {
+        let (pane, rect) = self.rects.iter().find(|(_, r)| contains(*r, col, row))?;
+        let (rows, cols) = inner_size(*rect);
+        let (x0, y0) = (rect.x + 1, rect.y + 2);
+        if col < x0 || row < y0 {
+            return None;
+        }
+        let (c, r) = (col - x0, row - y0);
+        (c < cols && r < rows).then_some((*pane, r, c))
+    }
+
+    /// Clamp an absolute point to `pane`'s interior, returning the 0-based cell —
+    /// so a drag that leaves the pane still resolves to its nearest edge cell.
+    fn clamp_to_pane(&self, pane: PaneId, col: u16, row: u16) -> Option<(u16, u16)> {
+        let rect = self
+            .rects
+            .iter()
+            .find(|(p, _)| *p == pane)
+            .map(|(_, r)| *r)?;
+        let (rows, cols) = inner_size(rect);
+        let c = col.saturating_sub(rect.x + 1).min(cols - 1);
+        let r = row.saturating_sub(rect.y + 2).min(rows - 1);
+        Some((r, c))
     }
 
     fn in_sidebar(&self, col: u16, row: u16) -> bool {
@@ -2375,6 +2501,51 @@ fn osc9(text: &str) -> Vec<u8> {
     out.extend_from_slice(b"\x1b]9;");
     out.extend_from_slice(text.as_bytes());
     out.push(0x07);
+    out
+}
+
+/// Order two `(row, col)` cells so the first precedes the second in reading
+/// order (top-to-bottom, then left-to-right).
+fn ordered(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+/// An OSC 52 clipboard-write escape targeting the system clipboard (`c`),
+/// carrying `text` base64-encoded and BEL-terminated. Re-emitted to the real
+/// terminal, it copies on the user's behalf — so a mouse selection can copy
+/// while tutti itself holds the mouse for scroll and select. Requires a terminal
+/// that honours OSC 52 (iTerm2, kitty, wezterm, tmux with `set-clipboard on`).
+fn osc52(text: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"\x1b]52;c;");
+    out.extend_from_slice(base64(text.as_bytes()).as_bytes());
+    out.push(0x07);
+    out
+}
+
+/// Standard-alphabet base64 with `=` padding — enough to wrap a clipboard
+/// payload for OSC 52 without pulling in a dependency.
+fn base64(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).map_or(0, |&b| b as u32);
+        let b2 = chunk.get(2).map_or(0, |&b| b as u32);
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
     out
 }
 
@@ -4523,6 +4694,133 @@ mod tests {
             })]
         );
         assert_eq!(app.mode, Mode::Scroll(PaneId(1)));
+    }
+
+    // ---- mouse selection ------------------------------------------------
+
+    /// Seed pane 1 with `text` and return its rect; the pane interior's top-left
+    /// cell (0,0) then sits at absolute `(rect.x + 1, rect.y + 2)`, so a cell
+    /// `(r, c)` is driven at `(rect.x + 1 + c, rect.y + 2 + r)`.
+    fn selection_fixture(app: &mut App, text: &[u8]) -> Rect {
+        attached(app);
+        app.sync_sizes(Rect::new(0, 0, 100, 24));
+        app.handle_frame(WireFrame::PaneSnapshot(PaneData {
+            pane: PaneId(1),
+            rows: 24,
+            cols: 80,
+            seq: 0,
+            bytes: text.to_vec(),
+        }));
+        app.rects
+            .iter()
+            .find(|(p, _)| *p == PaneId(1))
+            .map(|(_, r)| *r)
+            .expect("pane 1 has a rect")
+    }
+
+    /// The absolute terminal point of pane cell `(r, c)` inside `rect`.
+    fn cell_at(rect: Rect, r: u16, c: u16) -> (u16, u16) {
+        (rect.x + 1 + c, rect.y + 2 + r)
+    }
+
+    #[test]
+    fn dragging_across_one_row_copies_that_span() {
+        let mut app = App::new();
+        let rect = selection_fixture(&mut app, b"hello world");
+        let (x0, y0) = cell_at(rect, 0, 0);
+        let (x1, y1) = cell_at(rect, 0, 4);
+        app.on_mouse(MouseEventKind::Down(MouseButton::Left), x0, y0);
+        app.on_mouse(MouseEventKind::Drag(MouseButton::Left), x1, y1);
+        app.on_mouse(MouseEventKind::Up(MouseButton::Left), x1, y1);
+        assert_eq!(app.take_terminal_out(), vec![osc52("hello")]);
+        assert_eq!(app.transient(), Some("copied 5 chars"));
+    }
+
+    #[test]
+    fn dragging_across_rows_streams_first_partial_whole_and_last_partial() {
+        let mut app = App::new();
+        let rect = selection_fixture(&mut app, b"hello world\r\nsecond line\r\nthird");
+        // From "world" on row 0, through all of row 1, to "third" on row 2.
+        let (x0, y0) = cell_at(rect, 0, 6);
+        let (x1, y1) = cell_at(rect, 2, 4);
+        app.on_mouse(MouseEventKind::Down(MouseButton::Left), x0, y0);
+        app.on_mouse(MouseEventKind::Drag(MouseButton::Left), x1, y1);
+        app.on_mouse(MouseEventKind::Up(MouseButton::Left), x1, y1);
+        assert_eq!(
+            app.take_terminal_out(),
+            vec![osc52("world\nsecond line\nthird")],
+            "trailing blanks trimmed; whole middle row taken in full"
+        );
+    }
+
+    #[test]
+    fn a_plain_click_selects_and_copies_nothing() {
+        let mut app = App::new();
+        let rect = selection_fixture(&mut app, b"hello world");
+        let (x, y) = cell_at(rect, 0, 2);
+        app.on_mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        app.on_mouse(MouseEventKind::Up(MouseButton::Left), x, y);
+        assert!(
+            app.take_terminal_out().is_empty(),
+            "a focus click puts nothing on the clipboard"
+        );
+        assert!(app.selection_span(PaneId(1)).is_none());
+    }
+
+    #[test]
+    fn selection_span_tracks_the_drag_and_a_press_clears_it() {
+        let mut app = App::new();
+        let rect = selection_fixture(&mut app, b"hello world");
+        let (x0, y0) = cell_at(rect, 0, 0);
+        app.on_mouse(MouseEventKind::Down(MouseButton::Left), x0, y0);
+        assert!(
+            app.selection_span(PaneId(1)).is_none(),
+            "a press alone has not dragged yet"
+        );
+        let (x1, y1) = cell_at(rect, 0, 4);
+        app.on_mouse(MouseEventKind::Drag(MouseButton::Left), x1, y1);
+        assert_eq!(app.selection_span(PaneId(1)), Some(((0, 0), (0, 4))));
+        // A fresh press drops the highlight.
+        app.on_mouse(MouseEventKind::Down(MouseButton::Left), x0, y0);
+        assert!(app.selection_span(PaneId(1)).is_none());
+    }
+
+    #[test]
+    fn dragging_past_the_right_edge_clamps_to_the_last_column() {
+        let mut app = App::new();
+        let rect = selection_fixture(&mut app, b"hello world");
+        let (x0, y0) = cell_at(rect, 0, 0);
+        app.on_mouse(MouseEventKind::Down(MouseButton::Left), x0, y0);
+        // Way past the pane's right edge, still on the first row.
+        app.on_mouse(MouseEventKind::Drag(MouseButton::Left), 9999, y0);
+        app.on_mouse(MouseEventKind::Up(MouseButton::Left), 9999, y0);
+        assert_eq!(
+            app.take_terminal_out(),
+            vec![osc52("hello world")],
+            "the drag clamps to the pane and takes the whole line"
+        );
+    }
+
+    #[test]
+    fn ordered_sorts_cells_in_reading_order() {
+        assert_eq!(ordered((2, 3), (1, 5)), ((1, 5), (2, 3)));
+        assert_eq!(ordered((1, 1), (1, 4)), ((1, 1), (1, 4)));
+    }
+
+    #[test]
+    fn base64_matches_the_rfc_test_vectors() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foob"), "Zm9vYg==");
+        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn osc52_wraps_base64_in_a_clipboard_write() {
+        assert_eq!(osc52("hi"), b"\x1b]52;c;aGk=\x07".to_vec());
     }
 
     // ---- exited panes ---------------------------------------------------

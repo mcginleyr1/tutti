@@ -65,10 +65,14 @@ cargo fmt --check
   red/yellow/green only on state dots, the working spinner, and the blocked
   border. Names (projects, agents, the active workspace in the footer) stay at
   full intensity — identity bright, metadata dim; don't re-dim them. Chrome
-  backgrounds are truecolor-gated (`COLORTERM`) with a `chrome_background =
-  false` escape; **pane interiors are never themed**. Chrome panels are
-  borderless (background layers + caps section headers, no box-drawing
-  frames); pane frames are the only boxes.
+  paints **no background of its own** — it draws over the terminal's default so
+  it tracks the terminal's own light/dark scheme live (the same mechanism that
+  keeps pane interiors in step). The only background it paints is the selected
+  sidebar row, and that uses an **ANSI palette colour** (never truecolor RGB) so
+  the terminal repaints it too on a scheme flip. Never reintroduce a fixed-RGB
+  chrome shade — it would stay dark over a light terminal. Chrome panels are
+  borderless (caps section headers, no box-drawing frames); pane frames are the
+  only boxes.
 - Glyphs: safe-unicode set by default, nerd-font set behind `icons =
   "nerdfont"`. No private-use codepoints in the default set.
 - Which-key, the help overlay, and the bottom-bar hints all render from the

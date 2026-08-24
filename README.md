@@ -214,15 +214,21 @@ events (vim with `mouse=a`, htop) receives the wheel itself; a full-screen
 program without mouse reporting (Claude Code, less) gets arrow keys — the xterm
 "alternate scroll" convention — so it scrolls its own view; only a plain
 primary-screen pane (a shell) enters tutti's frozen scrollback browse
-(`q`/esc exits). Because tutti captures the mouse, your terminal's own
-drag-to-select can't see the drag — press the prefix then `m` to hand the mouse
-back, select and copy normally, and `m` again to re-grab it (most terminals also
-bypass capture while `Shift`/`Option` is held). `mouse = false` starts with the
-mouse off. Colors come from your
+(`q`/esc exits). Drag inside a pane to select its text; releasing copies the
+selection to your system clipboard (an OSC 52 write your terminal fulfils) and
+flashes `copied N chars`, so selecting works even while tutti holds the mouse for
+scroll and focus — the selection also reaches the pane's scrollback while you
+browse it. Copy needs a terminal that honours OSC 52 (iTerm2, kitty, WezTerm,
+Ghostty, tmux with `set-clipboard on`); where it does not (Apple Terminal), press
+the prefix then `m` to hand the mouse back for the terminal's own drag-to-select,
+and `m` again to re-grab it (most terminals also bypass capture while
+`Shift`/`Option` is held). `mouse = false` starts with the mouse off. Colors come
+from your
 terminal — tutti has no theme of its own: everything renders dim, with one accent
 (terminal blue) marking the focused/active thing and the red/yellow/green state
-dots the only other colour. On truecolor terminals a subtle neutral shade sits
-behind the chrome (app bar, sidebar, footer, panels); see `chrome_background`.
+dots the only other colour. The chrome paints no background of its own — it draws
+over your terminal's default, so it follows your terminal's light/dark scheme
+live, the same way the agent panes do.
 
 ## Configuration
 
@@ -236,7 +242,6 @@ prefix = "C-b"          # prefix chord
 mouse = true            # mouse capture at startup (prefix `m` toggles it live)
 preset = "default"      # prefix keymap: "default" (emacs/tmux-flavored) or "vim"
 sidebar = "on"          # workspace/agent sidebar: "on" (default), "auto", or "off"
-chrome_background = true # subtle shade behind the chrome (truecolor only)
 icons = "unicode"       # sidebar glyph set: "unicode" (default) or "nerdfont"
 notifications = true    # re-emit pane bells/notifications to your real terminal
 
@@ -281,15 +286,13 @@ now `default` already covers that muscle memory. The `[keys]` direct bindings ar
 shared across presets and override the defaults on top (e.g. set
 `focus_left = "none"` to reclaim `C-h` regardless of preset).
 
-**Chrome background.** `chrome_background` (default `true`) paints a subtle
-neutral dark shade behind the chrome — the app bar, sidebar, footer, and the
-which-key/help/notification panels — so they read as one surface distinct from
-the pane interiors (which are never shaded; agent output always renders on your
-terminal's own background). The shade is only drawn on **truecolor** terminals
-(those advertising `COLORTERM=truecolor`/`24bit`); elsewhere it falls back to no
-background rather than approximating the shade in the 256-colour palette. Light-
-theme users, or anyone who prefers a flat look, may want `chrome_background =
-false`. An unknown value is a hard error.
+**Chrome colors.** tutti's chrome — the app bar, sidebar, footer, and the
+which-key/help/notification panels — paints no background of its own. It draws
+over your terminal's own background, so when your terminal flips light/dark (for
+example following the OS appearance) the chrome flips with it, live, exactly like
+the agent panes do. The only background tutti paints is the selected sidebar
+row's highlight, and that uses an ANSI palette colour (not a fixed RGB), so the
+terminal repaints it from its own scheme too. There is nothing to configure.
 
 **Icons.** `icons` picks the sidebar glyph set. `unicode` (default) is the safe
 set every terminal renders — `●`/`○` workspace and state dots, a branch marker,
@@ -303,7 +306,7 @@ hard error.
 ## Sidebar
 
 A left column that turns the TUI into a control center for many projects and
-agents at once — a borderless panel on its own background layer, each section
+agents at once — a borderless panel, each section
 labelled by a quiet caps header (` ▾ PROJECTS`, ` ▾ WAITING`) with a `▾`/`▸`
 collapse arrow and a right-aligned count. Names render at full intensity and
 everything else recedes dim, so the eye lands on identity; the focused row

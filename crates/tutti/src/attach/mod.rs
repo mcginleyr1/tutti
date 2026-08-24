@@ -71,7 +71,6 @@ fn event_loop(
 ) -> Result<()> {
     let mut captured = config.mouse;
     let mut app = App::with_config(config);
-    app.set_truecolor(detect_truecolor());
     if let Some(prefill) = first_run {
         app.start_first_run_prompt(prefill);
     }
@@ -170,15 +169,6 @@ fn event_loop(
         }
     }
     Ok(())
-}
-
-/// Whether the real terminal advertises 24-bit colour via `COLORTERM`. Gates the
-/// chrome background shades so a non-truecolor terminal never gets an
-/// ANSI-approximated smear.
-fn detect_truecolor() -> bool {
-    std::env::var("COLORTERM")
-        .map(|v| v.contains("truecolor") || v.contains("24bit"))
-        .unwrap_or(false)
 }
 
 /// Write raw bytes to the real terminal. Bells and OSC escapes are non-printing,

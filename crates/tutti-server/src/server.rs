@@ -588,12 +588,14 @@ fn scroll(
     };
     let screen = pty.screen_scrolled(offset);
     let (rows, cols) = screen.size();
+    let mut snapshot = screen.contents_formatted();
+    snapshot.extend(screen.input_mode_formatted());
     let frame = Frame::PaneSnapshot(PaneData {
         pane,
         rows,
         cols,
         seq: 0,
-        bytes: screen.contents_formatted(),
+        bytes: snapshot,
     });
     send_reply(hub, cid, tx, frame.encode())
 }
@@ -1037,7 +1039,14 @@ fn broadcast_tick(hub: &Hub) {
             let outcome = match last.get(&pane) {
                 None => (0, None),
                 Some((prev, seq, _)) => {
-                    let diff = cur.contents_diff(prev);
+                    // Content and input modes (alt screen aside — vt100 omits
+                    // it — mouse reporting, its encoding, application cursor,
+                    // bracketed paste) are serialised separately; ship both so
+                    // the client's mirror parser routes the wheel correctly. A
+                    // pure mode flip (mouse reporting toggles, content still)
+                    // must reach the client, so it counts toward emptiness.
+                    let mut diff = cur.contents_diff(prev);
+                    diff.extend(cur.input_mode_diff(prev));
                     if diff.is_empty() {
                         (*seq, None)
                     } else {
@@ -1055,12 +1064,14 @@ fn broadcast_tick(hub: &Hub) {
                 continue;
             }
             let bytes = if client.seen.insert(pane) {
+                let mut snapshot = cur.contents_formatted();
+                snapshot.extend(cur.input_mode_formatted());
                 Frame::PaneSnapshot(PaneData {
                     pane,
                     rows,
                     cols,
                     seq,
-                    bytes: cur.contents_formatted(),
+                    bytes: snapshot,
                 })
                 .encode()
             } else if let Some(diff) = &delta {

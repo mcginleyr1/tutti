@@ -256,10 +256,6 @@ pub struct Config {
     pub keys: Keys,
     pub preset: Preset,
     pub sidebar: SidebarVisibility,
-    /// Whether the chrome (app bar, sidebar, footer, floating panels) takes a
-    /// subtle neutral background shade. Only honoured on truecolor terminals;
-    /// pane interiors never take a shade. Default on.
-    pub chrome_background: bool,
     /// The sidebar glyph set. Default `Unicode`.
     pub icons: Icons,
     /// Whether pane notifications re-emit to the real terminal and flash the
@@ -324,7 +320,6 @@ impl Config {
             }
         };
 
-        let chrome_background = raw.chrome_background.unwrap_or(true);
         let icons = match raw.icons.as_deref() {
             None | Some("unicode") => Icons::Unicode,
             Some("nerdfont") => Icons::Nerdfont,
@@ -361,7 +356,6 @@ impl Config {
             keys: Keys { bindings },
             preset,
             sidebar,
-            chrome_background,
             icons,
             notifications,
             projects,
@@ -400,7 +394,6 @@ struct RawConfig {
     mouse: Option<bool>,
     preset: Option<String>,
     sidebar: Option<String>,
-    chrome_background: Option<bool>,
     icons: Option<String>,
     notifications: Option<bool>,
     #[serde(default)]
@@ -752,21 +745,6 @@ kill_pane    = "A-x"
             Config::parse("notifications = true\n")
                 .unwrap()
                 .notifications
-        );
-    }
-
-    #[test]
-    fn chrome_background_defaults_on_and_toggles_off() {
-        assert!(Config::default().chrome_background);
-        assert!(
-            !Config::parse("chrome_background = false\n")
-                .unwrap()
-                .chrome_background
-        );
-        assert!(
-            Config::parse("chrome_background = true\n")
-                .unwrap()
-                .chrome_background
         );
     }
 
