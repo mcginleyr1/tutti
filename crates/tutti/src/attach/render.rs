@@ -373,6 +373,12 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
             }
         }
     }
+    // A blank spacer above the waiting header whenever tree rows precede it, so
+    // the sections breathe. Mirrored by `Sidebar::waiting_divider_row` — the
+    // click arithmetic counts this row too.
+    if !sidebar.projects_collapsed && tree_count > 0 {
+        lines.push(Line::default());
+    }
     lines.push(section_header(
         sidebar.waiting_collapsed,
         "waiting",
@@ -449,11 +455,11 @@ fn draw_diff_panel(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// The changed-files panel's header row (` CHANGES        N `): caps title,
+/// The changed-files panel's header row (` changes        N `): bold-dim title,
 /// count right-aligned — the sidebar section-header look, minus the collapse
 /// arrow (the panel is not collapsible; the prefix key toggles focus instead).
 fn changes_header(count: usize, width: u16) -> Line<'static> {
-    let label = "CHANGES";
+    let label = "changes";
     let count = count.to_string();
     let used = 2 + label.chars().count() + count.chars().count();
     let gap = (width as usize).saturating_sub(used);
@@ -484,33 +490,45 @@ fn file_stat_inner(file: &tutti_core::FileStat, sel: bool, content_w: usize) -> 
 }
 
 /// Split `path` into a (dim) directory prefix and its basename, clipped to fit
-/// `avail` columns. The directory clips first — from the left, behind a leading
-/// `…`, keeping the basename whole; a basename that alone overflows clips at
-/// its end.
+/// `avail` columns. The directory clips first — whole components dropped from
+/// the left behind `…/`, never mid-name fragments (`…/attach/app.rs`, not
+/// `…ti/src/attach/app.rs`) — keeping the basename whole; a basename that alone
+/// overflows clips at its end.
 fn clipped_path(path: &str, avail: usize) -> (String, String) {
     let (dir, base) = match path.rsplit_once('/') {
         Some((dir, base)) => (format!("{dir}/"), base.to_string()),
         None => (String::new(), path.to_string()),
     };
-    let (dir_w, base_w) = (dir.chars().count(), base.chars().count());
-    if dir_w + base_w <= avail {
+    if dir.chars().count() + base.chars().count() <= avail {
         return (dir, base);
     }
-    if base_w < avail {
-        let keep = avail - base_w - 1;
-        let tail: String = dir.chars().skip(dir_w - keep).collect();
-        return (format!("…{tail}"), base);
+    let base_w = base.chars().count();
+    if base_w + 2 <= avail {
+        let budget = avail - base_w - 2; // the `…/` prefix spends two columns
+        let mut kept = String::new();
+        for comp in dir.trim_end_matches('/').rsplit('/') {
+            if comp.chars().count() + 1 + kept.chars().count() > budget {
+                break;
+            }
+            kept = format!("{comp}/{kept}");
+        }
+        return (format!("…/{kept}"), base);
+    }
+    if base_w <= avail {
+        return (String::new(), base);
     }
     let clipped: String = base.chars().take(avail.saturating_sub(1)).collect();
     (String::new(), format!("{clipped}…"))
 }
 
-/// A section header row (` ▾ PROJECTS      N `): a collapse arrow, the caps
-/// title, and the count right-aligned to the panel edge. Kept quiet — the rows
-/// carry the brightness, the header just labels the group.
+/// A section header row (` ▾ projects      N `): a collapse arrow, the
+/// lowercase title bold-but-dim (weight gives hierarchy without brightness;
+/// caps stay reserved for the footer's mode chip), and the count right-aligned
+/// to the panel edge. Kept quiet — the rows carry the brightness, the header
+/// just labels the group.
 fn section_header(collapsed: bool, title: &str, count: usize, width: u16) -> Line<'static> {
     let arrow = if collapsed { '▸' } else { '▾' };
-    let label = title.to_uppercase();
+    let label = title.to_string();
     let count = count.to_string();
     // ' ' arrow ' ' label <gap> count ' '
     let used = 4 + label.chars().count() + count.chars().count();
@@ -715,7 +733,8 @@ fn agent_inner(
 
 /// The dim `state · kind` second line for an agent — indented under its title,
 /// which a tree row's guide pushes right — plus the bell mark when a
-/// notification is pending.
+/// notification is pending. A default-titled pane already says the kind in its
+/// title row, so the kind is dropped there rather than stuttered.
 fn agent_subtitle_inner(
     a: &AgentRow,
     sel: bool,
@@ -723,10 +742,12 @@ fn agent_subtitle_inner(
     content_w: u16,
 ) -> Vec<Span<'static>> {
     let indent = "  ".repeat(a.depth as usize + 1);
-    let mut spans = vec![Span::styled(
-        format!("{indent}{} · {}", state_label(a.state), a.kind),
-        dim(),
-    )];
+    let text = if a.kind == a.title {
+        format!("{indent}{}", state_label(a.state))
+    } else {
+        format!("{indent}{} · {}", state_label(a.state), a.kind)
+    };
+    let mut spans = vec![Span::styled(text, dim())];
     if notified {
         spans.push(Span::styled(
             " 🔔",
@@ -738,17 +759,20 @@ fn agent_subtitle_inner(
 
 /// The dim `project · kind` second line for a waiting-section row — the rows
 /// are cross-project, so the project is the orienting fact — plus the bell mark
-/// when a notification is pending.
+/// when a notification is pending. A default-titled pane already says the kind
+/// in its title row, so the kind is dropped there rather than stuttered.
 fn waiting_subtitle_inner(
     a: &AgentRow,
     sel: bool,
     notified: bool,
     content_w: u16,
 ) -> Vec<Span<'static>> {
-    let mut spans = vec![Span::styled(
-        format!("  {} · {}", a.project_name, a.kind),
-        dim(),
-    )];
+    let text = if a.kind == a.title {
+        format!("  {}", a.project_name)
+    } else {
+        format!("  {} · {}", a.project_name, a.kind)
+    };
+    let mut spans = vec![Span::styled(text, dim())];
     if notified {
         spans.push(Span::styled(
             " 🔔",
@@ -1112,16 +1136,18 @@ fn fit_hint(pairs: &[(String, &str)], avail: u16) -> (Vec<Span<'static>>, u16) {
     }
 }
 
-/// Two-tone key hints: each key bright, its label dim, joined by a dim `·`.
-/// Returns the spans and their total rendered width.
+/// Two-tone key hints: each key bright, its label dim, pairs separated by two
+/// plain spaces — the single space inside a pair binds key to label tighter
+/// than pair sits to pair, so the grouping needs no separator glyph. Returns
+/// the spans and their total rendered width.
 fn two_tone<S: AsRef<str>>(pairs: &[(S, &str)]) -> (Vec<Span<'static>>, u16) {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let mut spans = Vec::new();
     let mut width = 0usize;
     for (i, (key, label)) in pairs.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(" · ", dim));
-            width += 3;
+            spans.push(Span::raw("  "));
+            width += 2;
         }
         let key = key.as_ref().to_string();
         width += key.chars().count() + 1 + label.chars().count();
@@ -1590,10 +1616,10 @@ mod tests {
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
         assert!(
-            text.contains("PROJECTS"),
+            text.contains("projects"),
             "projects header missing: {text:?}"
         );
-        assert!(text.contains("WAITING"), "waiting header missing: {text:?}");
+        assert!(text.contains("waiting"), "waiting header missing: {text:?}");
         assert!(text.contains("api"), "workspace name missing: {text:?}");
         assert!(text.contains("main"), "branch subtitle missing: {text:?}");
         assert!(
@@ -1642,7 +1668,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(140, 20)).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
-        assert!(text.contains("CHANGES"), "panel header missing: {text:?}");
+        assert!(text.contains("changes"), "panel header missing: {text:?}");
         assert!(
             text.contains("main.rs") && text.contains("+12 −4"),
             "file row with exact counts missing: {text:?}"
@@ -1663,11 +1689,21 @@ mod tests {
             clipped_path("README.md", 20),
             ("".into(), "README.md".into())
         );
-        // The directory clips from the left behind a `…`; the basename survives.
-        let (dir, base) = clipped_path("crates/tutti/src/attach/app.rs", 16);
-        assert_eq!(base, "app.rs");
-        assert!(dir.starts_with('…'), "clipped dir leads with …: {dir:?}");
-        assert_eq!(dir.chars().count() + base.chars().count(), 16);
+        // The directory clips from the left behind `…/`, dropping whole
+        // components — never mid-name fragments; the basename survives.
+        assert_eq!(
+            clipped_path("crates/tutti/src/attach/app.rs", 16),
+            ("…/attach/".into(), "app.rs".into())
+        );
+        assert_eq!(
+            clipped_path("crates/tutti/src/attach/app.rs", 28),
+            ("…/tutti/src/attach/".into(), "app.rs".into())
+        );
+        // Even when no whole component fits, the `…/` still marks the elision.
+        assert_eq!(
+            clipped_path("crates/tutti/src/attach/app.rs", 9),
+            ("…/".into(), "app.rs".into())
+        );
         // A basename that alone overflows clips at its end.
         let (dir, base) = clipped_path("averylongfilename.rs", 8);
         assert_eq!(dir, "");
@@ -1785,7 +1821,7 @@ mod tests {
             "no agents header, no placeholder — the tree shows reality: {text:?}"
         );
         assert!(
-            text.contains("WAITING"),
+            text.contains("waiting"),
             "the waiting header still closes the tree: {text:?}"
         );
     }
@@ -2082,14 +2118,18 @@ mod tests {
         let line = popup_key_line("j/k", "move");
         assert_eq!(line.spans[0].style.fg, Some(ACCENT), "key span is accent");
         assert_eq!(line.spans[1].style, dim(), "label span is dim");
-        // The footer hint keeps bright keys with a dim separator.
-        let (spans, _) = two_tone(&[("a", "one"), ("b", "two")]);
+        // The footer hint separates pairs with two plain spaces — proximity
+        // groups a key with its label, no separator glyph.
+        let (spans, w) = two_tone(&[("a", "one"), ("b", "two")]);
         assert!(
-            spans
-                .iter()
-                .any(|s| s.content == " · " && s.style.add_modifier.contains(Modifier::DIM)),
-            "separator between pairs is dim"
+            spans.iter().any(|s| s.content == "  "),
+            "pairs are separated by two spaces"
         );
+        assert!(
+            !spans.iter().any(|s| s.content.contains('·')),
+            "no separator glyph between pairs"
+        );
+        assert_eq!(w, 12, "a one  b two");
     }
 
     #[test]
@@ -2296,16 +2336,16 @@ mod tests {
         // The projects header is the sidebar's first row, on content row 2 —
         // scoped to the 30-column sidebar (the pane area sits to its right).
         let top: String = row_text(buf, 2).chars().take(30).collect();
-        assert!(top.contains("PROJECTS"), "projects header: {top:?}");
+        assert!(top.contains("projects"), "projects header: {top:?}");
         assert!(
             top.trim_end().ends_with('2'),
             "projects count right-aligned in the header: {top:?}"
         );
         // The waiting header carries its own count below (web's blocked agent).
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("WAITING"), "waiting header: {text:?}");
+        assert!(text.contains("waiting"), "waiting header: {text:?}");
         assert!(
-            text.contains("WAITING                  1"),
+            text.contains("waiting                  1"),
             "waiting count right-aligned in the header: {text:?}"
         );
     }

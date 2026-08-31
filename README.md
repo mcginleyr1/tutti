@@ -309,8 +309,11 @@ hard error.
 
 A left column that turns the TUI into a control center for many projects and
 agents at once — a borderless panel, each section
-labelled by a quiet caps header (` ▾ PROJECTS`, ` ▾ WAITING`) with a `▾`/`▸`
-collapse arrow and a right-aligned count. Names render at full intensity and
+labelled by a quiet lowercase header (` ▾ projects`, ` ▾ waiting` — bold but
+dim, so weight carries the hierarchy without brightness; caps stay reserved
+for the footer's mode chip) with a `▾`/`▸`
+collapse arrow and a right-aligned count. A blank spacer row above the
+waiting header keeps the two sections from running together. Names render at full intensity and
 everything else recedes dim, so the eye lands on identity; the focused row
 pops in the accent colour. Two stacked sections:
 
@@ -356,8 +359,8 @@ single entry. The highlight follows the row's **identity**, not its position:
 when a kill or a state change reshapes the list, the cursor stays on the row
 it was on (falling back to the row's project when the row itself vanished),
 and a kill confirm re-checks its target before firing — a confirm can never
-land on the wrong workspace or agent. Click a section header (the `PROJECTS`
-or `WAITING` row) to collapse that section down to its header, or click again
+land on the wrong workspace or agent. Click a section header (the `projects`
+or `waiting` row) to collapse that section down to its header, or click again
 to expand it.
 
 Press the prefix then `w` to focus the sidebar (revealing it if hidden); the
@@ -419,8 +422,9 @@ agent still rings the bell and turns its pane border red until you focus it.
 ### Changed files panel
 
 The right-hand column mirrors the sidebar for *code*: whenever the active
-workspace has changes against trunk, a borderless `CHANGES` panel lists every
-changed file — directory dim, basename bright — with its exact `+added −removed`
+workspace has changes against trunk, a borderless `changes` panel lists every
+changed file — directory dim (clipped by whole components behind `…/`, never
+mid-name fragments), basename bright — with its exact `+added −removed`
 line counts right-aligned, always on and refreshed as agents work (same probe as
 the sidebar stat, so the two never disagree). It disappears when the workspace
 is clean, on narrow terminals, or with `diff_panel = "off"`.

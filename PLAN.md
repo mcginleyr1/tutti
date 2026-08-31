@@ -259,8 +259,9 @@ agent in each, `wait --until done` on all three, read back each diff summary.
 
 ## Ground rules for implementation
 
-- **Clean-room rule.** Do not read, reference, or consult the source code of any
-  similar AGPL-licensed tool. Implement everything from this spec alone.
+- **Prior art.** Consulting permissively-licensed (Apache/MIT/BSD) tools for
+  design ideas is fine; never copy code verbatim, and never consult
+  AGPL/copyleft sources.
 - `tutti-core` stays free of I/O and UI dependencies — pure types + state machine,
   heavily unit-tested (especially the agent state transitions and layout tree).
 - Every feature lands with: the socket API first, the CLI verb second, the TUI last.

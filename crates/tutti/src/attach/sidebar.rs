@@ -206,9 +206,11 @@ impl Sidebar {
 
     /// The screen row (relative to the sidebar frame's top) of the waiting
     /// divider — the border-fused `waiting` header. Row 0 is always the
-    /// projects header (the top border); the divider follows the tree body.
+    /// projects header (the top border); the divider follows the tree body,
+    /// plus the renderer's one-row spacer whenever tree rows precede it.
     fn waiting_divider_row(&self) -> usize {
-        1 + self.tree_body_rows()
+        let body = self.tree_body_rows();
+        1 + body + usize::from(body > 0)
     }
 
     /// The section header (if any) a click at `row` toggles. Row 0 is the
@@ -790,13 +792,16 @@ mod tests {
         assert_eq!(sidebar.entry_at_row(6), Some(2));
         assert_eq!(sidebar.entry_at_row(8), Some(3));
         assert_eq!(sidebar.entry_at_row(10), Some(4));
-        // Row 11 is the waiting divider, then two rows per waiting entry.
+        // Row 11 is the spacer, 12 the waiting divider, then two rows per
+        // waiting entry.
         assert_eq!(sidebar.entry_at_row(11), None);
-        assert_eq!(sidebar.header_at_row(11), Some(Section::Waiting));
-        assert_eq!(sidebar.entry_at_row(12), Some(5));
-        assert_eq!(sidebar.entry_at_row(14), Some(6));
+        assert_eq!(sidebar.header_at_row(11), None);
+        assert_eq!(sidebar.entry_at_row(12), None);
+        assert_eq!(sidebar.header_at_row(12), Some(Section::Waiting));
+        assert_eq!(sidebar.entry_at_row(13), Some(5));
+        assert_eq!(sidebar.entry_at_row(15), Some(6));
         // Past the last waiting entry.
-        assert_eq!(sidebar.entry_at_row(16), None);
+        assert_eq!(sidebar.entry_at_row(17), None);
     }
 
     #[test]
@@ -804,6 +809,7 @@ mod tests {
         let mut sidebar = build(&two_workspace_view(), Some(TabId(2)));
         sidebar.projects_collapsed = true;
         assert_eq!(sidebar.entry_at_row(1), None, "tree rows are hidden");
+        // No tree body, no spacer — the divider sits right below the header.
         assert_eq!(sidebar.header_at_row(1), Some(Section::Waiting));
         // Waiting rows follow immediately after the divider.
         assert_eq!(sidebar.entry_at_row(2), Some(5));
@@ -817,8 +823,8 @@ mod tests {
         let mut sidebar = build(&two_workspace_view(), Some(TabId(2)));
         sidebar.waiting_collapsed = true;
         assert_eq!(sidebar.entry_at_row(1), Some(0), "tree rows still map");
-        assert_eq!(sidebar.header_at_row(11), Some(Section::Waiting));
-        assert_eq!(sidebar.entry_at_row(12), None, "waiting rows are hidden");
+        assert_eq!(sidebar.header_at_row(12), Some(Section::Waiting));
+        assert_eq!(sidebar.entry_at_row(13), None, "waiting rows are hidden");
         assert!(!sidebar.is_visible(5), "a waiting entry is not visible");
         assert!(sidebar.is_visible(0), "a tree entry stays visible");
     }
@@ -849,11 +855,13 @@ mod tests {
         // The next agent is pushed down past the sub-rows, to 7-8.
         assert_eq!(sidebar.entry_at_row(7), Some(2));
         assert_eq!(sidebar.entry_at_row(8), Some(2));
-        // Row 9 is the waiting divider (the done agent queues there), pushed
-        // down past the subagent sub-rows; its entry sits at rows 10-11.
-        assert_eq!(sidebar.entry_at_row(9), None, "the waiting divider");
-        assert_eq!(sidebar.header_at_row(9), Some(Section::Waiting));
-        assert_eq!(sidebar.entry_at_row(10), Some(3));
-        assert_eq!(sidebar.entry_at_row(12), None, "past the last waiting row");
+        // Row 9 is the spacer, 10 the waiting divider (the done agent queues
+        // there), pushed down past the subagent sub-rows; its entry sits at
+        // rows 11-12.
+        assert_eq!(sidebar.entry_at_row(9), None, "the spacer");
+        assert_eq!(sidebar.entry_at_row(10), None, "the waiting divider");
+        assert_eq!(sidebar.header_at_row(10), Some(Section::Waiting));
+        assert_eq!(sidebar.entry_at_row(11), Some(3));
+        assert_eq!(sidebar.entry_at_row(13), None, "past the last waiting row");
     }
 }

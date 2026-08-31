@@ -56,8 +56,10 @@ cargo fmt --check
   is the agent/script API; the TUI is the human surface. A wave adding a
   human-relevant verb lands its TUI path in the same wave.
 - jj is the only VCS integrated — no git/mercurial adapters, by decree.
-- Clean-room: never read or reference the source of any AGPL-licensed agent
-  multiplexer, and never name such products in code, docs, commits, or plans.
+- Prior art: consulting permissively-licensed (Apache/MIT/BSD) tools for design
+  ideas is fine — never copy code verbatim, never consult AGPL/copyleft sources.
+  (Relaxed 2026-08-31: the tool that motivated the old clean-room rule
+  relicensed to Apache 2.0.)
 
 ## Design system (TUI)
 
@@ -71,8 +73,9 @@ cargo fmt --check
   sidebar row, and that uses an **ANSI palette colour** (never truecolor RGB) so
   the terminal repaints it too on a scheme flip. Never reintroduce a fixed-RGB
   chrome shade — it would stay dark over a light terminal. Chrome panels are
-  borderless (caps section headers, no box-drawing frames); pane frames are the
-  only boxes.
+  borderless (lowercase bold-dim section headers, no box-drawing frames); pane
+  frames are the only boxes. Caps are reserved for the footer's mode chip —
+  nothing else in the chrome is uppercase.
 - Glyphs: safe-unicode set by default, nerd-font set behind `icons =
   "nerdfont"`. No private-use codepoints in the default set.
 - Which-key, the help overlay, and the bottom-bar hints all render from the
