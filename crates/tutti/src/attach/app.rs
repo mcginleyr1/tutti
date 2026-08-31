@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 use tutti_core::{
-    AgentKind, AgentState, Direction, Event, Frame as WireFrame, Layout, PaneId, PaneInfo, Request,
-    Response, TabId, TabView, WorkspaceId, WorkspaceView,
+    AgentKind, AgentState, DIFF_RANGE, Direction, Event, FileStat, Frame as WireFrame, Layout,
+    PaneId, PaneInfo, Request, Response, TabId, TabView, WorkspaceId, WorkspaceView,
 };
 
 use tutti_agents::Registry;
@@ -25,6 +25,12 @@ use crate::config::{self, Action, Config, PrefixAction, RESIZE_DELTA, SidebarVis
 /// is suppressed entirely so panes keep usable room.
 const SIDEBAR_WIDTH: u16 = 30;
 const SIDEBAR_MIN_TOTAL: u16 = 80;
+
+/// The changed-files panel's fixed column width, and the minimum content width
+/// below which it is suppressed so panes keep usable room even beside the
+/// sidebar.
+const DIFF_PANEL_WIDTH: u16 = 32;
+const DIFF_PANEL_MIN_TOTAL: u16 = 120;
 
 /// Rows the top chrome header claims: the full-width app bar plus the dim rule
 /// beneath it. The content region begins below them.
@@ -107,6 +113,9 @@ pub enum Mode {
     Help,
     /// Navigating the sidebar; keys drive the selection instead of the pane.
     Sidebar,
+    /// Navigating the changed-files panel; `enter` opens the highlighted file's
+    /// diff, `d` the whole workspace diff.
+    DiffFiles,
     /// Editing the add-project directory prompt at the sidebar's foot.
     SidebarPrompt,
     /// Guided workspace creation, step 1: the `workspace name:` field.
@@ -183,6 +192,11 @@ pub struct App {
     resume_home: Option<PathBuf>,
     /// The sidebar column from the last size sync, for mouse hit-testing.
     sidebar_rect: Option<Rect>,
+    /// The changed-files panel column from the last size sync, for mouse
+    /// hit-testing. `None` while the panel is hidden.
+    diff_panel_rect: Option<Rect>,
+    /// The highlighted row in the changed-files panel while it is focused.
+    diff_selected: usize,
     /// The top tab-bar row from the last size sync, for mouse hit-testing.
     tab_bar_rect: Option<Rect>,
     /// When the client attached — the epoch the working spinner advances from,
@@ -271,6 +285,8 @@ impl App {
             launcher_target: None,
             resume_home: std::env::var_os("HOME").map(PathBuf::from),
             sidebar_rect: None,
+            diff_panel_rect: None,
+            diff_selected: 0,
             tab_bar_rect: None,
             spinner_epoch: Instant::now(),
             last_content_width: 0,
@@ -583,6 +599,13 @@ impl App {
         self.sidebar_selected =
             resolved.unwrap_or(self.sidebar_selected.min(sidebar.len().saturating_sub(1)));
         self.sidebar_anchor = anchor_at(&sidebar, self.sidebar_selected);
+        // Keep the changed-files cursor in range; a panel emptied by a refresh
+        // (everything merged, say) drops focus back to the panes.
+        let files = self.changed_files().len();
+        self.diff_selected = self.diff_selected.min(files.saturating_sub(1));
+        if self.mode == Mode::DiffFiles && files == 0 {
+            self.mode = Mode::Terminal;
+        }
         self.refocus();
     }
 
@@ -600,6 +623,7 @@ impl App {
             Mode::ConfirmCleanup(id) => self.on_key_confirm_cleanup(key, id),
             Mode::Scroll(pane) => self.on_key_scroll(key, pane),
             Mode::Sidebar => self.on_key_sidebar(key),
+            Mode::DiffFiles => self.on_key_diff_files(key),
             Mode::SidebarPrompt => self.on_key_prompt(key),
             Mode::SidebarWorkspaceName => self.on_key_workspace_name(key),
             Mode::SidebarWorkspaceDest => self.on_key_workspace_dest(key),
@@ -737,6 +761,10 @@ impl App {
             PrefixAction::TabNew => self.new_tab(),
             PrefixAction::Sidebar => {
                 self.focus_sidebar();
+                Vec::new()
+            }
+            PrefixAction::DiffFiles => {
+                self.focus_diff_panel();
                 Vec::new()
             }
             PrefixAction::Run => {
@@ -970,25 +998,52 @@ impl App {
             .any(|p| p.agent.is_some())
     }
 
-    /// Split a content area into the sidebar column (when shown) and the region
-    /// to its right. The single source of truth for the sidebar column: the
-    /// region right of it is further split into the tab bar and panes.
-    fn split_content(&self, content: Rect) -> (Option<Rect>, Rect) {
-        if !self.sidebar_shown(content.width) {
-            return (None, content);
-        }
-        let w = SIDEBAR_WIDTH.min(content.width);
-        let sidebar = Rect::new(content.x, content.y, w, content.height);
-        let panes = Rect::new(content.x + w, content.y, content.width - w, content.height);
-        (Some(sidebar), panes)
+    /// Split a content area into the sidebar column (when shown), the pane
+    /// region, and the changed-files panel (when shown) carved off the pane
+    /// region's right edge. The single source of truth for both chrome columns.
+    fn split_content(&self, content: Rect) -> (Option<Rect>, Rect, Option<Rect>) {
+        let (sidebar, mut panes) = if self.sidebar_shown(content.width) {
+            let w = SIDEBAR_WIDTH.min(content.width);
+            let sidebar = Rect::new(content.x, content.y, w, content.height);
+            let panes = Rect::new(content.x + w, content.y, content.width - w, content.height);
+            (Some(sidebar), panes)
+        } else {
+            (None, content)
+        };
+        let diff_panel = if self.diff_panel_shown(content.width) {
+            let w = DIFF_PANEL_WIDTH.min(panes.width);
+            let panel = Rect::new(panes.x + panes.width - w, panes.y, w, panes.height);
+            panes.width -= w;
+            Some(panel)
+        } else {
+            None
+        };
+        (sidebar, panes, diff_panel)
     }
 
-    /// The two regions a content area splits into: the sidebar column (when
-    /// shown, full height) and the pane area to its right. The tab list now lives
-    /// in the top app bar, so the content region no longer carries a tab-bar row.
-    /// Every rect the renderer, resize sync, and mouse hit-testing use flows from
-    /// here so they stay in agreement.
-    pub fn regions(&self, content: Rect) -> (Option<Rect>, Rect) {
+    /// Whether the changed-files panel renders: enabled in config, the active
+    /// workspace actually has changes against trunk, and the content is wide
+    /// enough that panes keep usable room beside both chrome columns.
+    fn diff_panel_shown(&self, total_width: u16) -> bool {
+        self.config.diff_panel
+            && total_width >= DIFF_PANEL_MIN_TOTAL
+            && !self.changed_files().is_empty()
+    }
+
+    /// The active workspace's changed files — what the changed-files panel
+    /// lists. Empty when no workspace is active or it is clean against trunk.
+    pub fn changed_files(&self) -> &[FileStat] {
+        self.active_workspace()
+            .map_or(&[], |w| w.changed_files.as_slice())
+    }
+
+    /// The three regions a content area splits into: the sidebar column (when
+    /// shown, full height), the pane area, and the changed-files panel (when
+    /// shown, full height) at the right edge. The tab list now lives in the top
+    /// app bar, so the content region no longer carries a tab-bar row. Every
+    /// rect the renderer, resize sync, and mouse hit-testing use flows from here
+    /// so they stay in agreement.
+    pub fn regions(&self, content: Rect) -> (Option<Rect>, Rect, Option<Rect>) {
         self.split_content(content)
     }
 
@@ -1206,11 +1261,87 @@ impl App {
         self.zoom = false;
         vec![control(&Request::PaneRun {
             tab: Some(tab),
-            cmd: vec![
-                "sh".into(),
-                "-lc".into(),
-                "jj --no-pager diff --color=always | less -R".into(),
-            ],
+            cmd: diff_pager_cmd(None),
+            ephemeral: true,
+        })]
+    }
+
+    /// Focus the changed-files panel. Refuses — with a status explaining why —
+    /// when the active workspace is clean against trunk, the panel is disabled
+    /// in config, or the terminal is too narrow to render it.
+    fn focus_diff_panel(&mut self) {
+        if self.changed_files().is_empty() {
+            self.set_status("no changes against trunk".into());
+            return;
+        }
+        if !self.diff_panel_shown(self.last_content_width) {
+            self.set_status("terminal too narrow for the changes panel".into());
+            return;
+        }
+        self.diff_selected = self.diff_selected.min(self.changed_files().len() - 1);
+        self.mode = Mode::DiffFiles;
+        self.prefix_since = None;
+        self.status = None;
+    }
+
+    fn on_key_diff_files(&mut self, key: KeyEvent) -> Vec<WireFrame> {
+        // The directional direct bindings step back into the pane area, keeping
+        // its focus — the panel sits at the content's right edge.
+        if let Some(Action::FocusLeft | Action::FocusRight) = self.config.keys.action_for(key) {
+            self.mode = Mode::Terminal;
+            self.status = None;
+            return Vec::new();
+        }
+        let len = self.changed_files().len();
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.diff_selected = (self.diff_selected + 1).min(len.saturating_sub(1));
+                Vec::new()
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.diff_selected = self.diff_selected.saturating_sub(1);
+                Vec::new()
+            }
+            KeyCode::Enter => self.open_selected_file_diff(),
+            KeyCode::Char('d') => {
+                let Some(tab) = self.active_tab else {
+                    return Vec::new();
+                };
+                self.mode = Mode::Terminal;
+                self.status = None;
+                vec![control(&Request::PaneRun {
+                    tab: Some(tab),
+                    cmd: diff_pager_cmd(None),
+                    ephemeral: true,
+                })]
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = Mode::Terminal;
+                self.status = None;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Open the highlighted file's diff against trunk in an ephemeral pager
+    /// pane, in the active workspace's tab.
+    fn open_selected_file_diff(&mut self) -> Vec<WireFrame> {
+        let Some(path) = self
+            .changed_files()
+            .get(self.diff_selected)
+            .map(|f| f.path.clone())
+        else {
+            return Vec::new();
+        };
+        let Some(tab) = self.active_tab else {
+            return Vec::new();
+        };
+        self.mode = Mode::Terminal;
+        self.status = None;
+        vec![control(&Request::PaneRun {
+            tab: Some(tab),
+            cmd: diff_pager_cmd(Some(&path)),
             ephemeral: true,
         })]
     }
@@ -1848,6 +1979,9 @@ impl App {
                 if self.in_sidebar(col, row) {
                     return self.sidebar_click(row);
                 }
+                if self.diff_panel_rect.is_some_and(|r| contains(r, col, row)) {
+                    return self.diff_panel_click(row);
+                }
                 if self.tab_bar_rect.is_some_and(|r| contains(r, col, row)) {
                     return self.tab_bar_click(col);
                 }
@@ -2049,6 +2183,49 @@ impl App {
         }
     }
 
+    /// A click on the changed-files panel: focus it and open the clicked file's
+    /// diff. The top row is the panel header; file rows follow the same
+    /// scroll-follow window the renderer draws.
+    fn diff_panel_click(&mut self, row: u16) -> Vec<WireFrame> {
+        let Some(rect) = self.diff_panel_rect else {
+            return Vec::new();
+        };
+        if self.changed_files().is_empty() {
+            return Vec::new();
+        }
+        if self.mode != Mode::DiffFiles {
+            self.mode = Mode::DiffFiles;
+            self.status = None;
+        }
+        let rel = row.saturating_sub(rect.y) as usize;
+        let Some(row_in_list) = rel.checked_sub(1) else {
+            return Vec::new();
+        };
+        let idx = self.diff_first_visible(rect.height) + row_in_list;
+        if idx >= self.changed_files().len() {
+            return Vec::new();
+        }
+        self.diff_selected = idx;
+        self.open_selected_file_diff()
+    }
+
+    /// The first file row the changed-files panel shows for `panel_height` (one
+    /// header row sits above the list): 0 until the selection would leave the
+    /// window, then following it. Shared by the renderer and click hit-testing
+    /// so clicks land on what is drawn.
+    pub fn diff_first_visible(&self, panel_height: u16) -> usize {
+        let visible = panel_height.saturating_sub(1) as usize;
+        if visible == 0 {
+            return 0;
+        }
+        self.diff_selected.saturating_sub(visible - 1)
+    }
+
+    /// The highlighted changed-files row, for the renderer.
+    pub fn diff_selected(&self) -> usize {
+        self.diff_selected
+    }
+
     /// Collapse or expand a sidebar section (projects, agents, or waiting).
     fn toggle_section(&mut self, section: sidebar::Section) {
         match section {
@@ -2126,8 +2303,9 @@ impl App {
         let (content, _footer) = App::content_rect(area);
         let (app_bar, _rule) = App::header_rects(area);
         self.last_content_width = content.width;
-        let (sidebar_rect, _panes) = self.regions(content);
+        let (sidebar_rect, _panes, diff_panel_rect) = self.regions(content);
         self.sidebar_rect = sidebar_rect;
+        self.diff_panel_rect = diff_panel_rect;
         self.tab_bar_rect = Some(self.tab_bar_rect(app_bar));
         self.rects = self.compute_rects(content);
         let mut out = Vec::new();
@@ -2146,7 +2324,7 @@ impl App {
     }
 
     pub fn compute_rects(&self, content: Rect) -> Vec<(PaneId, Rect)> {
-        let (_, panes) = self.regions(content);
+        let (_, panes, _) = self.regions(content);
         let Some(layout) = self.active_tab_view().and_then(|t| t.layout.as_ref()) else {
             return Vec::new();
         };
@@ -2472,6 +2650,36 @@ fn is_jj_workspace(dir: &Path) -> bool {
         cur = d.parent();
     }
     false
+}
+
+/// The ephemeral-pane command paging a workspace's diff against trunk
+/// (`DIFF_RANGE`), optionally scoped to one repo-root-relative `path`. stderr
+/// folds into the pager so a jj failure (a stale workspace, say) is read, not
+/// lost. The path rides a `root:"…"` fileset pattern — panel paths are
+/// repo-root-relative, while a bare pattern would resolve against the pane's
+/// cwd, which may sit below the root.
+fn diff_pager_cmd(path: Option<&str>) -> Vec<String> {
+    let scope = path.map_or_else(String::new, |p| format!(" {}", sh_quote(&root_pattern(p))));
+    vec![
+        "sh".into(),
+        "-lc".into(),
+        format!("jj --no-pager diff --color=always -r '{DIFF_RANGE}'{scope} 2>&1 | less -R"),
+    ]
+}
+
+/// A jj fileset pattern selecting exactly the repo-root-relative `path`, with
+/// the characters special inside a fileset string literal escaped.
+fn root_pattern(path: &str) -> String {
+    format!(
+        "root:\"{}\"",
+        path.replace('\\', "\\\\").replace('"', "\\\"")
+    )
+}
+
+/// `s` single-quoted for `sh -c`, with embedded single quotes escaped the only
+/// way sh allows: close, backslash-quote, reopen.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Whether `name` is a legal fork name: a non-empty run of ASCII letters,
@@ -3386,20 +3594,20 @@ mod tests {
         // auto: hidden for a single plain workspace.
         let mut app = auto();
         attached(&mut app);
-        let (sb, panes) = app.split_content(Rect::new(0, 0, 100, 24));
+        let (sb, panes, _) = app.split_content(Rect::new(0, 0, 100, 24));
         assert!(sb.is_none(), "auto hides an agentless single workspace");
         assert_eq!(panes.width, 100);
 
         // auto: shown with multiple workspaces, panes shrink by the column width.
         let mut app = auto();
         attach_with(&mut app, view_two_workspaces());
-        let (sb, panes) = app.split_content(Rect::new(0, 0, 100, 24));
+        let (sb, panes, _) = app.split_content(Rect::new(0, 0, 100, 24));
         assert_eq!(sb.unwrap().width, 30);
         assert_eq!(panes.width, 70);
         assert_eq!(panes.x, 30);
 
         // width floor suppresses it regardless of contents.
-        let (sb, panes) = app.split_content(Rect::new(0, 0, 79, 24));
+        let (sb, panes, _) = app.split_content(Rect::new(0, 0, 79, 24));
         assert!(sb.is_none(), "below the width floor the sidebar is hidden");
         assert_eq!(panes.width, 79);
 
@@ -3665,14 +3873,14 @@ mod tests {
             out,
             vec![control(&Request::PaneRun {
                 tab: Some(TabId(1)),
-                cmd: vec![
-                    "sh".into(),
-                    "-lc".into(),
-                    "jj --no-pager diff --color=always | less -R".into(),
-                ],
+                cmd: diff_pager_cmd(None),
                 ephemeral: true,
             })],
             "d spawns the ephemeral jj-diff pane in the workspace's tab"
+        );
+        assert!(
+            diff_pager_cmd(None)[2].contains(DIFF_RANGE),
+            "the pager diffs against trunk, not the bare working copy"
         );
         assert_eq!(app.mode, Mode::Terminal);
         assert_eq!(app.active_tab, Some(TabId(1)));
@@ -3794,6 +4002,144 @@ mod tests {
         let out = app.on_key(plain('f'));
         assert!(out.is_empty(), "f sends nothing");
         assert_eq!(app.mode, Mode::Sidebar, "f no longer opens any prompt");
+    }
+
+    /// One workspace whose delta against trunk carries two files, as the
+    /// server's change probe would report it.
+    fn view_with_changes() -> Vec<WorkspaceView> {
+        let mut ws = workspace(
+            1,
+            "api",
+            Some("main"),
+            vec![tab(1, "1", true, leaf(1), vec![shell(1)])],
+        );
+        ws.changes = Some("2 files +13 −4".into());
+        ws.changed_files = vec![
+            FileStat {
+                path: "src/main.rs".into(),
+                insertions: 12,
+                deletions: 4,
+            },
+            FileStat {
+                path: "crates/deep/dir/mod.rs".into(),
+                insertions: 1,
+                deletions: 0,
+            },
+        ];
+        vec![ws]
+    }
+
+    #[test]
+    fn prefix_f_focuses_the_panel_and_enter_opens_the_file_diff() {
+        let mut app = App::new();
+        attach_with(&mut app, view_with_changes());
+        app.sync_sizes(Rect::new(0, 0, 140, 40));
+        app.on_key(ctrl('b'));
+        app.on_key(plain('f'));
+        assert_eq!(app.mode, Mode::DiffFiles);
+
+        app.on_key(plain('j'));
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match only_request(&out) {
+            Request::PaneRun {
+                tab,
+                cmd,
+                ephemeral,
+            } => {
+                assert_eq!(tab, Some(TabId(1)));
+                assert!(ephemeral, "the pager pane vanishes when less quits");
+                assert!(
+                    cmd[2].contains(DIFF_RANGE),
+                    "the file diff uses the against-trunk revset: {}",
+                    cmd[2]
+                );
+                assert!(
+                    cmd[2].contains("root:\"crates/deep/dir/mod.rs\""),
+                    "the diff is scoped to the highlighted file, root-relative: {}",
+                    cmd[2]
+                );
+            }
+            other => panic!("expected PaneRun, got {other:?}"),
+        }
+        assert_eq!(
+            app.mode,
+            Mode::Terminal,
+            "opening the diff leaves the panel"
+        );
+    }
+
+    #[test]
+    fn prefix_f_with_a_clean_workspace_reports_instead_of_focusing() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        app.sync_sizes(Rect::new(0, 0, 140, 40));
+        app.on_key(ctrl('b'));
+        app.on_key(plain('f'));
+        assert_eq!(app.mode, Mode::Terminal, "nothing to show, focus stays put");
+        assert!(
+            app.transient()
+                .is_some_and(|t| t.contains("no changes against trunk")),
+            "the transient explains why the panel did not open"
+        );
+    }
+
+    #[test]
+    fn changed_files_panel_needs_changes_and_width() {
+        let content = Rect::new(0, 0, 140, 37);
+
+        // A clean workspace shows no panel.
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        assert!(app.split_content(content).2.is_none());
+
+        // With changes and room, the panel takes the right edge and panes give
+        // up its width.
+        let mut app = App::new();
+        attach_with(&mut app, view_with_changes());
+        let (_, panes, panel) = app.split_content(content);
+        let panel = panel.expect("changes + width show the panel");
+        assert_eq!(panel.width, 32);
+        assert_eq!(panel.x + panel.width, 140);
+        assert_eq!(panes.width, 140 - 30 - 32);
+
+        // Too narrow, or disabled in config, and it is suppressed.
+        assert!(app.split_content(Rect::new(0, 0, 100, 37)).2.is_none());
+        let mut app = App::with_config(Config::parse("diff_panel = \"off\"\n").unwrap());
+        attach_with(&mut app, view_with_changes());
+        assert!(app.split_content(content).2.is_none());
+    }
+
+    #[test]
+    fn clicking_a_panel_row_opens_that_files_diff() {
+        let mut app = App::new();
+        attach_with(&mut app, view_with_changes());
+        app.sync_sizes(Rect::new(0, 0, 140, 40));
+
+        // The panel spans x 108..140 below the header; its top row is the
+        // CHANGES header, so the second file sits two rows down.
+        let out = app.on_mouse(MouseEventKind::Down(MouseButton::Left), 110, 4);
+        match only_request(&out) {
+            Request::PaneRun { cmd, .. } => assert!(
+                cmd[2].contains("root:\"crates/deep/dir/mod.rs\""),
+                "the click resolves to the drawn row: {}",
+                cmd[2]
+            ),
+            other => panic!("expected PaneRun, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_pager_quoting_survives_hostile_paths() {
+        assert_eq!(
+            root_pattern(r#"a"b\c.txt"#),
+            r#"root:"a\"b\\c.txt""#,
+            "fileset string literals escape quotes and backslashes"
+        );
+        assert_eq!(
+            sh_quote("it's"),
+            r#"'it'\''s'"#,
+            "single quotes close, escape, and reopen for sh"
+        );
     }
 
     #[test]

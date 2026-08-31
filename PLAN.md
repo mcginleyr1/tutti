@@ -207,8 +207,12 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    removes a workspace (refused for one tutti did not create). ✅ stale workspaces
    are surfaced with a dim-red tag and cleared by `workspace update`
    (`jj workspace update-stale`). ✅ `tutti workspace diff [--stat]` serves
-   per-workspace diffs (sidebar shows `N files +A −B` per workspace, refreshed on
-   state transitions). ✅ Merge back: sidebar `m` (or `tutti workspace merge <id>
+   per-workspace diffs — **against trunk** (the fork point from
+   `main`/`master`/`trunk`), so committed agent work shows, not just the working
+   copy (sidebar shows `N files +A −B` per workspace, refreshed on
+   state transitions). ✅ Changed-files panel: an always-on right column listing
+   the active workspace's changed files with exact `+`/`−` counts (`C-b f`
+   focuses; enter = file diff, `d` = full diff, both in ephemeral pager panes). ✅ Merge back: sidebar `m` (or `tutti workspace merge <id>
    [--push]`) rebases the workspace onto trunk (`main`/`master`), refuses+undoes
    on conflict, advances the bookmark, optionally pushes, then offers cleanup —
    still a human-triggered decision.

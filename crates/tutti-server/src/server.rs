@@ -951,10 +951,10 @@ fn refresh_changes(hub: &Arc<Hub>, workspace: WorkspaceId) {
     };
     let hub = Arc::clone(hub);
     tokio::spawn(async move {
-        let changes = jj::change_stat(&dir).await;
+        let (changes, files) = jj::change_summary(&dir).await;
         let stale = jj::is_stale(&dir).await;
         let mut session = hub.session();
-        let stat_moved = session.set_changes(workspace, changes);
+        let stat_moved = session.set_changes(workspace, changes, files);
         let stale_moved = session.set_stale(workspace, stale);
         if stat_moved || stale_moved {
             let view = session.view();

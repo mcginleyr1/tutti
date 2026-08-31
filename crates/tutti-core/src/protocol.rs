@@ -10,7 +10,19 @@ use crate::state::AgentState;
 /// Response / Event shapes (including additive fields): the daemon reports it
 /// on attach and mismatched clients tell the user to restart the daemon —
 /// binaries upgrade on install, running daemons do not.
-pub const WIRE_REV: u32 = 2;
+pub const WIRE_REV: u32 = 3;
+
+/// The revset every workspace-delta surface diffs against: the fork point of
+/// the trunk bookmark (local `main`, else `master`, else `trunk`; `root()` when
+/// none exists — `latest` picks the bookmark over root because root is oldest)
+/// and the working copy. Answers "what has this workspace changed that hasn't
+/// landed on trunk" — a bare `jj diff` only shows `@`, which is nearly always
+/// empty because agents commit as they go. `fork_point` keeps a workspace that
+/// fell behind an advanced trunk from showing trunk's progress as reverse
+/// noise. Shared by the server's stat/diff probes and the client's pager panes
+/// so every surface agrees on what "the diff" is.
+pub const DIFF_RANGE: &str =
+    "fork_point(latest(present(main) | present(master) | present(trunk) | root()) | @)..@";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -205,6 +217,16 @@ pub struct SubagentInfo {
     pub running: bool,
 }
 
+/// One changed file in a workspace's delta against trunk (`DIFF_RANGE`):
+/// its repo-root-relative path and exact added/removed line counts. Drives the
+/// client's changed-files panel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileStat {
+    pub path: String,
+    pub insertions: u64,
+    pub deletions: u64,
+}
+
 /// The full structure an attached client renders: every workspace, its tabs,
 /// each tab's `Layout` tree and the panes living in it. Sent on attach and on
 /// every structural change so the client can lay panes out without a second
@@ -222,6 +244,11 @@ pub struct WorkspaceView {
     /// changes, or has not been probed yet — the sidebar stays quiet then.
     #[serde(default)]
     pub changes: Option<String>,
+    /// The per-file breakdown behind `changes`: each changed file with its exact
+    /// `+`/`−` line counts, in diff order. Empty when the workspace is not a jj
+    /// repo, is clean against trunk, or the server predates the field.
+    #[serde(default)]
+    pub changed_files: Vec<FileStat>,
     /// Whether this workspace's jj working copy is stale — its `@` was rewritten
     /// from another workspace, so it needs `jj workspace update-stale`. Surfaced
     /// as a sidebar tag; never auto-fixed. Defaults false for non-jj workspaces
@@ -466,6 +493,11 @@ mod tests {
             dir: PathBuf::from("/tmp/w"),
             branch: Some("main".into()),
             changes: Some("4 files +120 −33".into()),
+            changed_files: vec![FileStat {
+                path: "src/lib.rs".into(),
+                insertions: 120,
+                deletions: 33,
+            }],
             stale: false,
             parent: None,
             tabs: vec![TabView {
@@ -604,12 +636,13 @@ mod tests {
                 stat: false,
             }
         );
-        // A view serialized without `changes`/`stale`/`parent` (older server)
-        // defaults them.
+        // A view serialized without `changes`/`changed_files`/`stale`/`parent`
+        // (older server) defaults them.
         let view: WorkspaceView =
             serde_json::from_str(r#"{"id":1,"name":"api","dir":"/tmp/w","branch":null,"tabs":[]}"#)
                 .unwrap();
         assert_eq!(view.changes, None);
+        assert!(view.changed_files.is_empty());
         assert!(!view.stale);
         assert_eq!(view.parent, None);
         // A `parent` present on the wire round-trips into a nested child.

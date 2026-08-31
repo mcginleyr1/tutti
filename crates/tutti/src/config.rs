@@ -62,6 +62,8 @@ pub enum PrefixAction {
     TabPrev,
     TabNew,
     Sidebar,
+    /// Focus the changed-files panel (the per-file diff stats on the right).
+    DiffFiles,
     /// Open the agent launcher to run a choice in a new pane here.
     Run,
     /// Release/re-grab mouse capture so the terminal's own drag-to-select and
@@ -125,6 +127,7 @@ const DEFAULT_PREFIX_TABLE: &[PrefixBinding] = &[
     b(KeyCode::Char('p'), PrefixAction::TabPrev, "prev tab"),
     b(KeyCode::Char('c'), PrefixAction::TabNew, "new tab"),
     b(KeyCode::Char('w'), PrefixAction::Sidebar, "workspaces"),
+    b(KeyCode::Char('f'), PrefixAction::DiffFiles, "changed files"),
     b(KeyCode::Char('r'), PrefixAction::Run, "run here"),
     b(
         KeyCode::Char('o'),
@@ -155,6 +158,7 @@ const VIM_PREFIX_TABLE: &[PrefixBinding] = &[
     b(KeyCode::Char('n'), PrefixAction::TabNext, "next tab"),
     b(KeyCode::Char('p'), PrefixAction::TabPrev, "prev tab"),
     b(KeyCode::Char('w'), PrefixAction::Sidebar, "workspaces"),
+    b(KeyCode::Char('f'), PrefixAction::DiffFiles, "changed files"),
     b(KeyCode::Char('r'), PrefixAction::Run, "run here"),
     b(KeyCode::Char('z'), PrefixAction::Zoom, "zoom pane"),
     b(KeyCode::Char('['), PrefixAction::Scrollback, "scrollback"),
@@ -256,6 +260,10 @@ pub struct Config {
     pub keys: Keys,
     pub preset: Preset,
     pub sidebar: SidebarVisibility,
+    /// Whether the changed-files panel (per-file diff stats on the right) may
+    /// render. Default on; it only appears when the active workspace actually
+    /// has changes against trunk and the terminal is wide enough.
+    pub diff_panel: bool,
     /// The sidebar glyph set. Default `Unicode`.
     pub icons: Icons,
     /// Whether pane notifications re-emit to the real terminal and flash the
@@ -320,6 +328,14 @@ impl Config {
             }
         };
 
+        let diff_panel = match raw.diff_panel.as_deref() {
+            None | Some("on") => true,
+            Some("off") => false,
+            Some(other) => {
+                bail!("diff_panel: unknown value {other:?} (expected \"on\" or \"off\")")
+            }
+        };
+
         let icons = match raw.icons.as_deref() {
             None | Some("unicode") => Icons::Unicode,
             Some("nerdfont") => Icons::Nerdfont,
@@ -356,6 +372,7 @@ impl Config {
             keys: Keys { bindings },
             preset,
             sidebar,
+            diff_panel,
             icons,
             notifications,
             projects,
@@ -394,6 +411,7 @@ struct RawConfig {
     mouse: Option<bool>,
     preset: Option<String>,
     sidebar: Option<String>,
+    diff_panel: Option<String>,
     icons: Option<String>,
     notifications: Option<bool>,
     #[serde(default)]
@@ -685,6 +703,14 @@ kill_pane    = "A-x"
             Config::parse("sidebar = \"auto\"\n").unwrap().sidebar,
             SidebarVisibility::Auto
         );
+    }
+
+    #[test]
+    fn diff_panel_defaults_on_and_parses_off() {
+        assert!(Config::default().diff_panel);
+        assert!(Config::parse("diff_panel = \"on\"\n").unwrap().diff_panel);
+        assert!(!Config::parse("diff_panel = \"off\"\n").unwrap().diff_panel);
+        assert!(Config::parse("diff_panel = \"sometimes\"\n").is_err());
     }
 
     #[test]

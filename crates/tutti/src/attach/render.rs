@@ -92,6 +92,14 @@ const SIDEBAR_HINT: &[(&str, &str)] = &[
     ("esc", "back"),
 ];
 
+/// The changed-files-panel key hint, rendered two-tone in the bottom bar.
+const DIFF_HINT: &[(&str, &str)] = &[
+    ("enter", "file diff"),
+    ("d", "full diff"),
+    ("j/k", "move"),
+    ("esc", "back"),
+];
+
 /// The default dim style, applied to nearly everything that is not the accent.
 fn dim() -> Style {
     Style::default().add_modifier(Modifier::DIM)
@@ -107,7 +115,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     let (content, footer) = App::content_rect(area);
     let (app_bar, rule) = App::header_rects(area);
-    let (sidebar_rect, panes_area) = app.regions(content);
+    let (sidebar_rect, panes_area, diff_panel_rect) = app.regions(content);
     // One spinner frame for the whole draw so every working agent — sidebar dot
     // and pane border alike — animates in lockstep.
     let spinner = app.spinner_char();
@@ -125,6 +133,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_rule(frame, rule);
     if let Some(sidebar_rect) = sidebar_rect {
         draw_sidebar(frame, app, sidebar_rect, spinner);
+    }
+    if let Some(panel_rect) = diff_panel_rect {
+        draw_diff_panel(frame, app, panel_rect);
     }
     draw_footer(frame, app, footer);
     // A transient fires the one-row notification band over the last content row,
@@ -410,6 +421,88 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
             inner,
         );
     }
+}
+
+/// The changed-files panel: a caps header with the file count, then one row per
+/// changed file — its path (directory dim, basename full intensity) with exact
+/// `+`/`−` counts right-aligned. Borderless like the sidebar, dim by default,
+/// and paints no background of its own; the selection row (only while the panel
+/// is focused) uses the same ANSI-palette background as the sidebar's. The
+/// visible window follows the selection via `App::diff_first_visible`, which
+/// click hit-testing shares.
+fn draw_diff_panel(frame: &mut Frame, app: &App, area: Rect) {
+    if area.width < 3 || area.height < 1 {
+        return;
+    }
+    let content_w = area.width.saturating_sub(2) as usize;
+    let files = app.changed_files();
+    let focused = app.mode == Mode::DiffFiles;
+    let selected = app.diff_selected();
+    let first = app.diff_first_visible(area.height);
+    let visible = area.height.saturating_sub(1) as usize;
+
+    let mut lines = vec![changes_header(files.len(), area.width)];
+    for (i, file) in files.iter().enumerate().skip(first).take(visible) {
+        let sel = focused && i == selected;
+        lines.push(bare_row(file_stat_inner(file, sel, content_w), sel));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// The changed-files panel's header row (` CHANGES        N `): caps title,
+/// count right-aligned — the sidebar section-header look, minus the collapse
+/// arrow (the panel is not collapsible; the prefix key toggles focus instead).
+fn changes_header(count: usize, width: u16) -> Line<'static> {
+    let label = "CHANGES";
+    let count = count.to_string();
+    let used = 2 + label.chars().count() + count.chars().count();
+    let gap = (width as usize).saturating_sub(used);
+    Line::from(vec![
+        Span::styled(format!(" {label}"), dim().add_modifier(Modifier::BOLD)),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(format!("{count} "), dim()),
+    ])
+}
+
+/// One changed-file row's inner spans: the path clipped to fit beside the stat
+/// (directory prefix dim, basename full intensity — identity bright, metadata
+/// dim), the exact `+A −B` right-aligned dim.
+fn file_stat_inner(file: &tutti_core::FileStat, sel: bool, content_w: usize) -> Vec<Span<'static>> {
+    let stat = format!("+{} −{}", file.insertions, file.deletions);
+    let stat_w = stat.chars().count();
+    let avail = content_w.saturating_sub(stat_w + 1);
+    let (dir, base) = clipped_path(&file.path, avail);
+    let path_w = dir.chars().count() + base.chars().count();
+    let gap = content_w.saturating_sub(path_w + stat_w);
+    let spans = vec![
+        Span::styled(dir, dim()),
+        name_span(&base, sel, Modifier::empty()),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(stat, dim()),
+    ];
+    pad_inner(spans, sel, content_w as u16)
+}
+
+/// Split `path` into a (dim) directory prefix and its basename, clipped to fit
+/// `avail` columns. The directory clips first — from the left, behind a leading
+/// `…`, keeping the basename whole; a basename that alone overflows clips at
+/// its end.
+fn clipped_path(path: &str, avail: usize) -> (String, String) {
+    let (dir, base) = match path.rsplit_once('/') {
+        Some((dir, base)) => (format!("{dir}/"), base.to_string()),
+        None => (String::new(), path.to_string()),
+    };
+    let (dir_w, base_w) = (dir.chars().count(), base.chars().count());
+    if dir_w + base_w <= avail {
+        return (dir, base);
+    }
+    if base_w < avail {
+        let keep = avail - base_w - 1;
+        let tail: String = dir.chars().skip(dir_w - keep).collect();
+        return (format!("…{tail}"), base);
+    }
+    let clipped: String = base.chars().take(avail.saturating_sub(1)).collect();
+    (String::new(), format!("{clipped}…"))
 }
 
 /// A section header row (` ▾ PROJECTS      N `): a collapse arrow, the caps
@@ -917,6 +1010,10 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::raw("  "));
         spans.extend(two_tone(SIDEBAR_HINT).0);
     }
+    if app.mode == Mode::DiffFiles {
+        spans.push(Span::raw("  "));
+        spans.extend(two_tone(DIFF_HINT).0);
+    }
     let line = Line::from(spans);
     let left_width = line.width() as u16;
     if left_width > 0 {
@@ -939,6 +1036,7 @@ fn mode_label(mode: Mode) -> Option<&'static str> {
         Mode::Scroll(_) => Some("SCROLL"),
         Mode::Help => Some("HELP"),
         Mode::Sidebar => Some("SIDEBAR"),
+        Mode::DiffFiles => Some("CHANGES"),
         Mode::SidebarPrompt => Some("ADD PROJECT"),
         Mode::SidebarWorkspaceName | Mode::SidebarWorkspaceDest => Some("WORKSPACE"),
         Mode::Launcher | Mode::LauncherCommand => Some("RUN"),
@@ -1212,6 +1310,9 @@ fn help_lines(cfg: &Config) -> Vec<Line<'static>> {
     lines.push(popup_key_line("  a / d", "add project / diff"));
     lines.push(popup_key_line("  m / u", "merge / update stale"));
     lines.push(popup_key_line("  x", "kill workspace / agent"));
+    lines.push(Line::from(String::new()));
+    lines.push(Line::from("changed files (after C-b f):".to_string()));
+    lines.push(popup_key_line("  enter / d", "file diff / full diff"));
     lines.push(Line::from(String::new()));
     lines.push(Line::from(
         "stop the daemon:  tutti server stop".to_string(),
@@ -1500,6 +1601,78 @@ mod tests {
             "the agent nests under its project on a tree guide: {text:?}"
         );
         assert!(text.contains("claude"), "agent kind missing: {text:?}");
+    }
+
+    #[test]
+    fn changed_files_panel_lists_paths_with_exact_counts() {
+        let mut app = App::new();
+        let mut view = vec![workspace(
+            1,
+            "api",
+            Some("main"),
+            vec![tab(
+                1,
+                "1",
+                true,
+                leaf(1),
+                vec![pane(1, "zsh", None, AgentState::Idle)],
+            )],
+        )];
+        view[0].changes = Some("2 files +13 −4".into());
+        view[0].changed_files = vec![
+            tutti_core::FileStat {
+                path: "src/main.rs".into(),
+                insertions: 12,
+                deletions: 4,
+            },
+            tutti_core::FileStat {
+                path: "README.md".into(),
+                insertions: 1,
+                deletions: 0,
+            },
+        ];
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Response::Attached {
+                wire_rev: tutti_core::WIRE_REV,
+                session: "demo".into(),
+                workspaces: view,
+            })
+            .unwrap(),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(140, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("CHANGES"), "panel header missing: {text:?}");
+        assert!(
+            text.contains("main.rs") && text.contains("+12 −4"),
+            "file row with exact counts missing: {text:?}"
+        );
+        assert!(
+            text.contains("README.md") && text.contains("+1 −0"),
+            "second file row missing: {text:?}"
+        );
+    }
+
+    #[test]
+    fn clipped_path_keeps_the_basename_and_clips_the_directory_first() {
+        assert_eq!(
+            clipped_path("src/main.rs", 20),
+            ("src/".into(), "main.rs".into())
+        );
+        assert_eq!(
+            clipped_path("README.md", 20),
+            ("".into(), "README.md".into())
+        );
+        // The directory clips from the left behind a `…`; the basename survives.
+        let (dir, base) = clipped_path("crates/tutti/src/attach/app.rs", 16);
+        assert_eq!(base, "app.rs");
+        assert!(dir.starts_with('…'), "clipped dir leads with …: {dir:?}");
+        assert_eq!(dir.chars().count() + base.chars().count(), 16);
+        // A basename that alone overflows clips at its end.
+        let (dir, base) = clipped_path("averylongfilename.rs", 8);
+        assert_eq!(dir, "");
+        assert_eq!(base.chars().count(), 8);
+        assert!(base.ends_with('…'));
     }
 
     #[test]
@@ -1937,8 +2110,9 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
         assert_eq!(app.mode, Mode::Help);
 
-        // Tall enough to clear the whole panel, including the sidebar section.
-        let mut terminal = Terminal::new(TestBackend::new(64, 30)).unwrap();
+        // Tall enough to clear the whole panel, including the sidebar and
+        // changed-files sections.
+        let mut terminal = Terminal::new(TestBackend::new(64, 34)).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("detach"), "help missing detach: {text:?}");
@@ -1958,6 +2132,10 @@ mod tests {
                 && text.contains("update stale")
                 && text.contains("kill workspace / agent"),
             "help missing the sidebar workspace/merge/update/kill keys: {text:?}"
+        );
+        assert!(
+            text.contains("changed files") && text.contains("file diff / full diff"),
+            "help missing the changed-files panel keys: {text:?}"
         );
         // Detach is listed before the split bindings.
         assert!(

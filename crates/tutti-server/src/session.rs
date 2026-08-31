@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use tutti_core::{
-    AgentHookEvent, AgentKind, AgentState, Direction, Layout, Observation, PaneId, PaneInfo,
-    StateEvent, SubagentInfo, TabId, TabInfo, TabView, WorkspaceId, WorkspaceInfo, WorkspaceView,
+    AgentHookEvent, AgentKind, AgentState, Direction, FileStat, Layout, Observation, PaneId,
+    PaneInfo, StateEvent, SubagentInfo, TabId, TabInfo, TabView, WorkspaceId, WorkspaceInfo,
+    WorkspaceView,
 };
 
 use crate::pty::{PaneSize, PtyPane, PtySpec};
@@ -32,9 +33,13 @@ struct WorkspaceEntry {
     id: WorkspaceId,
     name: String,
     dir: PathBuf,
-    /// The last-computed jj change stat (`4 files +120 −33`), refreshed off the
-    /// hot path. `None` until probed, when not a jj repo, or when clean.
+    /// The last-computed jj change stat against trunk (`4 files +120 −33`),
+    /// refreshed off the hot path. `None` until probed, when not a jj repo, or
+    /// when clean against trunk.
     changes: Option<String>,
+    /// The per-file breakdown behind `changes`, refreshed in the same probe so
+    /// the two never disagree. Empty whenever `changes` is `None`.
+    changed_files: Vec<FileStat>,
     /// Whether the last stale probe found this workspace's jj working copy stale
     /// (its `@` was rewritten elsewhere). Only forks ever go stale in practice.
     stale: bool,
@@ -140,6 +145,7 @@ impl Session {
             name,
             dir,
             changes: None,
+            changed_files: Vec::new(),
             stale: false,
             fork,
             tabs: vec![tab],
@@ -181,13 +187,20 @@ impl Session {
         self.workspaces.iter().map(|w| w.id).collect()
     }
 
-    /// Store a freshly-computed change stat for workspace `id`. Returns whether
-    /// it moved (so the caller only rebroadcasts the view when something changed,
-    /// and a vanished workspace is a silent no-op).
-    pub fn set_changes(&mut self, id: WorkspaceId, changes: Option<String>) -> bool {
+    /// Store a freshly-computed change summary (stat plus per-file breakdown)
+    /// for workspace `id`. Returns whether either moved (so the caller only
+    /// rebroadcasts the view when something changed, and a vanished workspace is
+    /// a silent no-op).
+    pub fn set_changes(
+        &mut self,
+        id: WorkspaceId,
+        changes: Option<String>,
+        files: Vec<FileStat>,
+    ) -> bool {
         match self.workspaces.iter_mut().find(|w| w.id == id) {
-            Some(w) if w.changes != changes => {
+            Some(w) if w.changes != changes || w.changed_files != files => {
                 w.changes = changes;
+                w.changed_files = files;
                 true
             }
             _ => false,
@@ -340,6 +353,7 @@ impl Session {
                 dir: w.dir.clone(),
                 branch: git_branch(&w.dir),
                 changes: w.changes.clone(),
+                changed_files: w.changed_files.clone(),
                 stale: w.stale,
                 parent: w.fork.as_ref().and_then(|fork| {
                     roots.iter().find_map(|(id, root)| {

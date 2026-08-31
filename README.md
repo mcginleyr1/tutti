@@ -142,6 +142,7 @@ preset:
 | `%` / `"` | split right / split down |
 | `n` / `p` / `c` | next / previous / new tab |
 | `w` | focus the workspace/agent sidebar |
+| `f` | focus the changed-files panel (per-file diff stats) |
 | `r` | run an agent / shell / command here (opens the launcher) |
 | `o`, arrows | focus next pane / directional focus |
 | `z` | zoom focused pane |
@@ -242,6 +243,7 @@ prefix = "C-b"          # prefix chord
 mouse = true            # mouse capture at startup (prefix `m` toggles it live)
 preset = "default"      # prefix keymap: "default" (emacs/tmux-flavored) or "vim"
 sidebar = "on"          # workspace/agent sidebar: "on" (default), "auto", or "off"
+diff_panel = "on"       # changed-files panel: "on" (default) or "off"
 icons = "unicode"       # sidebar glyph set: "unicode" (default) or "nerdfont"
 notifications = true    # re-emit pane bells/notifications to your real terminal
 
@@ -320,9 +322,12 @@ pops in the accent colour. Two stacked sections:
   with right-aligned roll-up chips (`● 2 ● 1`) counting the subtree's
   blocked/working/done agents — over a dim line showing a branch marker and
   the git branch (read straight from `.git/HEAD`, including worktrees) on the
-  left and the jj change stat (`4 files +120 −33`) right-aligned. No branch
-  leaves the left blank rather than echoing the name; a clean or non-jj
-  workspace shows no stat. The stat refreshes as agents work (on every state
+  left and the jj change stat (`4 files +120 −33`) right-aligned — the
+  workspace's whole delta **against trunk**, not just its working copy, so it
+  tracks what the workspace has built up rather than going blank each time an
+  agent commits. No branch
+  leaves the left blank rather than echoing the name; a workspace clean
+  against trunk or non-jj shows no stat. The stat refreshes as agents work (on every state
   transition, on attach, and when a workspace is created) and is dropped first
   when the column is too narrow for both. A nested [workspace](#workspaces)
   whose `@` was rewritten from another workspace shows a dim-red `stale` tag
@@ -376,9 +381,12 @@ move the highlight, and `Enter` always opens whatever is typed. `~` expands to
 your home; relative paths resolve against the client's cwd and are canonicalized
 to an absolute path before the daemon sees them; a bad directory surfaces the
 server's error. `d`
-opens the selected workspace's **jj diff** in an ephemeral pane — a real terminal
-running `jj diff | less -R`, coloured, that vanishes the moment you quit `less`
-(pressing `d` on an agent row opens the diff for the agent's workspace). A
+opens the selected workspace's **jj diff against trunk** in an ephemeral pane — a
+real terminal paging the workspace's whole delta since it forked from `main`
+(else `master`/`trunk`), coloured, that vanishes the moment you quit `less`
+(pressing `d` on an agent row opens the diff for the agent's workspace). It
+diffs the *accumulated* work, not just the working copy — agents commit as they
+go, so a bare `jj diff` would almost always be empty. A
 non-jj workspace shows a transient error instead of spawning. `w` starts a new
 [**workspace**](#workspaces) nested under the selected project: a two-step prompt
 — `workspace name:` (`[A-Za-z0-9_-]+`; a bad name flashes the rule) then `where:`,
@@ -407,6 +415,23 @@ session is worth surfacing (more than one workspace, or at least one agent pane)
 and `off` keeps it hidden until you focus it with `w`. It is suppressed on very
 narrow terminals so panes keep usable room. With the sidebar off, a **blocked**
 agent still rings the bell and turns its pane border red until you focus it.
+
+### Changed files panel
+
+The right-hand column mirrors the sidebar for *code*: whenever the active
+workspace has changes against trunk, a borderless `CHANGES` panel lists every
+changed file — directory dim, basename bright — with its exact `+added −removed`
+line counts right-aligned, always on and refreshed as agents work (same probe as
+the sidebar stat, so the two never disagree). It disappears when the workspace
+is clean, on narrow terminals, or with `diff_panel = "off"`.
+
+`Ctrl+B f` focuses it: `j`/`k` move, `Enter` opens the highlighted **file's
+diff** against trunk in an ephemeral pager pane, `d` opens the **whole diff**,
+and `esc` steps back. Clicking a row jumps straight to that file's diff. Like
+every diff surface, it answers "what has this workspace changed that hasn't
+landed on trunk" — the delta since the fork point from `main` (else
+`master`/`trunk`), so a workspace that fell behind an advanced trunk never shows
+trunk's own progress as noise.
 
 ### Notifications
 
@@ -543,7 +568,7 @@ tutti workspace new --dir <path> | list | kill <id> [--discard]
 tutti workspace fork <id> --name <name> [-r <rev>]   # create a workspace: jj workspace add onto a sibling checkout
 tutti workspace merge <id> [--push]  # merge a workspace back into its project's trunk (main/master)
 tutti workspace update <id>          # jj workspace update-stale (clears the sidebar's stale tag)
-tutti workspace diff <id> [--stat]   # the workspace's jj diff (jj is required; --json for raw lines)
+tutti workspace diff <id> [--stat]   # the workspace's jj diff against trunk (jj is required; --json for raw lines)
 tutti tab new | list | select <id>
 tutti pane run [--tab <id>] [--ephemeral] -- <cmd...>
 tutti pane split <pane> right|down

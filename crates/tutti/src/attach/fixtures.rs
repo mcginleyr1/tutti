@@ -90,6 +90,7 @@ pub(crate) fn workspace(
         dir: PathBuf::from("/tmp/w"),
         branch: branch.map(Into::into),
         changes: None,
+        changed_files: Vec::new(),
         stale: false,
         parent: None,
         tabs,

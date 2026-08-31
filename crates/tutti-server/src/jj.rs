@@ -8,7 +8,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use tokio::process::Command;
-use tutti_core::Response;
+use tutti_core::{DIFF_RANGE, FileStat, Response};
 
 /// How long a `jj` invocation may run before it is killed. A wedged repo or a
 /// hung external diff tool must never stall a client or a background refresh.
@@ -101,20 +101,36 @@ pub async fn diff(dir: &Path, stat: bool) -> Response {
     Response::Content { lines }
 }
 
-/// The short change stat for `dir`, e.g. `4 files +120 −33`, or `None` for a
-/// non-repo, a clean working copy, or any failure. This is the always-on
-/// sidebar path, so it never surfaces an error — it just stays quiet.
-pub async fn change_stat(dir: &Path) -> Option<String> {
+/// The change summary for `dir` against trunk (`DIFF_RANGE`): the short sidebar
+/// stat (`4 files +120 −33`) plus the exact per-file breakdown driving the
+/// changed-files panel. `(None, [])` for a non-repo, a workspace clean against
+/// trunk, or any failure. This is the always-on sidebar path, so it never
+/// surfaces an error — it just stays quiet. One `jj diff --git` run yields both,
+/// so the stat and the file list can never disagree.
+pub async fn change_summary(dir: &Path) -> (Option<String>, Vec<FileStat>) {
     if !is_workspace(dir) {
-        return None;
+        return (None, Vec::new());
     }
-    let mut cmd = base_command(dir, true);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
-    let output = run(cmd, TIMEOUT).await.ok()?;
+    let mut cmd = Command::new("jj");
+    cmd.arg("--no-pager")
+        .arg("diff")
+        .arg("--git")
+        .arg("--color=never")
+        .arg("-r")
+        .arg(DIFF_RANGE)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let Ok(output) = run(cmd, TIMEOUT).await else {
+        return (None, Vec::new());
+    };
     if !output.status.success() {
-        return None;
+        return (None, Vec::new());
     }
-    parse_stat(&String::from_utf8_lossy(&output.stdout))
+    let files = parse_git_diff(&String::from_utf8_lossy(&output.stdout));
+    (summary_of(&files), files)
 }
 
 /// Whether the jj workspace at `dir` has a stale working copy — its `@` was
@@ -428,11 +444,17 @@ fn stderr_or(output: &std::process::Output, fallback: &str) -> String {
     }
 }
 
-/// A `jj --no-pager diff [--stat] --color=never` command rooted at `dir`, with
-/// stdin closed and the child killed if dropped (so a timeout reaps it).
+/// A `jj --no-pager diff [--stat] --color=never -r <DIFF_RANGE>` command rooted
+/// at `dir`, with stdin closed and the child killed if dropped (so a timeout
+/// reaps it). The revset is the workspace's whole delta against trunk — a bare
+/// `jj diff` would only show `@`, which agents keep empty by committing.
 fn base_command(dir: &Path, stat: bool) -> Command {
     let mut cmd = Command::new("jj");
-    cmd.arg("--no-pager").arg("diff").arg("--color=never");
+    cmd.arg("--no-pager")
+        .arg("diff")
+        .arg("--color=never")
+        .arg("-r")
+        .arg(DIFF_RANGE);
     if stat {
         cmd.arg("--stat");
     }
@@ -451,71 +473,149 @@ async fn run(mut cmd: Command, timeout: Duration) -> Result<std::process::Output
     }
 }
 
-/// Parse the trailing summary line of `jj diff --stat` into a short sidebar
-/// stat like `4 files +120 −33`. jj prints `N files changed, A insertions(+),
-/// B deletions(-)` (singular `file`/`insertion`/`deletion` at a count of 1, and
-/// a clause is dropped when jj omits it). Returns `None` for a clean working
-/// copy (`0 files changed`) or anything unparseable, so the sidebar stays quiet.
-pub fn parse_stat(output: &str) -> Option<String> {
-    let line = output.lines().rev().find(|l| l.contains("changed"))?.trim();
-    let files = clause_before(line, "file")?;
-    if files == 0 {
-        return None;
+/// Parse a `jj diff --git` unified diff into exact per-file `+`/`−` counts, in
+/// diff order. Header `---`/`+++` lines are only headers before a file's first
+/// `@@` hunk marker — after it, a line like `+++counter` is content and counts.
+/// The path prefers the `+++ b/` header (the post-change name, so renames show
+/// their new name); a file with no such header (a deletion's `+++ /dev/null`, a
+/// binary) falls back to the `b/` half of its `diff --git` line.
+pub fn parse_git_diff(text: &str) -> Vec<FileStat> {
+    let mut files: Vec<FileStat> = Vec::new();
+    let mut in_hunk = false;
+    for line in text.lines() {
+        if let Some(header) = line.strip_prefix("diff --git ") {
+            files.push(FileStat {
+                path: header
+                    .rsplit_once(" b/")
+                    .map_or_else(String::new, |(_, p)| p.to_string()),
+                insertions: 0,
+                deletions: 0,
+            });
+            in_hunk = false;
+            continue;
+        }
+        let Some(current) = files.last_mut() else {
+            continue;
+        };
+        if !in_hunk {
+            if line.starts_with("@@") {
+                in_hunk = true;
+            } else if let Some(path) = line.strip_prefix("+++ b/") {
+                current.path = path.to_string();
+            }
+        } else if line.starts_with('+') {
+            current.insertions += 1;
+        } else if line.starts_with('-') {
+            current.deletions += 1;
+        }
     }
-    let insertions = clause_before(line, "insertion").unwrap_or(0);
-    let deletions = clause_before(line, "deletion").unwrap_or(0);
-    let unit = if files == 1 { "file" } else { "files" };
-    Some(format!("{files} {unit} +{insertions} −{deletions}"))
+    files.retain(|f| !f.path.is_empty());
+    files
 }
 
-/// The integer immediately preceding the first token starting with `noun`
-/// (matching both `file` and `files`, `insertion` and `insertions`). `None` when
-/// the noun is absent or not preceded by a number.
-fn clause_before(line: &str, noun: &str) -> Option<u64> {
-    let tokens: Vec<&str> = line.split_whitespace().collect();
-    let idx = tokens.iter().position(|t| t.starts_with(noun))?;
-    tokens.get(idx.checked_sub(1)?)?.parse().ok()
+/// The short sidebar stat over a parsed file list, e.g. `4 files +120 −33`.
+/// `None` when the list is empty, so the sidebar stays quiet on a clean
+/// workspace.
+fn summary_of(files: &[FileStat]) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+    let insertions: u64 = files.iter().map(|f| f.insertions).sum();
+    let deletions: u64 = files.iter().map(|f| f.deletions).sum();
+    let unit = if files.len() == 1 { "file" } else { "files" };
+    Some(format!("{} {unit} +{insertions} −{deletions}", files.len()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn stat(path: &str, insertions: u64, deletions: u64) -> FileStat {
+        FileStat {
+            path: path.into(),
+            insertions,
+            deletions,
+        }
+    }
+
     #[test]
-    fn parse_stat_reads_plural_counts() {
+    fn parse_git_diff_counts_edits_adds_and_deletes() {
+        let text = "\
+diff --git a/a.txt b/a.txt
+index 5626abf0f7..f9d46ff33e 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1,2 +1,2 @@
+ one
+-two
++2
+diff --git a/new.txt b/new.txt
+new file mode 100644
+index 0000000000..234496b1ca
+--- /dev/null
++++ b/new.txt
+@@ -0,0 +1,1 @@
++third
+diff --git a/gone.txt b/gone.txt
+deleted file mode 100644
+index f719efd430..0000000000
+--- a/gone.txt
++++ /dev/null
+@@ -1,1 +0,0 @@
+-bye
+";
         assert_eq!(
-            parse_stat("a.txt | 3 +++\n2 files changed, 120 insertions(+), 33 deletions(-)")
-                .as_deref(),
+            parse_git_diff(text),
+            vec![
+                stat("a.txt", 1, 1),
+                stat("new.txt", 1, 0),
+                stat("gone.txt", 0, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_git_diff_header_lookalikes_in_content_still_count() {
+        // After the first `@@`, a `+++`/`---` line is content, not a header —
+        // e.g. an inserted line reading `++counter` renders as `+++counter`.
+        let text = "\
+diff --git a/c.c b/c.c
+--- a/c.c
++++ b/c.c
+@@ -1,1 +1,2 @@
+ x
++++counter
+---counter
+";
+        assert_eq!(parse_git_diff(text), vec![stat("c.c", 1, 1)]);
+    }
+
+    #[test]
+    fn parse_git_diff_binary_takes_path_from_the_header() {
+        let text = "\
+diff --git a/img.png b/img.png
+index 0000000000..234496b1ca
+Binary files a/img.png and b/img.png differ
+";
+        assert_eq!(parse_git_diff(text), vec![stat("img.png", 0, 0)]);
+    }
+
+    #[test]
+    fn parse_git_diff_empty_is_empty() {
+        assert!(parse_git_diff("").is_empty());
+    }
+
+    #[test]
+    fn summary_matches_the_sidebar_format() {
+        assert_eq!(
+            summary_of(&[stat("a", 120, 33), stat("b", 0, 0)]).as_deref(),
             Some("2 files +120 −33"),
         );
-    }
-
-    #[test]
-    fn parse_stat_reads_singular_forms() {
         assert_eq!(
-            parse_stat("one.txt | 1 +\n1 file changed, 1 insertion(+), 0 deletions(-)").as_deref(),
-            Some("1 file +1 −0"),
+            summary_of(&[stat("one", 1, 0)]).as_deref(),
+            Some("1 file +1 −0")
         );
-        // A summary that omits the deletions clause entirely still parses.
-        assert_eq!(
-            parse_stat("1 file changed, 1 insertion(+)").as_deref(),
-            Some("1 file +1 −0"),
-        );
-    }
-
-    #[test]
-    fn parse_stat_zero_change_is_none() {
-        assert_eq!(
-            parse_stat("0 files changed, 0 insertions(+), 0 deletions(-)"),
-            None,
-        );
-    }
-
-    #[test]
-    fn parse_stat_garbage_is_none() {
-        assert_eq!(parse_stat(""), None);
-        assert_eq!(parse_stat("not a stat line at all"), None);
-        assert_eq!(parse_stat("files changed, but no number"), None);
+        assert_eq!(summary_of(&[]), None);
     }
 
     #[test]
