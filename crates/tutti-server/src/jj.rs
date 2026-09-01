@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tokio::process::Command;
 use tutti_core::{DIFF_RANGE, FileStat, Response};
@@ -99,6 +99,27 @@ pub async fn diff(dir: &Path, stat: bool) -> Response {
         lines.push("… truncated".to_string());
     }
     Response::Content { lines }
+}
+
+/// When the jj repo behind the workspace at `dir` last recorded an operation:
+/// the mtime of its `op_heads/heads` directory, whose single file every jj
+/// operation — a snapshot, commit, bookmark move, push, from any shell —
+/// replaces. A cheap "something happened" signal the server polls instead of
+/// running jj. A secondary workspace's `.jj/repo` is a text file naming the
+/// main repo's store relative to its own `.jj`, so both layouts resolve to the
+/// one directory. `None` off a jj repo.
+pub fn op_heads_modified(dir: &Path) -> Option<SystemTime> {
+    let marker = dir.join(".jj").join("repo");
+    let repo = if marker.is_dir() {
+        marker
+    } else {
+        let target = std::fs::read_to_string(&marker).ok()?;
+        dir.join(".jj").join(target.trim())
+    };
+    std::fs::metadata(repo.join("op_heads").join("heads"))
+        .ok()?
+        .modified()
+        .ok()
 }
 
 /// The change summary for `dir` against trunk (`DIFF_RANGE`): the short sidebar

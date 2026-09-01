@@ -438,6 +438,7 @@ impl App {
                 if let Some(state) = self.panes.get_mut(&pane) {
                     state.info.state = to;
                 }
+                self.patch_view(pane, |info| info.state = to);
                 // Ring once when a pane that was working needs attention or
                 // finished while the user was looking elsewhere.
                 let needs_attention = matches!(to, AgentState::Blocked | AgentState::Done)
@@ -451,11 +452,32 @@ impl App {
                     state.info.exited = Some(code);
                     state.info.state = AgentState::Done;
                 }
+                self.patch_view(pane, |info| {
+                    info.exited = Some(code);
+                    info.state = AgentState::Done;
+                });
             }
             Event::PaneNotification { pane, title, body } => {
                 self.on_notification(pane, title, body)
             }
             Event::PaneOutput { .. } => {}
+        }
+    }
+
+    /// Apply `patch` to `pane`'s entry in the workspace view — what the sidebar
+    /// and the app-bar census render — so a `StateChanged`/`PaneExited` shows
+    /// there at once instead of waiting for the next `LayoutChanged`, which the
+    /// server sends only when a stat or the layout itself moved.
+    fn patch_view(&mut self, pane: PaneId, patch: impl Fn(&mut PaneInfo)) {
+        for info in self
+            .workspaces
+            .iter_mut()
+            .flat_map(|w| w.tabs.iter_mut())
+            .flat_map(|t| t.panes.iter_mut())
+        {
+            if info.id == pane {
+                patch(info);
+            }
         }
     }
 
@@ -3253,6 +3275,57 @@ mod tests {
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Event::StateChanged { pane, from, to }).unwrap(),
         ));
+    }
+
+    #[test]
+    fn state_changed_updates_the_sidebar_view_without_a_layout_event() {
+        use crate::attach::fixtures::agent;
+        let mut app = App::new();
+        attach_with(
+            &mut app,
+            vec![workspace(
+                1,
+                "api",
+                Some("main"),
+                vec![tab(
+                    1,
+                    "1",
+                    true,
+                    leaf(2),
+                    vec![agent(2, "claude", AgentState::Working)],
+                )],
+            )],
+        );
+        let row_state = |app: &App| {
+            app.sidebar().entries.iter().find_map(|e| match e {
+                SidebarEntry::Agent(a) if a.pane == PaneId(2) => Some(a.state),
+                _ => None,
+            })
+        };
+        assert_eq!(row_state(&app), Some(AgentState::Working));
+
+        state_changed(&mut app, PaneId(2), AgentState::Working, AgentState::Done);
+        assert_eq!(
+            row_state(&app),
+            Some(AgentState::Done),
+            "the sidebar follows the transition without a LayoutChanged"
+        );
+        assert_eq!(app.agent_census().done, 1, "so does the app-bar census");
+
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Event::PaneExited {
+                pane: PaneId(2),
+                code: 0,
+            })
+            .unwrap(),
+        ));
+        let exited = app
+            .workspaces
+            .iter()
+            .flat_map(tab_infos)
+            .find(|i| i.id == PaneId(2))
+            .and_then(|i| i.exited);
+        assert_eq!(exited, Some(0), "the view learns of the exit too");
     }
 
     #[test]

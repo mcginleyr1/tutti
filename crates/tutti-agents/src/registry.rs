@@ -50,11 +50,13 @@ pub struct AgentSpec {
 }
 
 impl AgentSpec {
-    /// Prompts, permission dialogs, and idle markers render at the bottom of the
-    /// screen, so `Blocked`/`Done` are detected only within the last
-    /// `TAIL_LINES` visible lines. This keeps a prompt that has scrolled up into
-    /// history from masking an active task running below it. `Working` markers
-    /// can appear anywhere, so they are matched against the whole screen.
+    /// Prompts, permission dialogs, status lines, and idle markers all render at
+    /// the bottom of the screen, so every pattern is matched only within the
+    /// last `TAIL_LINES` visible lines. This keeps a prompt that has scrolled up
+    /// into history from masking an active task below it — and keeps a
+    /// transcript that merely *quotes* a marker (an agent discussing "esc to
+    /// interrupt") from reading as that agent's own status line, which would
+    /// pin it in `Working`.
     const TAIL_LINES: usize = 15;
 
     #[allow(clippy::too_many_arguments)]
@@ -92,7 +94,7 @@ impl AgentSpec {
         } else if self
             .working_patterns
             .iter()
-            .any(|p| screen_text.contains(p.as_str()))
+            .any(|p| tail.contains(p.as_str()))
         {
             Some(Observation::Working)
         } else if self.done_patterns.iter().any(|p| tail.contains(p.as_str())) {
@@ -336,9 +338,23 @@ mod tests {
     }
 
     #[test]
-    fn working_marker_is_matched_across_whole_screen() {
+    fn working_marker_above_the_tail_is_ignored() {
         let screen = padded("Running the build", "log line", 20);
-        assert_eq!(claude().classify(&screen), Some(Observation::Working));
+        assert_eq!(claude().classify(&screen), None);
+    }
+
+    /// An agent talking *about* markers must not classify as working: the quoted
+    /// "esc to interrupt" sits in the transcript body, above the tail, while
+    /// the real status line — here the idle prompt — is at the bottom.
+    #[test]
+    fn a_transcript_quoting_a_marker_does_not_read_as_working() {
+        let mut screen = padded(
+            "we tuned the \"esc to interrupt\" marker today",
+            "more discussion",
+            20,
+        );
+        screen.push_str("\n❯");
+        assert_eq!(claude().classify(&screen), Some(Observation::Done));
     }
 
     #[test]

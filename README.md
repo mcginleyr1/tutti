@@ -348,8 +348,10 @@ pops in the accent colour. Two stacked sections:
   tracks what the workspace has built up rather than going blank each time an
   agent commits. No branch
   leaves the left blank rather than echoing the name; a workspace clean
-  against trunk or non-jj shows no stat. The stat refreshes as agents work (on every state
-  transition, on attach, and when a workspace is created) and is dropped first
+  against trunk or non-jj shows no stat. The stat refreshes as agents work (on
+  every state transition, on attach, when a workspace is created, and whenever
+  jj records an operation in the workspace — a commit, bookmark move, or push
+  from any shell) and is dropped first
   when the column is too narrow for both. A nested [workspace](#workspaces)
   whose `@` was rewritten from another workspace shows a dim-red `stale` tag
   in the stat's place until you run `workspace update`. An agent row is a
@@ -446,8 +448,9 @@ mid-name fragments), basename bright — with its exact `+added −removed` coun
 in green/red and a six-cell bar scaled to the largest change in the list
 (added cells green, removed red), so the shape of the delta reads before the
 numbers do. The header carries the file count and the coloured totals. Always
-on and refreshed as agents work (same probe as the sidebar stat, so the two
-never disagree); it disappears when the workspace is clean, on narrow
+on and refreshed as agents work and on every jj operation in the workspace
+(same probe as the sidebar stat, so the two never disagree); it disappears
+when the workspace is clean, on narrow
 terminals, or with `diff_panel = "off"`.
 
 `Ctrl+B f` focuses it — or `Ctrl+L` from the rightmost pane, the way `Ctrl+H`

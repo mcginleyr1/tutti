@@ -9,7 +9,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -139,6 +139,17 @@ pub async fn serve(
         }
     });
 
+    let vcs_hub = Arc::clone(&hub);
+    let vcs_watcher = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(DETECT_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut seen: HashMap<WorkspaceId, SystemTime> = HashMap::new();
+        loop {
+            interval.tick().await;
+            vcs_pass(&vcs_hub, &mut seen);
+        }
+    });
+
     let classify_hub = Arc::clone(&hub);
     let classifier = tokio::spawn(async move {
         let mut interval = tokio::time::interval(CLASSIFY_INTERVAL);
@@ -168,6 +179,7 @@ pub async fn serve(
 
     ticker.abort();
     detector.abort();
+    vcs_watcher.abort();
     classifier.abort();
     hub.session().kill_all();
     let _ = std::fs::remove_file(&socket_path);
@@ -971,6 +983,36 @@ fn refresh_pane_workspace(hub: &Arc<Hub>, pane: PaneId) {
     let workspace = hub.session().workspace_of_pane(pane);
     if let Some(workspace) = workspace {
         refresh_changes(hub, workspace);
+    }
+}
+
+/// One pass of the VCS watch: a workspace whose jj repo recorded an operation
+/// since the last pass — a commit, bookmark move, or push made from any shell,
+/// not just through tutti — gets its change stat refreshed, so the sidebar and
+/// changes panel follow work done outside tutti rather than waiting for an
+/// agent state transition that may never come. The first sighting of a
+/// workspace only records its mark (attach and creation already seed the stat);
+/// vanished workspaces are forgotten. Bound before the loop so the session
+/// guard is released before `refresh_changes` re-locks it.
+fn vcs_pass(hub: &Arc<Hub>, seen: &mut HashMap<WorkspaceId, SystemTime>) {
+    let workspaces: Vec<(WorkspaceId, PathBuf)> = {
+        let session = hub.session();
+        session
+            .workspace_ids()
+            .into_iter()
+            .filter_map(|id| session.workspace_dir(id).map(|dir| (id, dir)))
+            .collect()
+    };
+    seen.retain(|id, _| workspaces.iter().any(|(w, _)| w == id));
+    for (id, dir) in workspaces {
+        let Some(modified) = jj::op_heads_modified(&dir) else {
+            continue;
+        };
+        if let Some(previous) = seen.insert(id, modified)
+            && previous != modified
+        {
+            refresh_changes(hub, id);
+        }
     }
 }
 

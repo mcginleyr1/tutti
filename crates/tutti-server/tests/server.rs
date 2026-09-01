@@ -1287,6 +1287,62 @@ async fn workspace_ids(conn: &mut Conn) -> Vec<WorkspaceId> {
     }
 }
 
+/// A jj operation made outside tutti — a file edit snapshotted by a bare
+/// `jj status` from a shell: no agent, no pane, no tutti request — moves the
+/// workspace's change stat. The op-heads watch notices and rebroadcasts the
+/// view, so the sidebar and changes panel follow work done from any shell.
+/// Skips cleanly without `jj`.
+#[tokio::test]
+async fn a_shell_side_jj_operation_refreshes_the_change_stat() {
+    let Some(dir) = init_jj_repo() else {
+        return;
+    };
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let ws = workspace_id(
+        control
+            .request(Request::WorkspaceNew { dir: dir.clone() })
+            .await,
+    );
+    let mut viewer = server.connect().await;
+    viewer.send(&Request::Attach).await;
+    assert!(matches!(viewer.response().await, Response::Attached { .. }));
+    // Let the watch take the repo's first mark, so the operation below is a
+    // change it can see rather than its baseline.
+    sleep(Duration::from_millis(1500)).await;
+
+    std::fs::write(dir.join("third.txt"), "from a shell\n").unwrap();
+    assert!(run_jj(&dir, &["status"]).status.success());
+
+    assert!(
+        wait_workspace_changes(&mut viewer, ws, "3 files").await,
+        "a shell-side jj operation should refresh the stat without any agent transition"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    server.stop().await;
+}
+
+/// Read `LayoutChanged` events on an attached connection until workspace `ws`
+/// reports a change stat starting with `prefix`.
+async fn wait_workspace_changes(viewer: &mut Conn, ws: WorkspaceId, prefix: &str) -> bool {
+    timeout(DEADLINE, async {
+        loop {
+            if let Frame::Control(json) = viewer.read_frame().await
+                && let Ok(Event::LayoutChanged { workspaces }) =
+                    serde_json::from_slice::<Event>(&json)
+                && workspaces.iter().any(|w| {
+                    w.id == ws && w.changes.as_deref().is_some_and(|c| c.starts_with(prefix))
+                })
+            {
+                return true;
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// Read `LayoutChanged` events on an attached connection until workspace `ws`
 /// reports `stale == want`.
 async fn wait_workspace_stale(viewer: &mut Conn, ws: WorkspaceId, want: bool) -> bool {
