@@ -1284,44 +1284,55 @@ impl App {
         self.status = None;
     }
 
+    /// Keys while the changed-files panel is focused: vim/less list motion
+    /// (`j`/`k` step, `g`/`G` jump to the ends, `C-d`/`C-u` move half the
+    /// panel, plus their arrow/Home/End/Page equivalents), `enter`/`d` open a
+    /// diff, and `h`/`l`/`esc`/`q` — like the directional direct bindings —
+    /// step back into the pane area keeping its focus, since the panel sits at
+    /// the content's right edge.
     fn on_key_diff_files(&mut self, key: KeyEvent) -> Vec<WireFrame> {
-        // The directional direct bindings step back into the pane area, keeping
-        // its focus — the panel sits at the content's right edge.
         if let Some(Action::FocusLeft | Action::FocusRight) = self.config.keys.action_for(key) {
             self.mode = Mode::Terminal;
             self.status = None;
             return Vec::new();
         }
-        let len = self.changed_files().len();
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.diff_selected = (self.diff_selected + 1).min(len.saturating_sub(1));
-                Vec::new()
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.diff_selected = self.diff_selected.saturating_sub(1);
-                Vec::new()
-            }
-            KeyCode::Enter => self.open_selected_file_diff(),
+        let last = self.changed_files().len().saturating_sub(1);
+        let page = self
+            .diff_panel_rect
+            .map_or(0, |r| r.height.saturating_sub(1))
+            .max(1) as usize;
+        let half = (page / 2).max(1);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        self.diff_selected = match key.code {
+            KeyCode::Char('j') | KeyCode::Down => (self.diff_selected + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up => self.diff_selected.saturating_sub(1),
+            KeyCode::Char('d') if ctrl => (self.diff_selected + half).min(last),
+            KeyCode::Char('u') if ctrl => self.diff_selected.saturating_sub(half),
+            KeyCode::PageDown => (self.diff_selected + page).min(last),
+            KeyCode::PageUp => self.diff_selected.saturating_sub(page),
+            KeyCode::Char('g') | KeyCode::Home => 0,
+            KeyCode::Char('G') | KeyCode::End => last,
+            KeyCode::Enter => return self.open_selected_file_diff(),
             KeyCode::Char('d') => {
                 let Some(tab) = self.active_tab else {
                     return Vec::new();
                 };
                 self.mode = Mode::Terminal;
                 self.status = None;
-                vec![control(&Request::PaneRun {
+                return vec![control(&Request::PaneRun {
                     tab: Some(tab),
                     cmd: diff_pager_cmd(None),
                     ephemeral: true,
-                })]
+                })];
             }
-            KeyCode::Esc | KeyCode::Char('q') => {
+            KeyCode::Esc | KeyCode::Char('q' | 'h' | 'l') => {
                 self.mode = Mode::Terminal;
                 self.status = None;
-                Vec::new()
+                return Vec::new();
             }
-            _ => Vec::new(),
-        }
+            _ => return Vec::new(),
+        };
+        Vec::new()
     }
 
     /// Open the highlighted file's diff against trunk in an ephemeral pager
@@ -4065,6 +4076,73 @@ mod tests {
             app.mode,
             Mode::Terminal,
             "opening the diff leaves the panel"
+        );
+    }
+
+    #[test]
+    fn panel_vim_keys_jump_page_and_step_back_to_the_panes() {
+        let mut app = App::new();
+        let mut view = view_with_changes();
+        view[0].changed_files = (0..200)
+            .map(|i| FileStat {
+                path: format!("src/f{i}.rs"),
+                insertions: i,
+                deletions: 0,
+            })
+            .collect();
+        attach_with(&mut app, view);
+        app.sync_sizes(Rect::new(0, 0, 140, 40));
+        app.on_key(ctrl('b'));
+        app.on_key(plain('f'));
+        assert_eq!(app.mode, Mode::DiffFiles);
+        let page = app.diff_panel_rect.unwrap().height as usize - 1;
+        let half = page / 2;
+        assert!(
+            half > 1 && 2 * page < 200,
+            "the list must overflow the panel"
+        );
+
+        app.on_key(plain('G'));
+        assert_eq!(app.diff_selected(), 199, "G jumps to the last file");
+        app.on_key(plain('g'));
+        assert_eq!(app.diff_selected(), 0, "g jumps to the first file");
+        assert!(
+            app.on_key(ctrl('d')).is_empty(),
+            "C-d pages; it must not open the full diff like plain d"
+        );
+        assert_eq!(app.diff_selected(), half);
+        app.on_key(ctrl('d'));
+        assert_eq!(app.diff_selected(), 2 * half);
+        app.on_key(ctrl('u'));
+        assert_eq!(app.diff_selected(), half);
+        app.on_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.diff_selected(), half + page);
+        app.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(app.diff_selected(), 199);
+        app.on_key(ctrl('d'));
+        assert_eq!(app.diff_selected(), 199, "paging clamps at the last file");
+        app.on_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.diff_selected(), 199 - page);
+        app.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.diff_selected(), 0);
+        app.on_key(ctrl('u'));
+        assert_eq!(app.diff_selected(), 0, "paging saturates at the first file");
+        assert_eq!(
+            app.mode,
+            Mode::DiffFiles,
+            "motion keys keep the panel focused"
+        );
+
+        assert!(app.on_key(plain('h')).is_empty());
+        assert_eq!(app.mode, Mode::Terminal, "h steps back into the panes");
+        app.on_key(ctrl('b'));
+        app.on_key(plain('f'));
+        assert_eq!(app.diff_selected(), 0, "refocusing keeps the cursor");
+        app.on_key(plain('l'));
+        assert_eq!(
+            app.mode,
+            Mode::Terminal,
+            "l steps back too: nothing sits right of the panel"
         );
     }
 

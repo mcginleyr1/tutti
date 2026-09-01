@@ -1338,7 +1338,12 @@ fn help_lines(cfg: &Config) -> Vec<Line<'static>> {
     lines.push(popup_key_line("  x", "kill workspace / agent"));
     lines.push(Line::from(String::new()));
     lines.push(Line::from("changed files (after C-b f):".to_string()));
+    lines.push(popup_key_line(
+        "  j/k, g/G, C-d/C-u",
+        "move, top/end, half page",
+    ));
     lines.push(popup_key_line("  enter / d", "file diff / full diff"));
+    lines.push(popup_key_line("  h / esc", "back to the panes"));
     lines.push(Line::from(String::new()));
     lines.push(Line::from(
         "stop the daemon:  tutti server stop".to_string(),
@@ -2152,7 +2157,7 @@ mod tests {
 
         // Tall enough to clear the whole panel, including the sidebar and
         // changed-files sections.
-        let mut terminal = Terminal::new(TestBackend::new(64, 34)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(64, 36)).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("detach"), "help missing detach: {text:?}");
@@ -2174,7 +2179,9 @@ mod tests {
             "help missing the sidebar workspace/merge/update/kill keys: {text:?}"
         );
         assert!(
-            text.contains("changed files") && text.contains("file diff / full diff"),
+            text.contains("changed files")
+                && text.contains("file diff / full diff")
+                && text.contains("half page"),
             "help missing the changed-files panel keys: {text:?}"
         );
         // Detach is listed before the split bindings.
