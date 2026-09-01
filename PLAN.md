@@ -265,7 +265,10 @@ agent in each, `wait --until done` on all three, read back each diff summary.
 - `tutti-core` stays free of I/O and UI dependencies — pure types + state machine,
   heavily unit-tested (especially the agent state transitions and layout tree).
 - Every feature lands with: the socket API first, the CLI verb second, the TUI last.
-  If it isn't scriptable, it isn't done.
+  If it isn't scriptable, it isn't done. The converse holds for humans: the CLI is
+  the agent/script API, not the human interface — **no human-facing capability may
+  ship CLI-only**. A wave that adds a verb a human would use must land its TUI
+  path in the same wave.
 - Prefer boring, well-maintained crates; check latest versions at time of adding
   rather than pinning from this document.
 - Keep module boundaries such that a future plugin/extension layer (event hooks,
