@@ -637,9 +637,7 @@ impl App {
     }
 
     fn on_key_terminal(&mut self, key: KeyEvent) -> Vec<WireFrame> {
-        if self.config.prefix.matches(key) {
-            self.mode = Mode::Prefix;
-            self.prefix_since = Some(Instant::now());
+        if self.enter_prefix(key) {
             return Vec::new();
         }
         // Direct bindings intercept their chords before they reach the pane.
@@ -672,6 +670,19 @@ impl App {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// Enter prefix mode if `key` is the prefix chord, returning whether it was.
+    /// Shared by the terminal, sidebar, and changes-panel modes, so the prefix
+    /// verbs (`w`, `f`, `q`, …) reach across from whichever panel holds the
+    /// keys — prefix mode itself hands back to the terminal before dispatching.
+    fn enter_prefix(&mut self, key: KeyEvent) -> bool {
+        if !self.config.prefix.matches(key) {
+            return false;
+        }
+        self.mode = Mode::Prefix;
+        self.prefix_since = Some(Instant::now());
+        true
     }
 
     /// Perform a direct-binding action: directional focus (with edge-to-tab
@@ -1117,6 +1128,9 @@ impl App {
     }
 
     fn on_key_sidebar(&mut self, key: KeyEvent) -> Vec<WireFrame> {
+        if self.enter_prefix(key) {
+            return Vec::new();
+        }
         // The directional direct bindings cross the sidebar↔pane edge:
         // focus_right returns to the pane area (keeping its focus), focus_left
         // steps to the previous tab — the same wrap the pane's left edge does.
@@ -1287,14 +1301,26 @@ impl App {
     /// Keys while the changed-files panel is focused: vim/less list motion
     /// (`j`/`k` step, `g`/`G` jump to the ends, `C-d`/`C-u` move half the
     /// panel, plus their arrow/Home/End/Page equivalents), `enter`/`d` open a
-    /// diff, and `h`/`l`/`esc`/`q` — like the directional direct bindings —
-    /// step back into the pane area keeping its focus, since the panel sits at
-    /// the content's right edge.
+    /// diff. The panel is the content's right edge, and its edges behave like
+    /// a pane's: `h`/`esc`/`q` and the focus-left binding step back into the
+    /// pane area keeping its focus; `l` and the focus-right binding wrap on to
+    /// the next tab.
     fn on_key_diff_files(&mut self, key: KeyEvent) -> Vec<WireFrame> {
-        if let Some(Action::FocusLeft | Action::FocusRight) = self.config.keys.action_for(key) {
-            self.mode = Mode::Terminal;
-            self.status = None;
+        if self.enter_prefix(key) {
             return Vec::new();
+        }
+        match self.config.keys.action_for(key) {
+            Some(Action::FocusLeft) => {
+                self.mode = Mode::Terminal;
+                self.status = None;
+                return Vec::new();
+            }
+            Some(Action::FocusRight) => {
+                self.mode = Mode::Terminal;
+                self.status = None;
+                return self.switch_tab(1);
+            }
+            _ => {}
         }
         let last = self.changed_files().len().saturating_sub(1);
         let page = self
@@ -1325,7 +1351,12 @@ impl App {
                     ephemeral: true,
                 })];
             }
-            KeyCode::Esc | KeyCode::Char('q' | 'h' | 'l') => {
+            KeyCode::Char('l') => {
+                self.mode = Mode::Terminal;
+                self.status = None;
+                return self.switch_tab(1);
+            }
+            KeyCode::Esc | KeyCode::Char('q' | 'h') => {
                 self.mode = Mode::Terminal;
                 self.status = None;
                 return Vec::new();
@@ -2492,7 +2523,14 @@ impl App {
                     self.switch_tab(-1)
                 }
             }
-            FocusDir::Right => self.switch_tab(1),
+            FocusDir::Right => {
+                if self.diff_panel_rect.is_some() {
+                    self.focus_diff_panel();
+                    Vec::new()
+                } else {
+                    self.switch_tab(1)
+                }
+            }
             FocusDir::Up | FocusDir::Down => Vec::new(),
         }
     }
@@ -3350,6 +3388,79 @@ mod tests {
         let out = app.on_key(ctrl('l'));
         assert_eq!(out, vec![control(&Request::TabSelect { id: TabId(2) })]);
         assert_eq!(app.active_tab, Some(TabId(2)));
+    }
+
+    #[test]
+    fn ctrl_l_at_the_right_edge_steps_into_the_changes_panel_when_shown() {
+        let mut app = App::new();
+        attach_with(&mut app, view_with_changes());
+        app.sync_sizes(Rect::new(0, 0, 140, 40));
+        assert_eq!(app.mode, Mode::Terminal);
+        let out = app.on_key(ctrl('l'));
+        assert!(
+            out.is_empty(),
+            "stepping into the panel emits no tab select"
+        );
+        assert_eq!(app.mode, Mode::DiffFiles);
+        assert_eq!(app.active_tab, Some(TabId(1)), "the tab is unchanged");
+
+        // The panel's edges behave like a pane's: left steps back keeping the
+        // pane focus, right (or vim `l`) wraps on to the next tab.
+        app.on_key(ctrl('h'));
+        assert_eq!(app.mode, Mode::Terminal);
+        assert_eq!(app.focused, Some(PaneId(1)), "the pane keeps its focus");
+        app.on_key(ctrl('l'));
+        assert_eq!(app.mode, Mode::DiffFiles);
+        app.on_key(ctrl('l'));
+        assert_eq!(
+            app.mode,
+            Mode::Terminal,
+            "focus-right from the panel leaves it"
+        );
+        app.on_key(ctrl('l'));
+        app.on_key(plain('l'));
+        assert_eq!(app.mode, Mode::Terminal, "vim l mirrors focus-right");
+
+        // With the panel hidden (a clean workspace) the right edge still wraps
+        // to the next tab.
+        let mut app = App::new();
+        attach_with(&mut app, view_two_tabs());
+        app.sync_sizes(Rect::new(0, 0, 140, 40));
+        let out = app.on_key(ctrl('l'));
+        assert_eq!(out, vec![control(&Request::TabSelect { id: TabId(2) })]);
+    }
+
+    #[test]
+    fn prefix_verbs_work_from_inside_the_sidebar_and_the_changes_panel() {
+        let mut app = App::new();
+        attach_with(&mut app, view_with_changes());
+        app.sync_sizes(Rect::new(0, 0, 140, 40));
+        app.on_key(ctrl('b'));
+        app.on_key(plain('f'));
+        assert_eq!(app.mode, Mode::DiffFiles);
+        // From the panel, prefix-w hops straight to the sidebar …
+        app.on_key(ctrl('b'));
+        app.on_key(plain('w'));
+        assert_eq!(
+            app.mode,
+            Mode::Sidebar,
+            "prefix w reaches across from the panel"
+        );
+        // … and from the sidebar, prefix-f hops back to the panel.
+        app.on_key(ctrl('b'));
+        app.on_key(plain('f'));
+        assert_eq!(
+            app.mode,
+            Mode::DiffFiles,
+            "prefix f reaches across from the sidebar"
+        );
+        // Detach is reachable from a focused panel too.
+        app.on_key(ctrl('b'));
+        let out = app.on_key(plain('q'));
+        assert!(
+            out.iter().any(|f| matches!(f, WireFrame::Control(_))),
+            "prefix q from the panel still detaches: {out:?}"
+        );
     }
 
     #[test]

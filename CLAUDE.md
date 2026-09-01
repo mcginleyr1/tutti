@@ -68,8 +68,8 @@ cargo fmt --check
   Three palettes: `terminal` (default), `dark`, `light` — `theme = …` in config,
   an explicit choice; nothing detects the terminal.
 - Dim by default; ONE accent marks the focused/active thing (focused pane frame
-  and title, the focused panel's header, the `▎` gutter + name chip on a
-  selected row); red/yellow/green on state dots, the working spinner, the
+  and title, the focused panel's header and the rail down its edge, the `▎`
+  gutter + name chip on a selected row); red/yellow/green on state dots, the working spinner, the
   blocked border — and, as diff polarity, on `+`/`−` stats and bars (changes
   panel, sidebar stat, footer). Names (projects, agents, the active workspace
   in the footer) stay at full intensity — identity bright, metadata dim; don't

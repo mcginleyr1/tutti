@@ -450,6 +450,9 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
         }
     }
     frame.render_widget(Paragraph::new(lines), area);
+    if app.sidebar_focused() {
+        draw_focus_rail(frame, area);
+    }
 
     if app.sidebar_prompt_active() {
         // The prompt overlays the panel's content column (inside the padding).
@@ -511,6 +514,26 @@ fn draw_diff_panel(frame: &mut Frame, app: &App, area: Rect) {
         ));
     }
     frame.render_widget(Paragraph::new(lines), area);
+    if focused {
+        draw_focus_rail(frame, area);
+    }
+}
+
+/// The focus rail: while a chrome panel holds the keys, its left padding
+/// column carries a thin accent line down the panel's full height — the
+/// selected row's heavier `▎` mark sits on it — so the eye finds the focused
+/// panel before it reads a single row. Only empty padding cells are painted;
+/// anything a row already put there stays.
+fn draw_focus_rail(frame: &mut Frame, area: Rect) {
+    let buf = frame.buffer_mut();
+    for y in area.y..area.y + area.height {
+        if let Some(cell) = buf.cell_mut((area.x, y))
+            && cell.symbol() == " "
+        {
+            cell.set_symbol("▏");
+            cell.set_fg(accent());
+        }
+    }
 }
 
 /// The changed-files panel's header row (` changes     13 · +973 −190 `):
@@ -2999,6 +3022,56 @@ mod tests {
             "the selected row leads with an accent gutter mark"
         );
         assert_eq!(gutter.bg, select_bg());
+    }
+
+    #[test]
+    fn a_focused_panel_wears_an_accent_rail_down_its_left_edge() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = changes_app(Config::default());
+        let mut terminal = Terminal::new(TestBackend::new(140, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        app.sync_sizes(Rect::new(0, 0, 140, 20));
+        let w = 140usize;
+        // The changes panel starts at column 102; content rows run 2..=18.
+        let rail = |buf: &Buffer, col: usize| -> usize {
+            (2..19)
+                .filter(|row| {
+                    let c = &buf.content()[row * w + col];
+                    c.fg == accent() && (c.symbol() == "▏" || c.symbol() == "▎")
+                })
+                .count()
+        };
+        assert_eq!(rail(terminal.backend().buffer(), 102), 0, "no rail at rest");
+        assert_eq!(rail(terminal.backend().buffer(), 0), 0);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert_eq!(app.mode, Mode::DiffFiles, "ctrl-l steps into the panel");
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert_eq!(
+            rail(terminal.backend().buffer(), 102),
+            17,
+            "the whole panel edge is accent"
+        );
+        assert_eq!(
+            rail(terminal.backend().buffer(), 0),
+            0,
+            "the sidebar stays quiet"
+        );
+
+        // Prefix-w from inside the panel hops to the sidebar; the rail follows.
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert!(
+            app.sidebar_focused(),
+            "prefix w reaches across from the panel"
+        );
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert_eq!(
+            rail(terminal.backend().buffer(), 0),
+            17,
+            "focus moves the rail to the sidebar"
+        );
+        assert_eq!(rail(terminal.backend().buffer(), 102), 0);
     }
 
     #[test]

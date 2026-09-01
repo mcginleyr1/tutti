@@ -450,12 +450,16 @@ on and refreshed as agents work (same probe as the sidebar stat, so the two
 never disagree); it disappears when the workspace is clean, on narrow
 terminals, or with `diff_panel = "off"`.
 
-`Ctrl+B f` focuses it, and it moves like vim (or `less`): `j`/`k` step, `g`/`G`
-jump to the first/last file, `Ctrl+D`/`Ctrl+U` move half the panel (arrows,
-`Home`/`End`, and `PageUp`/`PageDown` work too). `Enter` opens the highlighted
-**file's diff** against trunk in an ephemeral pager pane, `d` opens the **whole
-diff**, and `h`/`esc` step back to the panes. Clicking a row jumps straight to
-that file's diff. Like every diff surface, it answers "what has this workspace
+`Ctrl+B f` focuses it — or `Ctrl+L` from the rightmost pane, the way `Ctrl+H`
+steps into the sidebar — and while it holds the keys an accent rail runs down
+its edge (the sidebar gets the same). It moves like vim (or `less`): `j`/`k`
+step, `g`/`G` jump to the first/last file, `Ctrl+D`/`Ctrl+U` move half the
+panel (arrows, `Home`/`End`, and `PageUp`/`PageDown` work too). `Enter` opens
+the highlighted **file's diff** against trunk in an ephemeral pager pane, `d`
+opens the **whole diff**; `h`/`esc` step back to the panes and `l`/`Ctrl+L`
+wrap on to the next tab, just as the pane's own right edge does. Clicking a
+row jumps straight to that file's diff. Like every diff surface, it answers
+"what has this workspace
 changed that hasn't landed on trunk" — the delta since the fork point from
 `main` (else `master`/`trunk`), so a workspace that fell behind an advanced
 trunk never shows trunk's own progress as noise.
