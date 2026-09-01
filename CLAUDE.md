@@ -45,6 +45,12 @@ cargo fmt --check
 - TUI geometry has one source of truth (`App::regions`/`content_rect`); any
   new chrome row/column updates it there and nowhere else, and mouse hit-tests
   follow automatically.
+- **The change probe's order is load-bearing** (`jj::probe` in
+  tutti-server/src/jj.rs): `jj log -r @` snapshots the working copy — tutti's
+  one recorded operation — then the op-heads mark is read, then the diff runs
+  `--ignore-working-copy`. Reorder it, or drop the flag, and the VCS watch
+  re-triggers on tutti's own snapshot: a working-copy scan per workspace every
+  second for as long as an agent keeps editing.
 
 ## Product vocabulary and rules
 

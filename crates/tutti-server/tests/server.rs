@@ -1315,7 +1315,7 @@ async fn a_shell_side_jj_operation_refreshes_the_change_stat() {
     assert!(run_jj(&dir, &["status"]).status.success());
 
     assert!(
-        wait_workspace_changes(&mut viewer, ws, "3 files").await,
+        wait_workspace_changes(&mut viewer, ws, "3 files", DEADLINE).await,
         "a shell-side jj operation should refresh the stat without any agent transition"
     );
 
@@ -1323,10 +1323,72 @@ async fn a_shell_side_jj_operation_refreshes_the_change_stat() {
     server.stop().await;
 }
 
+/// tutti's own probe snapshots the working copy, and a snapshot is a jj
+/// operation too. The watch must not take it for a shell-side change: after a
+/// tutti-triggered refresh, an edit with no jj command behind it stays unseen
+/// until a real operation lands — otherwise every refresh would breed the next,
+/// once a second, for as long as an agent keeps writing files. Skips cleanly
+/// without `jj`.
+#[tokio::test]
+async fn the_watch_ignores_the_probes_own_snapshot() {
+    let Some(dir) = init_jj_repo() else {
+        return;
+    };
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let ws = workspace_id(
+        control
+            .request(Request::WorkspaceNew { dir: dir.clone() })
+            .await,
+    );
+    let mut viewer = server.connect().await;
+    viewer.send(&Request::Attach).await;
+    assert!(matches!(viewer.response().await, Response::Attached { .. }));
+    sleep(Duration::from_millis(1500)).await;
+
+    // An edit no jj command has seen, surfaced by a tutti-triggered refresh (a
+    // second attach seeds every stat) — whose probe snapshots it.
+    std::fs::write(
+        dir.join("third.txt"),
+        "edited, never snapshotted by a shell\n",
+    )
+    .unwrap();
+    let mut second = server.connect().await;
+    second.send(&Request::Attach).await;
+    assert!(matches!(second.response().await, Response::Attached { .. }));
+    assert!(
+        wait_workspace_changes(&mut viewer, ws, "3 files", DEADLINE).await,
+        "the attach-triggered probe should surface the edit"
+    );
+
+    // Another such edit: the probe's own snapshot must not trigger a second
+    // probe, which would surface this one with no operation behind it.
+    std::fs::write(dir.join("fourth.txt"), "also unsnapshotted\n").unwrap();
+    assert!(
+        !wait_workspace_changes(&mut viewer, ws, "4 files", Duration::from_millis(2200)).await,
+        "the watch re-triggered on tutti's own snapshot"
+    );
+
+    // A real operation from a shell still lands it.
+    assert!(run_jj(&dir, &["status"]).status.success());
+    assert!(
+        wait_workspace_changes(&mut viewer, ws, "4 files", DEADLINE).await,
+        "a shell-side operation should still refresh the stat"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    server.stop().await;
+}
+
 /// Read `LayoutChanged` events on an attached connection until workspace `ws`
-/// reports a change stat starting with `prefix`.
-async fn wait_workspace_changes(viewer: &mut Conn, ws: WorkspaceId, prefix: &str) -> bool {
-    timeout(DEADLINE, async {
+/// reports a change stat starting with `prefix`, or `within` runs out.
+async fn wait_workspace_changes(
+    viewer: &mut Conn,
+    ws: WorkspaceId,
+    prefix: &str,
+    within: Duration,
+) -> bool {
+    timeout(within, async {
         loop {
             if let Frame::Control(json) = viewer.read_frame().await
                 && let Ok(Event::LayoutChanged { workspaces }) =

@@ -67,11 +67,28 @@ pub struct Hub {
     name: String,
     /// The agent registry driving detection and state classification.
     registry: Registry,
+    /// The VCS watch's book, one entry per workspace it has seen.
+    vcs: Mutex<HashMap<WorkspaceId, VcsMark>>,
+}
+
+/// One workspace's VCS-watch state: `mark` is the op-heads mtime as of the last
+/// completed change probe (`None` until one has recorded it), and `in_flight`
+/// counts the probes running now — the watch stands off while any is, since a
+/// probe's own snapshot is an operation too and must never read as one made
+/// outside tutti.
+#[derive(Default)]
+struct VcsMark {
+    mark: Option<SystemTime>,
+    in_flight: usize,
 }
 
 impl Hub {
     fn session(&self) -> std::sync::MutexGuard<'_, Session> {
         self.session.lock().expect("session poisoned")
+    }
+
+    fn vcs(&self) -> std::sync::MutexGuard<'_, HashMap<WorkspaceId, VcsMark>> {
+        self.vcs.lock().expect("vcs book poisoned")
     }
 }
 
@@ -117,6 +134,7 @@ pub async fn serve(
         next_client: AtomicU64::new(0),
         name,
         registry: Registry::default(),
+        vcs: Mutex::new(HashMap::new()),
     });
 
     let tick_hub = Arc::clone(&hub);
@@ -143,10 +161,9 @@ pub async fn serve(
     let vcs_watcher = tokio::spawn(async move {
         let mut interval = tokio::time::interval(DETECT_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut seen: HashMap<WorkspaceId, SystemTime> = HashMap::new();
         loop {
             interval.tick().await;
-            vcs_pass(&vcs_hub, &mut seen);
+            vcs_pass(&vcs_hub);
         }
     });
 
@@ -955,22 +972,31 @@ fn spawn_reaper(hub: &Arc<Hub>, pane: PaneId, pty: Arc<PtyPane>) {
 /// Recompute a workspace's jj change stat *and* stale flag off the
 /// render/dispatch path and, when either moved, rebroadcast the view so sidebars
 /// update. jj is shelled out to on a spawned task, so a slow repo never stalls
-/// the caller (the tick or dispatch). The two probes ride the same task so the
-/// stat and the stale tag stay in lockstep.
+/// the caller (the tick or dispatch). Both readings come from one `jj::probe`,
+/// so the stat and the stale tag stay in lockstep — and the probe's op-heads
+/// mark lands in the VCS watch's book behind it, so the watch never re-triggers
+/// on the snapshot the probe itself took. Marks only move forward: two probes
+/// overlapping cannot roll one back.
 fn refresh_changes(hub: &Arc<Hub>, workspace: WorkspaceId) {
     let Some(dir) = hub.session().workspace_dir(workspace) else {
         return;
     };
+    hub.vcs().entry(workspace).or_default().in_flight += 1;
     let hub = Arc::clone(hub);
     tokio::spawn(async move {
-        let (changes, files) = jj::change_summary(&dir).await;
-        let stale = jj::is_stale(&dir).await;
+        let probe = jj::probe(&dir).await;
         let mut session = hub.session();
-        let stat_moved = session.set_changes(workspace, changes, files);
-        let stale_moved = session.set_stale(workspace, stale);
-        if stat_moved || stale_moved {
-            let view = session.view();
-            drop(session);
+        let stat_moved = session.set_changes(workspace, probe.changes, probe.files);
+        let stale_moved = session.set_stale(workspace, probe.stale);
+        let view = (stat_moved || stale_moved).then(|| session.view());
+        drop(session);
+        {
+            let mut vcs = hub.vcs();
+            let entry = vcs.entry(workspace).or_default();
+            entry.in_flight = entry.in_flight.saturating_sub(1);
+            entry.mark = entry.mark.max(probe.mark);
+        }
+        if let Some(view) = view {
             broadcast_event(&hub, Event::LayoutChanged { workspaces: view });
         }
     });
@@ -987,14 +1013,16 @@ fn refresh_pane_workspace(hub: &Arc<Hub>, pane: PaneId) {
 }
 
 /// One pass of the VCS watch: a workspace whose jj repo recorded an operation
-/// since the last pass — a commit, bookmark move, or push made from any shell,
+/// since its last probe — a commit, bookmark move, or push made from any shell,
 /// not just through tutti — gets its change stat refreshed, so the sidebar and
 /// changes panel follow work done outside tutti rather than waiting for an
-/// agent state transition that may never come. The first sighting of a
-/// workspace only records its mark (attach and creation already seed the stat);
-/// vanished workspaces are forgotten. Bound before the loop so the session
-/// guard is released before `refresh_changes` re-locks it.
-fn vcs_pass(hub: &Arc<Hub>, seen: &mut HashMap<WorkspaceId, SystemTime>) {
+/// agent state transition that may never come. A probe's own snapshot never
+/// counts: the watch stands off while one is in flight, and the probe re-marks
+/// the repo behind itself. The first sighting of a workspace only records its
+/// mark (attach and creation already seed the stat); vanished workspaces are
+/// forgotten. The session guard is bound and released before the book is
+/// opened, and both before `refresh_changes` re-locks them.
+fn vcs_pass(hub: &Arc<Hub>) {
     let workspaces: Vec<(WorkspaceId, PathBuf)> = {
         let session = hub.session();
         session
@@ -1003,16 +1031,24 @@ fn vcs_pass(hub: &Arc<Hub>, seen: &mut HashMap<WorkspaceId, SystemTime>) {
             .filter_map(|id| session.workspace_dir(id).map(|dir| (id, dir)))
             .collect()
     };
-    seen.retain(|id, _| workspaces.iter().any(|(w, _)| w == id));
-    for (id, dir) in workspaces {
-        let Some(modified) = jj::op_heads_modified(&dir) else {
-            continue;
-        };
-        if let Some(previous) = seen.insert(id, modified)
-            && previous != modified
-        {
-            refresh_changes(hub, id);
-        }
+    let moved: Vec<WorkspaceId> = {
+        let mut vcs = hub.vcs();
+        vcs.retain(|id, _| workspaces.iter().any(|(w, _)| w == id));
+        workspaces
+            .iter()
+            .filter_map(|(id, dir)| {
+                let modified = jj::op_heads_modified(dir)?;
+                let entry = vcs.entry(*id).or_default();
+                if entry.in_flight > 0 {
+                    return None;
+                }
+                let previous = entry.mark.replace(modified);
+                previous.is_some_and(|p| p != modified).then_some(*id)
+            })
+            .collect()
+    };
+    for id in moved {
+        refresh_changes(hub, id);
     }
 }
 

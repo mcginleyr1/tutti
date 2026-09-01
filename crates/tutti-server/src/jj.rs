@@ -122,18 +122,50 @@ pub fn op_heads_modified(dir: &Path) -> Option<SystemTime> {
         .ok()
 }
 
+/// What one probe of a workspace learned, for the sidebar and changes panel:
+/// whether its working copy is stale, the op-heads mark the VCS watch measures
+/// from, and its change summary against trunk.
+pub struct Probe {
+    pub stale: bool,
+    pub mark: Option<SystemTime>,
+    pub changes: Option<String>,
+    pub files: Vec<FileStat>,
+}
+
+/// Probe the workspace at `dir`. The order is load-bearing: the stale check
+/// first (its `jj log -r @` snapshots the working copy — the one operation
+/// tutti itself records), then the op-heads mark, then the diff over that
+/// snapshot without taking another. So the mark covers everything the probe
+/// caused, and a watch comparing against it sees only operations that came
+/// afterwards — from a shell, an agent, or another workspace — never tutti's
+/// own.
+pub async fn probe(dir: &Path) -> Probe {
+    let stale = is_stale(dir).await;
+    let mark = op_heads_modified(dir);
+    let (changes, files) = change_summary(dir).await;
+    Probe {
+        stale,
+        mark,
+        changes,
+        files,
+    }
+}
+
 /// The change summary for `dir` against trunk (`DIFF_RANGE`): the short sidebar
 /// stat (`4 files +120 −33`) plus the exact per-file breakdown driving the
 /// changed-files panel. `(None, [])` for a non-repo, a workspace clean against
 /// trunk, or any failure. This is the always-on sidebar path, so it never
 /// surfaces an error — it just stays quiet. One `jj diff --git` run yields both,
-/// so the stat and the file list can never disagree.
-pub async fn change_summary(dir: &Path) -> (Option<String>, Vec<FileStat>) {
+/// so the stat and the file list can never disagree. Reads the working copy as
+/// last snapshotted (`--ignore-working-copy`): `probe` snapshots just before,
+/// and a second snapshot here would record an operation of its own.
+async fn change_summary(dir: &Path) -> (Option<String>, Vec<FileStat>) {
     if !is_workspace(dir) {
         return (None, Vec::new());
     }
     let mut cmd = Command::new("jj");
     cmd.arg("--no-pager")
+        .arg("--ignore-working-copy")
         .arg("diff")
         .arg("--git")
         .arg("--color=never")
@@ -161,7 +193,7 @@ pub async fn change_summary(dir: &Path) -> (Option<String>, Vec<FileStat>) {
 /// A non-repo or any spawn failure reads as not-stale, so the sidebar stays
 /// quiet. `--ignore-working-copy` is deliberately *not* passed: it would skip
 /// the snapshot and hide the very condition being probed.
-pub async fn is_stale(dir: &Path) -> bool {
+async fn is_stale(dir: &Path) -> bool {
     if !is_workspace(dir) {
         return false;
     }
