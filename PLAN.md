@@ -5,10 +5,13 @@ multiple terminal agents (Claude Code, Codex, Cursor CLI, OpenCode, etc.) in per
 panes, understands each agent's state (blocked / working / done / idle), and exposes a
 CLI + socket API so both humans and agents can drive it.
 
-**Out of scope for now (deliberate):** theming (we inherit the terminal's theme),
-remote/SSH/mobile clients, and a plugin system (we'll design a better one later —
-do not build extension points speculatively, but keep module boundaries clean so a
-plugin layer can be added without a rewrite).
+**Out of scope for now (deliberate):** remote/SSH/mobile clients, and a plugin
+system (we'll design a better one later — do not build extension points
+speculatively, but keep module boundaries clean so a plugin layer can be added
+without a rewrite). Theming was on this list until 2026-09-01: the default still
+inherits the terminal's palette live, and `theme = "dark" | "light"` are opt-in
+fixed truecolor palettes chosen in config — nothing detects the terminal (README
+Colour; the design rules live in CLAUDE.md).
 
 ---
 
@@ -143,8 +146,10 @@ Goal: attachable ratatui client with real pane rendering and tmux-grade ergonomi
    stream, renders. Detach with prefix `q`. Multiple clients may attach (all see the
    same session; sync sizes like tmux does — smallest client wins).
 2. **Rendering**: draw each pane's vt100 grid into its ratatui area; cursor, colors,
-   and attributes pass through — **no theming layer, the terminal's palette is the
-   theme**. Damage-based redraw (only re-render panes whose grid changed).
+   and attributes pass through — on the default `terminal` theme the terminal's
+   palette is the theme; the opt-in `dark`/`light` themes re-ground only a pane's
+   *default* colours. Damage-based redraw (only re-render panes whose grid
+   changed).
 3. **Input modes** (three, matching the concept model):
    - *terminal mode* — keys forwarded verbatim to the focused pane
    - *prefix mode* — `Ctrl+B` then an action key (split `%`/`"`, next tab `n`, kill `x`,
@@ -209,8 +214,10 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    (`jj workspace update-stale`). ✅ `tutti workspace diff [--stat]` serves
    per-workspace diffs — **against trunk** (the fork point from
    `main`/`master`/`trunk`), so committed agent work shows, not just the working
-   copy (sidebar shows `N files +A −B` per workspace, refreshed on
-   state transitions). ✅ Changed-files panel: an always-on right column listing
+   copy (sidebar shows `N files +A −B` per workspace, refreshed on state
+   transitions and on every operation the jj repo records — a commit,
+   bookmark move, or push from any shell). ✅ Changed-files panel: an
+   always-on right column listing
    the active workspace's changed files with exact `+`/`−` counts (`C-b f`
    focuses; enter = file diff, `d` = full diff, both in ephemeral pager panes). ✅ Merge back: sidebar `m` (or `tutti workspace merge <id>
    [--push]`) rebases the workspace onto trunk (`main`/`master`), refuses+undoes
@@ -231,12 +238,15 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    does not manage a foreign agent's subagents.
 7. **Conversation resume**: ✅ wave 1 — the launcher harvests resumable
    conversations for its target workspace from the agent tools' own session
-   stores (read-only; Claude Code today: `~/.claude/projects/<munged-cwd>/
-   <session-id>.jsonl`, newest-first by mtime, each candidate verified against
-   the `cwd` its transcript records since the munge is lossy) and offers up to
-   three `resume` rows at the panel's foot; picking one spawns
-   `claude --resume <session-id>` in a new pane. Scripts get the same via
-   `tutti pane run -- claude --resume <id>` — no new verb needed. Wave 2
+   stores (read-only; each candidate verified against the working directory
+   its own record names, since the stores are keyed lossily or not at all):
+   Claude Code (`~/.claude/projects/<munged-cwd>/<session-id>.jsonl`), Muse
+   Code (`$XDG_DATA_HOME/muse/sessions/YYYY/MM/DD/<id>/session.jsonl`), and
+   Mistral Vibe (`$VIBE_HOME/logs/session/session_*/meta.json`), merged
+   newest-first by mtime, up to three `resume` rows per agent at the panel's
+   foot; picking one spawns the tool's own recipe (`claude --resume <id>`,
+   `muse resume <id>`, `vibe --resume <id>`) in a new pane. Scripts get the
+   same via `tutti pane run -- <that command>` — no new verb needed. Wave 2
    (open): capture `session_id` per pane from the hook payloads so a restarted
    daemon can offer to revive the exact conversation each dead agent pane was
    holding, not just the project's most recent ones.
@@ -247,7 +257,7 @@ agent in each, `wait --until done` on all three, read back each diff summary.
 ## Phase 5 — Hardening & distribution
 
 - Config file: `~/.config/tutti/config.toml` (prefix key, mouse on/off, default shell,
-  agent registry overrides). No theme options.
+  agent registry overrides). `theme = terminal|dark|light` landed with it.
 - Crash-safety: server panics must not kill child PTYs where avoidable; client
   crashes never harm the server.
 - Perf targets: 60fps redraw with 8 busy panes; `pane read` on 10k-line scrollback
