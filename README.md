@@ -31,12 +31,15 @@ You need:
   Code](https://github.com/QwenLM/qwen-code), [Cursor
   CLI](https://cursor.com/cli), [Copilot
   CLI](https://github.com/github/copilot-cli), [Amp](https://ampcode.com),
-  [Factory Droid](https://factory.ai), [Augment
+  [Factory Droid](https://factory.ai), [Muse
+  Code](https://dev.meta.ai/docs/muse-code), [Mistral
+  Vibe](https://github.com/mistralai/mistral-vibe), [Augment
   Code](https://www.augmentcode.com), and [Amazon
   Q](https://github.com/aws/amazon-q-developer-cli). A missing agent shows dim
   in the launcher with its link, so the picker doubles as the install list.
-  Precise blocked/working/done detection is tuned per agent (Claude Code and
-  Codex today); the rest start from generic heuristics — see
+  Precise blocked/working/done detection is tuned per agent — Claude Code and
+  Codex fully, Muse Code (working/done) and Mistral Vibe (blocked/working) in
+  part; the rest start from generic heuristics — see
   `crates/tutti-agents/src/registry.rs`.
 
 From a checkout of this repository:
@@ -187,12 +190,16 @@ whatever you type via your login shell. Adding a project (`n`) opens the launche
 for the new workspace's first pane too — `esc` there just drops you into a shell,
 exactly as before. (Startup `[[projects]]` still mount plain shells, no launcher.)
 
-At the foot of the panel sit up to three **resume rows** — `resume   claude ·
-2h · <first prompt>` — harvested from the agent tools' own on-disk session
-stores for the target workspace's directory (read-only; Claude Code today,
-`~/.claude/projects/…`, each candidate verified against the `cwd` its own
-transcript records). Picking one relaunches the conversation in a new pane via
-the tool's resume flag (`claude --resume <session-id>`), so a conversation
+At the foot of the panel sit **resume rows** — `resume   claude · 2h · <first
+prompt>` — harvested from the agent tools' own on-disk session stores for the
+target workspace's directory, up to three per agent, newest first (read-only;
+Claude Code from `~/.claude/projects/…`, each candidate verified against the
+`cwd` its own transcript records; Muse Code from
+`$XDG_DATA_HOME/muse/sessions/…`, verified against the `workspace_root` its
+log names; Mistral Vibe from `$VIBE_HOME/logs/session/…`, verified against
+its `working_directory`). Picking one relaunches the conversation in a new
+pane via the tool's own resume recipe (`claude --resume <session-id>`, `muse
+resume <session-id>`, `vibe --resume <session-id>`), so a conversation
 orphaned by a daemon restart — or one from before the project was mounted in
 tutti — is one keystroke from continuing. A resume row for an uninstalled
 binary dims like any agent row.

@@ -234,6 +234,32 @@ impl Default for Registry {
                 ),
                 guess("amp", "Amp", "https://ampcode.com", &["amp"]),
                 guess("droid", "Factory Droid", "https://factory.ai", &["droid"]),
+                // Observed live (Muse Code 1.0.1 in a pty): the status line
+                // reads `Working (3s · esc to interrupt)` and `◇ Thinking`
+                // while a turn runs; the idle input box leads with `⟩`. Its
+                // approval dialog is untested, so Blocked keeps the guesses.
+                AgentSpec::new(
+                    "muse",
+                    "Muse Code",
+                    "https://dev.meta.ai/docs/muse-code",
+                    &["muse"],
+                    GUESS_BLOCKED,
+                    &["esc to interrupt", "Thinking", "Working"],
+                    &["⟩"],
+                ),
+                // Mistral Vibe's strings, from its source (2.23.3): the loading
+                // line reads `Thinking (3s Esc to interrupt)` and the approval
+                // dialog is titled `Permission for the <tool> tool`. Its input
+                // box carries no idle glyph, so there is no Done marker.
+                AgentSpec::new(
+                    "vibe",
+                    "Mistral Vibe",
+                    "https://github.com/mistralai/mistral-vibe",
+                    &["vibe"],
+                    &["Permission for the", "Always allow"],
+                    &["to interrupt", "Thinking", "Retrying"],
+                    &[],
+                ),
                 guess(
                     "auggie",
                     "Augment Code",
@@ -425,6 +451,32 @@ mod tests {
         assert!(classify("quiet shell output").is_none());
         state = state.apply(StateEvent::Activity);
         assert_eq!(state, AgentState::Working);
+    }
+
+    /// Screens captured from Muse Code 1.0.1 driving its echo provider in a
+    /// pty: the working status line outranks the ever-present input prompt,
+    /// and the prompt alone reads as Done once the turn lands.
+    #[test]
+    fn muse_screen_markers_classify_working_then_done() {
+        let spec = Registry::default().match_process("muse").unwrap().clone();
+        let working = "⟩ tutti pty probe prompt\n◇ Thinking\n── Voice input (⌥ + v to start) ──\n⟩ \n  echo · /tmp/proj\nWorking (0s · esc to interrupt)";
+        assert_eq!(spec.classify(working), Some(Observation::Working));
+        let idle = "⟩ tutti pty probe prompt\n◆ echo: tutti pty probe prompt\n── Voice input (⌥ + v to start) ──\n⟩ \n  echo · /tmp/proj";
+        assert_eq!(spec.classify(idle), Some(Observation::Done));
+    }
+
+    #[test]
+    fn vibe_screen_markers_classify_working_and_blocked() {
+        let spec = Registry::default().match_process("vibe").unwrap().clone();
+        let working = "fix the failing test\n⠋ Vibing (3s Esc to interrupt)";
+        assert_eq!(spec.classify(working), Some(Observation::Working));
+        let blocked = "⠋ Thinking (12s Esc to interrupt)\nPermission for the bash tool\n  › Yes\n    Allow for remainder of this session\n    Always allow\n    No";
+        assert_eq!(spec.classify(blocked), Some(Observation::Blocked));
+        assert_eq!(
+            spec.classify("plain output\nnothing special"),
+            None,
+            "no idle glyph means no Done marker"
+        );
     }
 
     #[test]

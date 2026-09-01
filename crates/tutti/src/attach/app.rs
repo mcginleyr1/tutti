@@ -1791,7 +1791,8 @@ impl App {
         self.launcher =
             launcher::build_rows(&Registry::default(), std::env::var_os("PATH").as_deref());
         if let (Some(dir), Some(home)) = (dir, self.resume_home.as_deref()) {
-            let sessions = tutti_agents::resume_sessions(dir, home, 3);
+            let stores = tutti_agents::Stores::from_env(home);
+            let sessions = tutti_agents::resume_sessions(dir, &stores, 3);
             let resume =
                 launcher::resume_rows(&sessions, &self.launcher, std::time::SystemTime::now());
             // Resume rows sit between the fixed rows and the dim uninstalled
