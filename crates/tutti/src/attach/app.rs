@@ -29,8 +29,8 @@ const SIDEBAR_MIN_TOTAL: u16 = 80;
 /// The changed-files panel's fixed column width, and the minimum content width
 /// below which it is suppressed so panes keep usable room even beside the
 /// sidebar.
-const DIFF_PANEL_WIDTH: u16 = 32;
-const DIFF_PANEL_MIN_TOTAL: u16 = 120;
+const DIFF_PANEL_WIDTH: u16 = 38;
+const DIFF_PANEL_MIN_TOTAL: u16 = 130;
 
 /// Rows the top chrome header claims: the full-width app bar plus the dim rule
 /// beneath it. The content region begins below them.
@@ -4177,9 +4177,9 @@ mod tests {
         attach_with(&mut app, view_with_changes());
         let (_, panes, panel) = app.split_content(content);
         let panel = panel.expect("changes + width show the panel");
-        assert_eq!(panel.width, 32);
+        assert_eq!(panel.width, 38);
         assert_eq!(panel.x + panel.width, 140);
-        assert_eq!(panes.width, 140 - 30 - 32);
+        assert_eq!(panes.width, 140 - 30 - 38);
 
         // Too narrow, or disabled in config, and it is suppressed.
         assert!(app.split_content(Rect::new(0, 0, 100, 37)).2.is_none());

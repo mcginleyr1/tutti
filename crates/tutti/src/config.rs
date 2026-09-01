@@ -84,6 +84,17 @@ pub enum SidebarVisibility {
     Off,
 }
 
+/// The chrome's colour theme. `Terminal` (the default) paints no ground of its
+/// own and uses only ANSI colours, so the chrome follows the terminal's own
+/// light/dark scheme live; `Dark` and `Light` are explicit truecolor themes
+/// with a shaded chrome over a tinted pane ground.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Theme {
+    Terminal,
+    Dark,
+    Light,
+}
+
 /// The glyph set for the sidebar's dots and markers. `Unicode` (the default) is
 /// the safe set every terminal renders; `Nerdfont` swaps in private-use icons
 /// for users with a patched font. Tree guides and the braille spinner are shared
@@ -266,6 +277,8 @@ pub struct Config {
     pub diff_panel: bool,
     /// The sidebar glyph set. Default `Unicode`.
     pub icons: Icons,
+    /// The chrome colour theme. Default `Terminal`.
+    pub theme: Theme,
     /// Whether pane notifications re-emit to the real terminal and flash the
     /// status bar. The sidebar bell mark is unaffected — always on.
     pub notifications: bool,
@@ -344,6 +357,17 @@ impl Config {
             }
         };
 
+        let theme = match raw.theme.as_deref() {
+            None | Some("terminal") => Theme::Terminal,
+            Some("dark") => Theme::Dark,
+            Some("light") => Theme::Light,
+            Some(other) => {
+                bail!(
+                    "theme: unknown value {other:?} (expected \"terminal\", \"dark\", or \"light\")"
+                )
+            }
+        };
+
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let projects = raw
             .projects
@@ -374,6 +398,7 @@ impl Config {
             sidebar,
             diff_panel,
             icons,
+            theme,
             notifications,
             projects,
             prefix_bindings,
@@ -413,6 +438,7 @@ struct RawConfig {
     sidebar: Option<String>,
     diff_panel: Option<String>,
     icons: Option<String>,
+    theme: Option<String>,
     notifications: Option<bool>,
     #[serde(default)]
     keys: RawKeys,
@@ -565,6 +591,21 @@ kill_pane    = "A-x"
         assert_eq!(config.keys.action_for(ctrl('k')), Some(Action::FocusUp));
         assert_eq!(config.keys.action_for(alt('l')), Some(Action::ResizeRight));
         assert_eq!(config.keys.action_for(alt('x')), Some(Action::KillPane));
+    }
+
+    #[test]
+    fn theme_defaults_to_terminal_and_names_bad_values() {
+        assert_eq!(Config::default().theme, Theme::Terminal);
+        assert_eq!(
+            Config::parse("theme = \"dark\"\n").unwrap().theme,
+            Theme::Dark
+        );
+        assert_eq!(
+            Config::parse("theme = \"light\"\n").unwrap().theme,
+            Theme::Light
+        );
+        let err = Config::parse("theme = \"solarized\"\n").unwrap_err();
+        assert!(err.to_string().contains("solarized"), "{err}");
     }
 
     #[test]

@@ -63,19 +63,28 @@ cargo fmt --check
 
 ## Design system (TUI)
 
-- Dim by default; ONE accent (terminal blue) marks the focused/active thing;
-  red/yellow/green only on state dots, the working spinner, and the blocked
-  border. Names (projects, agents, the active workspace in the footer) stay at
-  full intensity — identity bright, metadata dim; don't re-dim them. Chrome
-  paints **no background of its own** — it draws over the terminal's default so
-  it tracks the terminal's own light/dark scheme live (the same mechanism that
-  keeps pane interiors in step). The only background it paints is the selected
-  sidebar row, and that uses an **ANSI palette colour** (never truecolor RGB) so
-  the terminal repaints it too on a scheme flip. Never reintroduce a fixed-RGB
-  chrome shade — it would stay dark over a light terminal. Chrome panels are
-  borderless (lowercase bold-dim section headers, no box-drawing frames); pane
-  frames are the only boxes. Caps are reserved for the footer's mode chip —
-  nothing else in the chrome is uppercase.
+- All colour goes through `attach/theme.rs` (`theme::current()`, activated
+  per draw): never write a `Color::…` literal in render code outside that file.
+  Three palettes: `terminal` (default), `dark`, `light` — `theme = …` in config,
+  an explicit choice; nothing detects the terminal.
+- Dim by default; ONE accent marks the focused/active thing (focused pane frame
+  and title, the focused panel's header, the `▎` gutter + name chip on a
+  selected row); red/yellow/green on state dots, the working spinner, the
+  blocked border — and, as diff polarity, on `+`/`−` stats and bars (changes
+  panel, sidebar stat, footer). Names (projects, agents, the active workspace
+  in the footer) stay at full intensity — identity bright, metadata dim; don't
+  re-dim them. Chrome panels are borderless (lowercase bold-dim section
+  headers, no box-drawing frames); pane frames are the only boxes. Caps are
+  reserved for the footer's mode chip — nothing else in the chrome is uppercase.
+- The `terminal` theme paints **no background of its own** — it draws over the
+  terminal's default so it tracks the terminal's own light/dark scheme live
+  (the same mechanism that keeps pane interiors in step). Its only painted
+  background is the selected row, in an **ANSI palette colour** (never RGB) so
+  the terminal repaints it too on a scheme flip. Never put a fixed-RGB shade in
+  that palette — it would stay dark over a light terminal. The `dark`/`light`
+  palettes are the opposite by design: fixed truecolor grounds (chrome a step
+  apart from the pane ground, pane default colours re-grounded too) and an
+  explicit muted grey instead of DIM — that is what the user opts into.
 - Glyphs: safe-unicode set by default, nerd-font set behind `icons =
   "nerdfont"`. No private-use codepoints in the default set.
 - Which-key, the help overlay, and the bottom-bar hints all render from the

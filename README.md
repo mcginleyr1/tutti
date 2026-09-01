@@ -230,13 +230,22 @@ browse it. Copy needs a terminal that honours OSC 52 (iTerm2, kitty, WezTerm,
 Ghostty, tmux with `set-clipboard on`); where it does not (Apple Terminal), press
 the prefix then `m` to hand the mouse back for the terminal's own drag-to-select,
 and `m` again to re-grab it (most terminals also bypass capture while
-`Shift`/`Option` is held). `mouse = false` starts with the mouse off. Colors come
-from your
-terminal — tutti has no theme of its own: everything renders dim, with one accent
-(terminal blue) marking the focused/active thing and the red/yellow/green state
-dots the only other colour. The chrome paints no background of its own — it draws
-over your terminal's default, so it follows your terminal's light/dark scheme
-live, the same way the agent panes do.
+`Shift`/`Option` is held). `mouse = false` starts with the mouse off.
+
+**Colour.** The default `theme = "terminal"` takes its colours from your
+terminal: everything renders dim, one accent (terminal blue) marks the
+focused/active thing — the focused pane's frame and title, the focused panel's
+header, the `▎` gutter and name chip on a selected row — the red/yellow/green
+state dots say what agents are doing, and green/red `+`/`−` carry diff polarity
+in the changes panel, sidebar stat, and footer. The chrome paints no background
+of its own — it draws over your terminal's default, so it follows your
+terminal's light/dark scheme live, the same way the agent panes do.
+`theme = "dark"` and `theme = "light"` are explicit truecolor themes instead: a
+shaded chrome (app bar, sidebar, changes panel, footer) a step apart from a
+tinted pane ground, muted grey metadata rather than the DIM attribute, and
+accent/state/diff colours tuned to that ground — panes' default colours take
+the theme's ground too, so the whole screen reads as one surface. Pick the one
+matching your terminal; nothing is detected.
 
 ## Configuration
 
@@ -252,6 +261,8 @@ preset = "default"      # prefix keymap: "default" (emacs/tmux-flavored) or "vim
 sidebar = "on"          # workspace/agent sidebar: "on" (default), "auto", or "off"
 diff_panel = "on"       # changed-files panel: "on" (default) or "off"
 icons = "unicode"       # sidebar glyph set: "unicode" (default) or "nerdfont"
+theme = "terminal"      # "terminal" (default: your terminal's colours, live light/dark),
+                        # "dark", or "light" (shaded truecolor chrome)
 notifications = true    # re-emit pane bells/notifications to your real terminal
 
 [keys]                  # direct bindings; every entry optional; "none" disables
@@ -431,10 +442,13 @@ agent still rings the bell and turns its pane border red until you focus it.
 The right-hand column mirrors the sidebar for *code*: whenever the active
 workspace has changes against trunk, a borderless `changes` panel lists every
 changed file — directory dim (clipped by whole components behind `…/`, never
-mid-name fragments), basename bright — with its exact `+added −removed`
-line counts right-aligned, always on and refreshed as agents work (same probe as
-the sidebar stat, so the two never disagree). It disappears when the workspace
-is clean, on narrow terminals, or with `diff_panel = "off"`.
+mid-name fragments), basename bright — with its exact `+added −removed` counts
+in green/red and a six-cell bar scaled to the largest change in the list
+(added cells green, removed red), so the shape of the delta reads before the
+numbers do. The header carries the file count and the coloured totals. Always
+on and refreshed as agents work (same probe as the sidebar stat, so the two
+never disagree); it disappears when the workspace is clean, on narrow
+terminals, or with `diff_panel = "off"`.
 
 `Ctrl+B f` focuses it, and it moves like vim (or `less`): `j`/`k` step, `g`/`G`
 jump to the first/last file, `Ctrl+D`/`Ctrl+U` move half the panel (arrows,

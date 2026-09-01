@@ -9,6 +9,7 @@ mod launcher;
 mod layout;
 mod render;
 mod sidebar;
+mod theme;
 
 #[cfg(test)]
 pub(crate) mod fixtures;

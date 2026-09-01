@@ -14,19 +14,24 @@ use tutti_core::{AgentState, PaneId, PaneInfo, SubagentInfo};
 use super::app::{App, Mode};
 use super::launcher::LauncherRow;
 use super::sidebar::{AgentRow, SidebarEntry, WorkspaceRow};
+use super::theme;
 use crate::config::{self, Config, Icons, PrefixAction};
 use crate::render::state_label;
 
-/// The single accent colour — terminal blue — that marks the focused or active
-/// thing. Everything else renders dim so the one accent is unmistakable. State
-/// colours (red/yellow/green) appear only on state dots and the blocked border.
-const ACCENT: Color = Color::Blue;
+/// The accent colour of the active theme — the one thing that marks the
+/// focused or active thing. Everything else renders muted so it is
+/// unmistakable; state colours stay on state dots, the blocked border, and
+/// (with the diff colours) the change stats.
+fn accent() -> Color {
+    theme::current().accent
+}
 
-/// The subtle full-row background under the selected sidebar entry. An ANSI
-/// palette colour (never truecolor RGB), so it is drawn by the terminal from its
-/// own scheme and repaints on the fly when the terminal flips light/dark — the
-/// same mechanism that keeps pane interiors in step with the terminal.
-const SELECT_BG: Color = Color::DarkGray;
+/// The full-row background under a selected sidebar/panel row and a pane's
+/// mouse selection. On the terminal theme an ANSI palette colour, so the
+/// terminal repaints it from its own scheme on a light/dark flip.
+fn select_bg() -> Color {
+    theme::current().select_bg
+}
 
 /// A resolved glyph set: the concrete characters for the sidebar's dots and
 /// markers. Tree guides and the braille spinner are box-drawing/shared, so they
@@ -100,15 +105,34 @@ const DIFF_HINT: &[(&str, &str)] = &[
     ("esc", "back"),
 ];
 
-/// The default dim style, applied to nearly everything that is not the accent.
+/// The metadata style of the active theme — DIM on the terminal theme, an
+/// explicit muted colour on the truecolor ones — applied to nearly everything
+/// that is not a name or the accent.
 fn dim() -> Style {
-    Style::default().add_modifier(Modifier::DIM)
+    theme::current().dim()
+}
+
+/// Paint `style` under `rect` without touching its symbols — how a theme lays
+/// its ground before the chrome draws over it. A no-op for an empty style.
+fn fill(frame: &mut Frame, rect: Rect, style: Style) {
+    if style != Style::default() {
+        frame.buffer_mut().set_style(rect, style);
+    }
+}
+
+/// Clear `rect` and re-lay the theme ground `bg` under it, so a popup or an
+/// overlaid prompt row stays opaque *and* on-theme (a bare `Clear` would fall
+/// back to the terminal's own ground under a truecolor theme).
+fn clear(frame: &mut Frame, rect: Rect, bg: Option<Color>) {
+    frame.render_widget(Clear, rect);
+    fill(frame, rect, theme::current().ground(bg));
 }
 
 /// Render the whole UI: the top app bar and its rule, the sidebar and pane area
 /// beneath, and the footer — plus the transient notification band and any
 /// floating panel.
 pub fn draw(frame: &mut Frame, app: &App) {
+    let _theme = theme::activate(app.config().theme);
     let area = frame.area();
     if area.height == 0 {
         return;
@@ -116,6 +140,23 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let (content, footer) = App::content_rect(area);
     let (app_bar, rule) = App::header_rects(area);
     let (sidebar_rect, panes_area, diff_panel_rect) = app.regions(content);
+    // The theme's grounds go down first: the pane ground under everything,
+    // the panel shade under the chrome bars and columns. The terminal theme
+    // has no grounds, so it paints nothing and the terminal's own shows.
+    let palette = theme::current();
+    fill(frame, area, palette.ground(palette.pane_bg));
+    for rect in [
+        Some(app_bar),
+        Some(rule),
+        sidebar_rect,
+        diff_panel_rect,
+        Some(footer),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        fill(frame, rect, palette.ground(palette.panel_bg));
+    }
     // One spinner frame for the whole draw so every working agent — sidebar dot
     // and pane border alike — animates in lockstep.
     let spinner = app.spinner_char();
@@ -174,7 +215,7 @@ fn draw_app_bar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
         format!("tutti — {}", app.session)
     };
     let mut spans = vec![
-        Span::styled("▍", Style::default().fg(ACCENT)),
+        Span::styled("▍", Style::default().fg(accent())),
         Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
     ];
     spans.extend(census_spans(app, spinner));
@@ -240,8 +281,8 @@ fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
 fn tab_chip_style(active: bool) -> Style {
     if active {
         Style::default()
-            .fg(Color::Black)
-            .bg(ACCENT)
+            .fg(theme::current().on_accent)
+            .bg(accent())
             .add_modifier(Modifier::BOLD)
     } else {
         dim()
@@ -293,7 +334,7 @@ fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
 /// italic-dim.
 fn dashboard_action(key: &str, label: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{key}  "), Style::default().fg(ACCENT)),
+        Span::styled(format!("{key}  "), Style::default().fg(accent())),
         Span::styled(label.to_string(), dim().add_modifier(Modifier::ITALIC)),
     ])
 }
@@ -308,7 +349,12 @@ fn wordmark_lines() -> Vec<Line<'static>> {
         " █  ███  █   █  ███",
     ];
     ROWS.iter()
-        .map(|r| Line::from(Span::styled((*r).to_string(), Style::default().fg(ACCENT))))
+        .map(|r| {
+            Line::from(Span::styled(
+                (*r).to_string(),
+                Style::default().fg(accent()),
+            ))
+        })
         .collect()
 }
 
@@ -336,11 +382,13 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
     let glyphs = glyphs(app.config().icons);
 
     let mut lines: Vec<Line> = Vec::new();
+    let focused = app.sidebar_focused();
     lines.push(section_header(
         sidebar.projects_collapsed,
         "projects",
         sidebar.workspace_rows(),
         w,
+        focused,
     ));
     if !sidebar.projects_collapsed {
         for (i, entry) in sidebar.entries.iter().take(tree_count).enumerate() {
@@ -384,6 +432,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
         "waiting",
         waiting_count,
         w,
+        focused,
     ));
     if !sidebar.waiting_collapsed {
         for (i, entry) in sidebar.entries.iter().enumerate().skip(tree_count) {
@@ -429,13 +478,14 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
     }
 }
 
-/// The changed-files panel: a caps header with the file count, then one row per
-/// changed file — its path (directory dim, basename full intensity) with exact
-/// `+`/`−` counts right-aligned. Borderless like the sidebar, dim by default,
-/// and paints no background of its own; the selection row (only while the panel
-/// is focused) uses the same ANSI-palette background as the sidebar's. The
-/// visible window follows the selection via `App::diff_first_visible`, which
-/// click hit-testing shares.
+/// The changed-files panel: a header with the file count and the coloured
+/// `+`/`−` totals, then one row per changed file — its path (directory dim,
+/// basename full intensity), its exact counts in the diff colours, and a bar
+/// scaled to the largest change so the shape of the delta reads at a glance.
+/// Borderless like the sidebar, on the theme's panel ground; the selection row
+/// (only while the panel is focused) uses the shared selection background.
+/// The visible window follows the selection via `App::diff_first_visible`,
+/// which click hit-testing shares.
 fn draw_diff_panel(frame: &mut Frame, app: &App, area: Rect) {
     if area.width < 3 || area.height < 1 {
         return;
@@ -446,47 +496,136 @@ fn draw_diff_panel(frame: &mut Frame, app: &App, area: Rect) {
     let selected = app.diff_selected();
     let first = app.diff_first_visible(area.height);
     let visible = area.height.saturating_sub(1) as usize;
+    let max_total = files
+        .iter()
+        .map(|f| f.insertions + f.deletions)
+        .max()
+        .unwrap_or(0);
 
-    let mut lines = vec![changes_header(files.len(), area.width)];
+    let mut lines = vec![changes_header(files, area.width, focused)];
     for (i, file) in files.iter().enumerate().skip(first).take(visible) {
         let sel = focused && i == selected;
-        lines.push(bare_row(file_stat_inner(file, sel, content_w), sel));
+        lines.push(bare_row(
+            file_stat_inner(file, max_total, sel, content_w),
+            sel,
+        ));
     }
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// The changed-files panel's header row (` changes        N `): bold-dim title,
-/// count right-aligned — the sidebar section-header look, minus the collapse
-/// arrow (the panel is not collapsible; the prefix key toggles focus instead).
-fn changes_header(count: usize, width: u16) -> Line<'static> {
+/// The changed-files panel's header row (` changes     13 · +973 −190 `):
+/// bold title (accent while the panel is focused), the file count and the
+/// coloured totals right-aligned — the totals dropped when the row is too
+/// narrow for them.
+fn changes_header(files: &[tutti_core::FileStat], width: u16, focused: bool) -> Line<'static> {
     let label = "changes";
-    let count = count.to_string();
-    let used = 2 + label.chars().count() + count.chars().count();
+    let count = files.len().to_string();
+    let (added, removed) = files
+        .iter()
+        .fold((0, 0), |(a, r), f| (a + f.insertions, r + f.deletions));
+    let mut right = vec![Span::styled(count, dim())];
+    let totals = format!(" · +{added} −{removed}");
+    if width as usize >= 2 + label.len() + right[0].content.len() + totals.len() + 2 {
+        right.push(Span::styled(" · ", dim()));
+        right.extend(stat_spans(&format!("+{added} −{removed}")));
+    }
+    let used: usize = 2
+        + label.len()
+        + right
+            .iter()
+            .map(|s| s.content.chars().count())
+            .sum::<usize>();
     let gap = (width as usize).saturating_sub(used);
-    Line::from(vec![
-        Span::styled(format!(" {label}"), dim().add_modifier(Modifier::BOLD)),
+    let mut spans = vec![
+        Span::styled(format!(" {label}"), header_style(focused)),
         Span::raw(" ".repeat(gap)),
-        Span::styled(format!("{count} "), dim()),
-    ])
+    ];
+    spans.extend(right);
+    spans.push(Span::raw(" "));
+    Line::from(spans)
 }
+
+/// The width of a changed-file row's bar, in cells.
+const BAR_W: usize = 6;
 
 /// One changed-file row's inner spans: the path clipped to fit beside the stat
 /// (directory prefix dim, basename full intensity — identity bright, metadata
-/// dim), the exact `+A −B` right-aligned dim.
-fn file_stat_inner(file: &tutti_core::FileStat, sel: bool, content_w: usize) -> Vec<Span<'static>> {
+/// dim), then the exact `+A −B` in the diff colours and the scaled bar, both
+/// right-aligned so the bars line up down the column.
+fn file_stat_inner(
+    file: &tutti_core::FileStat,
+    max_total: u64,
+    sel: bool,
+    content_w: usize,
+) -> Vec<Span<'static>> {
     let stat = format!("+{} −{}", file.insertions, file.deletions);
     let stat_w = stat.chars().count();
-    let avail = content_w.saturating_sub(stat_w + 1);
+    let avail = content_w.saturating_sub(stat_w + 1 + BAR_W + 1);
     let (dir, base) = clipped_path(&file.path, avail);
     let path_w = dir.chars().count() + base.chars().count();
-    let gap = content_w.saturating_sub(path_w + stat_w);
-    let spans = vec![
+    let gap = content_w.saturating_sub(path_w + stat_w + 1 + BAR_W);
+    let mut spans = vec![
         Span::styled(dir, dim()),
         name_span(&base, sel, Modifier::empty()),
         Span::raw(" ".repeat(gap)),
-        Span::styled(stat, dim()),
     ];
+    spans.extend(stat_spans(&stat));
+    spans.push(Span::raw(" "));
+    spans.extend(stat_bar(file.insertions, file.deletions, max_total));
     pad_inner(spans, sel, content_w as u16)
+}
+
+/// A `BAR_W`-cell bar for one file: its length is the file's share of the
+/// largest change in the panel (never empty for a non-empty change), split
+/// into added and removed cells in proportion — each side keeping at least one
+/// cell when it is non-zero and the bar is long enough to show both.
+fn stat_bar(insertions: u64, deletions: u64, max_total: u64) -> Vec<Span<'static>> {
+    let total = insertions + deletions;
+    if total == 0 || max_total == 0 {
+        return vec![Span::raw(" ".repeat(BAR_W))];
+    }
+    let bar = BAR_W as u64;
+    let filled = (total * bar).div_ceil(max_total).clamp(1, bar);
+    let mut plus = (filled * insertions + total / 2) / total;
+    if insertions > 0 && plus == 0 && filled > 1 {
+        plus = 1;
+    }
+    if deletions > 0 && plus == filled && filled > 1 {
+        plus = filled - 1;
+    }
+    let minus = filled - plus;
+    let palette = theme::current();
+    vec![
+        Span::styled(
+            "█".repeat(plus as usize),
+            Style::default().fg(palette.added),
+        ),
+        Span::styled(
+            "█".repeat(minus as usize),
+            Style::default().fg(palette.removed),
+        ),
+        Span::raw(" ".repeat(BAR_W - filled as usize)),
+    ]
+}
+
+/// A change stat (`3 files +13 −4`, or just `+13 −4`) as spans: `+N` in the
+/// added colour, `−N` in the removed colour — a zero count dim — and anything
+/// else dim. Shared by the changes panel, the sidebar stat, and the footer.
+fn stat_spans(stat: &str) -> Vec<Span<'static>> {
+    let palette = theme::current();
+    let mut spans = Vec::new();
+    for (i, token) in stat.split(' ').enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let style = match token.chars().next() {
+            Some('+') if token != "+0" => Style::default().fg(palette.added),
+            Some('−') if token != "−0" => Style::default().fg(palette.removed),
+            _ => dim(),
+        };
+        spans.push(Span::styled(token.to_string(), style));
+    }
+    spans
 }
 
 /// Split `path` into a (dim) directory prefix and its basename, clipped to fit
@@ -526,7 +665,13 @@ fn clipped_path(path: &str, avail: usize) -> (String, String) {
 /// caps stay reserved for the footer's mode chip), and the count right-aligned
 /// to the panel edge. Kept quiet — the rows carry the brightness, the header
 /// just labels the group.
-fn section_header(collapsed: bool, title: &str, count: usize, width: u16) -> Line<'static> {
+fn section_header(
+    collapsed: bool,
+    title: &str,
+    count: usize,
+    width: u16,
+    focused: bool,
+) -> Line<'static> {
     let arrow = if collapsed { '▸' } else { '▾' };
     let label = title.to_string();
     let count = count.to_string();
@@ -535,21 +680,38 @@ fn section_header(collapsed: bool, title: &str, count: usize, width: u16) -> Lin
     let gap = (width as usize).saturating_sub(used);
     Line::from(vec![
         Span::styled(format!(" {arrow} "), dim()),
-        Span::styled(label, dim().add_modifier(Modifier::BOLD)),
+        Span::styled(label, header_style(focused)),
         Span::raw(" ".repeat(gap)),
         Span::styled(format!("{count} "), dim()),
     ])
+}
+
+/// A section header label: bold-dim at rest, bold accent while its panel holds
+/// focus — the accent marks where the keys go.
+fn header_style(focused: bool) -> Style {
+    if focused {
+        Style::default().fg(accent()).add_modifier(Modifier::BOLD)
+    } else {
+        dim().add_modifier(Modifier::BOLD)
+    }
 }
 
 /// A content row: one column of padding each side, the selection background
 /// carried across both so the highlight reads as one full-width bar.
 fn bare_row(inner: Vec<Span<'static>>, sel: bool) -> Line<'static> {
     let pad = if sel {
-        Style::default().bg(SELECT_BG)
+        Style::default().bg(select_bg())
     } else {
         Style::default()
     };
-    let mut spans = vec![Span::styled(" ", pad)];
+    // The selected row leads with an accent gutter mark, so focus reads even
+    // where the highlight is faint.
+    let gutter = if sel {
+        Span::styled("▎", pad.fg(accent()))
+    } else {
+        Span::raw(" ")
+    };
+    let mut spans = vec![gutter];
     spans.extend(inner);
     spans.push(Span::styled(" ", pad));
     Line::from(spans)
@@ -562,7 +724,7 @@ fn pad_inner(mut spans: Vec<Span<'static>>, sel: bool, content_w: u16) -> Vec<Sp
     if sel {
         for span in &mut spans {
             if span.style.bg.is_none() {
-                span.style = span.style.bg(SELECT_BG);
+                span.style = span.style.bg(select_bg());
             }
         }
     }
@@ -570,7 +732,7 @@ fn pad_inner(mut spans: Vec<Span<'static>>, sel: bool, content_w: u16) -> Vec<Sp
     if used < content_w as usize {
         let fill = " ".repeat(content_w as usize - used);
         let style = if sel {
-            Style::default().bg(SELECT_BG)
+            Style::default().bg(select_bg())
         } else {
             Style::default()
         };
@@ -587,8 +749,8 @@ fn name_span(text: &str, sel: bool, base: Modifier) -> Span<'static> {
         Span::styled(
             text.to_string(),
             Style::default()
-                .fg(Color::Black)
-                .bg(ACCENT)
+                .fg(theme::current().on_accent)
+                .bg(accent())
                 .add_modifier(base),
         )
     } else {
@@ -606,7 +768,7 @@ fn workspace_inner(
     glyphs: &Glyphs,
 ) -> Vec<Span<'static>> {
     let (dot, dot_style) = if w.active {
-        (glyphs.ws_active, Style::default().fg(ACCENT))
+        (glyphs.ws_active, Style::default().fg(accent()))
     } else {
         (glyphs.ws_inactive, dim())
     };
@@ -666,16 +828,14 @@ fn workspace_subtitle_inner(
         w.subtitle.as_deref().unwrap_or("")
     );
     if w.stale {
-        return right_tagged(
-            left,
+        let tag = Span::styled(
             format!("{} stale", glyphs.fork),
-            dim().fg(Color::Red),
-            sel,
-            content_w,
+            dim().fg(theme::current().blocked),
         );
+        return right_tagged(left, vec![tag], sel, content_w);
     }
     if let Some(changes) = w.changes.as_deref() {
-        return right_tagged(left, changes.to_string(), dim(), sel, content_w);
+        return right_tagged(left, stat_spans(changes), sel, content_w);
     }
     pad_inner(vec![Span::styled(left, dim())], sel, content_w)
 }
@@ -684,25 +844,21 @@ fn workspace_subtitle_inner(
 /// falling back to just the left text (padded) when the tag will not fit.
 fn right_tagged(
     left: String,
-    tag: String,
-    tag_style: Style,
+    tag: Vec<Span<'static>>,
     sel: bool,
     content_w: u16,
 ) -> Vec<Span<'static>> {
     let cw = content_w as usize;
     let lw = left.chars().count();
-    let tw = tag.chars().count();
+    let tw: usize = tag.iter().map(|s| s.content.chars().count()).sum();
     if lw + 1 + tw <= cw {
         let gap = cw - lw - tw;
-        let mut spans = vec![
-            Span::styled(left, dim()),
-            Span::raw(" ".repeat(gap)),
-            Span::styled(tag, tag_style),
-        ];
+        let mut spans = vec![Span::styled(left, dim()), Span::raw(" ".repeat(gap))];
+        spans.extend(tag);
         if sel {
             for span in &mut spans {
                 if span.style.bg.is_none() {
-                    span.style = span.style.bg(SELECT_BG);
+                    span.style = span.style.bg(select_bg());
                 }
             }
         }
@@ -837,12 +993,12 @@ fn draw_sidebar_prompt(
     let rows = (completions.len() as u16).min(inner.height.saturating_sub(1));
     for i in 0..rows {
         let style = if i as usize == selected {
-            Style::default().fg(ACCENT)
+            Style::default().fg(accent())
         } else {
             dim()
         };
         let row = Rect::new(inner.x, foot - rows + i, inner.width, 1);
-        frame.render_widget(Clear, row);
+        clear(frame, row, theme::current().panel_bg);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!("  {}", completions[i as usize]),
@@ -853,13 +1009,13 @@ fn draw_sidebar_prompt(
     }
 
     let row = Rect::new(inner.x, foot, inner.width, 1);
-    frame.render_widget(Clear, row);
+    clear(frame, row, theme::current().panel_bg);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("▍", Style::default().fg(ACCENT)),
+            Span::styled("▍", Style::default().fg(accent())),
             Span::styled(label.to_string(), dim()),
             Span::styled(text.to_string(), Style::default()),
-            Span::styled("█", Style::default().fg(ACCENT)),
+            Span::styled("█", Style::default().fg(accent())),
         ])),
         row,
     );
@@ -906,7 +1062,7 @@ fn draw_pane(frame: &mut Frame, app: &App, pane: PaneId, rect: Rect, spinner: ch
 /// attributes. Wide-character continuation cells are cleared so a glyph is not
 /// drawn twice. `selection`, when set, is the inclusive `(start, end)` span of a
 /// live mouse selection in screen coordinates; cells inside it take the
-/// `SELECT_BG` highlight — an ANSI palette colour, so it repaints with the
+/// `select_bg()` highlight — an ANSI palette colour, so it repaints with the
 /// terminal's scheme like the sidebar selection.
 fn draw_screen(
     buf: &mut Buffer,
@@ -934,12 +1090,16 @@ fn draw_screen(
                         buf_cell.set_char(' ');
                     }
                     let style = cell_style(cell);
-                    buf_cell.set_style(if selected { style.bg(SELECT_BG) } else { style });
+                    buf_cell.set_style(if selected {
+                        style.bg(select_bg())
+                    } else {
+                        style
+                    });
                 }
                 None => {
                     buf_cell.set_char(' ');
                     if selected {
-                        buf_cell.set_style(Style::default().bg(SELECT_BG));
+                        buf_cell.set_style(Style::default().bg(select_bg()));
                     }
                 }
             }
@@ -964,9 +1124,11 @@ fn in_span(start: (u16, u16), end: (u16, u16), cols: u16, row: u16, col: u16) ->
     col >= c0 && col <= c1
 }
 
-/// The ratatui style for a vt100 cell: colours passed straight through, no
-/// theming.
+/// The ratatui style for a vt100 cell: explicit colours pass straight through;
+/// the default foreground/background take the theme's pane ground (nothing —
+/// the terminal's own — on the terminal theme).
 pub fn cell_style(cell: &vt100::Cell) -> Style {
+    let palette = theme::current();
     let mut modifier = Modifier::empty();
     if cell.bold() {
         modifier |= Modifier::BOLD;
@@ -983,10 +1145,15 @@ pub fn cell_style(cell: &vt100::Cell) -> Style {
     if cell.inverse() {
         modifier |= Modifier::REVERSED;
     }
-    Style::default()
-        .fg(map_color(cell.fgcolor()))
-        .bg(map_color(cell.bgcolor()))
-        .add_modifier(modifier)
+    let fg = match cell.fgcolor() {
+        vt100::Color::Default => palette.fg.unwrap_or(Color::Reset),
+        colour => map_color(colour),
+    };
+    let bg = match cell.bgcolor() {
+        vt100::Color::Default => palette.pane_bg.unwrap_or(Color::Reset),
+        colour => map_color(colour),
+    };
+    Style::default().fg(fg).bg(bg).add_modifier(modifier)
 }
 
 /// Map a vt100 colour to the equivalent ratatui colour.
@@ -1009,7 +1176,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(label) = mode_label(app.mode) {
         spans.push(Span::styled(
             format!(" {label} "),
-            Style::default().fg(Color::Black).bg(ACCENT),
+            Style::default().fg(theme::current().on_accent).bg(accent()),
         ));
     } else if let Some(ws) = app.active_workspace() {
         // Terminal mode has no chip, so the bar earns its row with context:
@@ -1017,7 +1184,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         let glyphs = glyphs(app.config().icons);
         spans.push(Span::styled(
             format!(" {} ", glyphs.ws_active),
-            Style::default().fg(ACCENT),
+            Style::default().fg(accent()),
         ));
         spans.push(Span::styled(
             ws.name.clone(),
@@ -1027,7 +1194,8 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             spans.push(Span::styled(format!(" · {branch}"), dim()));
         }
         if let Some(changes) = &ws.changes {
-            spans.push(Span::styled(format!(" · {changes}"), dim()));
+            spans.push(Span::styled(" · ", dim()));
+            spans.extend(stat_spans(changes));
         }
     }
     if app.mode == Mode::Sidebar {
@@ -1075,16 +1243,16 @@ fn draw_notification(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let bg = if msg.contains("error") {
-        Color::Red
+        theme::current().blocked
     } else {
-        ACCENT
+        accent()
     };
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             msg.to_string(),
             Style::default()
-                .fg(Color::Black)
+                .fg(theme::current().on_accent)
                 .add_modifier(Modifier::BOLD),
         )))
         .style(Style::default().bg(bg))
@@ -1141,7 +1309,7 @@ fn fit_hint(pairs: &[(String, &str)], avail: u16) -> (Vec<Span<'static>>, u16) {
 /// than pair sits to pair, so the grouping needs no separator glyph. Returns
 /// the spans and their total rendered width.
 fn two_tone<S: AsRef<str>>(pairs: &[(S, &str)]) -> (Vec<Span<'static>>, u16) {
-    let dim = Style::default().add_modifier(Modifier::DIM);
+    let dim = dim();
     let mut spans = Vec::new();
     let mut width = 0usize;
     for (i, (key, label)) in pairs.iter().enumerate() {
@@ -1176,7 +1344,7 @@ fn draw_whichkey(frame: &mut Frame, app: &App, area: Rect) {
     let y = area.y + area.height.saturating_sub(height);
     let popup = Rect::new(x, y, width, height);
 
-    frame.render_widget(Clear, popup);
+    clear(frame, popup, theme::current().pane_bg);
     frame.render_widget(Paragraph::new(lines).block(popup_block(" keys ")), popup);
 }
 
@@ -1188,7 +1356,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect::new(x, y, width, height);
-    frame.render_widget(Clear, popup);
+    clear(frame, popup, theme::current().pane_bg);
     frame.render_widget(Paragraph::new(lines).block(popup_block(" help ")), popup);
 }
 
@@ -1228,13 +1396,13 @@ fn launcher_line(idx: usize, row: &LauncherRow, selected: bool) -> Line<'static>
     let marker = if selected {
         Span::styled(
             "❯ ",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
         )
     } else {
         Span::raw("  ")
     };
     let name_style = if selected {
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        Style::default().fg(accent()).add_modifier(Modifier::BOLD)
     } else {
         Style::default().add_modifier(Modifier::BOLD)
     };
@@ -1251,10 +1419,10 @@ fn launcher_line(idx: usize, row: &LauncherRow, selected: bool) -> Line<'static>
 /// sidebar prompt's accent-bar input.
 fn draw_launcher_command(frame: &mut Frame, app: &App, area: Rect) {
     let line = Line::from(vec![
-        Span::styled("▍", Style::default().fg(ACCENT)),
+        Span::styled("▍", Style::default().fg(accent())),
         Span::styled("run: ", dim()),
         Span::styled(app.launcher_command().to_string(), Style::default()),
-        Span::styled("█", Style::default().fg(ACCENT)),
+        Span::styled("█", Style::default().fg(accent())),
     ]);
     // A minimum width so a short command still reads as an input field.
     let width = (line.width() as u16 + 2).max(24).min(area.width);
@@ -1262,7 +1430,7 @@ fn draw_launcher_command(frame: &mut Frame, app: &App, area: Rect) {
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let popup = Rect::new(x, y, width, height);
-    frame.render_widget(Clear, popup);
+    clear(frame, popup, theme::current().pane_bg);
     let title = app.launcher_title();
     frame.render_widget(Paragraph::new(line).block(popup_block(&title)), popup);
 }
@@ -1276,7 +1444,7 @@ fn draw_centered_popup(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Li
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let popup = Rect::new(x, y, width, height);
-    frame.render_widget(Clear, popup);
+    clear(frame, popup, theme::current().pane_bg);
     frame.render_widget(Paragraph::new(lines).block(popup_block(title)), popup);
 }
 
@@ -1288,7 +1456,7 @@ fn popup_block(title: &str) -> Block<'_> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(dim())
+        .border_style(theme::current().frame())
         .title(title)
 }
 
@@ -1296,7 +1464,7 @@ fn popup_block(title: &str) -> Block<'_> {
 /// matches dispatch. Detach is listed first (it is what a stuck user needs).
 /// Every key hint renders its key in the accent, its label dim.
 fn help_lines(cfg: &Config) -> Vec<Line<'static>> {
-    let dim = Style::default().add_modifier(Modifier::DIM);
+    let dim = dim();
     let mut lines = vec![
         Line::from(format!("tutti — press {}, then:", cfg.prefix.label())),
         Line::from(String::new()),
@@ -1314,7 +1482,10 @@ fn help_lines(cfg: &Config) -> Vec<Line<'static>> {
     for pair in entries.chunks(2) {
         let mut spans = vec![Span::raw(" ")];
         for (i, (key, desc)) in pair.iter().enumerate() {
-            spans.push(Span::styled(format!(" {key}"), Style::default().fg(ACCENT)));
+            spans.push(Span::styled(
+                format!(" {key}"),
+                Style::default().fg(accent()),
+            ));
             let label = if i == 0 && pair.len() == 2 {
                 format!(" {desc:<14}")
             } else {
@@ -1357,7 +1528,7 @@ fn help_lines(cfg: &Config) -> Vec<Line<'static>> {
 /// which-key and help panels.
 fn popup_key_line(key: &str, label: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!(" {key}"), Style::default().fg(ACCENT)),
+        Span::styled(format!(" {key}"), Style::default().fg(accent())),
         Span::styled(format!(" {label} "), dim()),
     ])
 }
@@ -1379,7 +1550,7 @@ fn identity(info: &PaneInfo) -> String {
 fn border_title(info: &PaneInfo, spinner: char) -> Line<'static> {
     let mut spans = vec![Span::styled(
         identity(info),
-        Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
+        Style::default().add_modifier(Modifier::BOLD),
     )];
     if info.agent.is_some() {
         spans.push(Span::styled(" · ", dim()));
@@ -1392,9 +1563,9 @@ fn border_title(info: &PaneInfo, spinner: char) -> Line<'static> {
     }
     if let Some(code) = info.exited {
         spans.push(Span::styled(format!(" exited {code} · "), dim()));
-        spans.push(Span::styled("r", Style::default().fg(ACCENT)));
+        spans.push(Span::styled("r", Style::default().fg(accent())));
         spans.push(Span::styled(" resume · ", dim()));
-        spans.push(Span::styled("x", Style::default().fg(ACCENT)));
+        spans.push(Span::styled("x", Style::default().fg(accent())));
         spans.push(Span::styled(" close", dim()));
     }
     Line::from(spans)
@@ -1407,7 +1578,7 @@ fn pane_title_line(info: &PaneInfo, focused: bool, spinner: char) -> Line<'stati
     let marker = if focused {
         Span::styled(
             "❯ ",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
         )
     } else {
         Span::styled("  ", dim())
@@ -1441,21 +1612,24 @@ fn placeholder_title(pane: PaneId) -> PaneInfo {
 /// dim otherwise.
 fn pane_border_style(focused: bool, state: Option<AgentState>) -> Style {
     if focused {
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        Style::default().fg(accent()).add_modifier(Modifier::BOLD)
     } else if state == Some(AgentState::Blocked) {
-        Style::default().fg(Color::Red)
+        Style::default().fg(theme::current().blocked)
     } else {
-        dim()
+        theme::current().frame()
     }
 }
 
-/// Terminal-palette colours for each state — no theming layer. Blocked is the
-/// loud one: it is the pane asking for the user.
+/// The theme's colour for each state. Blocked is the loud one: it is the pane
+/// asking for the user.
 fn state_style(state: AgentState) -> Style {
+    let palette = theme::current();
     match state {
-        AgentState::Blocked => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        AgentState::Working => Style::default().fg(Color::Yellow),
-        AgentState::Done => Style::default().fg(Color::Green),
+        AgentState::Blocked => Style::default()
+            .fg(palette.blocked)
+            .add_modifier(Modifier::BOLD),
+        AgentState::Working => Style::default().fg(palette.working),
+        AgentState::Done => Style::default().fg(palette.done),
         AgentState::Idle | AgentState::Unknown => dim(),
     }
 }
@@ -1564,13 +1738,13 @@ mod tests {
         for x in 1..=5u16 {
             assert_eq!(
                 buf.cell((x, 4)).unwrap().bg,
-                SELECT_BG,
+                select_bg(),
                 "selected cell {x} carries the highlight",
             );
         }
         assert_ne!(
             buf.cell((6, 4)).unwrap().bg,
-            SELECT_BG,
+            select_bg(),
             "the cell past the selection is not highlighted",
         );
     }
@@ -1872,7 +2046,7 @@ mod tests {
         buf.content().iter().enumerate().find_map(|(i, c)| {
             let col = i as u16 % w;
             let row = i as u16 / w;
-            (c.bg == ACCENT && col < 30 && row >= 2).then_some(row)
+            (c.bg == accent() && col < 30 && row >= 2).then_some(row)
         })
     }
 
@@ -2047,7 +2221,7 @@ mod tests {
     fn pane_border_style_reflects_focus_and_blocked_attention() {
         assert_eq!(
             pane_border_style(true, Some(AgentState::Idle)).fg,
-            Some(ACCENT),
+            Some(accent()),
             "focused pane border is the accent"
         );
         assert_eq!(
@@ -2057,7 +2231,7 @@ mod tests {
         );
         assert_eq!(
             pane_border_style(true, Some(AgentState::Blocked)).fg,
-            Some(ACCENT),
+            Some(accent()),
             "focus wins over the blocked red"
         );
         assert!(
@@ -2084,7 +2258,7 @@ mod tests {
     #[test]
     fn tab_segment_marks_active_and_dims_new() {
         // The active tab is a bold accent block; everything else recedes dim.
-        assert_eq!(tab_chip_style(true).bg, Some(ACCENT));
+        assert_eq!(tab_chip_style(true).bg, Some(accent()));
         assert_eq!(tab_chip_style(true).fg, Some(Color::Black));
         assert!(tab_chip_style(true).add_modifier.contains(Modifier::BOLD));
         assert!(tab_chip_style(false).add_modifier.contains(Modifier::DIM));
@@ -2121,7 +2295,7 @@ mod tests {
         // The floating panels (which-key, help) render key letters in the
         // accent, labels dim.
         let line = popup_key_line("j/k", "move");
-        assert_eq!(line.spans[0].style.fg, Some(ACCENT), "key span is accent");
+        assert_eq!(line.spans[0].style.fg, Some(accent()), "key span is accent");
         assert_eq!(line.spans[1].style, dim(), "label span is dim");
         // The footer hint separates pairs with two plain spaces — proximity
         // groups a key with its label, no separator glyph.
@@ -2329,7 +2503,7 @@ mod tests {
         );
         // The active tab's segment is an accent block on that same row.
         let w = buf.area.width as usize;
-        let active = buf.content()[0..w].iter().any(|c| c.bg == ACCENT);
+        let active = buf.content()[0..w].iter().any(|c| c.bg == accent());
         assert!(active, "the active tab segment should be an accent block");
     }
 
@@ -2393,7 +2567,9 @@ mod tests {
         // The chip is an accent block.
         let w = buf.area.width as usize;
         assert!(
-            buf.content()[15 * w..16 * w].iter().any(|c| c.bg == ACCENT),
+            buf.content()[15 * w..16 * w]
+                .iter()
+                .any(|c| c.bg == accent()),
             "the mode chip should be an accent block"
         );
     }
@@ -2419,7 +2595,7 @@ mod tests {
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let buf = terminal.backend().buffer();
         assert!(
-            buf.content()[8 * w..9 * w].iter().all(|c| c.bg == ACCENT),
+            buf.content()[8 * w..9 * w].iter().all(|c| c.bg == accent()),
             "an info transient paints the band with the accent"
         );
     }
@@ -2443,7 +2619,7 @@ mod tests {
 
         let cells = terminal.backend().buffer().content();
         assert!(
-            cells.iter().any(|c| c.bg == SELECT_BG),
+            cells.iter().any(|c| c.bg == select_bg()),
             "the selected sidebar row should carry the ANSI selection highlight"
         );
         // The app bar is pure chrome across its full width: it must paint no
@@ -2605,6 +2781,262 @@ mod tests {
         assert!(
             text.contains("run:"),
             "the command input prompt is missing: {text:?}"
+        );
+    }
+    /// An attached app whose one workspace carries two changed files (16 and 1
+    /// lines), so the changes panel and its stat surfaces all render.
+    fn changes_app(config: Config) -> App {
+        let mut app = App::with_config(config);
+        let mut view = vec![workspace(
+            1,
+            "api",
+            Some("main"),
+            vec![tab(
+                1,
+                "1",
+                true,
+                leaf(1),
+                vec![pane(1, "zsh", None, AgentState::Idle)],
+            )],
+        )];
+        view[0].changes = Some("2 files +13 −4".into());
+        view[0].changed_files = vec![
+            tutti_core::FileStat {
+                path: "src/main.rs".into(),
+                insertions: 12,
+                deletions: 4,
+            },
+            tutti_core::FileStat {
+                path: "README.md".into(),
+                insertions: 1,
+                deletions: 0,
+            },
+        ];
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Response::Attached {
+                wire_rev: tutti_core::WIRE_REV,
+                session: "demo".into(),
+                workspaces: view,
+            })
+            .unwrap(),
+        ));
+        app
+    }
+
+    /// The row index of the first buffer row whose text contains `needle`.
+    fn row_containing(buf: &Buffer, needle: &str) -> usize {
+        (0..buf.area.height as usize)
+            .find(|r| row_text(buf, *r).contains(needle))
+            .unwrap_or_else(|| panic!("no row contains {needle:?}: {:?}", buffer_text(buf)))
+    }
+
+    /// The column at which `needle` starts on buffer row `row`.
+    fn col_of(buf: &Buffer, row: usize, needle: &str) -> usize {
+        let text = row_text(buf, row);
+        let at = text
+            .find(needle)
+            .unwrap_or_else(|| panic!("row {row} lacks {needle:?}: {text:?}"));
+        text[..at].chars().count()
+    }
+
+    /// The count of bar cells on `row` in the added and removed colours.
+    fn bar_cells(buf: &Buffer, row: usize) -> (usize, usize) {
+        let w = buf.area.width as usize;
+        let palette = theme::current();
+        let cells = &buf.content()[row * w..(row + 1) * w];
+        let count = |colour: Color| {
+            cells
+                .iter()
+                .filter(|c| c.symbol() == "█" && c.fg == colour)
+                .count()
+        };
+        (count(palette.added), count(palette.removed))
+    }
+
+    #[test]
+    fn dark_theme_lays_the_panel_and_pane_grounds() {
+        let app = changes_app(Config::parse("theme = \"dark\"\n").unwrap());
+        let mut terminal = Terminal::new(TestBackend::new(140, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let w = 140usize;
+        let cells = buf.content();
+        // The app bar, sidebar, changes panel, and footer sit on the panel shade.
+        for (row, col) in [(0, 5), (5, 2), (5, 130), (19, 5)] {
+            assert_eq!(
+                cells[row * w + col].bg,
+                theme::DARK.panel_bg.unwrap(),
+                "chrome at ({row},{col}) is on the panel shade"
+            );
+        }
+        // A pane's interior sits on the pane ground, its default text on the
+        // theme foreground.
+        assert_eq!(cells[5 * w + 60].bg, theme::DARK.pane_bg.unwrap());
+        assert_eq!(cells[5 * w + 60].fg, theme::DARK.fg.unwrap());
+        // Metadata is an explicit muted colour — the DIM attribute is the
+        // terminal theme's device.
+        assert!(
+            cells.iter().all(|c| !c.modifier.contains(Modifier::DIM)),
+            "a truecolor theme never leans on DIM"
+        );
+    }
+
+    #[test]
+    fn terminal_theme_paints_no_truecolor_ground_anywhere() {
+        let app = changes_app(Config::default());
+        let mut terminal = Terminal::new(TestBackend::new(140, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let cells = terminal.backend().buffer().content();
+        assert!(
+            cells.iter().all(|c| !matches!(c.bg, Color::Rgb(..))),
+            "the terminal theme leaves every ground to the terminal"
+        );
+        assert!(
+            cells.iter().any(|c| c.modifier.contains(Modifier::DIM)),
+            "metadata dims with the attribute so the terminal decides its shade"
+        );
+    }
+
+    #[test]
+    fn changes_panel_shows_coloured_totals_and_bars_scaled_to_the_largest_change() {
+        let app = changes_app(Config::default());
+        let mut terminal = Terminal::new(TestBackend::new(140, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let header = row_containing(buf, "changes");
+        let w = 140usize;
+        assert!(
+            row_text(buf, header).contains("2 · +13 −4"),
+            "the header carries the count and totals: {:?}",
+            row_text(buf, header)
+        );
+        // main.rs is the largest change (16 lines): a full six-cell bar, five
+        // added to one removed. README.md (1 line) still gets one added cell.
+        assert_eq!(bar_cells(buf, row_containing(buf, "main.rs")), (5, 1));
+        assert_eq!(bar_cells(buf, row_containing(buf, "README.md")), (1, 0));
+        // The exact counts wear the diff colours.
+        let main_row = row_containing(buf, "main.rs");
+        let plus = col_of(buf, main_row, "+12");
+        assert_eq!(buf.content()[main_row * w + plus].fg, theme::TERMINAL.added);
+    }
+
+    #[test]
+    fn stat_bar_keeps_both_sides_visible_and_never_empties_a_change() {
+        let widths = |spans: Vec<Span<'static>>| -> Vec<usize> {
+            spans.iter().map(|s| s.content.chars().count()).collect()
+        };
+        assert_eq!(
+            widths(stat_bar(0, 0, 10)),
+            vec![BAR_W],
+            "no change, blank bar"
+        );
+        assert_eq!(
+            widths(stat_bar(10, 0, 10)),
+            vec![6, 0, 0],
+            "all added, full"
+        );
+        assert_eq!(
+            widths(stat_bar(1, 99, 100)),
+            vec![1, 5, 0],
+            "a sliver of added still shows"
+        );
+        assert_eq!(
+            widths(stat_bar(99, 1, 100)),
+            vec![5, 1, 0],
+            "a sliver of removed still shows"
+        );
+        assert_eq!(
+            widths(stat_bar(1, 0, 100)),
+            vec![1, 0, 5],
+            "the smallest change keeps one cell"
+        );
+    }
+
+    #[test]
+    fn stat_spans_colour_polarity_and_dim_zero_counts() {
+        let spans = stat_spans("3 files +13 −0");
+        let by_text = |t: &str| spans.iter().find(|s| s.content == t).unwrap().style;
+        assert_eq!(by_text("+13").fg, Some(theme::TERMINAL.added));
+        assert!(
+            by_text("−0").add_modifier.contains(Modifier::DIM),
+            "a zero count stays dim"
+        );
+        assert!(by_text("files").add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn focused_panel_header_and_selected_row_take_the_accent() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = changes_app(Config::default());
+        let mut terminal = Terminal::new(TestBackend::new(140, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        app.sync_sizes(Rect::new(0, 0, 140, 20));
+        let buf = terminal.backend().buffer();
+        let w = 140usize;
+        let header = row_containing(buf, "changes");
+        let label = col_of(buf, header, "changes");
+        assert_ne!(
+            buf.content()[header * w + label].fg,
+            accent(),
+            "at rest the header is dim"
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::DiffFiles);
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        assert_eq!(
+            buf.content()[header * w + label].fg,
+            accent(),
+            "focus paints the header accent"
+        );
+        let selected = row_containing(buf, "main.rs");
+        let gutter = &buf.content()[selected * w + 102];
+        assert_eq!(
+            (gutter.symbol(), gutter.fg),
+            ("▎", accent()),
+            "the selected row leads with an accent gutter mark"
+        );
+        assert_eq!(gutter.bg, select_bg());
+    }
+
+    #[test]
+    fn section_header_lights_up_only_while_its_panel_is_focused() {
+        let at_rest = section_header(false, "projects", 2, 30, false);
+        assert!(at_rest.spans[1].style.add_modifier.contains(Modifier::DIM));
+        let focused = section_header(false, "projects", 2, 30, true);
+        assert_eq!(focused.spans[1].style.fg, Some(accent()));
+        assert!(focused.spans[1].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn focused_pane_title_is_bright_and_unfocused_recedes() {
+        let info = PaneInfo {
+            id: PaneId(1),
+            title: "claude".into(),
+            agent: Some("claude".into()),
+            state: AgentState::Done,
+            exited: None,
+            subagents: Vec::new(),
+        };
+        let focused = pane_title_line(&info, true, ' ');
+        assert_eq!(
+            focused.spans[0].style.fg,
+            Some(accent()),
+            "the ❯ marker is accent"
+        );
+        assert!(
+            !focused.spans[1].style.add_modifier.contains(Modifier::DIM)
+                && focused.spans[1].style.add_modifier.contains(Modifier::BOLD),
+            "the focused pane's name reads at full intensity"
+        );
+        let unfocused = pane_title_line(&info, false, ' ');
+        assert!(
+            unfocused.spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::DIM)
         );
     }
 }
