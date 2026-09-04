@@ -1925,14 +1925,13 @@ impl App {
             _ => return Vec::new(),
         };
         match kind {
-            LaunchKind::Agent(cmd) => self.launch_frames(vec![cmd]),
+            LaunchKind::Agent(cmd) | LaunchKind::Resume(cmd) => self.launch_frames(cmd),
             LaunchKind::Shell => self.launch_shell_and_close(),
             LaunchKind::Command => {
                 self.launcher_command.clear();
                 self.mode = Mode::LauncherCommand;
                 Vec::new()
             }
-            LaunchKind::Resume(cmd) => self.launch_frames(cmd),
         }
     }
 
@@ -3990,7 +3989,7 @@ mod tests {
         app.launcher = vec![LauncherRow {
             name: "claude".into(),
             role: "Claude Code".into(),
-            kind: LaunchKind::Agent("claude".into()),
+            kind: LaunchKind::Agent(vec!["claude".into()]),
             available: true,
         }];
         app.launcher_selected = 0;
@@ -4028,7 +4027,7 @@ mod tests {
         app.launcher = vec![LauncherRow {
             name: "claude".into(),
             role: "Claude Code".into(),
-            kind: LaunchKind::Agent("claude".into()),
+            kind: LaunchKind::Agent(vec!["claude".into()]),
             available: true,
         }];
         app.launcher_selected = 0;
@@ -5836,7 +5835,7 @@ mod tests {
         app.launcher = vec![LauncherRow {
             name: "claude".into(),
             role: "Claude Code".into(),
-            kind: LaunchKind::Agent("claude".into()),
+            kind: LaunchKind::Agent(vec!["claude".into()]),
             available: true,
         }];
         app.launcher_selected = 0;
@@ -6026,19 +6025,19 @@ mod tests {
             LauncherRow {
                 name: "up".into(),
                 role: "".into(),
-                kind: LaunchKind::Agent("up".into()),
+                kind: LaunchKind::Agent(vec!["up".into()]),
                 available: true,
             },
             LauncherRow {
                 name: "gone".into(),
                 role: "".into(),
-                kind: LaunchKind::Agent("gone".into()),
+                kind: LaunchKind::Agent(vec!["gone".into()]),
                 available: false,
             },
             LauncherRow {
                 name: "down".into(),
                 role: "".into(),
-                kind: LaunchKind::Agent("down".into()),
+                kind: LaunchKind::Agent(vec!["down".into()]),
                 available: true,
             },
         ];

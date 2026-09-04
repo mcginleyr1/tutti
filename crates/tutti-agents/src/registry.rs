@@ -44,6 +44,9 @@ pub struct AgentSpec {
     /// installed so the catalog doubles as a "where to get it" pointer.
     pub url: String,
     pub process_names: Vec<String>,
+    /// Argv after the binary for the launcher — empty for agents that open
+    /// on a bare run; `ori` needs `code` or it just prints its help.
+    pub launch_args: Vec<String>,
     pub blocked_patterns: Vec<String>,
     pub working_patterns: Vec<String>,
     pub done_patterns: Vec<String>,
@@ -74,6 +77,7 @@ impl AgentSpec {
             display: display.into(),
             url: url.into(),
             process_names: owned(process_names),
+            launch_args: Vec::new(),
             blocked_patterns: owned(blocked_patterns),
             working_patterns: owned(working_patterns),
             done_patterns: owned(done_patterns),
@@ -277,6 +281,28 @@ impl Default for Registry {
                     "https://github.com/aws/amazon-q-developer-cli",
                     &["q"],
                 ),
+                // Ori's bare binary is a harness launcher (`ori claude`,
+                // `ori codex`, …) — the agent it wraps is detected as itself,
+                // deeper in the tree — so the launcher runs `ori code`, its
+                // own agent. Observed live (0.13.0 in a pty): the input box
+                // reads `❯ Ask Ori anything…` when idle and `❯ Queue · ↑↓
+                // select · x delete · Enter steer · Esc` for the whole turn;
+                // the approval dialog is titled `Permission requested` with
+                // `Allow once` first. Its lowercase transcript echo,
+                // `⚠ permission requested: …`, outlives the dialog — never a
+                // Blocked marker.
+                AgentSpec {
+                    launch_args: owned(&["code"]),
+                    ..AgentSpec::new(
+                        "ori",
+                        "Ori",
+                        "https://openrouter.ai/labs/ori",
+                        &["ori"],
+                        &["Permission requested", "Allow once"],
+                        &["Enter steer", "Thinking…"],
+                        &["Ask Ori anything"],
+                    )
+                },
             ],
         }
     }
@@ -493,6 +519,24 @@ mod tests {
             None,
             "no idle glyph means no Done marker"
         );
+    }
+
+    /// Screens captured from Ori 0.13.0 driving a free model in a pty: the
+    /// input box carries the state — the steer hint for a running turn, the
+    /// placeholder once it lands — and the approval dialog outranks both.
+    #[test]
+    fn ori_screen_markers_classify_working_done_and_blocked() {
+        let spec = Registry::default().match_process("ori").unwrap().clone();
+        let working = " ❯ write a story\n ✻ Thinking…\n╭────╮\n│❯ Queue · ↑↓ select · x delete · Enter steer · Esc │\n╰────╯\n  liquid/lfm-2.5-2.6b:free  ori   ⏱ high";
+        assert_eq!(spec.classify(working), Some(Observation::Working));
+        let idle = " ⏺ ok\n   ↑ 101  ↓ 105  cache 5.6k  1.7s  61 tok/s\n╭────╮\n│❯ Ask Ori anything…   │\n╰────╯\n  liquid/lfm-2.5-2.6b:free  ori   ⏱ high  ○ 5%  Σt1.7s";
+        assert_eq!(spec.classify(idle), Some(Observation::Done));
+        let blocked = " ⏺ Thought briefly, running 1 command\n   ⎿ $ ls .\n┌────┐\n│ Permission requested │\n│ bash command: ls . │\n│  ▶ Allow once │\n│    Allow always │\n│    Reject once │\n│    Reject always │\n│ ↑/↓ choose · Enter confirm · Esc cancel │\n└────┘\n  liquid/lfm-2.5-2.6b:free  ori   ⏱ high";
+        assert_eq!(spec.classify(blocked), Some(Observation::Blocked));
+        // The answered dialog leaves a lowercase echo in the transcript that
+        // must not read as Blocked once the turn has landed.
+        let answered = " ⏺ Thought briefly, ran 1 command\n ⚠ permission requested: bash command: ls .\n ✻ Thought briefly\n ⏺ ok\n╭────╮\n│❯ Ask Ori anything…   │\n╰────╯\n  liquid/lfm-2.5-2.6b:free  ori   ⏱ high";
+        assert_eq!(spec.classify(answered), Some(Observation::Done));
     }
 
     #[test]

@@ -34,12 +34,13 @@ You need:
   [Factory Droid](https://factory.ai), [Muse
   Code](https://dev.meta.ai/docs/muse-code), [Mistral
   Vibe](https://github.com/mistralai/mistral-vibe), [Augment
-  Code](https://www.augmentcode.com), and [Amazon
-  Q](https://github.com/aws/amazon-q-developer-cli). A missing agent shows dim
+  Code](https://www.augmentcode.com), [Amazon
+  Q](https://github.com/aws/amazon-q-developer-cli), and
+  [Ori](https://openrouter.ai/labs/ori). A missing agent shows dim
   in the launcher with its link, so the picker doubles as the install list.
-  Precise blocked/working/done detection is tuned per agent — Claude Code and
-  Codex fully, Muse Code (working/done) and Mistral Vibe (blocked/working) in
-  part; the rest start from generic heuristics — see
+  Precise blocked/working/done detection is tuned per agent — Claude Code,
+  Codex, and Ori fully, Muse Code (working/done) and Mistral Vibe
+  (blocked/working) in part; the rest start from generic heuristics — see
   `crates/tutti-agents/src/registry.rs`.
 
 From a checkout of this repository:

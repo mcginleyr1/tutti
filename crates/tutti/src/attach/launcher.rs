@@ -12,8 +12,10 @@ use tutti_agents::{Registry, ResumeSession};
 /// What a launcher row runs when chosen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchKind {
-    /// Exec this agent binary directly — a `PaneRun` carrying `[name]`.
-    Agent(String),
+    /// Exec this agent — a `PaneRun` carrying its argv: the binary alone for
+    /// most (`[claude]`), plus the spec's launch args for one that needs a
+    /// subcommand to open its agent (`[ori, code]`).
+    Agent(Vec<String>),
     /// The user's login shell — today's default pane.
     Shell,
     /// Prompt for an arbitrary command line, run via `$SHELL -lc <input>`.
@@ -50,11 +52,13 @@ impl LauncherRow {
 pub fn build_rows(registry: &Registry, path: Option<&OsStr>) -> Vec<LauncherRow> {
     let agent_row = |spec: &tutti_agents::AgentSpec, available: bool| {
         let name = spec.kind.to_string();
-        let command = spec
-            .process_names
-            .first()
-            .cloned()
-            .unwrap_or_else(|| name.clone());
+        let mut argv = vec![
+            spec.process_names
+                .first()
+                .cloned()
+                .unwrap_or_else(|| name.clone()),
+        ];
+        argv.extend(spec.launch_args.iter().cloned());
         let role = if available {
             spec.display.clone()
         } else {
@@ -63,7 +67,7 @@ pub fn build_rows(registry: &Registry, path: Option<&OsStr>) -> Vec<LauncherRow>
         LauncherRow {
             name,
             role,
-            kind: LaunchKind::Agent(command),
+            kind: LaunchKind::Agent(argv),
             available,
         }
     };
@@ -240,7 +244,7 @@ mod tests {
         LauncherRow {
             name: name.into(),
             role: name.into(),
-            kind: LaunchKind::Agent(name.into()),
+            kind: LaunchKind::Agent(vec![name.into()]),
             available,
         }
     }
@@ -284,7 +288,7 @@ mod tests {
             rows[0].role, "Claude Code",
             "an installed row shows the product name"
         );
-        assert_eq!(rows[0].kind, LaunchKind::Agent("claude".into()));
+        assert_eq!(rows[0].kind, LaunchKind::Agent(vec!["claude".into()]));
         assert!(matches!(rows[1].kind, LaunchKind::Shell));
         assert!(matches!(rows[2].kind, LaunchKind::Command));
         assert!(
@@ -310,6 +314,27 @@ mod tests {
         assert!(
             rows[3..].iter().all(|r| !r.available),
             "everything after the fixed rows is the uninstalled catalog"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_spec_with_launch_args_runs_its_subcommand() {
+        let dir = temp_dir_unique();
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("ori");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        make_executable(&bin);
+        let path = std::ffi::OsString::from(&dir);
+
+        let rows = build_rows(&Registry::default(), Some(path.as_os_str()));
+        assert_eq!(rows[0].name, "ori");
+        assert_eq!(rows[0].role, "Ori");
+        assert_eq!(
+            rows[0].kind,
+            LaunchKind::Agent(vec!["ori".into(), "code".into()]),
+            "bare `ori` only prints its help; the row opens its agent"
         );
 
         std::fs::remove_dir_all(&dir).ok();
