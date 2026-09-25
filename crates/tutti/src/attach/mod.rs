@@ -50,6 +50,9 @@ pub fn run(
     conn.send(&control(&Request::Attach))
         .context("send attach request")?;
 
+    if config.theme == crate::config::Theme::Terminal {
+        theme::detect_terminal_background();
+    }
     let mut terminal = ratatui::init();
     if config.mouse {
         let _ = execute!(io::stdout(), EnableMouseCapture);

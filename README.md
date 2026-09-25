@@ -313,7 +313,10 @@ over your terminal's own background, so when your terminal flips light/dark (for
 example following the OS appearance) the chrome flips with it, live, exactly like
 the agent panes do. The only background tutti paints is the selected sidebar
 row's highlight, and that uses an ANSI palette colour (not a fixed RGB), so the
-terminal repaints it from its own scheme too. There is nothing to configure.
+terminal repaints it from its own scheme too. At attach, tutti asks the terminal
+once whether its background is light (OSC 11). If it is, the highlight uses ANSI
+7 (white) rather than ANSI 8 (bright black), which some light schemes set to
+pure black. That choice lasts until you reattach. There is nothing to configure.
 
 **Icons.** `icons` picks the sidebar glyph set. `unicode` (default) is the safe
 set every terminal renders — `●`/`○` workspace and state dots, a branch marker,

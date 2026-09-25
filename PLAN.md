@@ -10,7 +10,8 @@ system (we'll design a better one later — do not build extension points
 speculatively, but keep module boundaries clean so a plugin layer can be added
 without a rewrite). Theming was on this list until 2026-09-01: the default still
 inherits the terminal's palette live, and `theme = "dark" | "light"` are opt-in
-fixed truecolor palettes chosen in config — nothing detects the terminal (README
+fixed truecolor palettes chosen in config — the only detection is a one-shot
+light-background query at attach that picks the selection row's ANSI colour (README
 Colour; the design rules live in CLAUDE.md).
 
 ---

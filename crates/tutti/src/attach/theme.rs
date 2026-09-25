@@ -4,7 +4,9 @@
 //! flows through live and flips with it. `dark` and `light` are opt-in
 //! truecolor themes: a shaded chrome over a tinted pane ground, an explicit
 //! muted grey instead of DIM, and state/diff colours tuned to that ground. A
-//! theme is a fixed choice made in config; nothing here detects the terminal.
+//! theme is a fixed choice made in config. The one thing detected is whether
+//! the terminal's background is light, once at attach, and it only picks which
+//! ANSI colour the `terminal` theme's selection row uses.
 //!
 //! The active palette is thread-local, set for the span of one `draw` by
 //! `activate`, so every styling helper reads it without threading a parameter
@@ -12,8 +14,11 @@
 //! drops, so nothing leaks between draws or between test threads.
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use ratatui::style::{Color, Modifier, Style};
+use terminal_colorsaurus::{QueryOptions, ThemeMode};
 
 use crate::config::Theme;
 
@@ -96,6 +101,30 @@ pub static TERMINAL: Palette = Palette {
     removed: Color::Red,
 };
 
+/// `terminal` over a light background. ANSI 8 ("bright black") is a dark grey
+/// on most dark schemes but pure black on some light ones, so a light terminal
+/// takes its selection from ANSI 7 instead.
+pub static TERMINAL_LIGHT: Palette = Palette {
+    select_bg: Color::Gray,
+    ..TERMINAL
+};
+
+static LIGHT_TERMINAL: AtomicBool = AtomicBool::new(false);
+
+/// Ask the terminal once, before the TUI takes over input, whether its
+/// background is light. The answer is fixed for the attach: a later light/dark
+/// flip keeps the selection colour picked here. Terminals that don't answer
+/// are treated as dark.
+pub fn detect_terminal_background() {
+    let mut options = QueryOptions::default();
+    options.timeout = Duration::from_millis(300);
+    let light = matches!(
+        terminal_colorsaurus::theme_mode(options),
+        Ok(ThemeMode::Light)
+    );
+    LIGHT_TERMINAL.store(light, Ordering::Relaxed);
+}
+
 /// A graphite dark theme: chrome a step darker than the pane ground, soft blue
 /// accent, muted steel metadata.
 pub static DARK: Palette = Palette {
@@ -135,6 +164,7 @@ pub static LIGHT: Palette = Palette {
 /// The palette for a configured theme.
 pub fn palette(theme: Theme) -> &'static Palette {
     match theme {
+        Theme::Terminal if LIGHT_TERMINAL.load(Ordering::Relaxed) => &TERMINAL_LIGHT,
         Theme::Terminal => &TERMINAL,
         Theme::Dark => &DARK,
         Theme::Light => &LIGHT,
@@ -176,6 +206,18 @@ mod tests {
         assert_eq!(TERMINAL.ground(TERMINAL.panel_bg), Style::default());
         assert!(TERMINAL.dim().add_modifier.contains(Modifier::DIM));
         assert_eq!(TERMINAL.frame(), TERMINAL.dim());
+    }
+
+    #[test]
+    fn light_terminal_differs_only_in_a_palette_selection_colour() {
+        assert_eq!(TERMINAL_LIGHT.select_bg, Color::Gray);
+        assert_eq!(
+            Palette {
+                select_bg: TERMINAL.select_bg,
+                ..TERMINAL_LIGHT
+            },
+            TERMINAL
+        );
     }
 
     #[test]

@@ -72,7 +72,10 @@ cargo fmt --check
 - All colour goes through `attach/theme.rs` (`theme::current()`, activated
   per draw): never write a `Color::…` literal in render code outside that file.
   Three palettes: `terminal` (default), `dark`, `light` — `theme = …` in config,
-  an explicit choice; nothing detects the terminal.
+  an explicit choice. The one detection is `theme::detect_terminal_background`
+  (OSC 11 via terminal-colorsaurus, once at attach, before crossterm owns
+  input): a light terminal selects with ANSI 7 instead of ANSI 8, because some
+  light schemes (Ghostty "Primary") map ANSI 8 to pure black.
 - Dim by default; ONE accent marks the focused/active thing (focused pane frame
   and title, the focused panel's header and the rail down its edge, the `▎`
   gutter + name chip on a selected row); red/yellow/green on state dots, the working spinner, the

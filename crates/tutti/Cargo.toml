@@ -13,6 +13,7 @@ tutti-core.workspace = true
 tutti-agents.workspace = true
 ratatui.workspace = true
 vt100.workspace = true
+terminal-colorsaurus.workspace = true
 
 [dev-dependencies]
 tutti-core.workspace = true

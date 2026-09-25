@@ -23,6 +23,7 @@ vt100 = "0.16"
 anyhow = "1"
 sysinfo = "0.39"
 toml = "1"
+terminal-colorsaurus = "1"
 tutti-core = { path = "crates/tutti-core" }
 tutti-server = { path = "crates/tutti-server" }
 tutti-agents = { path = "crates/tutti-agents" }
