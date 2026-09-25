@@ -2025,11 +2025,7 @@ impl App {
                 // fresh, wherever it lands.
                 self.selection = None;
                 if let Some(pane) = self.pane_at(col, row) {
-                    self.focused = Some(pane);
-                    if matches!(self.mode, Mode::Prefix) {
-                        self.mode = Mode::Terminal;
-                        self.prefix_since = None;
-                    }
+                    let frames = self.mouse_focus(pane);
                     if let Some((pane, r, c)) = self.pane_cell_at(col, row) {
                         self.selection = Some(Selection {
                             pane,
@@ -2038,7 +2034,7 @@ impl App {
                             dragged: false,
                         });
                     }
-                    return Vec::new();
+                    return frames;
                 }
                 if self.in_sidebar(col, row) {
                     return self.sidebar_click(row);
@@ -2308,11 +2304,12 @@ impl App {
         let Some(pane) = self.pane_at(col, row) else {
             return Vec::new();
         };
-        self.focused = Some(pane);
+        let mut frames = self.mouse_focus(pane);
         if self.panes.get(&pane).is_some_and(|s| s.scroll.is_none())
             && let Some(bytes) = self.forwarded_wheel(pane, col, row, up)
         {
-            return vec![WireFrame::Input { pane, bytes }];
+            frames.push(WireFrame::Input { pane, bytes });
+            return frames;
         }
         let current = self.panes.get(&pane).and_then(|s| s.scroll).unwrap_or(0);
         let offset = if up {
@@ -2470,6 +2467,29 @@ impl App {
                 vec![control(&Request::PaneScroll { pane, offset: 0 })]
             }
             None => Vec::new(),
+        }
+    }
+
+    /// Focus `pane` from a click or wheel tick. Keys dispatch on `mode`, so the
+    /// mode follows the focus: prefix and the sidebar/changes panels hand the
+    /// keyboard back to the pane, and another pane's scrollback browse ends —
+    /// clicking the pane being browsed keeps the browse so a selection can copy
+    /// from it.
+    fn mouse_focus(&mut self, pane: PaneId) -> Vec<WireFrame> {
+        self.focused = Some(pane);
+        match self.mode {
+            Mode::Prefix => {
+                self.mode = Mode::Terminal;
+                self.prefix_since = None;
+                Vec::new()
+            }
+            Mode::Sidebar | Mode::DiffFiles => {
+                self.mode = Mode::Terminal;
+                self.status = None;
+                Vec::new()
+            }
+            Mode::Scroll(scrolled) if scrolled != pane => self.exit_scroll(scrolled),
+            _ => Vec::new(),
         }
     }
 
@@ -5373,6 +5393,48 @@ mod tests {
             "a focus click puts nothing on the clipboard"
         );
         assert!(app.selection_span(PaneId(1)).is_none());
+    }
+
+    #[test]
+    fn clicking_a_pane_hands_the_keyboard_back_from_the_panels() {
+        for panel in [Mode::Sidebar, Mode::DiffFiles] {
+            let mut app = App::new();
+            let rect = selection_fixture(&mut app, b"hello");
+            app.mode = panel;
+            let (x, y) = cell_at(rect, 0, 0);
+            app.on_mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+            assert_eq!(
+                app.mode,
+                Mode::Terminal,
+                "keys must follow the focus the click showed"
+            );
+        }
+    }
+
+    #[test]
+    fn clicking_another_pane_ends_the_scrollback_browse() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_panes());
+        app.sync_sizes(Rect::new(0, 0, 100, 24));
+        app.mode = Mode::Scroll(PaneId(1));
+        app.set_scroll(PaneId(1), Some(3));
+        let rect = app
+            .rects
+            .iter()
+            .find(|(p, _)| *p == PaneId(2))
+            .map(|(_, r)| *r)
+            .expect("pane 2 has a rect");
+        let (x, y) = cell_at(rect, 0, 0);
+        let out = app.on_mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        assert_eq!(
+            out,
+            vec![control(&Request::PaneScroll {
+                pane: PaneId(1),
+                offset: 0,
+            })]
+        );
+        assert_eq!(app.mode, Mode::Terminal);
+        assert_eq!(app.focused, Some(PaneId(2)));
     }
 
     #[test]

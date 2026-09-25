@@ -201,8 +201,13 @@ impl PtyPane {
         Ok(())
     }
 
-    /// Resize both the kernel pty and the vt100 grid.
+    /// Resize both the kernel pty and the vt100 grid. A zero dimension is
+    /// refused: `read` tiles scrollback in screen-height windows and would
+    /// never advance.
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
+        if rows == 0 || cols == 0 {
+            bail!("pane size must be at least 1x1, got {rows}x{cols}");
+        }
         self.master
             .lock()
             .expect("pty master poisoned")
@@ -766,6 +771,15 @@ mod tests {
             ),
             Ok(_) => panic!("spawn accepted a missing cwd"),
         }
+    }
+
+    #[test]
+    fn resize_refuses_a_zero_dimension() {
+        let pane = PtyPane::spawn(PtySpec::new("/bin/cat"), PaneSize::new(24, 80)).unwrap();
+        assert!(pane.resize(0, 80).is_err());
+        assert!(pane.resize(24, 0).is_err());
+        assert_eq!(pane.snapshot().rows, 24, "a refused resize leaves the grid");
+        pane.kill().unwrap();
     }
 
     /// Killing a pane must terminate the child's whole process group. A

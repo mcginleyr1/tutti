@@ -22,9 +22,13 @@ const FORK_TIMEOUT: Duration = Duration::from_secs(15);
 /// bookmark move, optional push — each of which can touch the store or network.
 const MERGE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Cap on lines returned to a client. A larger diff is truncated with a final
-/// marker so the protocol frame — and the consumer rendering it — stay bounded.
+/// Caps on a diff returned to a client, in lines and in raw bytes — one huge
+/// generated or minified line slips under any line cap. A larger diff is
+/// truncated with a final marker so the protocol frame stays under
+/// `MAX_FRAME_LEN` even after JSON escaping inflates control bytes sixfold, and
+/// the consumer rendering it stays bounded.
 const MAX_LINES: usize = 10_000;
+const MAX_BYTES: usize = 2 * 1024 * 1024;
 
 /// Walk from `dir` upward looking for a `.jj` directory. A tutti workspace may
 /// point inside a jj repo (a subdirectory of the working copy), so ancestors are
@@ -88,17 +92,23 @@ pub async fn diff(dir: &Path, stat: bool) -> Response {
         };
         return Response::Error { message };
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    Response::Content {
+        lines: clip(&output.stdout),
+    }
+}
+
+fn clip(stdout: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(&stdout[..stdout.len().min(MAX_BYTES)]);
     let mut lines: Vec<String> = text
         .lines()
         .take(MAX_LINES + 1)
         .map(str::to_string)
         .collect();
-    if lines.len() > MAX_LINES {
+    if lines.len() > MAX_LINES || stdout.len() > MAX_BYTES {
         lines.truncate(MAX_LINES);
         lines.push("… truncated".to_string());
     }
-    Response::Content { lines }
+    lines
 }
 
 /// When the jj repo behind the workspace at `dir` last recorded an operation:
@@ -589,6 +599,25 @@ mod tests {
             insertions,
             deletions,
         }
+    }
+
+    #[test]
+    fn clip_bounds_one_giant_line_below_the_frame_cap() {
+        // Worst case for JSON: every byte a control char escaped to `\u001b`.
+        let stdout = vec![0x1b; tutti_core::MAX_FRAME_LEN];
+        let lines = clip(&stdout);
+        assert_eq!(lines.last().map(String::as_str), Some("… truncated"));
+        let json = serde_json::to_vec(&Response::Content { lines }).unwrap();
+        tutti_core::Frame::Control(json).encode();
+    }
+
+    #[test]
+    fn clip_marks_only_an_oversized_diff() {
+        assert_eq!(clip(b"a\nb\n"), vec!["a", "b"]);
+        let many = "x\n".repeat(MAX_LINES + 1);
+        let lines = clip(many.as_bytes());
+        assert_eq!(lines.len(), MAX_LINES + 1);
+        assert_eq!(lines[MAX_LINES], "… truncated");
     }
 
     #[test]

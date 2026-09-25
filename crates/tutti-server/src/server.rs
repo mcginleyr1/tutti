@@ -232,12 +232,21 @@ async fn handle_conn(hub: Arc<Hub>, stream: tokio::net::UnixStream) -> Result<()
 
     let mut buf = Vec::new();
     let mut wedged = false;
-    while let Some(frame) = read_frame(&mut read_half, &mut buf).await? {
-        if handle_frame(&hub, cid, &tx, &abort, frame).is_break() {
-            wedged = true;
-            break;
+    // A read error (reset socket, malformed frame) still falls through to the
+    // cleanup: a client left registered keeps its writer task alive and
+    // defeats the ticker's nobody-attached shortcut.
+    let outcome = loop {
+        match read_frame(&mut read_half, &mut buf).await {
+            Ok(Some(frame)) => {
+                if handle_frame(&hub, cid, &tx, &abort, frame).is_break() {
+                    wedged = true;
+                    break Ok(());
+                }
+            }
+            Ok(None) => break Ok(()),
+            Err(err) => break Err(err),
         }
-    }
+    };
 
     hub.clients.lock().expect("clients poisoned").remove(&cid);
     if wedged {
@@ -248,7 +257,7 @@ async fn handle_conn(hub: Arc<Hub>, stream: tokio::net::UnixStream) -> Result<()
         drop(tx);
         let _ = writer.await;
     }
-    Ok(())
+    outcome
 }
 
 async fn writer_loop(mut half: OwnedWriteHalf, mut rx: mpsc::Receiver<Vec<u8>>) {
