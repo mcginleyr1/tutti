@@ -51,6 +51,11 @@ cargo fmt --check
   `--ignore-working-copy`. Reorder it, or drop the flag, and the VCS watch
   re-triggers on tutti's own snapshot: a working-copy scan per workspace every
   second for as long as an agent keeps editing.
+- **Every state transition goes through `publish_transition`** (server.rs),
+  followed by a refresh of the pane's workspace — on entering `Working` too. A
+  site that broadcasts `StateChanged` directly, or only refreshes on turn ends,
+  silently loses checkpoints (the first turn's baseline would be snapshotted at
+  its end and deduped away).
 
 ## Product vocabulary and rules
 

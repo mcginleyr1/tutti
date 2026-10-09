@@ -182,6 +182,15 @@ Goal: the differentiator. Tutti knows which panes are agents and what state they
    - fallback `Unknown`
    States: `Blocked` (needs input), `Working`, `Done` (finished, unseen),
    `Idle` (finished, viewed), `Unknown`. Focusing a `Done` pane transitions it to `Idle`.
+   ✅ Ranked sources: `PaneInfo.source` names what set the state, ordered Hook >
+   Program (OSC 7501) > Progress (OSC 9;4) > Screen > Activity, and a lower
+   source cannot move a pane a higher one holds (one exception: a visible
+   Blocked dialog beats a stale progress/program Working). A claim ends when its
+   source clears it, the child exits, or the detected agent changes; hook claims
+   stay sticky. Any pane may report its own state (OSC 7501 root record only, no
+   `?` probe; OSC 9;4 never surfaces as a notification) and then shows where
+   agent state does, labelled by its `app`. A non-hook pane `Working` with no
+   output and no classifier match for 30s stalls to `Unknown`.
 3. **Surfacing**: colored state badge per pane border + tab, workspace overview in
    navigate mode grouped by state (Blocked first), optional terminal bell / OSC 9
    desktop notification on `Working → Blocked/Done`.
@@ -236,7 +245,12 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    subagent rows to the pane (shown indented under the agent in the sidebar) and
    upgrades Blocked/Done detection from screen heuristics to exact hook signals
    (a hook-driven pane is skipped by the screen classifier). Display only — tutti
-   does not manage a foreign agent's subagents.
+   does not manage a foreign agent's subagents. ✅ opencode joins through a
+   JavaScript plugin (`tutti hooks opencode [--install]`, same confirm + backup
+   flow) that forwards session busy/idle/permission/error as `agent-event
+   opencode`. Open: hook install is CLI-only for both (no TUI path yet — debt
+   against the ground rule), and Codex/Gemini integrations need their specs read
+   and a live run before they land.
 7. **Conversation resume**: ✅ wave 1 — the launcher harvests resumable
    conversations for its target workspace from the agent tools' own session
    stores (read-only; each candidate verified against the working directory
@@ -251,6 +265,30 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    (open): capture `session_id` per pane from the hook payloads so a restarted
    daemon can offer to revive the exact conversation each dead agent pane was
    holding, not just the project's most recent ones.
+8. **Per-turn checkpoints**: ✅ each agent turn's end (a pane leaving Working,
+   through the single `publish_transition` funnel in server.rs) checkpoints the
+   workspace's jj `@` — the commit id the change probe's own snapshot already
+   reads (`jj log -r @ -T commit_id`), so no extra jj operation. Where the agent
+   started (on detection, or on first entering Working) is #1, so turn 1 can be
+   undone. In daemon memory, newest 50 per pane, numbered per pane and never
+   reused; not persisted across daemon restarts. Surfaces: `tutti pane
+   checkpoints | checkpoint-diff [N] [--stat] | restore <N> [--force]` and the
+   changes panel's `turns` section (enter = turn diff, `r` = confirmed
+   restore). Restores are refused mid-turn and when stale, and save the replaced
+   state first as `before restore`. Open: persist the lists (they are just
+   commit ids), and label turns from hook payloads.
+9. **Answer from the queue**: ✅ `p` (or a right-click) on a blocked sidebar row
+   opens a peek overlay of that agent's live prompt; answer keys go out as a
+   guarded `PaneSend` whose `expect` is the prompt fingerprint (FNV-1a over the
+   last 12 non-empty screen rows, one function in tutti-core shared by client
+   and server). The daemon writes only while the pane is Blocked, the
+   fingerprint still matches, and the pane has redrawn since the last guarded
+   answer — so the first answer wins and a refusal writes nothing. Scripts get
+   the same guard via `pane read --fingerprint` and `pane send --expect`.
+   Open: hook-held approvals (a hook that blocks until answered from the
+   queue), a table-driven sidebar keymap (only prefix keys are table-driven
+   today), and correlating responses so a refused answer can't cancel a pending
+   fork/merge follow-up.
 
 **Acceptance:** a script (or an agent) can: create 3 worktree workspaces, launch an
 agent in each, `wait --until done` on all three, read back each diff summary.
