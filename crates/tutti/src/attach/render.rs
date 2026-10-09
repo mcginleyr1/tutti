@@ -9,14 +9,14 @@ use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
-use tutti_core::{AgentState, PaneId, PaneInfo, SubagentInfo};
+use tutti_core::{AgentState, Checkpoint, PaneId, PaneInfo, SubagentInfo};
 
 use super::app::{App, Mode};
 use super::launcher::LauncherRow;
 use super::sidebar::{AgentRow, SidebarEntry, WorkspaceRow};
 use super::theme;
 use crate::config::{self, Config, Icons, PrefixAction};
-use crate::render::state_label;
+use crate::render::{age, state_label, unix_now};
 
 /// The accent colour of the active theme — the one thing that marks the
 /// focused or active thing. Everything else renders muted so it is
@@ -108,9 +108,11 @@ const PEEK_HINT: &[(&str, &str)] = &[
 ];
 
 /// The changed-files-panel key hint, rendered two-tone in the bottom bar.
+/// `enter` opens whichever row the cursor is on — a file's or a turn's diff.
 const DIFF_HINT: &[(&str, &str)] = &[
-    ("enter", "file diff"),
+    ("enter", "diff"),
     ("d", "full diff"),
+    ("r", "restore turn"),
     ("j/k", "move"),
     ("esc", "back"),
 ];
@@ -500,30 +502,47 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
 /// Borderless like the sidebar, on the theme's panel ground; the selection row
 /// (only while the panel is focused) uses the shared selection background.
 /// The visible window follows the selection via `App::diff_first_visible`,
-/// which click hit-testing shares.
+/// which click hit-testing shares. When the agent in view has checkpoints, a
+/// `turns` section follows the files: its newest turns, one row each, the
+/// cursor walking on into them from the last file.
 fn draw_diff_panel(frame: &mut Frame, app: &App, area: Rect) {
     if area.width < 3 || area.height < 1 {
         return;
     }
     let content_w = area.width.saturating_sub(2) as usize;
     let files = app.changed_files();
-    let focused = app.mode == Mode::DiffFiles;
+    let turns = app.shown_turns();
+    let focused = app.diff_panel_focused();
     let selected = app.diff_selected();
+    let in_turns = selected >= files.len();
     let first = app.diff_first_visible(area.height);
-    let visible = area.height.saturating_sub(1) as usize;
+    let drawn = app.diff_files_drawn(area.height);
     let max_total = files
         .iter()
         .map(|f| f.insertions + f.deletions)
         .max()
         .unwrap_or(0);
 
-    let mut lines = vec![changes_header(files, area.width, focused)];
-    for (i, file) in files.iter().enumerate().skip(first).take(visible) {
+    let mut lines = vec![changes_header(files, area.width, focused && !in_turns)];
+    for (i, file) in files.iter().enumerate().skip(first).take(drawn) {
         let sel = focused && i == selected;
         lines.push(bare_row(
             file_stat_inner(file, max_total, sel, content_w),
             sel,
         ));
+    }
+    if !turns.is_empty() {
+        let total = app
+            .turns_pane()
+            .and_then(|p| app.panes.get(&p))
+            .map_or(0, |s| s.info.checkpoints.len());
+        lines.push(Line::default());
+        lines.push(turns_header(total, area.width, focused && in_turns));
+        let now = unix_now();
+        for (j, turn) in turns.iter().enumerate() {
+            let sel = focused && selected == files.len() + j;
+            lines.push(bare_row(turn_inner(turn, now, sel, content_w), sel));
+        }
     }
     frame.render_widget(Paragraph::new(lines), area);
     if focused {
@@ -578,6 +597,47 @@ fn changes_header(files: &[tutti_core::FileStat], width: u16, focused: bool) -> 
     spans.extend(right);
     spans.push(Span::raw(" "));
     Line::from(spans)
+}
+
+/// The changes panel's `turns` section header (` turns          12 `): the
+/// bold title (accent while the cursor is in the section) and the pane's
+/// checkpoint count right-aligned, like the `changes` header above it.
+fn turns_header(count: usize, width: u16, focused: bool) -> Line<'static> {
+    let label = "turns";
+    let count = count.to_string();
+    let gap = (width as usize).saturating_sub(2 + label.len() + count.len());
+    Line::from(vec![
+        Span::styled(format!(" {label}"), header_style(focused)),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(count, dim()),
+        Span::raw(" "),
+    ])
+}
+
+/// One turn row's inner spans: `#N` at full intensity (the turn's identity, an
+/// accent chip when selected), its age and what closed it dim, and the turn's
+/// `+A −B` right-aligned in the diff colours — none for the first state
+/// recorded for a pane, which has nothing earlier to diff against.
+fn turn_inner(turn: &Checkpoint, now: u64, sel: bool, content_w: usize) -> Vec<Span<'static>> {
+    let n = format!("#{}", turn.n);
+    let stat = turn.from.as_ref().map_or_else(String::new, |_| {
+        format!("+{} −{}", turn.insertions, turn.deletions)
+    });
+    let (n_w, stat_w) = (n.chars().count(), stat.chars().count());
+    let meta: String = format!(" {} {}", age(turn.time, now), turn.label)
+        .chars()
+        .take(content_w.saturating_sub(n_w + stat_w + 1))
+        .collect();
+    let gap = content_w.saturating_sub(n_w + meta.chars().count() + stat_w);
+    let mut spans = vec![
+        name_span(&n, sel, Modifier::empty()),
+        Span::styled(meta, dim()),
+        Span::raw(" ".repeat(gap)),
+    ];
+    if !stat.is_empty() {
+        spans.extend(stat_spans(&stat));
+    }
+    pad_inner(spans, sel, content_w as u16)
 }
 
 /// The width of a changed-file row's bar, in cells.
@@ -1268,7 +1328,8 @@ fn mode_label(mode: Mode) -> Option<&'static str> {
         | Mode::ConfirmKillWorkspace(_)
         | Mode::ConfirmKillAgent(_)
         | Mode::ConfirmMerge(_)
-        | Mode::ConfirmCleanup(_) => Some("CONFIRM"),
+        | Mode::ConfirmCleanup(_)
+        | Mode::ConfirmRestore(..) => Some("CONFIRM"),
         Mode::Scroll(_) => Some("SCROLL"),
         Mode::Help => Some("HELP"),
         Mode::Sidebar => Some("SIDEBAR"),
@@ -1602,6 +1663,7 @@ fn help_lines(cfg: &Config) -> Vec<Line<'static>> {
         "move, top/end, half page",
     ));
     lines.push(popup_key_line("  enter / d", "file diff / full diff"));
+    lines.push(popup_key_line("  enter / r", "turn diff / restore to turn"));
     lines.push(popup_key_line("  h / esc", "back to the panes"));
     lines.push(Line::from(String::new()));
     lines.push(Line::from(
@@ -1692,6 +1754,7 @@ fn placeholder_title(pane: PaneId) -> PaneInfo {
         state: AgentState::Unknown,
         exited: None,
         subagents: Vec::new(),
+        checkpoints: Vec::new(),
     }
 }
 
@@ -2258,6 +2321,7 @@ mod tests {
             state: AgentState::Blocked,
             exited: None,
             subagents: Vec::new(),
+            checkpoints: Vec::new(),
         };
         assert_eq!(title_text(&info), "claude · blocked");
     }
@@ -2271,6 +2335,7 @@ mod tests {
             state: AgentState::Working,
             exited: None,
             subagents: Vec::new(),
+            checkpoints: Vec::new(),
         };
         assert_eq!(title_text(&info), "claude · ⠋ working");
     }
@@ -2284,6 +2349,7 @@ mod tests {
             state: AgentState::Unknown,
             exited: None,
             subagents: Vec::new(),
+            checkpoints: Vec::new(),
         };
         assert_eq!(title_text(&info), "zsh", "no `· unknown` suffix");
     }
@@ -2297,6 +2363,7 @@ mod tests {
             state: AgentState::Done,
             exited: Some(0),
             subagents: Vec::new(),
+            checkpoints: Vec::new(),
         };
         assert_eq!(
             title_text(&info),
@@ -3048,6 +3115,57 @@ mod tests {
     }
 
     #[test]
+    fn changes_panel_lists_the_agents_turns_newest_first_under_the_files() {
+        let mut app = changes_app(Config::default());
+        let turn = |n: u64, from: Option<&str>, label: &str| Checkpoint {
+            n,
+            commit: format!("c{n}"),
+            from: from.map(Into::into),
+            time: unix_now(),
+            label: label.into(),
+            files: 1,
+            insertions: 3,
+            deletions: 1,
+        };
+        let mut view = app.workspaces.clone();
+        view[0].tabs[0].panes[0] = pane(1, "zsh", Some("claude"), AgentState::Done);
+        view[0].tabs[0].panes[0].checkpoints =
+            vec![turn(1, None, "start"), turn(2, Some("c1"), "done")];
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&tutti_core::Event::LayoutChanged { workspaces: view }).unwrap(),
+        ));
+        use crate::attach::fixtures::{ctrl, plain};
+        app.sync_sizes(Rect::new(0, 0, 140, 20));
+        app.on_key(ctrl('b'));
+        app.on_key(plain('f'));
+        let mut terminal = Terminal::new(TestBackend::new(140, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let w = 140usize;
+
+        let header = row_containing(buf, "turns");
+        assert!(
+            header > row_containing(buf, "README.md"),
+            "turns follow the files"
+        );
+        assert!(row_text(buf, header).trim_end().ends_with('2'), "the count");
+        let newest = row_containing(buf, "#2");
+        assert_eq!(newest, header + 1, "the newest turn lists first");
+        assert!(row_text(buf, newest).contains("now done"));
+        let plus = col_of(buf, newest, "+3");
+        assert_eq!(buf.content()[newest * w + plus].fg, theme::TERMINAL.added);
+        let start = row_text(buf, row_containing(buf, "#1"));
+        assert!(
+            start.contains("start") && !start.contains("+3"),
+            "the first state has no diff to count: {start:?}"
+        );
+        assert!(
+            buffer_text(buf).contains("r restore turn"),
+            "the footer hint offers the restore key"
+        );
+    }
+
+    #[test]
     fn stat_bar_keeps_both_sides_visible_and_never_empties_a_change() {
         let widths = |spans: Vec<Span<'static>>| -> Vec<usize> {
             spans.iter().map(|s| s.content.chars().count()).collect()
@@ -3196,6 +3314,7 @@ mod tests {
             state: AgentState::Done,
             exited: None,
             subagents: Vec::new(),
+            checkpoints: Vec::new(),
         };
         let focused = pane_title_line(&info, true, ' ');
         assert_eq!(

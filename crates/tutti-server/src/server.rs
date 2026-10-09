@@ -21,8 +21,8 @@ use tokio::sync::mpsc;
 
 use tutti_agents::{ProcessTree, Registry};
 use tutti_core::{
-    AgentHookEvent, AgentKind, Direction, Event, Frame, PaneData, PaneId, Request, Response,
-    StateEvent, WorkspaceId, prompt_fingerprint,
+    AgentHookEvent, AgentKind, AgentState, Checkpoint, Direction, Event, Frame, PaneData, PaneId,
+    Request, Response, StateEvent, WorkspaceId, prompt_fingerprint,
 };
 
 use crate::jj;
@@ -341,6 +341,10 @@ fn handle_frame(
             }) => workspace_fork(hub, cid, tx, id, name, revision, dest),
             Ok(Request::WorkspaceMerge { id, push }) => workspace_merge(hub, cid, tx, id, push),
             Ok(Request::WorkspaceUpdate { id }) => workspace_update(hub, tx, id),
+            Ok(Request::PaneCheckpointDiff { pane, n, stat }) => {
+                checkpoint_diff(hub, tx, pane, n, stat)
+            }
+            Ok(Request::PaneRestore { pane, n, force }) => pane_restore(hub, tx, pane, n, force),
             Ok(request) => {
                 let response = dispatch(hub, request);
                 send_reply(hub, cid, tx, encode_json(&response))
@@ -511,6 +515,15 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             delta,
         } => resize_split(hub, pane, direction, delta),
         Request::AgentEvent { pane, event } => agent_event(hub, pane, event),
+        Request::PaneCheckpoints { pane } => {
+            let checkpoints = hub.session().turns(pane).map(|t| t.entries().to_vec());
+            match checkpoints {
+                Some(checkpoints) => Response::Checkpoints { checkpoints },
+                None => Response::Error {
+                    message: format!("no pane {pane}"),
+                },
+            }
+        }
         // Handled in `handle_frame`; unreachable here.
         Request::Attach
         | Request::Detach
@@ -519,7 +532,9 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
         | Request::WorkspaceKill { .. }
         | Request::WorkspaceFork { .. }
         | Request::WorkspaceMerge { .. }
-        | Request::WorkspaceUpdate { .. } => Response::Ok,
+        | Request::WorkspaceUpdate { .. }
+        | Request::PaneCheckpointDiff { .. }
+        | Request::PaneRestore { .. } => Response::Ok,
     }
 }
 
@@ -553,18 +568,32 @@ fn focus_pane(hub: &Arc<Hub>, pane: PaneId) -> Response {
     let to = from.apply(StateEvent::Focused);
     session.set_pane_state(pane, to);
     drop(session);
-    if from != to {
-        broadcast_event(hub, Event::StateChanged { pane, from, to });
-    }
+    publish_transition(hub, pane, from, to);
     Response::Ok
+}
+
+/// Publish one pane's state transition — the single funnel every transition
+/// source goes through, so each one gets checkpoints for free: broadcast
+/// `StateChanged` and note the turn edge on the pane (leaving `Working` ends a
+/// turn; entering it with nothing recorded takes the baseline). The caller then
+/// refreshes the pane's workspace (batched per pass where it can): that probe's
+/// snapshot of `@` is what gets recorded. A no-op when `from == to`.
+fn publish_transition(hub: &Hub, pane: PaneId, from: AgentState, to: AgentState) {
+    if from == to {
+        return;
+    }
+    hub.session().note_transition(pane, from, to);
+    broadcast_event(hub, Event::StateChanged { pane, from, to });
 }
 
 /// Ingest a Claude Code hook event for `pane`: fold it onto the pane's exact
 /// state and subagent list, then broadcast what moved. A subagent-list change
 /// broadcasts the fresh view (`LayoutChanged`); a state move broadcasts
 /// `StateChanged` so a Blocked/Done still rings the client bell. Both can fire.
-/// An unknown pane is a silent `Ok` — the hook must never fail on tutti's side.
-/// The session guard is dropped before any broadcast (which re-locks `clients`).
+/// A state move also refreshes the workspace's changes, which records the
+/// turn's checkpoint. An unknown pane is a silent `Ok` — the hook must never
+/// fail on tutti's side. The session guard is dropped before any broadcast
+/// (which re-locks `clients`).
 fn agent_event(hub: &Arc<Hub>, pane: PaneId, event: AgentHookEvent) -> Response {
     let mut session = hub.session();
     let Some(outcome) = session.apply_agent_event(pane, event) else {
@@ -576,7 +605,8 @@ fn agent_event(hub: &Arc<Hub>, pane: PaneId, event: AgentHookEvent) -> Response 
         broadcast_event(hub, Event::LayoutChanged { workspaces: view });
     }
     if let Some((from, to)) = outcome.transition {
-        broadcast_event(hub, Event::StateChanged { pane, from, to });
+        publish_transition(hub, pane, from, to);
+        refresh_pane_workspace(hub, pane);
     }
     Response::Ok
 }
@@ -960,6 +990,144 @@ fn workspace_update(
     ControlFlow::Continue(())
 }
 
+/// Resolve `pane`'s checkpoint `n` (its newest when `None`) with what acting on
+/// it needs: the pane's workspace, that workspace's directory, and the pane's
+/// state. The error names whatever is missing.
+fn find_checkpoint(
+    hub: &Hub,
+    pane: PaneId,
+    n: Option<u64>,
+) -> Result<(WorkspaceId, PathBuf, AgentState, Checkpoint), String> {
+    let mut session = hub.session();
+    let gone = || format!("no pane {pane}");
+    let state = session.pane_state(pane).ok_or_else(gone)?;
+    let workspace = session.workspace_of_pane(pane).ok_or_else(gone)?;
+    let dir = session.workspace_dir(workspace).ok_or_else(gone)?;
+    let turns = session.turns(pane).ok_or_else(gone)?;
+    let checkpoint = match n {
+        Some(n) => turns.get(n),
+        None => turns.entries().last(),
+    };
+    let checkpoint = checkpoint.cloned().ok_or_else(|| match n {
+        Some(n) => format!("pane {pane} has no checkpoint #{n}"),
+        None => format!("pane {pane} has no checkpoints yet"),
+    })?;
+    Ok((workspace, dir, state, checkpoint))
+}
+
+/// Serve one checkpoint's turn diff, `from..commit`, on a spawned task like
+/// `workspace_diff`. The pane's first recorded state has nothing earlier to
+/// diff against and answers Error saying so.
+fn checkpoint_diff(
+    hub: &Arc<Hub>,
+    tx: &mpsc::Sender<Vec<u8>>,
+    pane: PaneId,
+    n: Option<u64>,
+    stat: bool,
+) -> ControlFlow<()> {
+    let target = find_checkpoint(hub, pane, n);
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let response = match target {
+            Ok((
+                _,
+                dir,
+                _,
+                Checkpoint {
+                    from: Some(from),
+                    commit,
+                    ..
+                },
+            )) => jj::diff_between(&dir, &from, &commit, stat).await,
+            Ok((_, _, _, checkpoint)) => Response::Error {
+                message: format!(
+                    "#{} is the first state recorded for pane {pane} — nothing earlier to diff",
+                    checkpoint.n
+                ),
+            },
+            Err(message) => Response::Error { message },
+        };
+        let _ = tx.send(encode_json(&response)).await;
+    });
+    ControlFlow::Continue(())
+}
+
+/// Restore `pane`'s workspace to checkpoint `n`. Refused while the pane is
+/// working or blocked — its agent is mid-turn and would write straight over the
+/// restore — unless `force`. The jj side runs on a spawned task inside the VCS
+/// watch's in-flight window, so its snapshot and restore (operations tutti
+/// itself made) never read as outside work; the refresh it ends with re-marks
+/// the repo behind them and rebroadcasts the stat.
+fn pane_restore(
+    hub: &Arc<Hub>,
+    tx: &mpsc::Sender<Vec<u8>>,
+    pane: PaneId,
+    n: u64,
+    force: bool,
+) -> ControlFlow<()> {
+    let target = find_checkpoint(hub, pane, Some(n)).and_then(|(workspace, dir, state, c)| {
+        if !force && matches!(state, AgentState::Working | AgentState::Blocked) {
+            let state = format!("{state:?}").to_lowercase();
+            return Err(format!(
+                "pane {pane} is {state} — restore once its turn ends, or force it"
+            ));
+        }
+        Ok((workspace, dir, c.commit))
+    });
+    if let Ok((workspace, ..)) = &target {
+        hub.vcs().entry(*workspace).or_default().in_flight += 1;
+    }
+    let hub = Arc::clone(hub);
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let response = match target {
+            Ok((workspace, dir, commit)) => {
+                let response = restore_to(&hub, &dir, pane, n, &commit).await;
+                refresh_changes(&hub, workspace);
+                {
+                    let mut vcs = hub.vcs();
+                    let entry = vcs.entry(workspace).or_default();
+                    entry.in_flight = entry.in_flight.saturating_sub(1);
+                }
+                response
+            }
+            Err(message) => Response::Error { message },
+        };
+        let _ = tx.send(encode_json(&response)).await;
+    });
+    ControlFlow::Continue(())
+}
+
+/// The jj half of a restore: snapshot `@` (refusing a stale working copy), save
+/// it as a `before restore` checkpoint — so the restore is itself undoable from
+/// the same list — unless nothing changed since the pane's head, restore
+/// checkpoint `n`'s `commit`, and point the pane's next turn at the result.
+async fn restore_to(hub: &Hub, dir: &Path, pane: PaneId, n: u64, commit: &str) -> Response {
+    let (stale, before) = jj::snapshot_head(dir).await;
+    if stale {
+        return Response::Error {
+            message: "the workspace is stale — update it before restoring".into(),
+        };
+    }
+    let Some(before) = before else {
+        return Response::Error {
+            message: "jj could not snapshot the working copy".into(),
+        };
+    };
+    let saved = record_checkpoint(hub, dir, pane, &before, "before restore").await;
+    match jj::restore(dir, commit).await {
+        Ok(after) => {
+            let mut session = hub.session();
+            if let Some(turns) = session.turns(pane) {
+                turns.set_head(after);
+            }
+            drop(session);
+            Response::Restored { n, saved }
+        }
+        Err(message) => Response::Error { message },
+    }
+}
+
 fn spawn_reaper(hub: &Arc<Hub>, pane: PaneId, pty: Arc<PtyPane>) {
     let hub = Arc::clone(hub);
     tokio::spawn(async move {
@@ -985,9 +1153,7 @@ fn spawn_reaper(hub: &Arc<Hub>, pane: PaneId, pty: Arc<PtyPane>) {
         }
         let transition = hub.session().mark_exited(pane, code);
         if let Some((from, to)) = transition {
-            if from != to {
-                broadcast_event(&hub, Event::StateChanged { pane, from, to });
-            }
+            publish_transition(&hub, pane, from, to);
             broadcast_event(&hub, Event::PaneExited { pane, code });
             // A finished agent likely touched files; refresh its workspace stat.
             refresh_pane_workspace(&hub, pane);
@@ -1003,18 +1169,36 @@ fn spawn_reaper(hub: &Arc<Hub>, pane: PaneId, pty: Arc<PtyPane>) {
 /// mark lands in the VCS watch's book behind it, so the watch never re-triggers
 /// on the snapshot the probe itself took. Marks only move forward: two probes
 /// overlapping cannot roll one back.
+///
+/// The probe is also the checkpoint recorder: the turn edges the workspace's
+/// panes noted are drained *before* it spawns, so its snapshot of `@` is
+/// guaranteed to postdate them, and each is recorded against that commit.
 fn refresh_changes(hub: &Arc<Hub>, workspace: WorkspaceId) {
-    let Some(dir) = hub.session().workspace_dir(workspace) else {
-        return;
+    let (dir, turns) = {
+        let mut session = hub.session();
+        let Some(dir) = session.workspace_dir(workspace) else {
+            return;
+        };
+        (dir, session.take_turns(workspace))
     };
     hub.vcs().entry(workspace).or_default().in_flight += 1;
     let hub = Arc::clone(hub);
     tokio::spawn(async move {
         let probe = jj::probe(&dir).await;
+        let mut recorded = false;
+        if let Some(head) = &probe.head {
+            for (pane, labels) in turns {
+                for label in labels {
+                    recorded |= record_checkpoint(&hub, &dir, pane, head, &label)
+                        .await
+                        .is_some();
+                }
+            }
+        }
         let mut session = hub.session();
         let stat_moved = session.set_changes(workspace, probe.changes, probe.files);
         let stale_moved = session.set_stale(workspace, probe.stale);
-        let view = (stat_moved || stale_moved).then(|| session.view());
+        let view = (stat_moved || stale_moved || recorded).then(|| session.view());
         drop(session);
         {
             let mut vcs = hub.vcs();
@@ -1036,6 +1220,38 @@ fn refresh_pane_workspace(hub: &Arc<Hub>, pane: PaneId) {
     if let Some(workspace) = workspace {
         refresh_changes(hub, workspace);
     }
+}
+
+/// Record `commit` — an `@` the caller just snapshotted in `dir` — as `pane`'s
+/// next checkpoint, its stat taken over the turn (`head..commit`) once, here.
+/// `None` when nothing was recorded: the pane is gone, `@` has not moved since
+/// its head, the turn's diff is empty (a `jj new` moves `@` without changing a
+/// file), or jj failed. The session lock is never held across the jj call;
+/// `Turns::record` re-checks the head it diffed from instead.
+async fn record_checkpoint(
+    hub: &Hub,
+    dir: &Path,
+    pane: PaneId,
+    commit: &str,
+    label: &str,
+) -> Option<u64> {
+    let from = hub.session().turns(pane)?.head();
+    if from.as_deref() == Some(commit) {
+        return None;
+    }
+    let files = match &from {
+        Some(from) => jj::files_between(dir, from, commit).await?,
+        None => Vec::new(),
+    };
+    if from.is_some() && files.is_empty() {
+        return None;
+    }
+    let time = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    hub.session()
+        .turns(pane)?
+        .record(from, commit, label, time, &files)
 }
 
 /// One pass of the VCS watch: a workspace whose jj repo recorded an operation
@@ -1200,7 +1416,8 @@ fn broadcast_tick(hub: &Hub) {
 
 /// One agent-detection pass: snapshot the process tree, walk each live pane's
 /// child subtree, and record the matched agent kind. A change to any pane's
-/// agent broadcasts the fresh view so clients relabel their badges.
+/// agent broadcasts the fresh view so clients relabel their badges, and an
+/// agent appearing refreshes its workspace so where it started is checkpointed.
 async fn detect_pass(hub: &Arc<Hub>) {
     let panes = hub.session().live_panes();
     if panes.is_empty() {
@@ -1221,13 +1438,23 @@ async fn detect_pass(hub: &Arc<Hub>) {
 
     let mut session = hub.session();
     let mut changed = false;
+    let mut started: HashSet<WorkspaceId> = HashSet::new();
     for (pane, agent) in detected {
-        changed |= session.set_agent(pane, agent);
+        let appeared = agent.is_some();
+        if session.set_agent(pane, agent) {
+            changed = true;
+            if appeared {
+                started.extend(session.workspace_of_pane(pane));
+            }
+        }
     }
-    if changed {
-        let view = session.view();
-        drop(session);
+    let view = changed.then(|| session.view());
+    drop(session);
+    if let Some(view) = view {
         broadcast_event(hub, Event::LayoutChanged { workspaces: view });
+    }
+    for workspace in started {
+        refresh_changes(hub, workspace);
     }
 }
 
@@ -1300,7 +1527,7 @@ fn classify_pass(hub: &Arc<Hub>, last_gen: &mut HashMap<PaneId, u64>) {
     // one workspace triggers a single jj refresh, not one per pane.
     let mut workspaces: HashSet<WorkspaceId> = HashSet::new();
     for (pane, from, to) in changes {
-        broadcast_event(hub, Event::StateChanged { pane, from, to });
+        publish_transition(hub, pane, from, to);
         let workspace = hub.session().workspace_of_pane(pane);
         if let Some(workspace) = workspace {
             workspaces.insert(workspace);

@@ -496,8 +496,8 @@ in green/red and a six-cell bar scaled to the largest change in the list
 numbers do. The header carries the file count and the coloured totals. Always
 on and refreshed as agents work and on every jj operation in the workspace
 (same probe as the sidebar stat, so the two never disagree); it disappears
-when the workspace is clean, on narrow
-terminals, or with `diff_panel = "off"`.
+when the workspace is clean and the pane in view has no turns to list (see
+below), on narrow terminals, or with `diff_panel = "off"`.
 
 `Ctrl+B f` focuses it — or `Ctrl+L` from the rightmost pane, the way `Ctrl+H`
 steps into the sidebar — and while it holds the keys an accent rail runs down
@@ -512,6 +512,39 @@ row jumps straight to that file's diff. Like every diff surface, it answers
 changed that hasn't landed on trunk" — the delta since the fork point from
 `main` (else `master`/`trunk`), so a workspace that fell behind an advanced
 trunk never shows trunk's own progress as noise.
+
+### Turns: review and undo one agent turn
+
+Every time an agent's turn ends — its pane leaves **working** for done or
+blocked — tutti records a **checkpoint**: the commit id of the workspace's jj
+`@` right then. jj keeps a superseded `@` addressable by id, so one turn can be
+diffed and restored long after later edits replace it. The snapshot is the one
+tutti's change probe already takes (no extra jj operation per turn), and a turn
+that changed nothing records none. Where the agent **started** is checkpointed
+too — when tutti first detects the agent, or when the pane first enters working
+— so turn 1 has a "before" to diff and restore to.
+
+When the pane in view has checkpoints, the changes panel grows a `turns`
+section under the files: the newest five, `#N age label +A −B` (label = what
+closed the turn: `done`, `blocked`, `start`, `before restore`). The cursor walks
+from the last file on into the turns; `Enter` on a turn pages **that turn's
+diff** (from the checkpoint before it) in an ephemeral pager pane, and `r` asks
+`restore the working copy to #N? y/N`. A restore rewrites the workspace's
+working copy to the turn's state (`jj restore --from <checkpoint>`): it is
+refused while the agent is working or blocked (the agent would write straight
+over it) and in a stale workspace, and refusals land in the notification band.
+Before restoring, tutti saves the current state as a `before restore`
+checkpoint (when anything changed since the last one), so the restore is itself
+undoable from the same list — and jj's op log (`jj op log` / `jj undo`) keeps
+every restore reversible regardless.
+
+Known limits: checkpoints live in the daemon's memory (newest 50 per pane) and
+are **not persisted** — a restarted daemon starts every pane's list empty.
+Several agents in one workspace share a working copy, so a pane's turn diff
+includes anything else that changed in that window (another agent's edits, your
+own). A restore rewrites the working copy only — work an agent committed stays
+in history, with `@` carrying the reverting change. Workspaces outside jj get
+no checkpoints.
 
 ### Notifications
 
@@ -655,6 +688,9 @@ tutti pane split <pane> right|down
 tutti pane list | kill | rename | focus <pane>
 tutti pane send <pane> --text <s> | --keys <s> [--expect <fp>]   # --expect: answer a blocked agent, refused if its prompt moved on
 tutti pane read <pane> [--lines N] [--unwrapped] | --fingerprint # --fingerprint: the prompt fingerprint --expect takes
+tutti pane checkpoints <pane>        # the pane's per-turn checkpoints, newest first (n, age, label, stat, commit)
+tutti pane checkpoint-diff <pane> [N] [--stat]  # one turn's diff (default: the newest)
+tutti pane restore <pane> <N> [--force]         # restore the working copy to turn N (--force mid-turn)
 tutti hooks claude [--raw]           # print the Claude Code hooks snippet to wire agent-event
 tutti agent-event claude             # forward a Claude Code hook event (JSON on stdin) — used by hooks
 tutti [attach]                       # bare `tutti` attaches; a fresh session asks where to start

@@ -14,6 +14,7 @@ use tutti_core::{
     WorkspaceView, prompt_fingerprint,
 };
 
+use crate::checkpoints::Turns;
 use crate::pty::{PaneSize, PtyPane, PtySpec};
 
 /// The most subagent rows kept per pane before the oldest is dropped, bounding
@@ -75,6 +76,8 @@ struct PaneSlot {
     /// the pane draws past it, the agent has not visibly taken that answer, and
     /// its prompt — fingerprint unchanged — must not be answered twice.
     answered: Option<u64>,
+    /// The pane's per-turn checkpoints, overlaid onto its `PaneInfo` in views.
+    turns: Turns,
 }
 
 #[derive(Default)]
@@ -590,14 +593,49 @@ impl Session {
     }
 
     /// Record the agent kind detected for a pane. Returns whether it changed.
+    /// An agent appearing notes its start as a checkpoint for the caller's next
+    /// change probe — detection lands well before the agent's first edit.
     pub fn set_agent(&mut self, pane: PaneId, agent: Option<AgentKind>) -> bool {
         match self.panes.get_mut(&pane) {
             Some(slot) if slot.meta.agent != agent => {
+                if agent.is_some() {
+                    slot.turns.note_start();
+                }
                 slot.meta.agent = agent;
                 true
             }
             _ => false,
         }
+    }
+
+    /// Note a pane's state transition on its checkpoint list (see
+    /// `Turns::note_transition`); its workspace's next change probe records it.
+    pub fn note_transition(&mut self, pane: PaneId, from: AgentState, to: AgentState) {
+        if let Some(slot) = self.panes.get_mut(&pane) {
+            slot.turns.note_transition(from, to);
+        }
+    }
+
+    /// Drain what every pane of `workspace` noted since the last probe: the
+    /// checkpoint labels the probe about to snapshot must record, per pane.
+    pub fn take_turns(&mut self, workspace: WorkspaceId) -> Vec<(PaneId, Vec<String>)> {
+        let tabs: Vec<TabId> = self
+            .workspaces
+            .iter()
+            .filter(|w| w.id == workspace)
+            .flat_map(|w| w.tabs.iter().map(|t| t.id))
+            .collect();
+        self.panes
+            .iter_mut()
+            .filter(|(_, slot)| tabs.contains(&slot.tab))
+            .map(|(id, slot)| (*id, slot.turns.take_pending()))
+            .filter(|(_, labels)| !labels.is_empty())
+            .collect()
+    }
+
+    /// A pane's checkpoint list, `None` for an unknown pane.
+    pub fn turns(&mut self, pane: PaneId) -> Option<&mut Turns> {
+        self.panes.get_mut(&pane).map(|slot| &mut slot.turns)
     }
 
     pub fn pane_state(&self, pane: PaneId) -> Option<AgentState> {
@@ -767,12 +805,14 @@ impl Session {
                     state: AgentState::default(),
                     exited: None,
                     subagents: Vec::new(),
+                    checkpoints: Vec::new(),
                 },
                 pty,
                 tab,
                 ephemeral,
                 hook_seen: false,
                 answered: None,
+                turns: Turns::default(),
             },
         );
         Ok(id)
@@ -804,7 +844,10 @@ fn stop_subagent(subs: &mut [SubagentInfo], id: &str) -> bool {
 }
 
 fn pane_info(slot: &PaneSlot) -> PaneInfo {
-    slot.meta.clone()
+    PaneInfo {
+        checkpoints: slot.turns.entries().to_vec(),
+        ..slot.meta.clone()
+    }
 }
 
 fn pane_title(program: &str) -> String {

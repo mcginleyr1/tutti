@@ -1,4 +1,4 @@
-use tutti_core::{AgentState, PaneInfo, TabInfo, WorkspaceInfo};
+use tutti_core::{AgentState, Checkpoint, PaneInfo, TabInfo, WorkspaceInfo};
 
 pub fn workspaces(items: &[WorkspaceInfo]) -> String {
     let rows: Vec<Vec<String>> = items
@@ -44,6 +44,53 @@ pub fn panes(items: &[PaneInfo]) -> String {
         })
         .collect();
     table(&["ID", "TITLE", "AGENT", "STATE", "EXIT"], &rows)
+}
+
+/// A pane's checkpoints, newest first: number, age, what closed the turn, the
+/// turn's stat, and the short commit id (usable anywhere jj takes a revision).
+pub fn checkpoints(items: &[Checkpoint], now: u64) -> String {
+    let rows: Vec<Vec<String>> = items
+        .iter()
+        .rev()
+        .map(|c| {
+            vec![
+                format!("#{}", c.n),
+                age(c.time, now),
+                c.label.clone(),
+                turn_stat(c),
+                c.commit.chars().take(12).collect(),
+            ]
+        })
+        .collect();
+    table(&["N", "AGE", "LABEL", "STAT", "COMMIT"], &rows)
+}
+
+/// A checkpoint's turn stat (`2 files +14 −3`), or `-` for the first state
+/// recorded for a pane, which has nothing earlier to diff against.
+fn turn_stat(c: &Checkpoint) -> String {
+    if c.from.is_none() {
+        return "-".into();
+    }
+    let unit = if c.files == 1 { "file" } else { "files" };
+    format!("{} {unit} +{} −{}", c.files, c.insertions, c.deletions)
+}
+
+/// A compact age from `then` to `now`, both unix seconds: `now`, `Nm`, `Nh`,
+/// or `Nd`.
+pub(crate) fn age(then: u64, now: u64) -> String {
+    match now.saturating_sub(then) {
+        0..=59 => "now".into(),
+        secs @ 60..=3599 => format!("{}m", secs / 60),
+        secs @ 3600..=86_399 => format!("{}h", secs / 3600),
+        secs => format!("{}d", secs / 86_400),
+    }
+}
+
+/// The current time in unix seconds, the clock checkpoint ages read against.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 pub(crate) fn state_label(state: AgentState) -> &'static str {
@@ -127,11 +174,56 @@ mod tests {
             state: AgentState::Idle,
             exited: None,
             subagents: Vec::new(),
+            checkpoints: Vec::new(),
         }]);
         assert_eq!(
             rendered,
             "ID  TITLE  AGENT  STATE  EXIT\n\
              3   shell  -      idle   -\n"
+        );
+    }
+
+    #[test]
+    fn checkpoint_table_lists_newest_first_with_age_and_stat() {
+        let start = Checkpoint {
+            n: 1,
+            commit: "da7330dd4aa56869ad23109aba788bb16deb53af".into(),
+            from: None,
+            time: 1_000,
+            label: "start".into(),
+            files: 0,
+            insertions: 0,
+            deletions: 0,
+        };
+        let turn = Checkpoint {
+            n: 2,
+            commit: "0fe66d0872aa60dad12f02a7c49e1d220a67229d".into(),
+            from: Some(start.commit.clone()),
+            time: 1_000 + 3 * 3600,
+            label: "done".into(),
+            files: 1,
+            insertions: 2,
+            deletions: 1,
+        };
+        assert_eq!(
+            checkpoints(&[start, turn], 1_000 + 3 * 3600 + 30),
+            "N   AGE  LABEL  STAT          COMMIT\n\
+             #2  now  done   1 file +2 −1  0fe66d0872aa\n\
+             #1  3h   start  -             da7330dd4aa5\n"
+        );
+    }
+
+    #[test]
+    fn age_buckets_into_minutes_hours_and_days() {
+        assert_eq!(age(100, 159), "now");
+        assert_eq!(age(100, 160), "1m");
+        assert_eq!(age(0, 3599), "59m");
+        assert_eq!(age(0, 3600), "1h");
+        assert_eq!(age(0, 2 * 86_400), "2d");
+        assert_eq!(
+            age(500, 100),
+            "now",
+            "a clock that stepped back reads as now"
         );
     }
 

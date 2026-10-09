@@ -15,7 +15,8 @@ use tutti_core::{DIFF_RANGE, FileStat, Response};
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A longer cap for `jj workspace add`: forking materializes a whole working
-/// copy on disk, so it needs more headroom than a read-only probe.
+/// copy on disk, so it needs more headroom than a read-only probe. A checkpoint
+/// restore rewrites the checkout the same way and shares it.
 const FORK_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Cap on each `jj` invocation in the merge sequence — rebase, conflict probe,
@@ -80,6 +81,31 @@ pub async fn diff(dir: &Path, stat: bool) -> Response {
     }
     let mut cmd = base_command(dir, stat);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    content(cmd).await
+}
+
+/// Serve one turn's diff, `from..to`, as a protocol `Response` (`--stat` for
+/// the summary), capped like `diff`. Reads commits only
+/// (`--ignore-working-copy`), so it records no operation.
+pub async fn diff_between(dir: &Path, from: &str, to: &str, stat: bool) -> Response {
+    let mut args = vec![
+        "--ignore-working-copy",
+        "diff",
+        "--color=never",
+        "--from",
+        from,
+        "--to",
+        to,
+    ];
+    if stat {
+        args.push("--stat");
+    }
+    content(jj_cmd(dir, &args)).await
+}
+
+/// Run a jj diff command and shape it into a protocol `Response`: its clipped
+/// stdout, or its stderr (or a spawn/timeout error) as an Error.
+async fn content(cmd: Command) -> Response {
     let output = match run(cmd, TIMEOUT).await {
         Ok(output) => output,
         Err(message) => return Response::Error { message },
@@ -134,28 +160,31 @@ pub fn op_heads_modified(dir: &Path) -> Option<SystemTime> {
 
 /// What one probe of a workspace learned, for the sidebar and changes panel:
 /// whether its working copy is stale, the op-heads mark the VCS watch measures
-/// from, and its change summary against trunk.
+/// from, the commit id `@` held at the snapshot (what a turn ending now
+/// checkpoints), and its change summary against trunk.
 pub struct Probe {
     pub stale: bool,
     pub mark: Option<SystemTime>,
+    pub head: Option<String>,
     pub changes: Option<String>,
     pub files: Vec<FileStat>,
 }
 
-/// Probe the workspace at `dir`. The order is load-bearing: the stale check
-/// first (its `jj log -r @` snapshots the working copy — the one operation
-/// tutti itself records), then the op-heads mark, then the diff over that
-/// snapshot without taking another. So the mark covers everything the probe
-/// caused, and a watch comparing against it sees only operations that came
-/// afterwards — from a shell, an agent, or another workspace — never tutti's
-/// own.
+/// Probe the workspace at `dir`. The order is load-bearing: the snapshot first
+/// (its `jj log -r @` snapshots the working copy — the one operation tutti
+/// itself records — and reads back the stale flag and `@`'s commit id), then
+/// the op-heads mark, then the diff over that snapshot without taking another.
+/// So the mark covers everything the probe caused, and a watch comparing
+/// against it sees only operations that came afterwards — from a shell, an
+/// agent, or another workspace — never tutti's own.
 pub async fn probe(dir: &Path) -> Probe {
-    let stale = is_stale(dir).await;
+    let (stale, head) = snapshot_head(dir).await;
     let mark = op_heads_modified(dir);
     let (changes, files) = change_summary(dir).await;
     Probe {
         stale,
         mark,
+        head,
         changes,
         files,
     }
@@ -196,16 +225,17 @@ async fn change_summary(dir: &Path) -> (Option<String>, Vec<FileStat>) {
     (summary_of(&files), files)
 }
 
-/// Whether the jj workspace at `dir` has a stale working copy — its `@` was
-/// rewritten from another workspace, so it needs `jj workspace update-stale`.
-/// Probes with `jj log -r @`, which snapshots the working copy (the operation
-/// that surfaces staleness) and prints a `stale` warning to stderr when it is.
-/// A non-repo or any spawn failure reads as not-stale, so the sidebar stays
-/// quiet. `--ignore-working-copy` is deliberately *not* passed: it would skip
-/// the snapshot and hide the very condition being probed.
-async fn is_stale(dir: &Path) -> bool {
+/// Snapshot the jj workspace at `dir` and read back `@`: whether its working
+/// copy is stale — its `@` was rewritten from another workspace, so it needs
+/// `jj workspace update-stale` — and the commit id `@` names after the
+/// snapshot. `jj log -r @` snapshots the working copy (the operation that
+/// surfaces staleness) and prints a `stale` warning to stderr when it is. A
+/// non-repo or any spawn failure reads as not-stale with no commit, so the
+/// sidebar stays quiet. `--ignore-working-copy` is deliberately *not* passed:
+/// it would skip the snapshot and hide the very condition being probed.
+pub async fn snapshot_head(dir: &Path) -> (bool, Option<String>) {
     if !is_workspace(dir) {
-        return false;
+        return (false, None);
     }
     let mut cmd = Command::new("jj");
     cmd.arg("--no-pager")
@@ -214,16 +244,58 @@ async fn is_stale(dir: &Path) -> bool {
         .arg("@")
         .arg("--no-graph")
         .arg("-T")
-        .arg("")
+        .arg("commit_id")
         .current_dir(dir)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     match run(cmd, TIMEOUT).await {
-        Ok(output) => String::from_utf8_lossy(&output.stderr).contains("stale"),
-        Err(_) => false,
+        Ok(output) => {
+            let stale = String::from_utf8_lossy(&output.stderr).contains("stale");
+            let head = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            (
+                stale,
+                (output.status.success() && !head.is_empty()).then_some(head),
+            )
+        }
+        Err(_) => (false, None),
     }
+}
+
+/// The per-file stat of one turn, `from..to`, or `None` when jj fails. Reads
+/// commits only (`--ignore-working-copy`), so it records no operation.
+pub async fn files_between(dir: &Path, from: &str, to: &str) -> Option<Vec<FileStat>> {
+    let args = [
+        "--ignore-working-copy",
+        "diff",
+        "--git",
+        "--color=never",
+        "--from",
+        from,
+        "--to",
+        to,
+    ];
+    let output = run(jj_cmd(dir, &args), TIMEOUT).await.ok()?;
+    output
+        .status
+        .success()
+        .then(|| parse_git_diff(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Restore the working copy at `dir` to `commit`'s tree (`jj restore --from`)
+/// and return the commit id `@` holds afterwards — what the pane's next turn
+/// diffs from. jj records the restore as an operation, so `jj undo` reverses
+/// it as well. The caller has already snapshotted and refused a stale copy.
+pub async fn restore(dir: &Path, commit: &str) -> Result<String, String> {
+    let output = run(jj_cmd(dir, &["restore", "--from", commit]), FORK_TIMEOUT).await?;
+    if !output.status.success() {
+        return Err(stderr_or(&output, "jj restore failed"));
+    }
+    Ok(log_template(dir, "@", "commit_id")
+        .await?
+        .trim()
+        .to_string())
 }
 
 /// Fork the jj repo rooted at `repo_root` into a new workspace at `dest`, named

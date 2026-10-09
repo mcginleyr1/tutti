@@ -206,6 +206,26 @@ enum PaneAction {
     Focus {
         pane: u64,
     },
+    /// List the pane's per-turn checkpoints, newest first.
+    Checkpoints {
+        pane: u64,
+    },
+    /// Show one checkpoint's turn diff (the newest unless N is given).
+    CheckpointDiff {
+        pane: u64,
+        n: Option<u64>,
+        #[arg(long)]
+        stat: bool,
+    },
+    /// Restore the pane's workspace to checkpoint N, first saving the current
+    /// state as a checkpoint so the restore can itself be undone.
+    Restore {
+        pane: u64,
+        n: u64,
+        /// Restore even while the pane is mid-turn (working or blocked).
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -494,6 +514,17 @@ fn to_request(command: Command) -> Result<Request> {
                 unwrapped,
             },
             PaneAction::Focus { pane } => Request::PaneFocus { pane: PaneId(pane) },
+            PaneAction::Checkpoints { pane } => Request::PaneCheckpoints { pane: PaneId(pane) },
+            PaneAction::CheckpointDiff { pane, n, stat } => Request::PaneCheckpointDiff {
+                pane: PaneId(pane),
+                n,
+                stat,
+            },
+            PaneAction::Restore { pane, n, force } => Request::PaneRestore {
+                pane: PaneId(pane),
+                n,
+                force,
+            },
         }),
         Command::Server { .. }
         | Command::Attach
@@ -679,6 +710,17 @@ fn emit(response: Response, json: bool) -> i32 {
         }
         Response::Fingerprint { fingerprint } => {
             println!("{fingerprint}");
+            0
+        }
+        Response::Checkpoints { checkpoints } => {
+            print!("{}", render::checkpoints(&checkpoints, render::unix_now()));
+            0
+        }
+        Response::Restored { n, saved } => {
+            match saved {
+                Some(saved) => println!("restored to #{n} (the state it replaced is #{saved})"),
+                None => println!("restored to #{n}"),
+            }
             0
         }
         // The attach handshake reply is consumed by the TUI, never the CLI.
@@ -1001,6 +1043,50 @@ mod tests {
         assert_eq!(
             request_of(&["tutti", "pane", "focus", "3"]),
             Request::PaneFocus { pane: PaneId(3) }
+        );
+    }
+
+    #[test]
+    fn checkpoint_verbs_parse() {
+        assert_eq!(
+            request_of(&["tutti", "pane", "checkpoints", "3"]),
+            Request::PaneCheckpoints { pane: PaneId(3) }
+        );
+        assert_eq!(
+            request_of(&["tutti", "pane", "checkpoint-diff", "3"]),
+            Request::PaneCheckpointDiff {
+                pane: PaneId(3),
+                n: None,
+                stat: false,
+            }
+        );
+        assert_eq!(
+            request_of(&["tutti", "pane", "checkpoint-diff", "3", "2", "--stat"]),
+            Request::PaneCheckpointDiff {
+                pane: PaneId(3),
+                n: Some(2),
+                stat: true,
+            }
+        );
+        assert_eq!(
+            request_of(&["tutti", "pane", "restore", "3", "1"]),
+            Request::PaneRestore {
+                pane: PaneId(3),
+                n: 1,
+                force: false,
+            }
+        );
+        assert_eq!(
+            request_of(&["tutti", "pane", "restore", "3", "1", "--force"]),
+            Request::PaneRestore {
+                pane: PaneId(3),
+                n: 1,
+                force: true,
+            }
+        );
+        assert!(
+            Cli::try_parse_from(["tutti", "pane", "restore", "3"]).is_err(),
+            "restore names the checkpoint explicitly"
         );
     }
 

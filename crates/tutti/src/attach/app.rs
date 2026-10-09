@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 use tutti_core::{
-    AgentKind, AgentState, DIFF_RANGE, Direction, Event, FileStat, Frame as WireFrame, Layout,
-    PaneId, PaneInfo, Request, Response, TabId, TabView, WorkspaceId, WorkspaceView,
+    AgentKind, AgentState, Checkpoint, DIFF_RANGE, Direction, Event, FileStat, Frame as WireFrame,
+    Layout, PaneId, PaneInfo, Request, Response, TabId, TabView, WorkspaceId, WorkspaceView,
     prompt_fingerprint, prompt_rows,
 };
 
@@ -33,6 +33,10 @@ const SIDEBAR_MIN_TOTAL: u16 = 80;
 /// sidebar.
 const DIFF_PANEL_WIDTH: u16 = 38;
 const DIFF_PANEL_MIN_TOTAL: u16 = 130;
+
+/// How many of the newest turns the changes panel's `turns` section lists; the
+/// CLI (`tutti pane checkpoints`) reaches the rest.
+const TURNS_SHOWN: usize = 5;
 
 /// Rows the top chrome header claims: the full-width app bar plus the dim rule
 /// beneath it. The content region begins below them.
@@ -115,12 +119,16 @@ pub enum Mode {
     /// After a merge lands, offering to clean up (discard) the merged workspace
     /// (`y` discards it, anything else keeps it).
     ConfirmCleanup(WorkspaceId),
+    /// Confirming a restore of the pane's workspace to its checkpoint `n`,
+    /// raised from the changes panel's `turns` section (`y` restores, anything
+    /// else cancels).
+    ConfirmRestore(PaneId, u64),
     Scroll(PaneId),
     Help,
     /// Navigating the sidebar; keys drive the selection instead of the pane.
     Sidebar,
     /// Navigating the changed-files panel; `enter` opens the highlighted file's
-    /// diff, `d` the whole workspace diff.
+    /// (or turn's) diff, `d` the whole workspace diff, `r` restores to a turn.
     DiffFiles,
     /// Editing the add-project directory prompt at the sidebar's foot.
     SidebarPrompt,
@@ -205,7 +213,8 @@ pub struct App {
     /// The changed-files panel column from the last size sync, for mouse
     /// hit-testing. `None` while the panel is hidden.
     diff_panel_rect: Option<Rect>,
-    /// The highlighted row in the changed-files panel while it is focused.
+    /// The highlighted row in the changed-files panel while it is focused: the
+    /// changed files first, then the listed turns.
     diff_selected: usize,
     /// The top tab-bar row from the last size sync, for mouse hit-testing.
     tab_bar_rect: Option<Rect>,
@@ -598,6 +607,10 @@ impl App {
                     self.mode = Mode::ConfirmCleanup(id);
                 }
             }
+            Response::Restored { n, saved } => self.set_status(match saved {
+                Some(saved) => format!("restored to #{n} — the state it replaced is #{saved}"),
+                None => format!("restored to #{n}"),
+            }),
             Response::Error { message } => {
                 // A failed new-workspace, guided-create, or merge request must not
                 // later hijack the tab, the launcher, or the cleanup confirm.
@@ -646,14 +659,15 @@ impl App {
         self.sidebar_selected =
             resolved.unwrap_or(self.sidebar_selected.min(sidebar.len().saturating_sub(1)));
         self.sidebar_anchor = anchor_at(&sidebar, self.sidebar_selected);
-        // Keep the changed-files cursor in range; a panel emptied by a refresh
-        // (everything merged, say) drops focus back to the panes.
-        let files = self.changed_files().len();
-        self.diff_selected = self.diff_selected.min(files.saturating_sub(1));
-        if self.mode == Mode::DiffFiles && files == 0 {
+        self.refocus();
+        // Keep the changes-panel cursor in range (after refocus: the turns
+        // follow the focused pane); a panel emptied by a refresh (everything
+        // merged, say) drops focus back to the panes.
+        let rows = self.diff_rows();
+        self.diff_selected = self.diff_selected.min(rows.saturating_sub(1));
+        if self.mode == Mode::DiffFiles && rows == 0 {
             self.mode = Mode::Terminal;
         }
-        self.refocus();
     }
 
     // ---- keyboard -------------------------------------------------------
@@ -668,6 +682,7 @@ impl App {
             Mode::ConfirmKillAgent(pane) => self.on_key_confirm_agent(key, pane),
             Mode::ConfirmMerge(id) => self.on_key_confirm_merge(key, id),
             Mode::ConfirmCleanup(id) => self.on_key_confirm_cleanup(key, id),
+            Mode::ConfirmRestore(pane, n) => self.on_key_confirm_restore(key, pane, n),
             Mode::Scroll(pane) => self.on_key_scroll(key, pane),
             Mode::Sidebar => self.on_key_sidebar(key),
             Mode::DiffFiles => self.on_key_diff_files(key),
@@ -1082,12 +1097,11 @@ impl App {
     }
 
     /// Whether the changed-files panel renders: enabled in config, the active
-    /// workspace actually has changes against trunk, and the content is wide
-    /// enough that panes keep usable room beside both chrome columns.
+    /// workspace actually has changes against trunk or the agent in view has
+    /// turns to list, and the content is wide enough that panes keep usable
+    /// room beside both chrome columns.
     fn diff_panel_shown(&self, total_width: u16) -> bool {
-        self.config.diff_panel
-            && total_width >= DIFF_PANEL_MIN_TOTAL
-            && !self.changed_files().is_empty()
+        self.config.diff_panel && total_width >= DIFF_PANEL_MIN_TOTAL && self.diff_rows() > 0
     }
 
     /// The active workspace's changed files — what the changed-files panel
@@ -1095,6 +1109,48 @@ impl App {
     pub fn changed_files(&self) -> &[FileStat] {
         self.active_workspace()
             .map_or(&[], |w| w.changed_files.as_slice())
+    }
+
+    /// The pane whose checkpoints the changes panel's `turns` section lists:
+    /// the focused pane when it has any, else the first pane of the active tab
+    /// that does — so a pager opened over a turn, or a shell split beside the
+    /// agent, keeps the agent's turns in view.
+    pub fn turns_pane(&self) -> Option<PaneId> {
+        let has = |p: &PaneId| {
+            self.panes
+                .get(p)
+                .is_some_and(|s| !s.info.checkpoints.is_empty())
+        };
+        self.focused
+            .filter(has)
+            .or_else(|| self.active_tab_panes().into_iter().find(has))
+    }
+
+    /// The turns the changes panel lists, newest first: the last few of the
+    /// `turns_pane`'s checkpoints.
+    pub fn shown_turns(&self) -> Vec<&Checkpoint> {
+        self.turns_pane()
+            .and_then(|p| self.panes.get(&p))
+            .map_or(Vec::new(), |s| {
+                s.info.checkpoints.iter().rev().take(TURNS_SHOWN).collect()
+            })
+    }
+
+    /// Every row the changes-panel cursor can land on: files, then turns.
+    fn diff_rows(&self) -> usize {
+        self.changed_files().len() + self.shown_turns().len()
+    }
+
+    /// The turn under the changes-panel cursor, when it sits past the files.
+    fn selected_turn(&self) -> Option<Checkpoint> {
+        let i = self.diff_selected.checked_sub(self.changed_files().len())?;
+        self.shown_turns().get(i).map(|&turn| turn.clone())
+    }
+
+    /// Whether the changes panel holds the keys — including while its restore
+    /// confirm is open, so the highlight stays on the turn being asked about.
+    pub fn diff_panel_focused(&self) -> bool {
+        matches!(self.mode, Mode::DiffFiles | Mode::ConfirmRestore(..))
     }
 
     /// The three regions a content area splits into: the sidebar column (when
@@ -1414,10 +1470,10 @@ impl App {
     }
 
     /// Focus the changed-files panel. Refuses — with a status explaining why —
-    /// when the active workspace is clean against trunk, the panel is disabled
-    /// in config, or the terminal is too narrow to render it.
+    /// when the active workspace is clean against trunk with no turns to list,
+    /// the panel is disabled in config, or the terminal is too narrow for it.
     fn focus_diff_panel(&mut self) {
-        if self.changed_files().is_empty() {
+        if self.diff_rows() == 0 {
             self.set_status("no changes against trunk".into());
             return;
         }
@@ -1425,7 +1481,7 @@ impl App {
             self.set_status("terminal too narrow for the changes panel".into());
             return;
         }
-        self.diff_selected = self.diff_selected.min(self.changed_files().len() - 1);
+        self.diff_selected = self.diff_selected.min(self.diff_rows() - 1);
         self.mode = Mode::DiffFiles;
         self.prefix_since = None;
         self.status = None;
@@ -1433,11 +1489,13 @@ impl App {
 
     /// Keys while the changed-files panel is focused: vim/less list motion
     /// (`j`/`k` step, `g`/`G` jump to the ends, `C-d`/`C-u` move half the
-    /// panel, plus their arrow/Home/End/Page equivalents), `enter`/`d` open a
-    /// diff. The panel is the content's right edge, and its edges behave like
-    /// a pane's: `h`/`esc`/`q` and the focus-left binding step back into the
-    /// pane area keeping its focus; `l` and the focus-right binding wrap on to
-    /// the next tab.
+    /// panel, plus their arrow/Home/End/Page equivalents) over the files and
+    /// then the turns, `enter` opens the highlighted file's or turn's diff, `d`
+    /// the whole diff, `r` asks to restore the highlighted turn. The panel is
+    /// the content's right edge, and its edges behave like a pane's:
+    /// `h`/`esc`/`q` and the focus-left binding step back into the pane area
+    /// keeping its focus; `l` and the focus-right binding wrap on to the next
+    /// tab.
     fn on_key_diff_files(&mut self, key: KeyEvent) -> Vec<WireFrame> {
         if self.enter_prefix(key) {
             return Vec::new();
@@ -1455,7 +1513,7 @@ impl App {
             }
             _ => {}
         }
-        let last = self.changed_files().len().saturating_sub(1);
+        let last = self.diff_rows().saturating_sub(1);
         let page = self
             .diff_panel_rect
             .map_or(0, |r| r.height.saturating_sub(1))
@@ -1471,7 +1529,16 @@ impl App {
             KeyCode::PageUp => self.diff_selected.saturating_sub(page),
             KeyCode::Char('g') | KeyCode::Home => 0,
             KeyCode::Char('G') | KeyCode::End => last,
-            KeyCode::Enter => return self.open_selected_file_diff(),
+            KeyCode::Enter => {
+                return match self.selected_turn() {
+                    Some(turn) => self.open_turn_diff(&turn),
+                    None => self.open_selected_file_diff(),
+                };
+            }
+            KeyCode::Char('r') => {
+                self.confirm_restore();
+                return Vec::new();
+            }
             KeyCode::Char('d') => {
                 let Some(tab) = self.active_tab else {
                     return Vec::new();
@@ -1518,6 +1585,68 @@ impl App {
             tab: Some(tab),
             cmd: diff_pager_cmd(Some(&path)),
             ephemeral: true,
+        })]
+    }
+
+    /// Open `turn`'s diff in an ephemeral pager pane in the active tab, the way
+    /// `d` pages the whole workspace's. The first state recorded for a pane has
+    /// nothing earlier to diff against, which the status line says instead.
+    fn open_turn_diff(&mut self, turn: &Checkpoint) -> Vec<WireFrame> {
+        let Some(from) = &turn.from else {
+            self.set_status(format!("#{} is where the history starts", turn.n));
+            return Vec::new();
+        };
+        let Some(tab) = self.active_tab else {
+            return Vec::new();
+        };
+        self.mode = Mode::Terminal;
+        self.status = None;
+        vec![control(&Request::PaneRun {
+            tab: Some(tab),
+            cmd: turn_pager_cmd(from, &turn.commit),
+            ephemeral: true,
+        })]
+    }
+
+    /// Open the restore confirm for the highlighted turn: `y` restores the
+    /// working copy to it, anything else cancels. A file row has no turn.
+    fn confirm_restore(&mut self) {
+        let (Some(pane), Some(turn)) = (self.turns_pane(), self.selected_turn()) else {
+            self.set_status("select a turn to restore".into());
+            return;
+        };
+        self.mode = Mode::ConfirmRestore(pane, turn.n);
+        self.set_status(format!("restore the working copy to #{}? y/N", turn.n));
+    }
+
+    /// Resolve the restore confirm: `y` sends the restore only when the same
+    /// pane still lists checkpoint `n` (a kill may have dropped it since the
+    /// confirm opened); anything else cancels. The panel keeps the keys while it
+    /// has rows; a server refusal (the agent is mid-turn, the workspace stale)
+    /// lands as an error in the notification band.
+    fn on_key_confirm_restore(&mut self, key: KeyEvent, pane: PaneId, n: u64) -> Vec<WireFrame> {
+        self.mode = if self.diff_rows() == 0 {
+            Mode::Terminal
+        } else {
+            Mode::DiffFiles
+        };
+        self.status = None;
+        if !matches!(key.code, KeyCode::Char('y' | 'Y')) {
+            return Vec::new();
+        }
+        let listed = self
+            .panes
+            .get(&pane)
+            .is_some_and(|s| s.info.checkpoints.iter().any(|c| c.n == n));
+        if !listed {
+            self.set_status(format!("#{n} is gone"));
+            return Vec::new();
+        }
+        self.set_status(format!("restoring #{n}…"));
+        vec![control(&Request::PaneRestore {
+            pane,
+            n,
+            force: false,
         })]
     }
 
@@ -2386,13 +2515,14 @@ impl App {
     }
 
     /// A click on the changed-files panel: focus it and open the clicked file's
-    /// diff. The top row is the panel header; file rows follow the same
-    /// scroll-follow window the renderer draws.
+    /// or turn's diff. The top row is the panel header; file rows follow the
+    /// same scroll-follow window the renderer draws, then the turns block (a
+    /// spacer and its header, then one row per turn).
     fn diff_panel_click(&mut self, row: u16) -> Vec<WireFrame> {
         let Some(rect) = self.diff_panel_rect else {
             return Vec::new();
         };
-        if self.changed_files().is_empty() {
+        if self.diff_rows() == 0 {
             return Vec::new();
         }
         if self.mode != Mode::DiffFiles {
@@ -2403,24 +2533,58 @@ impl App {
         let Some(row_in_list) = rel.checked_sub(1) else {
             return Vec::new();
         };
-        let idx = self.diff_first_visible(rect.height) + row_in_list;
-        if idx >= self.changed_files().len() {
+        let first = self.diff_first_visible(rect.height);
+        let drawn = self.diff_files_drawn(rect.height);
+        if row_in_list < drawn {
+            self.diff_selected = first + row_in_list;
+            return self.open_selected_file_diff();
+        }
+        let Some(j) = (row_in_list - drawn).checked_sub(2) else {
+            return Vec::new();
+        };
+        if j >= self.shown_turns().len() {
             return Vec::new();
         }
-        self.diff_selected = idx;
-        self.open_selected_file_diff()
+        self.diff_selected = self.changed_files().len() + j;
+        match self.selected_turn() {
+            Some(turn) => self.open_turn_diff(&turn),
+            None => Vec::new(),
+        }
+    }
+
+    /// How many file rows fit in a changes panel of `panel_height`: all of it
+    /// below the header, less the turns block at the foot (a spacer, its
+    /// header, and one row per listed turn) when there are turns.
+    fn diff_file_window(&self, panel_height: u16) -> usize {
+        let turns = self.shown_turns().len();
+        let reserved = if turns == 0 { 0 } else { 2 + turns };
+        (panel_height as usize).saturating_sub(1 + reserved)
+    }
+
+    /// How many file rows a panel of `panel_height` actually draws — the turns
+    /// block follows straight after them. Shared by the renderer and clicks.
+    pub fn diff_files_drawn(&self, panel_height: u16) -> usize {
+        let files = self.changed_files().len();
+        let first = self.diff_first_visible(panel_height);
+        files
+            .saturating_sub(first)
+            .min(self.diff_file_window(panel_height))
     }
 
     /// The first file row the changed-files panel shows for `panel_height` (one
-    /// header row sits above the list): 0 until the selection would leave the
-    /// window, then following it. Shared by the renderer and click hit-testing
-    /// so clicks land on what is drawn.
+    /// header row sits above the list, the turns block below it): 0 until the
+    /// selection would leave the window, then following it — a cursor down in
+    /// the turns keeps the files' window where it was. Shared by the renderer
+    /// and click hit-testing so clicks land on what is drawn.
     pub fn diff_first_visible(&self, panel_height: u16) -> usize {
-        let visible = panel_height.saturating_sub(1) as usize;
+        let visible = self.diff_file_window(panel_height);
         if visible == 0 {
             return 0;
         }
-        self.diff_selected.saturating_sub(visible - 1)
+        let cursor = self
+            .diff_selected
+            .min(self.changed_files().len().saturating_sub(1));
+        cursor.saturating_sub(visible - 1)
     }
 
     /// The highlighted changed-files row, for the renderer.
@@ -2901,6 +3065,21 @@ fn diff_pager_cmd(path: Option<&str>) -> Vec<String> {
     ]
 }
 
+/// The ephemeral-pane command paging one turn's diff, `from..to`. Both ends
+/// are commit ids, so the pager reads commits only (`--ignore-working-copy`)
+/// and records no jj operation of its own.
+fn turn_pager_cmd(from: &str, to: &str) -> Vec<String> {
+    vec![
+        "sh".into(),
+        "-lc".into(),
+        format!(
+            "jj --no-pager --ignore-working-copy diff --color=always --from {} --to {} 2>&1 | less -R",
+            sh_quote(from),
+            sh_quote(to)
+        ),
+    ]
+}
+
 /// A jj fileset pattern selecting exactly the repo-root-relative `path`, with
 /// the characters special inside a fileset string literal escaped.
 fn root_pattern(path: &str) -> String {
@@ -3214,6 +3393,7 @@ fn placeholder_info(pane: PaneId) -> PaneInfo {
         state: AgentState::Unknown,
         exited: None,
         subagents: Vec::new(),
+        checkpoints: Vec::new(),
     }
 }
 
@@ -4761,6 +4941,209 @@ mod tests {
             sh_quote("it's"),
             r#"'it'\''s'"#,
             "single quotes close, escape, and reopen for sh"
+        );
+    }
+
+    fn checkpoint(n: u64, from: Option<&str>, commit: &str, label: &str) -> Checkpoint {
+        Checkpoint {
+            n,
+            commit: commit.into(),
+            from: from.map(Into::into),
+            time: 0,
+            label: label.into(),
+            files: 1,
+            insertions: n,
+            deletions: 0,
+        }
+    }
+
+    /// `view_with_changes` whose one pane is an agent with three turns behind
+    /// it: where it started, a turn that blocked, and one that finished.
+    fn view_with_turns() -> Vec<WorkspaceView> {
+        let mut view = view_with_changes();
+        let pane = &mut view[0].tabs[0].panes[0];
+        pane.agent = Some("claude".into());
+        pane.checkpoints = vec![
+            checkpoint(1, None, "c1", "start"),
+            checkpoint(2, Some("c1"), "c2", "blocked"),
+            checkpoint(3, Some("c2"), "c3", "done"),
+        ];
+        view
+    }
+
+    fn focus_panel(app: &mut App) {
+        app.sync_sizes(Rect::new(0, 0, 140, 40));
+        app.on_key(ctrl('b'));
+        app.on_key(plain('f'));
+        assert_eq!(app.mode, Mode::DiffFiles);
+    }
+
+    #[test]
+    fn the_panel_walks_from_files_into_turns_and_enter_pages_a_turn() {
+        let mut app = App::new();
+        attach_with(&mut app, view_with_turns());
+        focus_panel(&mut app);
+        let shown: Vec<u64> = app.shown_turns().iter().map(|t| t.n).collect();
+        assert_eq!(shown, [3, 2, 1], "the newest turn lists first");
+
+        app.on_key(plain('G'));
+        assert_eq!(app.diff_selected(), 4, "two files, then three turns");
+        app.on_key(plain('k'));
+        app.on_key(plain('k'));
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match only_request(&out) {
+            Request::PaneRun {
+                tab,
+                cmd,
+                ephemeral,
+            } => {
+                assert_eq!(tab, Some(TabId(1)));
+                assert!(ephemeral, "the pager pane vanishes when less quits");
+                assert!(
+                    cmd[2].contains("--from 'c2' --to 'c3'"),
+                    "the newest turn diffs from the one before it: {}",
+                    cmd[2]
+                );
+                assert!(
+                    cmd[2].contains("--ignore-working-copy"),
+                    "paging commits never snapshots: {}",
+                    cmd[2]
+                );
+            }
+            other => panic!("expected PaneRun, got {other:?}"),
+        }
+        assert_eq!(
+            app.mode,
+            Mode::Terminal,
+            "opening the diff leaves the panel"
+        );
+    }
+
+    #[test]
+    fn enter_on_the_first_state_explains_instead_of_paging() {
+        let mut app = App::new();
+        attach_with(&mut app, view_with_turns());
+        focus_panel(&mut app);
+        app.on_key(plain('G'));
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(out.is_empty(), "#1 has nothing earlier to diff against");
+        assert!(app.transient().is_some_and(|t| t.contains("#1")));
+        assert_eq!(app.mode, Mode::DiffFiles);
+    }
+
+    #[test]
+    fn r_confirms_a_restore_and_only_y_sends_it() {
+        let mut app = App::new();
+        attach_with(&mut app, view_with_turns());
+        focus_panel(&mut app);
+        app.on_key(plain('G'));
+        assert!(app.on_key(plain('r')).is_empty(), "r asks first");
+        assert_eq!(app.mode, Mode::ConfirmRestore(PaneId(1), 1));
+        assert!(app.diff_panel_focused(), "the turn stays highlighted");
+        assert!(app.transient().is_some_and(|t| t.contains("#1? y/N")));
+
+        let out = app.on_key(plain('y'));
+        assert_eq!(
+            only_request(&out),
+            Request::PaneRestore {
+                pane: PaneId(1),
+                n: 1,
+                force: false,
+            },
+            "the TUI never forces: a mid-turn refusal comes back as an error"
+        );
+        assert_eq!(app.mode, Mode::DiffFiles);
+
+        app.on_key(plain('r'));
+        assert!(app.on_key(plain('n')).is_empty(), "any other key cancels");
+        assert_eq!(app.mode, Mode::DiffFiles);
+
+        app.on_key(plain('g'));
+        assert!(app.on_key(plain('r')).is_empty());
+        assert_eq!(app.mode, Mode::DiffFiles, "a file row has no turn");
+        assert!(app.transient().is_some_and(|t| t.contains("select a turn")));
+    }
+
+    #[test]
+    fn a_restore_confirm_rechecks_the_turn_before_sending() {
+        let mut app = App::new();
+        attach_with(&mut app, view_with_turns());
+        focus_panel(&mut app);
+        app.on_key(plain('G'));
+        app.on_key(plain('r'));
+        // The turn leaves the list under the confirm (dropped past the cap, the
+        // pane killed and its id reused) — y must not restore a stale target.
+        let mut view = view_with_turns();
+        view[0].tabs[0].panes[0].checkpoints.remove(0);
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Event::LayoutChanged { workspaces: view }).unwrap(),
+        ));
+        assert!(app.on_key(plain('y')).is_empty());
+        assert!(app.transient().is_some_and(|t| t.contains("#1 is gone")));
+    }
+
+    #[test]
+    fn turns_alone_show_the_panel_and_follow_the_agent_past_a_pager() {
+        let content = Rect::new(0, 0, 140, 37);
+        let mut view = view_with_turns();
+        view[0].changed_files.clear();
+        view[0].changes = None;
+        let mut app = App::new();
+        attach_with(&mut app, view.clone());
+        assert!(
+            app.split_content(content).2.is_some(),
+            "a clean workspace still lists the agent's turns"
+        );
+
+        // A pager pane split beside the agent takes focus but has no turns:
+        // the panel keeps showing the agent's.
+        view[0].tabs[0].layout = Some(split(Direction::Horizontal, leaf(1), leaf(2)));
+        view[0].tabs[0].panes.push(shell(2));
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Event::LayoutChanged { workspaces: view }).unwrap(),
+        ));
+        app.focused = Some(PaneId(2));
+        assert_eq!(app.turns_pane(), Some(PaneId(1)));
+        assert!(app.split_content(content).2.is_some());
+    }
+
+    #[test]
+    fn clicking_a_turn_row_pages_that_turn() {
+        let mut app = App::new();
+        attach_with(&mut app, view_with_turns());
+        app.sync_sizes(Rect::new(0, 0, 140, 40));
+        // Panel rows from its top (y 2): header, two files, a spacer, the
+        // `turns` header, then the turns newest first — #2 sits at y 8.
+        let out = app.on_mouse(MouseEventKind::Down(MouseButton::Left), 110, 8);
+        match only_request(&out) {
+            Request::PaneRun { cmd, .. } => assert!(
+                cmd[2].contains("--from 'c1' --to 'c2'"),
+                "the click resolves to the drawn turn: {}",
+                cmd[2]
+            ),
+            other => panic!("expected PaneRun, got {other:?}"),
+        }
+        assert!(
+            app.on_mouse(MouseEventKind::Down(MouseButton::Left), 110, 6)
+                .is_empty(),
+            "the turns header is not a row"
+        );
+    }
+
+    #[test]
+    fn a_restored_reply_names_the_state_it_saved() {
+        let mut app = App::new();
+        attach_with(&mut app, view_with_turns());
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Response::Restored {
+                n: 1,
+                saved: Some(4),
+            })
+            .unwrap(),
+        ));
+        assert!(
+            app.transient()
+                .is_some_and(|t| t.contains("restored to #1") && t.contains("#4"))
         );
     }
 

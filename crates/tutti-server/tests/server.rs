@@ -13,8 +13,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
 use tutti_core::{
-    AgentHookEvent, AgentState, Direction, Event, Frame, Layout, PaneData, PaneId, Request,
-    Response, SubagentInfo, WorkspaceId,
+    AgentHookEvent, AgentState, Checkpoint, Direction, Event, Frame, Layout, PaneData, PaneId,
+    Request, Response, SubagentInfo, WorkspaceId,
 };
 use tutti_server::{PaneSize, serve};
 
@@ -2283,4 +2283,216 @@ async fn tab_names(conn: &mut Conn) -> Vec<String> {
         Response::Tabs { tabs } => tabs.into_iter().map(|t| t.name).collect(),
         other => panic!("expected Tabs, got {other:?}"),
     }
+}
+
+/// Poll `pane`'s checkpoints until at least `want` are recorded.
+async fn wait_checkpoints(conn: &mut Conn, pane: PaneId, want: usize) -> Vec<Checkpoint> {
+    timeout(DEADLINE, async {
+        loop {
+            if let Response::Checkpoints { checkpoints } =
+                conn.request(Request::PaneCheckpoints { pane }).await
+                && checkpoints.len() >= want
+            {
+                return checkpoints;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("pane {pane} never reached {want} checkpoints"))
+}
+
+/// Drive `pane` with one hook event, the way `tutti agent-event` does.
+async fn hook(conn: &mut Conn, pane: PaneId, event: AgentHookEvent) {
+    assert_eq!(
+        conn.request(Request::AgentEvent { pane, event }).await,
+        Response::Ok
+    );
+}
+
+/// One agent turn, driven by hook events against a real jj repo: entering
+/// `Working` checkpoints where the agent started, leaving it checkpoints the
+/// turn with its stat; the turn's diff is served from the two commits; and a
+/// restore rewinds the files on disk — refused mid-turn unless forced, first
+/// saving the state it replaces as a checkpoint so the restore itself undoes.
+/// Skips cleanly without `jj`.
+#[tokio::test]
+async fn a_turn_checkpoints_its_diff_and_restores_round_trip() {
+    if !jj_on_path() {
+        eprintln!("skipping: jj is not on PATH");
+        return;
+    }
+    let dir = jj_git_init("ckpt");
+    std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let ws = workspace_id(
+        conn.request(Request::WorkspaceNew { dir: dir.clone() })
+            .await,
+    );
+    let pane = pane_id(
+        conn.request(Request::PaneRun {
+            tab: None,
+            cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+            ephemeral: false,
+        })
+        .await,
+    );
+
+    hook(&mut conn, pane, AgentHookEvent::Activity { detail: None }).await;
+    let start = wait_checkpoints(&mut conn, pane, 1).await.remove(0);
+    assert_eq!((start.n, start.label.as_str()), (1, "start"));
+    assert_eq!(start.from, None, "nothing was recorded before the start");
+
+    std::fs::write(dir.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "bee\n").unwrap();
+    hook(&mut conn, pane, AgentHookEvent::Done).await;
+    let turn = wait_checkpoints(&mut conn, pane, 2).await.remove(1);
+    assert_eq!((turn.n, turn.label.as_str()), (2, "done"));
+    assert_eq!(
+        turn.from.as_ref(),
+        Some(&start.commit),
+        "the turn diffs from the start"
+    );
+    assert_eq!((turn.files, turn.insertions, turn.deletions), (2, 3, 1));
+
+    match conn
+        .request(Request::PaneCheckpointDiff {
+            pane,
+            n: None,
+            stat: false,
+        })
+        .await
+    {
+        Response::Content { lines } => {
+            let text = lines.join("\n");
+            assert!(text.contains("b.txt") && text.contains("TWO"), "{text}");
+        }
+        other => panic!("expected Content, got {other:?}"),
+    }
+    match conn
+        .request(Request::PaneCheckpointDiff {
+            pane,
+            n: Some(2),
+            stat: true,
+        })
+        .await
+    {
+        Response::Content { lines } => assert!(
+            lines.iter().any(|l| l.contains("2 files changed")),
+            "{lines:?}"
+        ),
+        other => panic!("expected Content, got {other:?}"),
+    }
+    assert!(matches!(
+        conn.request(Request::PaneCheckpointDiff {
+            pane,
+            n: Some(1),
+            stat: false,
+        })
+        .await,
+        Response::Error { .. }
+    ));
+
+    // Mid-turn, a restore is refused unless forced.
+    hook(&mut conn, pane, AgentHookEvent::Activity { detail: None }).await;
+    match conn
+        .request(Request::PaneRestore {
+            pane,
+            n: 1,
+            force: false,
+        })
+        .await
+    {
+        Response::Error { message } => assert!(message.contains("working"), "{message}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+
+    let mut viewer = server.connect().await;
+    viewer.send(&Request::Attach).await;
+    assert!(matches!(viewer.response().await, Response::Attached { .. }));
+
+    // An edit no turn recorded is saved as `before restore` on the way back.
+    std::fs::write(dir.join("c.txt"), "unrecorded\n").unwrap();
+    assert_eq!(
+        conn.request(Request::PaneRestore {
+            pane,
+            n: 1,
+            force: true,
+        })
+        .await,
+        Response::Restored {
+            n: 1,
+            saved: Some(3)
+        }
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "one\ntwo\n"
+    );
+    assert!(!dir.join("b.txt").exists() && !dir.join("c.txt").exists());
+    let saved = wait_checkpoints(&mut conn, pane, 3).await.remove(2);
+    assert_eq!(saved.label, "before restore");
+    assert_eq!((saved.files, saved.insertions), (1, 1), "just c.txt");
+    assert!(
+        wait_workspace_changes(&mut viewer, ws, "1 file", DEADLINE).await,
+        "the restore refreshes the change stat"
+    );
+
+    // Restoring the saved state undoes the restore.
+    assert_eq!(
+        conn.request(Request::PaneRestore {
+            pane,
+            n: 3,
+            force: true,
+        })
+        .await,
+        Response::Restored { n: 3, saved: None }
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "one\nTWO\nthree\n"
+    );
+    assert!(dir.join("b.txt").exists() && dir.join("c.txt").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+    server.stop().await;
+}
+
+/// A turn outside a jj workspace records nothing, silently.
+#[tokio::test]
+async fn checkpoints_stay_empty_outside_jj() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let dir = fresh_dir("nockpt");
+    conn.request(Request::WorkspaceNew { dir: dir.clone() })
+        .await;
+    let pane = pane_id(
+        conn.request(Request::PaneRun {
+            tab: None,
+            cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+            ephemeral: false,
+        })
+        .await,
+    );
+    hook(&mut conn, pane, AgentHookEvent::Activity { detail: None }).await;
+    hook(&mut conn, pane, AgentHookEvent::Done).await;
+    sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        conn.request(Request::PaneCheckpoints { pane }).await,
+        Response::Checkpoints {
+            checkpoints: Vec::new()
+        }
+    );
+    assert!(matches!(
+        conn.request(Request::PaneRestore {
+            pane,
+            n: 1,
+            force: false,
+        })
+        .await,
+        Response::Error { .. }
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    server.stop().await;
 }

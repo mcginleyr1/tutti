@@ -1,3 +1,4 @@
+pub mod checkpoints;
 pub mod jj;
 pub mod keys;
 pub mod pty;

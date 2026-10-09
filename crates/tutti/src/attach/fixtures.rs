@@ -35,6 +35,7 @@ pub(crate) fn pane(id: u64, title: &str, agent: Option<&str>, state: AgentState)
         state,
         exited: None,
         subagents: Vec::new(),
+        checkpoints: Vec::new(),
     }
 }
 

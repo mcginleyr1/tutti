@@ -163,6 +163,31 @@ pub enum Request {
         pane: PaneId,
         event: AgentHookEvent,
     },
+    /// List `pane`'s per-turn checkpoints, oldest first. Answered with
+    /// `Response::Checkpoints` (empty for a pane outside a jj workspace).
+    PaneCheckpoints {
+        pane: PaneId,
+    },
+    /// Serve one checkpoint's turn diff — from the state before it to its
+    /// commit — answered with `Response::Content`. `n` defaults to the newest;
+    /// `stat` asks for the `--stat` summary instead of the full diff.
+    PaneCheckpointDiff {
+        pane: PaneId,
+        #[serde(default)]
+        n: Option<u64>,
+        #[serde(default)]
+        stat: bool,
+    },
+    /// Restore the pane's workspace working copy to checkpoint `n` (`jj restore
+    /// --from`), first saving the current state as a `before restore`
+    /// checkpoint. Refused while the pane is working or blocked unless `force`,
+    /// and in a stale workspace. Answered with `Response::Restored`.
+    PaneRestore {
+        pane: PaneId,
+        n: u64,
+        #[serde(default)]
+        force: bool,
+    },
     Attach,
     Detach,
 }
@@ -221,6 +246,34 @@ pub struct PaneInfo {
     /// non-hook panes.
     #[serde(default)]
     pub subagents: Vec<SubagentInfo>,
+    /// The pane's per-turn checkpoints, oldest first (the newest 50 kept).
+    /// Empty outside a jj workspace, before the first turn, and from older
+    /// servers.
+    #[serde(default)]
+    pub checkpoints: Vec<Checkpoint>,
+}
+
+/// One agent turn's checkpoint: the commit id of the workspace's `@` right
+/// after the turn ended. jj keeps a superseded `@` commit addressable by id, so
+/// the turn can be diffed and restored long after later snapshots replace it.
+/// `n` counts per pane and is never reused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub n: u64,
+    pub commit: String,
+    /// The state the turn started from — the previous checkpoint, or whatever a
+    /// restore left — so the turn's diff is `from..commit`. `None` when there
+    /// was nothing earlier to diff against (the pane's first recorded state).
+    pub from: Option<String>,
+    /// Unix seconds when it was recorded.
+    pub time: u64,
+    /// What closed the turn: the state it ended in (`done`, `blocked`), `start`
+    /// for where the agent began, or `before restore`.
+    pub label: String,
+    /// The turn's stat over `from..commit`, computed once at record time.
+    pub files: usize,
+    pub insertions: u64,
+    pub deletions: u64,
 }
 
 /// One subagent row under a hook-driven agent in the sidebar: a short
@@ -329,6 +382,18 @@ pub enum Response {
     /// A `PaneFingerprint` reply: the pane's prompt fingerprint, 16 hex digits.
     Fingerprint {
         fingerprint: String,
+    },
+    /// A pane's checkpoints, oldest first.
+    Checkpoints {
+        checkpoints: Vec<Checkpoint>,
+    },
+    /// A `PaneRestore` landed: the working copy now matches checkpoint `n`.
+    /// `saved` is the `before restore` checkpoint holding the state it replaced
+    /// — `None` when nothing had changed since the pane's last checkpoint or
+    /// restore, so no new one was needed.
+    Restored {
+        n: u64,
+        saved: Option<u64>,
     },
     /// The attach handshake reply: the session name and its full view. The
     /// pane snapshots that seed the client's parsers follow as pane frames.
@@ -495,7 +560,31 @@ mod tests {
             pane: PaneId(3),
             event: AgentHookEvent::Done,
         });
+        roundtrip(&Request::PaneCheckpoints { pane: PaneId(3) });
+        roundtrip(&Request::PaneCheckpointDiff {
+            pane: PaneId(3),
+            n: Some(2),
+            stat: true,
+        });
+        roundtrip(&Request::PaneRestore {
+            pane: PaneId(3),
+            n: 1,
+            force: true,
+        });
         roundtrip(&Request::Attach);
+    }
+
+    fn sample_checkpoint() -> Checkpoint {
+        Checkpoint {
+            n: 2,
+            commit: "0fe66d0872aa60dad12f02a7c49e1d220a67229d".into(),
+            from: Some("da7330dd4aa56869ad23109aba788bb16deb53af".into()),
+            time: 1_760_000_000,
+            label: "done".into(),
+            files: 1,
+            insertions: 2,
+            deletions: 1,
+        }
     }
 
     #[test]
@@ -545,6 +634,7 @@ mod tests {
                     state: AgentState::Idle,
                     exited: None,
                     subagents: Vec::new(),
+                    checkpoints: vec![sample_checkpoint()],
                 }],
             }],
         }]
@@ -569,8 +659,28 @@ mod tests {
                     desc: "build the core".into(),
                     running: true,
                 }],
+                checkpoints: Vec::new(),
             }],
         });
+        roundtrip(&Response::Checkpoints {
+            checkpoints: vec![
+                Checkpoint {
+                    n: 1,
+                    from: None,
+                    label: "start".into(),
+                    files: 0,
+                    insertions: 0,
+                    deletions: 0,
+                    ..sample_checkpoint()
+                },
+                sample_checkpoint(),
+            ],
+        });
+        roundtrip(&Response::Restored {
+            n: 1,
+            saved: Some(3),
+        });
+        roundtrip(&Response::Restored { n: 2, saved: None });
         roundtrip(&Response::Content {
             lines: vec!["line one".into(), "line two".into()],
         });
@@ -687,6 +797,30 @@ mod tests {
         )
         .unwrap();
         assert!(pane.subagents.is_empty());
+        // ...and before `checkpoints` existed, to no checkpoints.
+        assert!(pane.checkpoints.is_empty());
+        // `pane_checkpoint_diff` without `n`/`stat` is the newest turn's full
+        // diff; `pane_restore` without `force` respects the state guard.
+        let diff: Request =
+            serde_json::from_str(r#"{"type":"pane_checkpoint_diff","pane":4}"#).unwrap();
+        assert_eq!(
+            diff,
+            Request::PaneCheckpointDiff {
+                pane: PaneId(4),
+                n: None,
+                stat: false,
+            }
+        );
+        let restore: Request =
+            serde_json::from_str(r#"{"type":"pane_restore","pane":4,"n":2}"#).unwrap();
+        assert_eq!(
+            restore,
+            Request::PaneRestore {
+                pane: PaneId(4),
+                n: 2,
+                force: false,
+            }
+        );
         // `workspace_kill` from before `discard` existed still parses (keep).
         let kill: Request = serde_json::from_str(r#"{"type":"workspace_kill","id":2}"#).unwrap();
         assert_eq!(
