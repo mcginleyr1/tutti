@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use tutti_core::{
     AgentHookEvent, AgentKind, AgentState, Direction, FileStat, Layout, Observation, PaneId,
     PaneInfo, StateEvent, SubagentInfo, TabId, TabInfo, TabView, WorkspaceId, WorkspaceInfo,
-    WorkspaceView,
+    WorkspaceView, prompt_fingerprint,
 };
 
 use crate::pty::{PaneSize, PtyPane, PtySpec};
@@ -71,6 +71,10 @@ struct PaneSlot {
     /// screen-heuristic classifier skips it — the hooks are ground truth and
     /// would otherwise fight the exact signals.
     hook_seen: bool,
+    /// The pty output generation the last guarded answer was written at. Until
+    /// the pane draws past it, the agent has not visibly taken that answer, and
+    /// its prompt — fingerprint unchanged — must not be answered twice.
+    answered: Option<u64>,
 }
 
 #[derive(Default)]
@@ -447,6 +451,35 @@ impl Session {
             .write_input(bytes)
     }
 
+    /// A guarded send: answer the prompt a blocked agent is showing, only if it
+    /// is still the prompt `expect` fingerprinted. Refused — nothing written —
+    /// when the pane is not `Blocked`, when it has not drawn anything since the
+    /// last guarded answer (that one is still in flight, so this would answer
+    /// the same prompt twice), or when its prompt fingerprint moved. The
+    /// in-flight mark is the generation of exactly the grid that was checked.
+    pub fn pane_answer(&mut self, pane: PaneId, bytes: &[u8], expect: &str) -> Result<()> {
+        let slot = self
+            .panes
+            .get_mut(&pane)
+            .with_context(|| format!("no pane {pane}"))?;
+        if slot.meta.state != AgentState::Blocked {
+            let state = format!("{:?}", slot.meta.state).to_lowercase();
+            bail!(
+                "pane {pane} is not blocked ({state}): a guarded send only answers a blocked agent"
+            );
+        }
+        let grid = slot.pty.snapshot();
+        if slot.answered == Some(grid.generation) {
+            bail!("pane {pane} was already answered: waiting for it to redraw");
+        }
+        if prompt_fingerprint(&grid.lines) != expect {
+            bail!("the prompt changed since you looked: read pane {pane} again");
+        }
+        slot.pty.write_input(bytes)?;
+        slot.answered = Some(grid.generation);
+        Ok(())
+    }
+
     pub fn pane_read(
         &self,
         pane: PaneId,
@@ -739,6 +772,7 @@ impl Session {
                 tab,
                 ephemeral,
                 hook_seen: false,
+                answered: None,
             },
         );
         Ok(id)

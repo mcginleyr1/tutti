@@ -3,6 +3,7 @@
 //! owns no socket and no terminal, so it can be exercised headlessly in tests.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -11,6 +12,7 @@ use ratatui::layout::Rect;
 use tutti_core::{
     AgentKind, AgentState, DIFF_RANGE, Direction, Event, FileStat, Frame as WireFrame, Layout,
     PaneId, PaneInfo, Request, Response, TabId, TabView, WorkspaceId, WorkspaceView,
+    prompt_fingerprint, prompt_rows,
 };
 
 use tutti_agents::Registry;
@@ -44,6 +46,10 @@ const WHICHKEY_DELAY: Duration = Duration::from_millis(500);
 
 /// Up to this many directory completions surface under the add-project prompt.
 const MAX_COMPLETIONS: usize = 8;
+
+/// The peek overlay's narrowest width, so its hint row (answer keys, esc, how
+/// to jump in: 62 columns padded) fits between the borders over a narrow pane.
+const PEEK_MIN_WIDTH: u16 = 64;
 
 /// The braille working-spinner frames and their advance interval, shared by
 /// every working agent so they animate in lockstep. Swap for ASCII by editing
@@ -127,6 +133,10 @@ pub enum Mode {
     Launcher,
     /// The launcher's free-form command input.
     LauncherCommand,
+    /// Peeking at a blocked agent from the sidebar: its live prompt floats in an
+    /// overlay and answer keys go to it as guarded sends, while focus, tab, and
+    /// layout stay exactly where they were.
+    Peek(PaneId),
 }
 
 pub struct App {
@@ -199,6 +209,9 @@ pub struct App {
     diff_selected: usize,
     /// The top tab-bar row from the last size sync, for mouse hit-testing.
     tab_bar_rect: Option<Rect>,
+    /// The peek overlay from the last size sync, for mouse hit-testing.
+    /// `None` while not peeking.
+    peek_rect: Option<Rect>,
     /// When the client attached — the epoch the working spinner advances from,
     /// so every working agent shares one frame counter.
     spinner_epoch: Instant,
@@ -288,6 +301,7 @@ impl App {
             diff_panel_rect: None,
             diff_selected: 0,
             tab_bar_rect: None,
+            peek_rect: None,
             spinner_epoch: Instant::now(),
             last_content_width: 0,
             adopt_active_view: false,
@@ -428,6 +442,17 @@ impl App {
             self.handle_event(event);
         } else if let Ok(response) = serde_json::from_slice::<Response>(json) {
             self.handle_response(response);
+        }
+        // A peek only ever answers a blocked agent: once the agent moves on —
+        // answered from here or from anywhere else — or vanishes, the overlay
+        // closes itself back onto the sidebar it was opened from.
+        if let Mode::Peek(pane) = self.mode
+            && self
+                .panes
+                .get(&pane)
+                .is_none_or(|s| s.info.state != AgentState::Blocked)
+        {
+            self.mode = Mode::Sidebar;
         }
     }
 
@@ -651,6 +676,7 @@ impl App {
             Mode::SidebarWorkspaceDest => self.on_key_workspace_dest(key),
             Mode::Launcher => self.on_key_launcher(key),
             Mode::LauncherCommand => self.on_key_launcher_command(key),
+            Mode::Peek(pane) => self.on_key_peek(key, pane),
             Mode::Help => {
                 self.mode = Mode::Terminal;
                 Vec::new()
@@ -958,6 +984,7 @@ impl App {
                 | Mode::ConfirmKillAgent(_)
                 | Mode::ConfirmMerge(_)
                 | Mode::ConfirmCleanup(_)
+                | Mode::Peek(_)
         )
     }
 
@@ -1180,6 +1207,10 @@ impl App {
                 Vec::new()
             }
             KeyCode::Enter => self.jump_to_selected(&sidebar),
+            KeyCode::Char('p') => {
+                self.open_peek(&sidebar);
+                Vec::new()
+            }
             KeyCode::Char('n') => self.new_agent_in_selected(&sidebar),
             KeyCode::Char('a') => {
                 self.open_project_prompt();
@@ -1229,6 +1260,86 @@ impl App {
             }
             None => Vec::new(),
         }
+    }
+
+    /// Peek at the selected agent row when it is blocked: open the overlay over
+    /// its live prompt. Nothing else moves — no focus, tab, or layout change —
+    /// so the pane underneath and the prompt being fingerprinted stay put.
+    fn open_peek(&mut self, sidebar: &Sidebar) {
+        match sidebar.entries.get(self.sidebar_selected) {
+            Some(SidebarEntry::Agent(a)) if a.state == AgentState::Blocked => {
+                self.mode = Mode::Peek(a.pane);
+                self.status = None;
+            }
+            _ => self.set_status("peek answers a blocked agent".into()),
+        }
+    }
+
+    /// Keys while peeking. `esc` closes back to the sidebar — never forwarded,
+    /// esc is the back key throughout. An answer key (an unmodified character,
+    /// enter, an arrow, tab, backspace) goes to the peeked pane as a guarded
+    /// send, fingerprinted from the mirror the overlay is drawing: the event
+    /// loop draws every applied frame before it reads keys, so the server
+    /// refuses the key if the prompt moved past what was on screen. Anything
+    /// else is dropped — esc and free-form typing belong in the pane itself.
+    fn on_key_peek(&mut self, key: KeyEvent, pane: PaneId) -> Vec<WireFrame> {
+        if key.code == KeyCode::Esc {
+            self.mode = Mode::Sidebar;
+            self.status = None;
+            return Vec::new();
+        }
+        let answer = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && matches!(
+                key.code,
+                KeyCode::Char(_)
+                    | KeyCode::Enter
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Tab
+                    | KeyCode::BackTab
+                    | KeyCode::Backspace
+            );
+        let text = answer
+            .then(|| input::encode_key(key))
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+        let (Some(text), Some(state)) = (text, self.panes.get(&pane)) else {
+            return Vec::new();
+        };
+        vec![control(&Request::PaneSend {
+            pane,
+            text: Some(text),
+            keys: None,
+            expect: Some(prompt_fingerprint(&screen_rows(state.parser.screen()))),
+        })]
+    }
+
+    /// The peek overlay while peeking: the peeked pane, the popup rect centred
+    /// in the terminal `area`, and the mirror rows it shows — the prompt region
+    /// the fingerprint covers, clipped from the top only when the terminal is
+    /// too short to hold it. The one geometry source the renderer and the mouse
+    /// hit-test share; the overlay floats, so the pane layout never moves.
+    pub fn peek_popup(&self, area: Rect) -> Option<(PaneId, Rect, Range<usize>)> {
+        let Mode::Peek(pane) = self.mode else {
+            return None;
+        };
+        let screen = self.panes.get(&pane)?.parser.screen();
+        let region = prompt_rows(&screen_rows(screen));
+        // Two border rows and the hint row around the region.
+        let height = (region.len().max(1) as u16 + 3).min(area.height);
+        let width = (screen.size().1 + 2).max(PEEK_MIN_WIDTH).min(area.width);
+        let popup = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
+        let shown = region.len().min(height.saturating_sub(3) as usize);
+        Some((pane, popup, region.end - shown..region.end))
     }
 
     /// Jump to the selected entry's workspace — its active-or-first tab, the
@@ -2019,7 +2130,21 @@ impl App {
 
     /// Handle a mouse event, returning frames to send to the server.
     pub fn on_mouse(&mut self, kind: MouseEventKind, col: u16, row: u16) -> Vec<WireFrame> {
+        // The peek overlay is modal: a press inside it is swallowed — the pane
+        // beneath must not take focus — and a press outside dismisses it.
+        if matches!(self.mode, Mode::Peek(_)) {
+            if matches!(kind, MouseEventKind::Down(_))
+                && !self.peek_rect.is_some_and(|r| contains(r, col, row))
+            {
+                self.mode = Mode::Sidebar;
+            }
+            return Vec::new();
+        }
         match kind {
+            MouseEventKind::Down(MouseButton::Right) if self.in_sidebar(col, row) => {
+                self.sidebar_peek_click(row);
+                Vec::new()
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 // Any press drops a prior selection's highlight before starting
                 // fresh, wherever it lands.
@@ -2243,6 +2368,23 @@ impl App {
         }
     }
 
+    /// A right-click inside the sidebar: focus it, select the row under the
+    /// pointer, and peek at it — the mouse twin of `p`.
+    fn sidebar_peek_click(&mut self, row: u16) {
+        let Some(rect) = self.sidebar_rect else {
+            return;
+        };
+        if self.sidebar_prompt_active() {
+            return;
+        }
+        let sidebar = self.sidebar();
+        if let Some(idx) = sidebar.entry_at_row(row.saturating_sub(rect.y) as usize) {
+            self.mode = Mode::Sidebar;
+            self.select_entry(&sidebar, idx);
+            self.open_peek(&sidebar);
+        }
+    }
+
     /// A click on the changed-files panel: focus it and open the clicked file's
     /// diff. The top row is the panel header; file rows follow the same
     /// scroll-follow window the renderer draws.
@@ -2368,6 +2510,7 @@ impl App {
         self.sidebar_rect = sidebar_rect;
         self.diff_panel_rect = diff_panel_rect;
         self.tab_bar_rect = Some(self.tab_bar_rect(app_bar));
+        self.peek_rect = self.peek_popup(area).map(|(_, rect, _)| rect);
         self.rects = self.compute_rects(content);
         let mut out = Vec::new();
         for (pane, rect) in &self.rects {
@@ -3042,6 +3185,12 @@ fn prev_visible(sidebar: &Sidebar, from: usize) -> usize {
         }
     }
     from
+}
+
+/// A screen's visible rows as text, top to bottom — what the prompt fingerprint
+/// and its region are computed over, exactly as the server computes them.
+fn screen_rows(screen: &vt100::Screen) -> Vec<String> {
+    screen.rows(0, screen.size().1).collect()
 }
 
 fn tab_infos(w: &WorkspaceView) -> impl Iterator<Item = &PaneInfo> {
@@ -3917,6 +4066,197 @@ mod tests {
             PaneId(3),
             "blocked panes lead the queue in pane order"
         );
+    }
+
+    /// `view_two_workspaces` with blocked pane 3's mirror holding a permission
+    /// dialog, the sidebar focused, and the cursor on pane 3's waiting row.
+    fn peek_fixture() -> App {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        app.handle_frame(WireFrame::PaneSnapshot(PaneData {
+            pane: PaneId(3),
+            rows: 8,
+            cols: 40,
+            seq: 0,
+            bytes: "Bash command\r\n  rm -rf build\r\n\r\nDo you want to proceed?\r\n❯ 1. Yes\r\n  2. No"
+                .as_bytes()
+                .to_vec(),
+        }));
+        focus_sidebar(&mut app);
+        let waiting = app
+            .sidebar()
+            .index_of(sidebar::EntryIdent::Waiting(PaneId(3)));
+        for _ in 0..waiting.expect("pane 3 waits in the queue") {
+            app.on_key(plain('j'));
+        }
+        app
+    }
+
+    /// The guarded send the peek should emit for `text`, fingerprinted from
+    /// pane 3's mirror as it stands.
+    fn guarded_answer(app: &App, text: &str) -> WireFrame {
+        let rows = screen_rows(app.panes[&PaneId(3)].parser.screen());
+        control(&Request::PaneSend {
+            pane: PaneId(3),
+            text: Some(text.into()),
+            keys: None,
+            expect: Some(prompt_fingerprint(&rows)),
+        })
+    }
+
+    #[test]
+    fn p_on_a_blocked_row_peeks_and_answer_keys_go_out_guarded() {
+        let mut app = peek_fixture();
+        app.focus_change(); // drain the attach-time focus report
+        let (focused, tab, selected) = (app.focused, app.active_tab, app.sidebar_selected());
+        assert_eq!(app.on_key(plain('p')), Vec::new(), "opening sends nothing");
+        assert_eq!(app.mode, Mode::Peek(PaneId(3)));
+
+        assert_eq!(app.on_key(plain('1')), vec![guarded_answer(&app, "1")]);
+        assert_eq!(app.on_key(plain('y')), vec![guarded_answer(&app, "y")]);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.on_key(enter), vec![guarded_answer(&app, "\r")]);
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.on_key(down), vec![guarded_answer(&app, "\x1b[B")]);
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(app.on_key(backspace), vec![guarded_answer(&app, "\x7f")]);
+        // Chords are not answers; they go nowhere rather than to the agent.
+        assert_eq!(app.on_key(ctrl('c')), Vec::new());
+        assert_eq!(app.on_key(alt('y')), Vec::new());
+        assert_eq!(app.mode, Mode::Peek(PaneId(3)), "answering keeps it open");
+
+        // esc is never forwarded: it closes, landing exactly where we were.
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.on_key(esc), Vec::new());
+        assert_eq!(app.mode, Mode::Sidebar);
+        assert_eq!(
+            (app.focused, app.active_tab, app.sidebar_selected()),
+            (focused, tab, selected),
+            "peeking never moves focus, the tab, or the cursor"
+        );
+        assert_eq!(
+            app.focus_change(),
+            None,
+            "the server hears of no focus move"
+        );
+    }
+
+    #[test]
+    fn p_on_a_row_that_is_not_blocked_only_flashes() {
+        let mut app = peek_fixture();
+        app.on_key(plain('k')); // web's last tree agent: pane 3, blocked too
+        app.on_key(plain('k')); // pane 2, working
+        assert_eq!(app.on_key(plain('p')), Vec::new());
+        assert_eq!(app.mode, Mode::Sidebar);
+        assert!(app.transient().is_some_and(|t| t.contains("blocked")));
+    }
+
+    #[test]
+    fn the_peek_closes_itself_once_the_agent_leaves_blocked() {
+        let mut app = peek_fixture();
+        app.on_key(plain('p'));
+        state_changed(&mut app, PaneId(2), AgentState::Working, AgentState::Done);
+        assert_eq!(
+            app.mode,
+            Mode::Peek(PaneId(3)),
+            "another pane's move is not ours"
+        );
+        state_changed(
+            &mut app,
+            PaneId(3),
+            AgentState::Blocked,
+            AgentState::Working,
+        );
+        assert_eq!(app.mode, Mode::Sidebar);
+
+        // A peeked pane that vanishes closes it too.
+        let mut app = peek_fixture();
+        app.on_key(plain('p'));
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Event::LayoutChanged {
+                workspaces: view_one_pane(),
+            })
+            .unwrap(),
+        ));
+        assert_eq!(app.mode, Mode::Sidebar);
+    }
+
+    #[test]
+    fn a_refused_answer_flashes_the_reason_and_keeps_the_peek_open() {
+        let mut app = peek_fixture();
+        app.on_key(plain('p'));
+        app.on_key(plain('1'));
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Response::Error {
+                message: "the prompt changed since you looked: read pane 3 again".into(),
+            })
+            .unwrap(),
+        ));
+        assert_eq!(app.mode, Mode::Peek(PaneId(3)));
+        assert!(
+            app.transient()
+                .is_some_and(|t| t.contains("prompt changed"))
+        );
+    }
+
+    #[test]
+    fn the_mouse_peeks_with_a_right_click_and_the_overlay_is_modal() {
+        let mut app = peek_fixture();
+        app.mode = Mode::Terminal;
+        let area = Rect::new(0, 0, 100, 24);
+        app.sync_sizes(area);
+        let sidebar = app.sidebar_rect.unwrap();
+        let row = (sidebar.y..sidebar.y + sidebar.height)
+            .find(|r| {
+                app.sidebar().entry_at_row((r - sidebar.y) as usize)
+                    == app
+                        .sidebar()
+                        .index_of(sidebar::EntryIdent::Waiting(PaneId(3)))
+            })
+            .unwrap();
+        app.on_mouse(MouseEventKind::Down(MouseButton::Right), sidebar.x + 2, row);
+        assert_eq!(app.mode, Mode::Peek(PaneId(3)));
+        app.sync_sizes(area);
+
+        // A press inside the overlay is swallowed: the pane beneath keeps
+        // its focus and nothing is sent.
+        let (_, popup, _) = app.peek_popup(area).unwrap();
+        let out = app.on_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            popup.x + popup.width / 2,
+            popup.y + 1,
+        );
+        assert_eq!(out, Vec::new());
+        assert_eq!(app.mode, Mode::Peek(PaneId(3)));
+        assert_eq!(app.focused, Some(PaneId(1)));
+
+        // A press outside dismisses it, and only that.
+        let out = app.on_mouse(MouseEventKind::Down(MouseButton::Left), 99, 23);
+        assert_eq!(out, Vec::new());
+        assert_eq!(app.mode, Mode::Sidebar);
+        assert_eq!(app.focused, Some(PaneId(1)));
+    }
+
+    #[test]
+    fn the_peek_popup_frames_exactly_the_fingerprinted_region() {
+        let mut app = peek_fixture();
+        app.on_key(plain('p'));
+        let rows = screen_rows(app.panes[&PaneId(3)].parser.screen());
+        let region = prompt_rows(&rows);
+        assert_eq!(region, 0..6, "the dialog, blank spacer row included");
+
+        let (pane, popup, shown) = app.peek_popup(Rect::new(0, 0, 100, 24)).unwrap();
+        assert_eq!(pane, PaneId(3));
+        assert_eq!(shown, region);
+        assert_eq!(popup.height, 6 + 3, "borders and the hint row around it");
+        assert_eq!(
+            popup.width, PEEK_MIN_WIDTH,
+            "a narrow pane still fits the hint"
+        );
+
+        // Too short a terminal clips from the top, keeping the options in view.
+        let (_, popup, shown) = app.peek_popup(Rect::new(0, 0, 100, 7)).unwrap();
+        assert_eq!((popup.height, shown), (7, 2..6));
     }
 
     #[test]

@@ -186,6 +186,10 @@ enum PaneAction {
         /// Key names to send (interpreted by the server).
         #[arg(long)]
         keys: Option<String>,
+        /// Answer a blocked agent: send only while the pane is blocked and its
+        /// prompt still has this fingerprint (from `pane read --fingerprint`).
+        #[arg(long)]
+        expect: Option<String>,
     },
     Read {
         pane: u64,
@@ -193,6 +197,10 @@ enum PaneAction {
         lines: Option<usize>,
         #[arg(long)]
         unwrapped: bool,
+        /// Print the prompt fingerprint `pane send --expect` takes, instead of
+        /// the screen.
+        #[arg(long, conflicts_with_all = ["lines", "unwrapped"])]
+        fingerprint: bool,
     },
     /// Mark a pane focused (records it active and clears its Done badge).
     Focus {
@@ -459,15 +467,27 @@ fn to_request(command: Command) -> Result<Request> {
                 pane: PaneId(pane),
                 title,
             },
-            PaneAction::Send { pane, text, keys } => Request::PaneSend {
+            PaneAction::Send {
+                pane,
+                text,
+                keys,
+                expect,
+            } => Request::PaneSend {
                 pane: PaneId(pane),
                 text,
                 keys,
+                expect,
             },
+            PaneAction::Read {
+                pane,
+                fingerprint: true,
+                ..
+            } => Request::PaneFingerprint { pane: PaneId(pane) },
             PaneAction::Read {
                 pane,
                 lines,
                 unwrapped,
+                fingerprint: false,
             } => Request::PaneRead {
                 pane: PaneId(pane),
                 lines,
@@ -655,6 +675,10 @@ fn emit(response: Response, json: bool) -> i32 {
             for line in lines {
                 println!("{line}");
             }
+            0
+        }
+        Response::Fingerprint { fingerprint } => {
+            println!("{fingerprint}");
             0
         }
         // The attach handshake reply is consumed by the TUI, never the CLI.
@@ -884,6 +908,7 @@ mod tests {
                 pane: PaneId(2),
                 text: Some("hello".to_string()),
                 keys: None,
+                expect: None,
             }
         );
         assert_eq!(
@@ -892,12 +917,46 @@ mod tests {
                 pane: PaneId(2),
                 text: None,
                 keys: Some("C-c Enter".to_string()),
+                expect: None,
             }
         );
         assert!(Cli::try_parse_from(["tutti", "pane", "send", "2"]).is_err());
         assert!(
             Cli::try_parse_from(["tutti", "pane", "send", "2", "--text", "a", "--keys", "b"])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn guarded_send_and_fingerprint_read_parse() {
+        assert_eq!(
+            request_of(&[
+                "tutti", "pane", "send", "2", "--keys", "enter", "--expect", "9f3a"
+            ]),
+            Request::PaneSend {
+                pane: PaneId(2),
+                text: None,
+                keys: Some("enter".into()),
+                expect: Some("9f3a".into()),
+            }
+        );
+        // `--expect` guards a payload; it is not one.
+        assert!(Cli::try_parse_from(["tutti", "pane", "send", "2", "--expect", "9f3a"]).is_err());
+        assert_eq!(
+            request_of(&["tutti", "pane", "read", "5", "--fingerprint"]),
+            Request::PaneFingerprint { pane: PaneId(5) }
+        );
+        assert!(
+            Cli::try_parse_from([
+                "tutti",
+                "pane",
+                "read",
+                "5",
+                "--fingerprint",
+                "--lines",
+                "3"
+            ])
+            .is_err()
         );
     }
 

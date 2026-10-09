@@ -2,6 +2,7 @@ mod domain;
 mod frame;
 mod ids;
 mod paths;
+mod prompt;
 mod protocol;
 mod state;
 
@@ -9,6 +10,7 @@ pub use domain::{AgentKind, Direction, Layout};
 pub use frame::{Frame, FrameError, MAX_FRAME_LEN, PaneData};
 pub use ids::{PaneId, TabId, WorkspaceId};
 pub use paths::{socket_dir, socket_path};
+pub use prompt::{PROMPT_LINES, prompt_fingerprint, prompt_rows};
 pub use protocol::{
     AgentHookEvent, DIFF_RANGE, Event, FileStat, PaneInfo, Request, Response, SubagentInfo,
     TabInfo, TabView, WIRE_REV, WorkspaceInfo, WorkspaceView,

@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use tutti_agents::{ProcessTree, Registry};
 use tutti_core::{
     AgentHookEvent, AgentKind, Direction, Event, Frame, PaneData, PaneId, Request, Response,
-    StateEvent, WorkspaceId,
+    StateEvent, WorkspaceId, prompt_fingerprint,
 };
 
 use crate::jj;
@@ -454,6 +454,7 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             pane,
             text,
             keys: key_names,
+            expect,
         } => {
             let mut bytes = Vec::new();
             if let Some(text) = &text {
@@ -470,10 +471,26 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
                     message: "pane send needs text or keys".into(),
                 };
             }
-            let r = hub.session().pane_send(pane, &bytes);
+            // The guard's check and write share one session guard, so no other
+            // send can slip between them.
+            let r = match &expect {
+                Some(expect) => hub.session().pane_answer(pane, &bytes, expect),
+                None => hub.session().pane_send(pane, &bytes),
+            };
             match r {
                 Ok(()) => Response::Ok,
                 Err(err) => error(err),
+            }
+        }
+        Request::PaneFingerprint { pane } => {
+            let pty = hub.session().pty(pane);
+            match pty {
+                Some(pty) => Response::Fingerprint {
+                    fingerprint: prompt_fingerprint(&pty.snapshot().lines),
+                },
+                None => Response::Error {
+                    message: format!("no pane {pane}"),
+                },
             }
         }
         Request::PaneRead {

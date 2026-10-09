@@ -101,10 +101,11 @@ cd ~/code/myproject && tutti
 4. **Herd from the sidebar.** `Ctrl+B w` focuses the sidebar: a tree of your
    projects with each one's agents nested beneath it (state dots: blocked red,
    working spinner, done green), and the cross-project **waiting** queue of
-   everything blocked on you. `Enter` jumps to what you highlight; `n` starts
-   another agent in the selected project (in its own tab), `d` shows its jj
-   diff, `w` creates a nested workspace, `m` merges one back. See
-   [Sidebar](#sidebar) and [Workspaces](#workspaces).
+   everything blocked on you. `Enter` jumps to what you highlight; `p` on a
+   blocked agent **peeks** at its prompt and lets you answer it in place,
+   without leaving your pane; `n` starts another agent in the selected project
+   (in its own tab), `d` shows its jj diff, `w` creates a nested workspace, `m`
+   merges one back. See [Sidebar](#sidebar) and [Workspaces](#workspaces).
 
 5. **Detach and return.** `Ctrl+B d` detaches; every pane keeps running under
    the daemon. `tutti` reattaches — state dots and the waiting queue catch you
@@ -371,7 +372,8 @@ pops in the accent colour. Two stacked sections:
   **done** agent from *every* project, blocked first, each over a dim
   `project · kind` line naming where it lives (subagent rows stay in the
   tree). `Enter` (or a click) jumps to the agent itself, so a stuck agent two
-  projects away is never invisible and always one keystroke away.
+  projects away is never invisible and always one keystroke away — and `p`
+  answers it without going there at all ([below](#answering-from-the-queue)).
 
 The app bar answers "does anything need me?" from across the room: after the
 session title it carries a state census (`● 1 blocked · ⠋ 2 working · ● 1
@@ -390,7 +392,8 @@ to expand it.
 Press the prefix then `w` to focus the sidebar (revealing it if hidden); the
 cursor lands on the active project's row. While focused, `j`/`k` (or the
 arrows) move the highlight across both sections, `Enter`
-jumps and hands focus back to the pane, and `esc` unfocuses (esc is the back key
+jumps and hands focus back to the pane, `p` peeks at a blocked agent to answer
+it in place, and `esc` unfocuses (esc is the back key
 throughout). `w` opens **guided [workspace](#workspaces) creation** on the
 selected project (below); `n` starts a **new agent** (or shell/command) in the
 selected project: it jumps to that workspace and opens the launcher over it, and
@@ -434,7 +437,8 @@ workspace's checkout (`jj workspace forget` + delete; the server refuses this
 for a workspace tutti did not create, surfacing that error), and any other key
 cancels. On an agent row, `x` kills **only that agent's pane** (`kill claude?
 y/N`) — never the workspace around it. A mouse click focuses the sidebar, or
-jumps straight to the entry clicked.
+jumps straight to the entry clicked; a right-click on a blocked agent's row
+peeks at it instead.
 
 Visibility is set by the `sidebar` config value: `on` (default) always shows it
 — the control column is the point — while `auto` reveals it only once the
@@ -442,6 +446,44 @@ session is worth surfacing (more than one workspace, or at least one agent pane)
 and `off` keeps it hidden until you focus it with `w`. It is suppressed on very
 narrow terminals so panes keep usable room. With the sidebar off, a **blocked**
 agent still rings the bell and turns its pane border red until you focus it.
+
+### Answering from the queue
+
+`p` on a **blocked** agent's row (in the waiting queue, or its tree row) — or a
+right-click on it — opens a **peek**: a floating ` answer <agent> · <workspace> `
+panel showing that agent's live prompt, the tail of its screen (exactly the
+rows the safety check below covers), drawn from the screen tutti already
+mirrors, so it updates as the agent redraws. While it is open, answer keys go
+straight to that agent: digits and letters (`1`, `y`/`n`, …), `Enter`, the
+arrows, `Tab`, `Backspace`. Nothing else moves — your focused pane, tab, and
+layout stay exactly where they were, and closing the peek leaves you on the
+sidebar row you opened it from. `esc` closes it and is never forwarded (esc is
+the back key throughout); for an esc or free-form typing, close the peek and
+press `Enter` on the row to jump into the pane. Clicks inside the panel do
+nothing (the pane beneath never takes focus); a click outside closes it. The
+footer shows an `ANSWER` chip while it is up.
+
+Every key is a **guarded send**: tutti fingerprints the prompt you are looking
+at (the last 12 non-empty rows of the agent's screen, trailing whitespace
+ignored) and the daemon re-reads the live screen before writing. If the prompt
+changed since you looked — the agent moved on, or someone answered from
+another client — the key is refused and **nothing is written**; the reason
+flashes in the notification band and the peek stays open over the new prompt.
+The first answer to a prompt wins: until the agent visibly redraws, a second
+answer to the same prompt is refused too. A guarded send also only ever goes to
+a pane that is blocked. Once the agent leaves the blocked state the peek closes
+itself.
+
+Scripts get the same guard (`--json` works on both):
+
+```sh
+fp=$(tutti pane read 3 --fingerprint)   # take the fingerprint first…
+tutti pane read 3 --lines 12            # …then read what it covers and decide
+tutti pane send 3 --text 1 --expect "$fp"  # refused if the prompt moved on
+```
+
+Taking the fingerprint *before* reading keeps it safe: if the screen changes in
+between, the fingerprint is the older one and the send is refused.
 
 ### Changed files panel
 
@@ -611,8 +653,8 @@ tutti tab new | list | select <id>
 tutti pane run [--tab <id>] [--ephemeral] -- <cmd...>
 tutti pane split <pane> right|down
 tutti pane list | kill | rename | focus <pane>
-tutti pane send <pane> --text <s> | --keys <s>
-tutti pane read <pane> [--lines N] [--unwrapped]
+tutti pane send <pane> --text <s> | --keys <s> [--expect <fp>]   # --expect: answer a blocked agent, refused if its prompt moved on
+tutti pane read <pane> [--lines N] [--unwrapped] | --fingerprint # --fingerprint: the prompt fingerprint --expect takes
 tutti hooks claude [--raw]           # print the Claude Code hooks snippet to wire agent-event
 tutti agent-event claude             # forward a Claude Code hook event (JSON on stdin) — used by hooks
 tutti [attach]                       # bare `tutti` attaches; a fresh session asks where to start

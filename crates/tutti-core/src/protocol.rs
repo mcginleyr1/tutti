@@ -10,7 +10,7 @@ use crate::state::AgentState;
 /// Response / Event shapes (including additive fields): the daemon reports it
 /// on attach and mismatched clients tell the user to restart the daemon —
 /// binaries upgrade on install, running daemons do not.
-pub const WIRE_REV: u32 = 3;
+pub const WIRE_REV: u32 = 4;
 
 /// The revset every workspace-delta surface diffs against: the fork point of
 /// the trunk bookmark (local `main`, else `master`, else `trunk`; `root()` when
@@ -101,6 +101,21 @@ pub enum Request {
         pane: PaneId,
         text: Option<String>,
         keys: Option<String>,
+        /// Makes this a *guarded* send — an answer to a blocked agent: the
+        /// server writes only while `pane` is `Blocked`, its current
+        /// `prompt_fingerprint` still equals this one, and it has redrawn since
+        /// the last guarded answer; otherwise it answers Error and writes
+        /// nothing. So a keypress never lands on a prompt other than the one
+        /// its sender looked at, and of two answers to one prompt the first
+        /// wins. `None` is the plain unguarded send.
+        #[serde(default)]
+        expect: Option<String>,
+    },
+    /// The pane's current `prompt_fingerprint`, answered with
+    /// `Response::Fingerprint` — what a script passes back as a guarded
+    /// send's `expect`.
+    PaneFingerprint {
+        pane: PaneId,
     },
     PaneRead {
         pane: PaneId,
@@ -311,6 +326,10 @@ pub enum Response {
     Content {
         lines: Vec<String>,
     },
+    /// A `PaneFingerprint` reply: the pane's prompt fingerprint, 16 hex digits.
+    Fingerprint {
+        fingerprint: String,
+    },
     /// The attach handshake reply: the session name and its full view. The
     /// pane snapshots that seed the client's parsers follow as pane frames.
     /// `wire_rev` is the server's `WIRE_REV`; a client warns on mismatch (an
@@ -420,7 +439,15 @@ mod tests {
             pane: PaneId(2),
             text: Some("hello".into()),
             keys: None,
+            expect: None,
         });
+        roundtrip(&Request::PaneSend {
+            pane: PaneId(2),
+            text: None,
+            keys: Some("enter".into()),
+            expect: Some("af63dc4c8601ec8c".into()),
+        });
+        roundtrip(&Request::PaneFingerprint { pane: PaneId(2) });
         roundtrip(&Request::PaneRead {
             pane: PaneId(2),
             lines: Some(50),
@@ -547,6 +574,9 @@ mod tests {
         roundtrip(&Response::Content {
             lines: vec!["line one".into(), "line two".into()],
         });
+        roundtrip(&Response::Fingerprint {
+            fingerprint: "af63dc4c8601ec8c".into(),
+        });
         roundtrip(&Response::Merged {
             pushed: true,
             bookmark: "main".into(),
@@ -664,6 +694,19 @@ mod tests {
             Request::WorkspaceKill {
                 id: WorkspaceId(2),
                 discard: false,
+            }
+        );
+        // `pane_send` from before `expect` existed is a plain, unguarded send.
+        let send: Request =
+            serde_json::from_str(r#"{"type":"pane_send","pane":2,"text":"y","keys":null}"#)
+                .unwrap();
+        assert_eq!(
+            send,
+            Request::PaneSend {
+                pane: PaneId(2),
+                text: Some("y".into()),
+                keys: None,
+                expect: None,
             }
         );
         // `workspace_fork` without a revision or dest defaults both to `None`.

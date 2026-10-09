@@ -64,6 +64,9 @@ pub struct Snapshot {
     pub cursor_col: u16,
     /// One entry per visible row, top to bottom.
     pub lines: Vec<String>,
+    /// The output generation this grid reflects — exactly: both are read under
+    /// the parser lock the reader thread bumps it under.
+    pub generation: u64,
 }
 
 impl Snapshot {
@@ -240,6 +243,7 @@ impl PtyPane {
             cursor_row,
             cursor_col,
             lines,
+            generation: *self.output_rx.borrow(),
         }
     }
 
@@ -461,10 +465,10 @@ fn read_loop(
                         queue.drain(..overflow);
                     }
                 }
-                parser
-                    .lock()
-                    .expect("pty parser poisoned")
-                    .process(&buf[..n]);
+                // Bumped under the parser lock, so a `snapshot` sees a grid and
+                // a generation that agree.
+                let mut grid = parser.lock().expect("pty parser poisoned");
+                grid.process(&buf[..n]);
                 output_tx.send_modify(|generation| *generation = generation.wrapping_add(1));
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,

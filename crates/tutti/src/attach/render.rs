@@ -87,6 +87,7 @@ fn glyphs(icons: Icons) -> &'static Glyphs {
 /// merges one back into its project.
 const SIDEBAR_HINT: &[(&str, &str)] = &[
     ("enter", "jump"),
+    ("p", "peek"),
     ("n", "new agent"),
     ("w", "workspace"),
     ("a", "add project"),
@@ -95,6 +96,15 @@ const SIDEBAR_HINT: &[(&str, &str)] = &[
     ("u", "update"),
     ("x", "kill"),
     ("esc", "back"),
+];
+
+/// The peek overlay's hint row, two-tone: the answer keys, how to close, and
+/// how to get at what the overlay will not forward (esc, free typing) — esc
+/// back to the row, then enter jumps into the pane.
+const PEEK_HINT: &[(&str, &str)] = &[
+    ("y/n 1-9 ↑↓ enter", "answer"),
+    ("esc", "close"),
+    ("esc enter", "jump in to type"),
 ];
 
 /// The changed-files-panel key hint, rendered two-tone in the bottom bar.
@@ -179,6 +189,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_diff_panel(frame, app, panel_rect);
     }
     draw_footer(frame, app, footer);
+    // Under the band, so a refused answer's flash stays readable over it.
+    draw_peek(frame, app, area);
     // A transient fires the one-row notification band over the last content row,
     // just above the footer.
     if app.transient().is_some() && footer.y > content.y {
@@ -1071,7 +1083,13 @@ fn draw_pane(frame: &mut Frame, app: &App, pane: PaneId, rect: Rect, spinner: ch
 
     if let Some(state) = state {
         let screen = state.parser.screen();
-        draw_screen(frame.buffer_mut(), inner, screen, app.selection_span(pane));
+        draw_screen(
+            frame.buffer_mut(),
+            inner,
+            screen,
+            0,
+            app.selection_span(pane),
+        );
         if focused && state.scroll.is_none() && !screen.hide_cursor() {
             let (row, col) = screen.cursor_position();
             if col < inner.width && row < inner.height {
@@ -1082,23 +1100,26 @@ fn draw_pane(frame: &mut Frame, app: &App, pane: PaneId, rect: Rect, spinner: ch
 }
 
 /// Blit a vt100 screen into `area`, one cell at a time, mapping colours and
-/// attributes. Wide-character continuation cells are cleared so a glyph is not
-/// drawn twice. `selection`, when set, is the inclusive `(start, end)` span of a
-/// live mouse selection in screen coordinates; cells inside it take the
-/// `select_bg()` highlight — an ANSI palette colour, so it repaints with the
-/// terminal's scheme like the sidebar selection.
+/// attributes, starting from screen row `first_row` (0 for a pane; the prompt
+/// region's top for a peek). Wide-character continuation cells are cleared so a
+/// glyph is not drawn twice. `selection`, when set, is the inclusive `(start,
+/// end)` span of a live mouse selection in screen coordinates; cells inside it
+/// take the `select_bg()` highlight — an ANSI palette colour, so it repaints
+/// with the terminal's scheme like the sidebar selection.
 fn draw_screen(
     buf: &mut Buffer,
     area: Rect,
     screen: &vt100::Screen,
+    first_row: u16,
     selection: Option<((u16, u16), (u16, u16))>,
 ) {
     let (rows, cols) = screen.size();
-    let height = area.height.min(rows);
+    let height = area.height.min(rows.saturating_sub(first_row));
     let width = area.width.min(cols);
-    for row in 0..height {
+    for y in 0..height {
+        let row = first_row + y;
         for col in 0..width {
-            let Some(buf_cell) = buf.cell_mut((area.x + col, area.y + row)) else {
+            let Some(buf_cell) = buf.cell_mut((area.x + col, area.y + y)) else {
                 continue;
             };
             let selected = selection.is_some_and(|(s, e)| in_span(s, e, cols, row, col));
@@ -1255,6 +1276,7 @@ fn mode_label(mode: Mode) -> Option<&'static str> {
         Mode::SidebarPrompt => Some("ADD PROJECT"),
         Mode::SidebarWorkspaceName | Mode::SidebarWorkspaceDest => Some("WORKSPACE"),
         Mode::Launcher | Mode::LauncherCommand => Some("RUN"),
+        Mode::Peek(_) => Some("ANSWER"),
     }
 }
 
@@ -1458,6 +1480,45 @@ fn draw_launcher_command(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line).block(popup_block(&title)), popup);
 }
 
+/// The peek overlay: a centred rounded panel titled ` answer <agent> ·
+/// <workspace> ` showing the live tail of a blocked agent's screen — exactly
+/// the prompt region its fingerprint covers — blitted cell by cell from the
+/// client's mirror, over the two-tone hint row. Geometry comes from
+/// `App::peek_popup`, which the mouse hit-test shares.
+fn draw_peek(frame: &mut Frame, app: &App, area: Rect) {
+    let Some((pane, popup, rows)) = app.peek_popup(area) else {
+        return;
+    };
+    let Some(state) = app.panes.get(&pane) else {
+        return;
+    };
+    let workspace = app
+        .workspaces
+        .iter()
+        .find(|w| w.tabs.iter().any(|t| t.panes.iter().any(|p| p.id == pane)))
+        .map_or_else(String::new, |w| format!(" · {}", w.name));
+    let title = format!(" answer {}{workspace} ", identity(&state.info));
+    clear(frame, popup, theme::current().pane_bg);
+    let block = popup_block(&title);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if inner.height == 0 {
+        return;
+    }
+    let body = Rect::new(inner.x, inner.y, inner.width, inner.height - 1);
+    draw_screen(
+        frame.buffer_mut(),
+        body,
+        state.parser.screen(),
+        rows.start as u16,
+        None,
+    );
+    let hint = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
+    let mut spans = vec![Span::raw(" ")];
+    spans.extend(two_tone(PEEK_HINT).0);
+    frame.render_widget(Paragraph::new(Line::from(spans)), hint);
+}
+
 /// Render `lines` in a rounded panel titled `title`, centred over `area`. Shared
 /// by the launcher picker with the help/which-key panel look.
 fn draw_centered_popup(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line>) {
@@ -1526,6 +1587,10 @@ fn help_lines(cfg: &Config) -> Vec<Line<'static>> {
     lines.push(Line::from(String::new()));
     lines.push(Line::from("sidebar (after C-b w):".to_string()));
     lines.push(popup_key_line("  j/k", "move"));
+    lines.push(popup_key_line(
+        "  p",
+        "peek: answer a blocked agent in place",
+    ));
     lines.push(popup_key_line("  n / w", "new agent / new workspace"));
     lines.push(popup_key_line("  a / d", "add project / diff"));
     lines.push(popup_key_line("  m / u", "merge / update stale"));
@@ -2748,6 +2813,45 @@ mod tests {
             text.contains("run in api"),
             "the launcher panel title names the target workspace: {text:?}"
         );
+    }
+
+    #[test]
+    fn peek_overlay_shows_the_blocked_prompt_over_its_hint() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = app_two_workspaces();
+        app.handle_frame(WireFrame::PaneSnapshot(PaneData {
+            pane: PaneId(2),
+            rows: 10,
+            cols: 50,
+            seq: 0,
+            bytes: b"old transcript\r\n\r\nDo you want to proceed?\r\n> 1. Yes\r\n  2. No".to_vec(),
+        }));
+        let area = Rect::new(0, 0, 100, 24);
+        app.sync_sizes(area);
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        // api, web, web's agent, then the agent's waiting row.
+        for _ in 0..3 {
+            app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Peek(PaneId(2)));
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let text = buffer_text(buf);
+        assert!(text.contains("answer claude · web"), "title: {text:?}");
+        let (_, popup, _) = app.peek_popup(area).unwrap();
+        let inside = |needle: &str| {
+            let row = row_containing(buf, needle) as u16;
+            let col = col_of(buf, row as usize, needle) as u16;
+            row > popup.y && row < popup.y + popup.height && col > popup.x
+        };
+        assert!(inside("Do you want to proceed?"), "the prompt: {text:?}");
+        assert!(inside("2. No"), "its options: {text:?}");
+        assert!(inside("jump in to type"), "the hint row: {text:?}");
+        assert!(row_text(buf, 23).contains("ANSWER"), "the footer mode chip");
     }
 
     #[test]

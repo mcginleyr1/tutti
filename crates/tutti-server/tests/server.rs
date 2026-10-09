@@ -234,6 +234,7 @@ async fn pane_send_echoes_into_grid() {
             pane,
             text: Some("hello-echo\n".into()),
             keys: None,
+            expect: None,
         })
         .await,
         Response::Ok
@@ -821,6 +822,7 @@ async fn hook_driven_pane_ignores_screen_classification() {
             pane,
             text: Some("esc to interrupt\n".into()),
             keys: None,
+            expect: None,
         })
         .await,
         Response::Ok
@@ -981,6 +983,7 @@ async fn agent_state_changes_working_then_blocked() {
                 pane,
                 text: Some("esc to interrupt\n".into()),
                 keys: None,
+                expect: None,
             })
             .await,
         Response::Ok
@@ -993,6 +996,7 @@ async fn agent_state_changes_working_then_blocked() {
                 pane,
                 text: Some("Do you want to continue?\n".into()),
                 keys: None,
+                expect: None,
             })
             .await,
         Response::Ok
@@ -1007,6 +1011,226 @@ async fn agent_state_changes_working_then_blocked() {
     );
 
     server.stop().await;
+}
+
+/// A stand-in for an agent's permission dialog: a shell that asks, reads one
+/// answer line, and reports it. The tty echoes in cooked mode, so any byte
+/// written to the pane redraws its prompt row — a fingerprint unchanged after a
+/// refusal proves the refusal wrote nothing.
+const PROMPT: &str = "printf 'Proceed? [y/n] '; read a; echo \"answered:$a\"; sleep 30";
+
+/// Run `PROMPT`, wait for it to draw, and put the pane in `Blocked` with a hook
+/// event (deterministic, unlike the screen classifier). Returns the pane and
+/// its prompt fingerprint.
+async fn blocked_prompt(conn: &mut Conn) -> (PaneId, String) {
+    let pane = run_marker(conn, PROMPT).await;
+    assert!(
+        read_until(conn, pane, "Proceed?").await,
+        "the prompt never drew"
+    );
+    assert_eq!(
+        conn.request(Request::AgentEvent {
+            pane,
+            event: AgentHookEvent::Blocked { message: None },
+        })
+        .await,
+        Response::Ok
+    );
+    let fp = fingerprint(conn, pane).await;
+    (pane, fp)
+}
+
+async fn fingerprint(conn: &mut Conn, pane: PaneId) -> String {
+    match conn.request(Request::PaneFingerprint { pane }).await {
+        Response::Fingerprint { fingerprint } => fingerprint,
+        other => panic!("expected Fingerprint, got {other:?}"),
+    }
+}
+
+fn guarded(pane: PaneId, text: &str, expect: &str) -> Request {
+    Request::PaneSend {
+        pane,
+        text: Some(text.into()),
+        keys: None,
+        expect: Some(expect.into()),
+    }
+}
+
+fn refusal(response: Response) -> String {
+    match response {
+        Response::Error { message } => message,
+        other => panic!("expected the guarded send to be refused, got {other:?}"),
+    }
+}
+
+/// A guarded send whose fingerprint still matches the blocked prompt lands.
+#[tokio::test]
+async fn guarded_send_answers_a_blocked_prompt() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let (pane, fp) = blocked_prompt(&mut conn).await;
+    assert_eq!(fp.len(), 16, "a fingerprint is 16 hex digits: {fp}");
+
+    assert_eq!(conn.request(guarded(pane, "y\n", &fp)).await, Response::Ok);
+    assert!(
+        read_until(&mut conn, pane, "answered:y").await,
+        "the guarded answer never reached the prompt"
+    );
+    server.stop().await;
+}
+
+/// A guarded send carrying a stale fingerprint is refused and writes nothing.
+#[tokio::test]
+async fn guarded_send_refuses_a_changed_prompt_and_writes_nothing() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let (pane, fp) = blocked_prompt(&mut conn).await;
+
+    let message = refusal(conn.request(guarded(pane, "y\n", "0000000000000000")).await);
+    assert!(message.contains("prompt changed"), "{message}");
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        fingerprint(&mut conn, pane).await,
+        fp,
+        "a refused send wrote to the pane (its echo moved the prompt)"
+    );
+    server.stop().await;
+}
+
+/// The guard answers blocked agents only: a matching fingerprint on a pane in
+/// any other state is refused, nothing written.
+#[tokio::test]
+async fn guarded_send_refuses_a_pane_that_is_not_blocked() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let pane = run_marker(&mut conn, PROMPT).await;
+    assert!(read_until(&mut conn, pane, "Proceed?").await);
+    let fp = fingerprint(&mut conn, pane).await;
+
+    let message = refusal(conn.request(guarded(pane, "y\n", &fp)).await);
+    assert!(message.contains("not blocked"), "{message}");
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        fingerprint(&mut conn, pane).await,
+        fp,
+        "nothing was written"
+    );
+    server.stop().await;
+}
+
+/// First answer wins: two clients answering the same prompt — the second sent
+/// at once, before or after the pane has echoed the first — only the first
+/// lands; once the prompt has moved on, the old fingerprint stays stale.
+#[tokio::test]
+async fn of_two_answers_to_one_prompt_only_the_first_lands() {
+    let server = TestServer::start();
+    let mut first = server.connect().await;
+    let mut second = server.connect().await;
+    let (pane, fp) = blocked_prompt(&mut first).await;
+
+    assert_eq!(first.request(guarded(pane, "y\n", &fp)).await, Response::Ok);
+    let message = refusal(second.request(guarded(pane, "n\n", &fp)).await);
+    assert!(
+        message.contains("already answered") || message.contains("prompt changed"),
+        "{message}"
+    );
+    assert!(read_until(&mut first, pane, "answered:y").await);
+
+    let settled = fingerprint(&mut first, pane).await;
+    let message = refusal(second.request(guarded(pane, "n\n", &fp)).await);
+    assert!(message.contains("prompt changed"), "{message}");
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        fingerprint(&mut first, pane).await,
+        settled,
+        "the refused second answer wrote nothing"
+    );
+    server.stop().await;
+}
+
+/// A client's mirror — a parser seeded from the attach snapshot, then fed the
+/// deltas — fingerprints exactly like the live grid once caught up, over the
+/// cases where the two grids' cells can differ: wide characters, written
+/// trailing spaces, coloured blanks, a soft-wrapped row, and an absolutely
+/// placed one. Checked on both the snapshot and the delta path.
+#[tokio::test]
+async fn a_mirror_fingerprints_like_the_live_grid() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let script = concat!(
+        "printf '漢字 wide ✓ done\\n'; ",
+        "printf 'trailing   \\n'; ",
+        "printf '\\033[44m   \\033[0m\\n'; ",
+        "printf '\\033[41m\\033[K\\033[0m\\n'; ",
+        "printf '%0100d\\n' 0; ",
+        "printf '\\033[20;30Hplaced\\n'; ",
+        "printf 'phase one\\n'; read a; ",
+        "printf '\\033[2J\\033[H❯ 1. Yes   \\n  2. No\\n\\033[42m \\033[0m\\n'; ",
+        "printf '%0150d\\n' 1; printf 'phase two\\n'; sleep 30",
+    );
+    let pane = run_marker(&mut control, script).await;
+    assert!(read_until(&mut control, pane, "phase one").await);
+
+    let mut viewer = server.connect().await;
+    viewer.send(&Request::Attach).await;
+    let mut mirror = None;
+    let live = fingerprint(&mut control, pane).await;
+    mirror_until(&mut viewer, pane, &mut mirror, &live).await;
+
+    assert_eq!(
+        control
+            .request(Request::PaneSend {
+                pane,
+                text: Some("go\n".into()),
+                keys: None,
+                expect: None,
+            })
+            .await,
+        Response::Ok
+    );
+    assert!(read_until(&mut control, pane, "phase two").await);
+    let live = fingerprint(&mut control, pane).await;
+    mirror_until(&mut viewer, pane, &mut mirror, &live).await;
+    server.stop().await;
+}
+
+/// Feed `pane`'s snapshot and delta frames off an attached connection into
+/// `mirror` the way the client does, until its rows fingerprint as `want`.
+async fn mirror_until(
+    viewer: &mut Conn,
+    pane: PaneId,
+    mirror: &mut Option<vt100::Parser>,
+    want: &str,
+) {
+    let rows = |parser: &vt100::Parser| -> Vec<String> {
+        let screen = parser.screen();
+        screen.rows(0, screen.size().1).collect()
+    };
+    let caught_up = timeout(DEADLINE, async {
+        loop {
+            match viewer.read_frame().await {
+                Frame::PaneSnapshot(d) if d.pane == pane => {
+                    let mut parser = vt100::Parser::new(d.rows, d.cols, 0);
+                    parser.process(&d.bytes);
+                    *mirror = Some(parser);
+                }
+                Frame::PaneDelta(d) if d.pane == pane => mirror
+                    .as_mut()
+                    .expect("a delta arrived before the snapshot")
+                    .process(&d.bytes),
+                _ => continue,
+            }
+            if tutti_core::prompt_fingerprint(&rows(mirror.as_ref().unwrap())) == want {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        caught_up.is_ok(),
+        "the mirror never fingerprinted like the live grid ({want}): {:#?}",
+        mirror.as_ref().map(rows)
+    );
 }
 
 /// A fresh empty temp directory, unique per call.
