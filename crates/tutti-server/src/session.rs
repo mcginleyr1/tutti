@@ -6,20 +6,28 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use tutti_core::{
     AgentHookEvent, AgentKind, AgentState, Direction, FileStat, Layout, Observation, PaneId,
-    PaneInfo, StateEvent, SubagentInfo, TabId, TabInfo, TabView, WorkspaceId, WorkspaceInfo,
-    WorkspaceView, prompt_fingerprint,
+    PaneInfo, StateEvent, StateSource, SubagentInfo, TabId, TabInfo, TabView, WorkspaceId,
+    WorkspaceInfo, WorkspaceView, prompt_fingerprint,
 };
 
 use crate::checkpoints::Turns;
-use crate::pty::{PaneSize, PtyPane, PtySpec};
+use crate::pty::{PaneSize, PtyPane, PtySpec, StatusReport};
 
 /// The most subagent rows kept per pane before the oldest is dropped, bounding
 /// the list even for an agent that spawns many short-lived subagents.
 const SUBAGENT_CAP: usize = 16;
+/// How long a `Working` pane not held by a hook may go without PTY output or a
+/// classifier `Working` match before it reads as `Unknown`: a build killed
+/// mid-report never says clear, and a wedged agent never says done.
+pub const STALL_AFTER: Duration = Duration::from_secs(30);
+/// The least gap between two OSC 7501 `msg` notifications from one pane (the
+/// program-status spec's rate limit).
+const REPORT_NOTIFY_EVERY: Duration = Duration::from_secs(30);
 
 struct TabEntry {
     id: TabId,
@@ -68,16 +76,21 @@ struct PaneSlot {
     /// An ephemeral pane is removed outright when its child exits (the reaper
     /// drops it from the layout) instead of being kept as an exited corpse.
     ephemeral: bool,
-    /// Set once this pane has reported an agent hook event. From then on the
-    /// screen-heuristic classifier skips it — the hooks are ground truth and
-    /// would otherwise fight the exact signals.
-    hook_seen: bool,
     /// The pty output generation the last guarded answer was written at. Until
     /// the pane draws past it, the agent has not visibly taken that answer, and
     /// its prompt — fingerprint unchanged — must not be answered twice.
     answered: Option<u64>,
     /// The pane's per-turn checkpoints, overlaid onto its `PaneInfo` in views.
     turns: Turns,
+    /// The label a pane with no detected agent shows under in agent surfaces
+    /// once it reports its own status (OSC 7501 `app`, else its title); dropped
+    /// when that report comes to rest (`settle`).
+    label: Option<String>,
+    /// The last sign of life — PTY output, a classifier `Working` match, a
+    /// status report — that the stall timer measures from.
+    alive: Instant,
+    /// When an OSC 7501 `msg` last raised a notification here.
+    notified: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -517,36 +530,37 @@ impl Session {
             .collect()
     }
 
-    /// Live agent panes that are *not* hook-driven, with their kind and pty —
-    /// the targets of the screen-classification pass. A pane that has reported a
-    /// hook event is excluded: its state comes from exact hook signals, and the
-    /// screen heuristics would only fight them. Agent detection is unaffected (it
-    /// walks `live_panes`), so a hook-driven pane still shows its badge.
-    pub fn agent_panes(&self) -> Vec<(PaneId, AgentKind, Arc<PtyPane>)> {
+    /// Live panes the classify pass tends, with their detected kind and pty:
+    /// detected agents (classified from their screen) plus any pane holding a
+    /// program/progress claim (for the stall timer). A hook-driven pane is
+    /// excluded: its state comes from exact hook signals, which the screen
+    /// heuristics would only fight, and hooks never stall. Agent detection is
+    /// unaffected (it walks `live_panes`), so a hook-driven pane keeps its badge.
+    pub fn agent_panes(&self) -> Vec<(PaneId, Option<AgentKind>, Arc<PtyPane>)> {
         self.panes
             .iter()
-            .filter(|(_, s)| s.meta.exited.is_none() && !s.hook_seen)
-            .filter_map(|(id, s)| {
-                s.meta
-                    .agent
-                    .clone()
-                    .map(|agent| (*id, agent, Arc::clone(&s.pty)))
+            .filter(|(_, s)| {
+                s.meta.exited.is_none()
+                    && s.meta.source != Some(StateSource::Hook)
+                    && (s.meta.agent.is_some() || s.meta.source.is_some_and(StateSource::claims))
             })
+            .map(|(id, s)| (*id, s.meta.agent.clone(), Arc::clone(&s.pty)))
             .collect()
     }
 
-    /// Apply a Claude Code hook event to `pane`, marking it hook-driven. Returns
-    /// what moved so the caller broadcasts the right event(s): a state transition
-    /// (via the shared `AgentState::apply`) drives `StateChanged`; a subagent-list
-    /// change drives `LayoutChanged`. `None` for an unknown pane (a hook must
-    /// never fail because its pane has gone away).
+    /// Apply an agent hook event to `pane`, which claims it for good (hooks
+    /// outrank every other source). Returns what moved so the caller broadcasts
+    /// the right event(s): a state transition (via the shared
+    /// `AgentState::apply`) drives `StateChanged`; a subagent-list change drives
+    /// `LayoutChanged`. `None` for an unknown pane (a hook must never fail
+    /// because its pane has gone away).
     pub fn apply_agent_event(
         &mut self,
         pane: PaneId,
         event: AgentHookEvent,
     ) -> Option<AgentEventOutcome> {
         let slot = self.panes.get_mut(&pane)?;
-        slot.hook_seen = true;
+        slot.meta.source = Some(StateSource::Hook);
         let subs = &mut slot.meta.subagents;
         let mut subagents_changed = false;
         let mut classified = None;
@@ -592,7 +606,9 @@ impl Session {
         })
     }
 
-    /// Record the agent kind detected for a pane. Returns whether it changed.
+    /// Record the agent kind detected for a pane. Returns whether it changed. A
+    /// change ends any program/progress claim and the self-reported label —
+    /// they spoke for whatever ran there before; a hook claim stays (sticky).
     /// An agent appearing notes its start as a checkpoint for the caller's next
     /// change probe — detection lands well before the agent's first edit.
     pub fn set_agent(&mut self, pane: PaneId, agent: Option<AgentKind>) -> bool {
@@ -602,6 +618,10 @@ impl Session {
                     slot.turns.note_start();
                 }
                 slot.meta.agent = agent;
+                slot.label = None;
+                if slot.meta.source != Some(StateSource::Hook) {
+                    slot.meta.source = None;
+                }
                 true
             }
             _ => false,
@@ -636,6 +656,124 @@ impl Session {
     /// A pane's checkpoint list, `None` for an unknown pane.
     pub fn turns(&mut self, pane: PaneId) -> Option<&mut Turns> {
         self.panes.get_mut(&pane).map(|slot| &mut slot.turns)
+    }
+
+    /// Apply a program's own status report (OSC 9;4 / 7501) to `pane` under the
+    /// source ranking: refused while a higher source's claim is live, else it
+    /// sets the state and claims the pane for its source. A clear ends the
+    /// claim only for the source holding it; what that claim held in motion
+    /// (Working/Blocked) settles to Idle, an outcome (Done) stays until seen.
+    /// An accepted report labels a pane with no detected agent (its `app`, else
+    /// the title) so it shows where agent state does, and a `msg` on a move to
+    /// Done/Blocked becomes a notification at most every 30s.
+    pub fn apply_report(
+        &mut self,
+        pane: PaneId,
+        report: StatusReport,
+        now: Instant,
+    ) -> ReportOutcome {
+        let Some(slot) = self.panes.get_mut(&pane) else {
+            return ReportOutcome::default();
+        };
+        let (from, held) = (slot.meta.state, slot.meta.source);
+        let to = match report.state {
+            Some(state) => state,
+            None if held == Some(report.source) => match from {
+                AgentState::Working | AgentState::Blocked => AgentState::Idle,
+                other => other,
+            },
+            None => return ReportOutcome::default(),
+        };
+        if !report.source.may_move(held, from, to) {
+            return ReportOutcome::default();
+        }
+        slot.alive = now;
+        slot.meta.state = to;
+        slot.meta.source = report.state.map(|_| report.source);
+        let mut relisted = false;
+        if report.state.is_some() {
+            let label = report.app.clone().or_else(|| Some(slot.meta.title.clone()));
+            relisted = slot.meta.agent.is_none() && slot.label != label;
+            slot.label = label;
+        }
+        let notify = report
+            .msg
+            .filter(|_| from != to && matches!(to, AgentState::Done | AgentState::Blocked))
+            .filter(|_| {
+                slot.notified
+                    .is_none_or(|at| now.duration_since(at) >= REPORT_NOTIFY_EVERY)
+            })
+            .map(|msg| {
+                slot.notified = Some(now);
+                (report.app, msg)
+            });
+        ReportOutcome {
+            transition: (from != to).then_some((from, to)),
+            relisted,
+            notify,
+        }
+    }
+
+    /// Fold one classify pass onto `pane`: PTY output since the last pass is an
+    /// Activity, a screen match a Screen observation (applied second, so it
+    /// wins), each landing only where the live claim lets it
+    /// (`StateSource::may_move`). Output or a `Working` match keeps the pane
+    /// alive; a `Working` pane not held by a hook and silent for `STALL_AFTER`
+    /// drops to `Unknown`, ending its claim. Returns the net transition.
+    pub fn observe(
+        &mut self,
+        pane: PaneId,
+        advanced: bool,
+        classified: Option<Observation>,
+        now: Instant,
+    ) -> Option<(AgentState, AgentState)> {
+        let slot = self.panes.get_mut(&pane)?;
+        if advanced || classified == Some(Observation::Working) {
+            slot.alive = now;
+        }
+        let from = slot.meta.state;
+        let signals = [
+            (
+                StateSource::Activity,
+                advanced.then_some(StateEvent::Activity),
+            ),
+            (StateSource::Screen, classified.map(StateEvent::Classified)),
+        ];
+        for (source, event) in signals {
+            let Some(event) = event else { continue };
+            let (current, next) = (slot.meta.state, slot.meta.state.apply(event));
+            if next != current && source.may_move(slot.meta.source, current, next) {
+                slot.meta.state = next;
+                slot.meta.source = Some(source);
+            }
+        }
+        if slot.meta.state == AgentState::Working
+            && slot.meta.source != Some(StateSource::Hook)
+            && now.duration_since(slot.alive) >= STALL_AFTER
+        {
+            slot.meta.state = AgentState::Unknown;
+            slot.meta.source = None;
+        }
+        let to = slot.meta.state;
+        (from != to).then_some((from, to))
+    }
+
+    /// Drop a self-reported pane's label once its report has nothing left to
+    /// say — no live claim, and Idle or Unknown — so it leaves the agent
+    /// surfaces until it reports again. Returns whether the pane's listing
+    /// changed: the caller rebroadcasts the view, since a client only patches
+    /// state from `StateChanged`.
+    pub fn settle(&mut self, pane: PaneId) -> bool {
+        let Some(slot) = self.panes.get_mut(&pane) else {
+            return false;
+        };
+        let resting = !slot.meta.source.is_some_and(StateSource::claims)
+            && matches!(slot.meta.state, AgentState::Idle | AgentState::Unknown);
+        if !resting || slot.label.is_none() {
+            return false;
+        }
+        slot.label = None;
+        slot.meta.agent.is_none()
     }
 
     pub fn pane_state(&self, pane: PaneId) -> Option<AgentState> {
@@ -684,8 +822,9 @@ impl Session {
 
     /// Record a child's exit, keeping the pane and its grid readable. A child
     /// exit is a `Done` observation, so the state advances the same way the
-    /// classifier would. Returns the `(from, to)` state transition, or `None`
-    /// when the pane is already gone or already marked exited.
+    /// classifier would, and it ends whatever claim the pane held. Returns the
+    /// `(from, to)` state transition, or `None` when the pane is already gone
+    /// or already marked exited.
     pub fn mark_exited(&mut self, pane: PaneId, code: i32) -> Option<(AgentState, AgentState)> {
         match self.panes.get_mut(&pane) {
             Some(slot) if slot.meta.exited.is_none() => {
@@ -693,6 +832,7 @@ impl Session {
                 let from = slot.meta.state;
                 let to = from.apply(StateEvent::Classified(Observation::Done));
                 slot.meta.state = to;
+                slot.meta.source = None;
                 Some((from, to))
             }
             _ => None,
@@ -806,13 +946,16 @@ impl Session {
                     exited: None,
                     subagents: Vec::new(),
                     checkpoints: Vec::new(),
+                    source: None,
                 },
                 pty,
                 tab,
                 ephemeral,
-                hook_seen: false,
                 answered: None,
                 turns: Turns::default(),
+                label: None,
+                alive: Instant::now(),
+                notified: None,
             },
         );
         Ok(id)
@@ -825,6 +968,18 @@ pub struct AgentEventOutcome {
     pub transition: Option<(AgentState, AgentState)>,
     /// Whether the subagent list changed (so a fresh view must be broadcast).
     pub subagents_changed: bool,
+}
+
+/// What `apply_report` changed, so the server broadcasts the right events.
+#[derive(Debug, Default, PartialEq)]
+pub struct ReportOutcome {
+    /// The pane's `(from, to)` state transition, when the report moved it.
+    pub transition: Option<(AgentState, AgentState)>,
+    /// Whether a pane with no detected agent gained or changed its label (so a
+    /// fresh view must be broadcast).
+    pub relisted: bool,
+    /// A `(title, body)` notification from the report's `msg`.
+    pub notify: Option<(Option<String>, String)>,
 }
 
 /// Mark a subagent stopped. Prefers the running entry whose id matches; failing
@@ -843,11 +998,17 @@ fn stop_subagent(subs: &mut [SubagentInfo], id: &str) -> bool {
     false
 }
 
+/// A pane's wire metadata. One with no detected agent that is self-reporting
+/// presents its label as the agent, which is all every agent surface keys on.
 fn pane_info(slot: &PaneSlot) -> PaneInfo {
-    PaneInfo {
+    let mut info = PaneInfo {
         checkpoints: slot.turns.entries().to_vec(),
         ..slot.meta.clone()
+    };
+    if info.agent.is_none() {
+        info.agent = slot.label.clone().map(AgentKind);
     }
+    info
 }
 
 fn pane_title(program: &str) -> String {
@@ -896,10 +1057,237 @@ fn parse_head(contents: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{git_branch, parse_head, stop_subagent};
+    use super::{STALL_AFTER, Session, git_branch, parse_head, stop_subagent};
+    use crate::pty::{PaneSize, StatusReport};
+    use AgentState::{Blocked, Done, Idle, Unknown, Working};
+    use StateSource::{Hook, Program, Progress, Screen};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use tutti_core::SubagentInfo;
+    use std::time::{Duration, Instant};
+    use tutti_core::{
+        AgentHookEvent, AgentState, Observation, PaneId, PaneInfo, StateSource, SubagentInfo,
+    };
+
+    /// A session holding one live `sleep` pane (titled `sleep`). The temp dir is
+    /// returned so it outlives the pane's cwd.
+    fn session_with_pane() -> (Session, PaneId, TempDir) {
+        let tmp = TempDir::new();
+        let mut session = Session::new(PaneSize::new(24, 80), "test");
+        session.workspace_new(tmp.path().to_path_buf());
+        let pane = session
+            .pane_run(None, vec!["/bin/sleep".into(), "30".into()], false)
+            .unwrap();
+        (session, pane, tmp)
+    }
+
+    fn report(source: StateSource, state: Option<AgentState>) -> StatusReport {
+        StatusReport {
+            source,
+            state,
+            app: None,
+            msg: None,
+        }
+    }
+
+    fn app_report(state: Option<AgentState>, app: &str, msg: Option<&str>) -> StatusReport {
+        StatusReport {
+            source: Program,
+            state,
+            app: Some(app.into()),
+            msg: msg.map(Into::into),
+        }
+    }
+
+    fn info(session: &Session, pane: PaneId) -> PaneInfo {
+        session
+            .pane_list()
+            .into_iter()
+            .find(|p| p.id == pane)
+            .unwrap()
+    }
+
+    fn state_of(session: &Session, pane: PaneId) -> (AgentState, Option<StateSource>) {
+        let info = info(session, pane);
+        (info.state, info.source)
+    }
+
+    #[test]
+    fn a_program_claim_outranks_progress_and_activity_until_cleared() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let t0 = Instant::now();
+        s.apply_report(pane, report(Program, Some(Working)), t0);
+        assert_eq!(state_of(&s, pane), (Working, Some(Program)));
+
+        // Lower sources cannot move it while the claim is live.
+        s.apply_report(pane, report(Progress, Some(Done)), t0);
+        s.apply_report(pane, report(Progress, None), t0);
+        assert_eq!(state_of(&s, pane), (Working, Some(Program)));
+        s.apply_report(pane, report(Program, Some(Done)), t0);
+        assert_eq!(s.observe(pane, true, None, t0), None, "activity is refused");
+        assert_eq!(state_of(&s, pane), (Done, Some(Program)));
+
+        // A clear ends the claim; an outcome (Done) stays until it is seen.
+        s.apply_report(pane, report(Program, None), t0);
+        assert_eq!(state_of(&s, pane), (Done, None));
+
+        // Progress now speaks, and its own clear settles Working to Idle.
+        s.apply_report(pane, report(Progress, Some(Working)), t0);
+        assert_eq!(state_of(&s, pane), (Working, Some(Progress)));
+        s.apply_report(pane, report(Progress, None), t0);
+        assert_eq!(state_of(&s, pane), (Idle, None));
+
+        // A clear from a source holding nothing is a no-op.
+        s.apply_report(pane, report(Program, Some(Blocked)), t0);
+        s.apply_report(pane, report(Progress, None), t0);
+        assert_eq!(state_of(&s, pane), (Blocked, Some(Program)));
+        s.apply_report(pane, report(Program, None), t0);
+        assert_eq!(
+            state_of(&s, pane),
+            (Idle, None),
+            "a cleared Blocked settles"
+        );
+    }
+
+    #[test]
+    fn a_hook_claim_is_absolute_and_sticky() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let t0 = Instant::now();
+        s.apply_agent_event(pane, AgentHookEvent::Blocked { message: None });
+        assert_eq!(state_of(&s, pane), (Blocked, Some(Hook)));
+        s.apply_report(pane, report(Program, Some(Done)), t0);
+        s.apply_report(pane, report(Progress, Some(Working)), t0);
+        s.observe(pane, true, Some(Observation::Working), t0);
+        assert_eq!(state_of(&s, pane), (Blocked, Some(Hook)));
+        s.set_agent(pane, Some("claude".into()));
+        assert_eq!(
+            state_of(&s, pane),
+            (Blocked, Some(Hook)),
+            "survives set_agent"
+        );
+        assert!(
+            s.agent_panes().iter().all(|(p, _, _)| *p != pane),
+            "a hook pane is never classified"
+        );
+    }
+
+    #[test]
+    fn a_screen_blocked_beats_a_stale_progress_working_and_nothing_else() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let t0 = Instant::now();
+        s.apply_report(pane, report(Progress, Some(Working)), t0);
+        assert_eq!(s.observe(pane, true, Some(Observation::Done), t0), None);
+        assert_eq!(
+            s.observe(pane, false, Some(Observation::Blocked), t0),
+            Some((Working, Blocked))
+        );
+        assert_eq!(
+            state_of(&s, pane),
+            (Blocked, Some(Screen)),
+            "the claim ended"
+        );
+    }
+
+    #[test]
+    fn claims_end_when_the_agent_changes_or_the_child_exits() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let t0 = Instant::now();
+        s.apply_report(pane, app_report(Some(Working), "build", None), t0);
+        assert!(s.set_agent(pane, Some("claude".into())));
+        assert_eq!(state_of(&s, pane), (Working, None));
+        assert_eq!(info(&s, pane).agent, Some("claude".into()));
+        s.set_agent(pane, None);
+        assert_eq!(info(&s, pane).agent, None, "the label went with the claim");
+
+        s.apply_report(pane, report(Program, Some(Working)), t0);
+        assert_eq!(s.mark_exited(pane, 0), Some((Working, Done)));
+        assert_eq!(state_of(&s, pane), (Done, None));
+    }
+
+    #[test]
+    fn a_quiet_working_pane_stalls_to_unknown() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let t0 = Instant::now();
+        s.apply_report(pane, report(Program, Some(Working)), t0);
+        assert_eq!(s.observe(pane, false, None, t0 + STALL_AFTER / 2), None);
+        // Output keeps it alive even though the claim refuses the Activity...
+        assert_eq!(s.observe(pane, true, None, t0 + STALL_AFTER / 2), None);
+        assert_eq!(s.observe(pane, false, None, t0 + STALL_AFTER), None);
+        // ...and so does a classifier Working match...
+        let t1 = t0 + STALL_AFTER;
+        assert_eq!(s.observe(pane, false, Some(Observation::Working), t1), None);
+        // ...until a full stall interval goes by with neither.
+        assert_eq!(
+            s.observe(pane, false, None, t1 + STALL_AFTER),
+            Some((Working, Unknown))
+        );
+        assert_eq!(
+            state_of(&s, pane),
+            (Unknown, None),
+            "the stall ends the claim"
+        );
+        assert!(
+            s.settle(pane),
+            "a stalled self-reported pane leaves the surfaces"
+        );
+    }
+
+    #[test]
+    fn a_hook_working_pane_never_stalls() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let t0 = Instant::now();
+        s.apply_agent_event(pane, AgentHookEvent::Activity { detail: None });
+        assert_eq!(s.observe(pane, false, None, t0 + STALL_AFTER * 10), None);
+        assert_eq!(state_of(&s, pane), (Working, Some(Hook)));
+    }
+
+    #[test]
+    fn a_self_reported_pane_lists_until_its_report_settles() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let t0 = Instant::now();
+        assert_eq!(info(&s, pane).agent, None);
+        assert!(
+            s.apply_report(pane, app_report(Some(Working), "build", None), t0)
+                .relisted
+        );
+        assert_eq!(info(&s, pane).agent, Some("build".into()));
+        assert!(
+            !s.apply_report(pane, app_report(Some(Done), "build", None), t0)
+                .relisted
+        );
+        s.apply_report(pane, report(Program, None), t0);
+        assert!(!s.settle(pane), "an unseen Done keeps it listed");
+        assert_eq!(info(&s, pane).agent, Some("build".into()));
+        s.set_pane_state(pane, Idle); // focused
+        assert!(s.settle(pane));
+        assert_eq!(info(&s, pane).agent, None);
+
+        // Progress carries no app: the pane lists under its title.
+        assert!(
+            s.apply_report(pane, report(Progress, Some(Working)), t0)
+                .relisted
+        );
+        assert_eq!(info(&s, pane).agent, Some("sleep".into()));
+        s.apply_report(pane, report(Progress, None), t0);
+        assert!(s.settle(pane));
+    }
+
+    #[test]
+    fn a_report_msg_notifies_on_done_or_blocked_at_most_every_30s() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let t0 = Instant::now();
+        let notify = |s: &mut Session, state, at| {
+            s.apply_report(pane, app_report(Some(state), "build", Some("note")), at)
+                .notify
+        };
+        assert_eq!(notify(&mut s, Working, t0), None, "working is no news");
+        let note = Some((Some("build".to_string()), "note".to_string()));
+        assert_eq!(notify(&mut s, Done, t0), note);
+        assert_eq!(notify(&mut s, Done, t0), None, "no transition, no note");
+        notify(&mut s, Working, t0 + Duration::from_secs(1));
+        assert_eq!(notify(&mut s, Blocked, t0 + Duration::from_secs(2)), None);
+        notify(&mut s, Working, t0 + Duration::from_secs(30));
+        assert_eq!(notify(&mut s, Blocked, t0 + Duration::from_secs(30)), note);
+    }
 
     fn sub(id: &str, running: bool) -> SubagentInfo {
         SubagentInfo {

@@ -175,6 +175,7 @@ mod tests {
             exited: None,
             subagents: Vec::new(),
             checkpoints: Vec::new(),
+            source: None,
         }]);
         assert_eq!(
             rendered,

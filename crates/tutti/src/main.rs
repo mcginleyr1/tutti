@@ -50,23 +50,26 @@ enum Command {
     },
     /// Attach the interactive TUI (alias for bare `tutti`).
     Attach,
-    /// Forward a Claude Code hook event to tutti (reads the hook JSON on stdin).
-    /// Wired up by `tutti hooks claude`; a silent no-op outside a tutti pane.
+    /// Forward an agent's hook event to tutti (reads its JSON on stdin): a
+    /// Claude Code hook payload, or an opencode event from tutti's plugin.
+    /// Wired up by `tutti hooks <agent>`; a silent no-op outside a tutti pane.
     AgentEvent {
         #[arg(value_enum)]
         agent: HookAgent,
     },
-    /// Print or install the settings.json hooks wiring Claude Code to tutti.
+    /// Print or install the hooks wiring an agent to tutti: Claude Code's
+    /// settings.json hooks, or opencode's plugin.
     Hooks {
         #[arg(value_enum)]
         agent: HookAgent,
-        /// Print only the JSON (omit the install instructions on stderr).
+        /// Print only the snippet (omit the install instructions on stderr).
         #[arg(long, conflicts_with = "install")]
         raw: bool,
-        /// Merge the hooks into settings.json (shows the change, asks first).
+        /// Install it (shows the change, asks first).
         #[arg(long)]
         install: bool,
-        /// Install into ./.claude/settings.json instead of ~/.claude/.
+        /// Install into the project (./.claude/settings.json,
+        /// ./.opencode/plugins/) instead of the user config.
         #[arg(long, requires = "install")]
         project: bool,
         /// Skip the confirmation prompt.
@@ -75,11 +78,11 @@ enum Command {
     },
 }
 
-/// The agent whose hook schema `agent-event`/`hooks` speak. Only Claude Code is
-/// wired up today; the value-enum keeps room for more without changing the shape.
+/// The agent whose hook schema `agent-event`/`hooks` speak.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 enum HookAgent {
     Claude,
+    Opencode,
 }
 
 #[derive(Subcommand)]
@@ -263,23 +266,25 @@ fn run(cli: Cli) -> Result<i32> {
             attach_session(&cli.session)?;
             Ok(0)
         }
-        Some(Command::AgentEvent {
-            agent: HookAgent::Claude,
-        }) => run_agent_event(&cli.session),
+        Some(Command::AgentEvent { agent }) => run_agent_event(&cli.session, agent),
         Some(Command::Hooks {
-            agent: HookAgent::Claude,
+            agent,
             raw,
             install,
             project,
             yes,
-        }) => {
-            if install {
-                install_hooks(project, yes)
-            } else {
+        }) => match (agent, install) {
+            (HookAgent::Claude, true) => install_hooks(project, yes),
+            (HookAgent::Opencode, true) => install_opencode_plugin(project, yes),
+            (HookAgent::Claude, false) => {
                 emit_hooks(raw);
                 Ok(0)
             }
-        }
+            (HookAgent::Opencode, false) => {
+                emit_opencode_plugin(raw);
+                Ok(0)
+            }
+        },
         Some(command) => {
             let request = to_request(command)?;
             let mut client = Client::connect_or_start(&cli.session)?;
@@ -533,12 +538,12 @@ fn to_request(command: Command) -> Result<Request> {
     }
 }
 
-/// Forward one Claude Code hook event (read as JSON on stdin) to the daemon.
-/// Built to never break a Claude session: outside a tutti-spawned pane
-/// (`TUTTI_PANE` unset) it exits 0 silently; a malformed or irrelevant event
-/// sends nothing; a connect/send failure is a stderr note, never a failure exit.
-/// This is the one deliberately never-fail path in the CLI.
-fn run_agent_event(session: &str) -> Result<i32> {
+/// Forward one agent hook event (read as JSON on stdin) to the daemon. Built to
+/// never break an agent session: outside a tutti-spawned pane (`TUTTI_PANE`
+/// unset) it exits 0 silently; a malformed or irrelevant event sends nothing; a
+/// connect/send failure is a stderr note, never a failure exit. This is the one
+/// deliberately never-fail path in the CLI.
+fn run_agent_event(session: &str, agent: HookAgent) -> Result<i32> {
     let Some(pane) = std::env::var("TUTTI_PANE")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -554,7 +559,11 @@ fn run_agent_event(session: &str) -> Result<i32> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&input) else {
         return Ok(0);
     };
-    let Some(event) = hooks::map_claude_event(&value) else {
+    let event = match agent {
+        HookAgent::Claude => hooks::map_claude_event(&value),
+        HookAgent::Opencode => hooks::map_opencode_event(&value),
+    };
+    let Some(event) = event else {
         return Ok(0);
     };
     if let Err(err) = send_agent_event(&session, PaneId(pane), event) {
@@ -584,11 +593,96 @@ fn emit_hooks(raw: bool) {
     }
 }
 
+/// Print the opencode plugin: the JavaScript to stdout, plus — unless `--raw` —
+/// where it goes on stderr, so the plugin pipes cleanly on its own.
+fn emit_opencode_plugin(raw: bool) {
+    print!("{}", hooks::OPENCODE_PLUGIN);
+    if !raw {
+        eprintln!("# Save the plugin above as ~/.config/opencode/plugins/tutti.js (or");
+        eprintln!("# .opencode/plugins/tutti.js in a project) — or let tutti do it:");
+        eprintln!("# `tutti hooks opencode --install`. Outside a tutti pane it does nothing.");
+    }
+}
+
+/// Write the opencode plugin into opencode's global plugin dir
+/// (`$XDG_CONFIG_HOME/opencode/plugins`, else `~/.config/opencode/plugins`, as
+/// opencode resolves it) or, with `--project`, `./.opencode/plugins`: show it,
+/// ask (unless `--yes`), back up an older tutti plugin, write atomically. A
+/// file of that name that is not tutti's is never touched.
+fn install_opencode_plugin(project: bool, yes: bool) -> Result<i32> {
+    let config = if project {
+        PathBuf::from(".opencode")
+    } else {
+        match std::env::var_os("XDG_CONFIG_HOME").filter(|dir| !dir.is_empty()) {
+            Some(dir) => PathBuf::from(dir).join("opencode"),
+            None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?)
+                .join(".config/opencode"),
+        }
+    };
+    let path = config.join("plugins/tutti.js");
+    match std::fs::read_to_string(&path) {
+        Ok(text) if text == hooks::OPENCODE_PLUGIN => {
+            println!("tutti plugin already installed at {}", path.display());
+            return Ok(0);
+        }
+        Ok(text) if !text.starts_with(hooks::OPENCODE_PLUGIN_MARKER) => bail!(
+            "{} exists and is not tutti's plugin; refusing to overwrite it",
+            path.display()
+        ),
+        Ok(_) => println!("{}: replacing an older tutti plugin\n", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("{}: adding the tutti plugin\n", path.display())
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+    println!("--- plugin ---\n{}", hooks::OPENCODE_PLUGIN);
+    let code = confirm_and_write(&path, hooks::OPENCODE_PLUGIN, yes)?;
+    if code == 0 {
+        println!("installed the tutti plugin into {}", path.display());
+    }
+    Ok(code)
+}
+
+/// Ask (unless `yes`), then write `contents` to `path`: create its directory,
+/// back an existing file up to `<name>.bak`, and write `<name>.tmp` beside it
+/// before renaming it into place. Shared by every `hooks <agent> --install`.
+fn confirm_and_write(path: &Path, contents: &str, yes: bool) -> Result<i32> {
+    use std::io::Write;
+
+    if !yes {
+        eprint!("Write {}? [y/N] ", path.display());
+        std::io::stderr().flush().ok();
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            eprintln!("aborted; nothing written");
+            return Ok(1);
+        }
+    }
+    let beside = |suffix: &str| {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    if path.exists() {
+        let backup = beside(".bak");
+        std::fs::copy(path, &backup)
+            .with_context(|| format!("backing up to {}", backup.display()))?;
+        eprintln!("backed up existing file to {}", backup.display());
+    }
+    let tmp = beside(".tmp");
+    std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(0)
+}
+
 /// Merge the hooks into settings.json: show before/after, ask (unless `--yes`),
 /// back up the old file, write atomically.
 fn install_hooks(project: bool, yes: bool) -> Result<i32> {
-    use std::io::Write;
-
     let path = if project {
         PathBuf::from(".claude/settings.json")
     } else {
@@ -619,36 +713,12 @@ fn install_hooks(project: bool, yes: bool) -> Result<i32> {
     );
     println!("--- hooks before ---\n{before}\n--- hooks after ---\n{after}\n");
 
-    if !yes {
-        eprint!("Write {}? [y/N] ", path.display());
-        std::io::stderr().flush().ok();
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        if !matches!(answer.trim(), "y" | "Y" | "yes") {
-            eprintln!("aborted; nothing written");
-            return Ok(1);
-        }
+    let settings = serde_json::to_string_pretty(&merged).expect("settings serialize");
+    let code = confirm_and_write(&path, &settings, yes)?;
+    if code == 0 {
+        println!("installed tutti hooks into {}", path.display());
     }
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    if path.exists() {
-        let backup = path.with_extension("json.bak");
-        std::fs::copy(&path, &backup)
-            .with_context(|| format!("backing up to {}", backup.display()))?;
-        eprintln!("backed up existing file to {}", backup.display());
-    }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(
-        &tmp,
-        serde_json::to_string_pretty(&merged).expect("settings serialize"),
-    )
-    .with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
-    println!("installed tutti hooks into {}", path.display());
-    Ok(0)
+    Ok(code)
 }
 
 fn emit(response: Response, json: bool) -> i32 {
@@ -1143,6 +1213,26 @@ mod tests {
                 install: true,
                 yes: true,
                 project: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["tutti", "agent-event", "opencode"])
+                .unwrap()
+                .command,
+            Some(Command::AgentEvent {
+                agent: HookAgent::Opencode
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["tutti", "hooks", "opencode", "--install", "--project"])
+                .unwrap()
+                .command,
+            Some(Command::Hooks {
+                agent: HookAgent::Opencode,
+                install: true,
+                project: true,
+                yes: false,
                 ..
             })
         ));

@@ -9,7 +9,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -21,13 +21,13 @@ use tokio::sync::mpsc;
 
 use tutti_agents::{ProcessTree, Registry};
 use tutti_core::{
-    AgentHookEvent, AgentKind, AgentState, Checkpoint, Direction, Event, Frame, PaneData, PaneId,
-    Request, Response, StateEvent, WorkspaceId, prompt_fingerprint,
+    AgentHookEvent, AgentKind, AgentState, Checkpoint, Direction, Event, Frame, Observation,
+    PaneData, PaneId, Request, Response, StateEvent, WorkspaceId, prompt_fingerprint,
 };
 
 use crate::jj;
 use crate::keys;
-use crate::pty::{PaneSize, PtyPane};
+use crate::pty::{PaneSize, PtyPane, Signal, StatusReport};
 use crate::session::Session;
 
 /// Cadence of the render tick: coalesced pane deltas to attached clients.
@@ -556,7 +556,9 @@ fn resize_split(hub: &Arc<Hub>, pane: PaneId, axis: Direction, delta: f32) -> Re
 }
 
 /// Focus a pane: record it active and apply a `Focused` state event, flipping a
-/// `Done` pane to `Idle` (marked seen). Broadcasts the transition if it changed.
+/// `Done` pane to `Idle` (marked seen). Broadcasts the transition if it changed
+/// — and the view, when that settles a self-reported pane out of the agent
+/// surfaces.
 fn focus_pane(hub: &Arc<Hub>, pane: PaneId) -> Response {
     let mut session = hub.session();
     if session.set_active_pane(pane).is_err() {
@@ -567,7 +569,11 @@ fn focus_pane(hub: &Arc<Hub>, pane: PaneId) -> Response {
     let from = session.pane_state(pane).expect("pane exists");
     let to = from.apply(StateEvent::Focused);
     session.set_pane_state(pane, to);
+    let view = session.settle(pane).then(|| session.view());
     drop(session);
+    if let Some(view) = view {
+        broadcast_event(hub, Event::LayoutChanged { workspaces: view });
+    }
     publish_transition(hub, pane, from, to);
     Response::Ok
 }
@@ -584,6 +590,40 @@ fn publish_transition(hub: &Hub, pane: PaneId, from: AgentState, to: AgentState)
     }
     hub.session().note_transition(pane, from, to);
     broadcast_event(hub, Event::StateChanged { pane, from, to });
+}
+
+/// Fold a program's own status report (OSC 9;4 / 7501, pulled from `pane`'s
+/// output) onto its state under the source ranking, then broadcast what moved:
+/// the view first when the pane's agent-surface listing changed (so the client
+/// has the row before its state), the transition, and the report's `msg` as a
+/// notification. The session guard is dropped before any broadcast. A state
+/// move refreshes the workspace, as a hook's does: that probe records the
+/// turn's checkpoint, and entering `Working` must probe too, or a first turn's
+/// baseline would only be snapshotted at its end. Progress ticks within one
+/// state move nothing, so a progress bar never runs jj.
+fn program_status(hub: &Arc<Hub>, pane: PaneId, report: StatusReport) {
+    let mut session = hub.session();
+    let outcome = session.apply_report(pane, report, Instant::now());
+    let relisted = outcome.relisted | session.settle(pane);
+    let view = relisted.then(|| session.view());
+    drop(session);
+    if let Some(view) = view {
+        broadcast_event(hub, Event::LayoutChanged { workspaces: view });
+    }
+    if let Some((from, to)) = outcome.transition {
+        publish_transition(hub, pane, from, to);
+        refresh_pane_workspace(hub, pane);
+    }
+    if let Some((title, body)) = outcome.notify {
+        broadcast_event(
+            hub,
+            Event::PaneNotification {
+                pane,
+                title,
+                body: Some(body),
+            },
+        );
+    }
 }
 
 /// Ingest a Claude Code hook event for `pane`: fold it onto the pane's exact
@@ -1305,21 +1345,26 @@ fn refresh_all_changes(hub: &Arc<Hub>) {
     }
 }
 
-fn broadcast_tick(hub: &Hub) {
+fn broadcast_tick(hub: &Arc<Hub>) {
     let panes = hub.session().live_panes();
 
     // Drain each pane's bells/notifications every tick so the queues stay
     // bounded even with nobody attached; `broadcast_event` is a no-op then.
+    // Status reports ride the same queue, so a program's word lands within a
+    // tick, in stream order with the notifications around it.
     for (pane, pty) in &panes {
-        for note in pty.take_notifications() {
-            broadcast_event(
-                hub,
-                Event::PaneNotification {
-                    pane: *pane,
-                    title: note.title,
-                    body: note.body,
-                },
-            );
+        for signal in pty.take_notifications() {
+            match signal {
+                Signal::Notify(note) => broadcast_event(
+                    hub,
+                    Event::PaneNotification {
+                        pane: *pane,
+                        title: note.title,
+                        body: note.body,
+                    },
+                ),
+                Signal::Status(report) => program_status(hub, *pane, report),
+            }
         }
     }
 
@@ -1476,27 +1521,29 @@ fn process_tree() -> ProcessTree {
     tree
 }
 
-/// One state-classification pass over agent panes. PTY output since the last
-/// pass is an `Activity` event; a classifier match on the screen text is a
-/// `Classified` event. Both are folded onto the pane's state — activity first
-/// so a screen match takes precedence — and any net change is broadcast.
+/// One state-classification pass over agent panes (and panes holding a
+/// program/progress claim). PTY output since the last pass is an `Activity`
+/// event; a classifier match on a detected agent's screen text is a
+/// `Classified` event. `Session::observe` folds both onto the pane's state —
+/// activity first so a screen match takes precedence, each only where the live
+/// claim allows — and runs the stall timer; any net change is broadcast, plus
+/// the view when one settles a self-reported pane out of the agent surfaces.
 fn classify_pass(hub: &Arc<Hub>, last_gen: &mut HashMap<PaneId, u64>) {
     let panes = hub.session().agent_panes();
     if panes.is_empty() {
         return;
     }
-    let events: Vec<(PaneId, bool, Option<StateEvent>)> = panes
+    let events: Vec<(PaneId, bool, Option<Observation>)> = panes
         .iter()
         .map(|(pane, kind, pty)| {
             let generation = *pty.output_receiver().borrow();
             let advanced = last_gen
                 .insert(*pane, generation)
                 .map_or(generation != 0, |prev| prev != generation);
-            let classified = hub
-                .registry
-                .spec(kind)
-                .and_then(|spec| spec.classify(&pty.screen().contents()))
-                .map(StateEvent::Classified);
+            let classified = kind
+                .as_ref()
+                .and_then(|kind| hub.registry.spec(kind))
+                .and_then(|spec| spec.classify(&pty.screen().contents()));
             (*pane, advanced, classified)
         })
         .collect();
@@ -1504,25 +1551,21 @@ fn classify_pass(hub: &Arc<Hub>, last_gen: &mut HashMap<PaneId, u64>) {
     // without bound as panes come and go.
     last_gen.retain(|pane, _| panes.iter().any(|(p, _, _)| p == pane));
 
+    let now = Instant::now();
     let mut session = hub.session();
     let mut changes = Vec::new();
+    let mut relisted = false;
     for (pane, advanced, classified) in events {
-        let Some(from) = session.pane_state(pane) else {
-            continue;
-        };
-        let mut to = from;
-        if advanced {
-            to = to.apply(StateEvent::Activity);
-        }
-        if let Some(event) = classified {
-            to = to.apply(event);
-        }
-        if to != from {
-            session.set_pane_state(pane, to);
+        if let Some((from, to)) = session.observe(pane, advanced, classified, now) {
             changes.push((pane, from, to));
+            relisted |= session.settle(pane);
         }
     }
+    let view = relisted.then(|| session.view());
     drop(session);
+    if let Some(view) = view {
+        broadcast_event(hub, Event::LayoutChanged { workspaces: view });
+    }
     // Dedupe the workspaces of the changed panes so a burst of transitions in
     // one workspace triggers a single jj refresh, not one per pane.
     let mut workspaces: HashSet<WorkspaceId> = HashSet::new();

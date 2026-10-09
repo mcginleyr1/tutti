@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{AgentKind, Direction, Layout};
 use crate::ids::{PaneId, TabId, WorkspaceId};
-use crate::state::AgentState;
+use crate::state::{AgentState, StateSource};
 
 /// The wire-protocol revision. BUMP THIS on ANY change to the Request /
 /// Response / Event shapes (including additive fields): the daemon reports it
@@ -237,6 +237,10 @@ pub struct TabInfo {
 pub struct PaneInfo {
     pub id: PaneId,
     pub title: String,
+    /// The detected agent kind. A pane with none that reports its own status
+    /// (OSC 7501 / 9;4) carries its label here instead — the 7501 `app`, else
+    /// its title — while that report has something to say, so a build in a
+    /// shell pane shows wherever agent state does.
     pub agent: Option<AgentKind>,
     pub state: AgentState,
     pub exited: Option<i32>,
@@ -251,6 +255,11 @@ pub struct PaneInfo {
     /// servers.
     #[serde(default)]
     pub checkpoints: Vec<Checkpoint>,
+    /// What set `state`: a hook, the pane's own program report (OSC 7501 /
+    /// 9;4), the screen classifier, or output activity. `None` until something
+    /// has, and after a claim ends. Defaults `None` for older servers.
+    #[serde(default)]
+    pub source: Option<StateSource>,
 }
 
 /// One agent turn's checkpoint: the commit id of the workspace's `@` right
@@ -430,6 +439,8 @@ pub enum Event {
     /// A pane emitted a bell or desktop-notification escape (OSC 9 / 777). A
     /// bare bell carries no text; OSC 9 fills `body`; OSC 777 fills `title`
     /// and/or `body`. Purely an attention signal — it never drives pane state.
+    /// An OSC 7501 report's `msg` lands here too (`title` = its `app`) when the
+    /// report moves the pane to done/blocked, at most once per 30s per pane.
     PaneNotification {
         pane: PaneId,
         title: Option<String>,
@@ -635,6 +646,7 @@ mod tests {
                     exited: None,
                     subagents: Vec::new(),
                     checkpoints: vec![sample_checkpoint()],
+                    source: None,
                 }],
             }],
         }]
@@ -660,6 +672,19 @@ mod tests {
                     running: true,
                 }],
                 checkpoints: Vec::new(),
+                source: Some(StateSource::Hook),
+            }],
+        });
+        roundtrip(&Response::Panes {
+            panes: vec![PaneInfo {
+                id: PaneId(2),
+                title: "zsh".into(),
+                agent: Some("build".into()),
+                state: AgentState::Done,
+                exited: None,
+                subagents: Vec::new(),
+                checkpoints: Vec::new(),
+                source: Some(StateSource::Program),
             }],
         });
         roundtrip(&Response::Checkpoints {
@@ -791,12 +816,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(child.parent, Some(WorkspaceId(1)));
-        // A `pane_info` from before `subagents` existed defaults to an empty list.
+        // A `pane_info` from before `subagents`/`source` existed defaults them.
         let pane: PaneInfo = serde_json::from_str(
             r#"{"id":1,"title":"shell","agent":null,"state":"idle","exited":null}"#,
         )
         .unwrap();
         assert!(pane.subagents.is_empty());
+        assert_eq!(pane.source, None);
         // ...and before `checkpoints` existed, to no checkpoints.
         assert!(pane.checkpoints.is_empty());
         // `pane_checkpoint_diff` without `n`/`stat` is the newest turn's full
@@ -821,6 +847,12 @@ mod tests {
                 force: false,
             }
         );
+        // The source rides the wire snake_case.
+        let pane: PaneInfo = serde_json::from_str(
+            r#"{"id":1,"title":"sh","agent":null,"state":"working","exited":null,"source":"progress"}"#,
+        )
+        .unwrap();
+        assert_eq!(pane.source, Some(StateSource::Progress));
         // `workspace_kill` from before `discard` existed still parses (keep).
         let kill: Request = serde_json::from_str(r#"{"type":"workspace_kill","id":2}"#).unwrap();
         assert_eq!(

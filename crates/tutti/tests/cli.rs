@@ -6,10 +6,10 @@
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::thread;
 
-use tutti_core::{Frame, PaneId, Request, Response, WorkspaceId, WorkspaceInfo};
+use tutti_core::{AgentHookEvent, Frame, PaneId, Request, Response, WorkspaceId, WorkspaceInfo};
 
 fn unique_base(label: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -47,6 +47,18 @@ fn run_scenario(
     assert_request: impl FnOnce(&Request) + Send + 'static,
     reply: Response,
 ) -> Output {
+    run_scenario_with(label, args, &[], "", assert_request, reply)
+}
+
+/// `run_scenario` with extra environment and `stdin` piped to the binary.
+fn run_scenario_with(
+    label: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    stdin: &str,
+    assert_request: impl FnOnce(&Request) + Send + 'static,
+    reply: Response,
+) -> Output {
     let base = unique_base(label);
     let sock_dir = base.join("tutti");
     std::fs::create_dir_all(&sock_dir).unwrap();
@@ -61,15 +73,147 @@ fn run_scenario(
         stream.flush().unwrap();
     });
 
-    let output = Command::new(env!("CARGO_BIN_EXE_tutti"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tutti"))
         .args(args)
         .env("XDG_RUNTIME_DIR", &base)
-        .output()
+        .envs(envs.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
 
     server.join().unwrap();
     let _ = std::fs::remove_dir_all(&base);
     output
+}
+
+/// A recorded opencode event, piped to `agent-event opencode` inside a tutti
+/// pane (`TUTTI_PANE`/`TUTTI_SESSION` set), reaches the daemon as the mapped
+/// `AgentEvent` — the path tutti's opencode plugin drives.
+#[test]
+fn agent_event_opencode_forwards_a_recorded_permission_prompt() {
+    let payload = r#"{"type":"permission.asked","properties":{"id":"per_1","sessionID":"ses_1",
+        "permission":"bash","patterns":["rm -rf build"],"metadata":{},"always":[]}}"#;
+    let output = run_scenario_with(
+        "ocevent",
+        &["agent-event", "opencode"],
+        &[("TUTTI_PANE", "7"), ("TUTTI_SESSION", "tutti")],
+        payload,
+        |req| {
+            assert_eq!(
+                *req,
+                Request::AgentEvent {
+                    pane: PaneId(7),
+                    event: AgentHookEvent::Blocked {
+                        message: Some("bash".into()),
+                    },
+                }
+            );
+        },
+        Response::Ok,
+    );
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty() && output.stderr.is_empty());
+}
+
+/// `agent-event opencode` never fails: outside a tutti pane, and on an
+/// irrelevant event, it exits 0 having sent nothing (no daemon is listening).
+#[test]
+fn agent_event_opencode_is_a_silent_no_op_when_there_is_nothing_to_send() {
+    for (envs, payload) in [
+        (
+            vec![],
+            r#"{"type":"session.status","properties":{"status":{"type":"busy"}}}"#,
+        ),
+        (
+            vec![("TUTTI_PANE", "7")],
+            r#"{"type":"message.part.updated","properties":{}}"#,
+        ),
+        (vec![("TUTTI_PANE", "7")], "not json"),
+    ] {
+        let base = unique_base("ocnoop");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_tutti"))
+            .args(["agent-event", "opencode"])
+            .env("XDG_RUNTIME_DIR", &base)
+            .env_remove("TUTTI_PANE")
+            .envs(envs)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "for {payload}");
+        assert!(output.stdout.is_empty() && output.stderr.is_empty());
+    }
+}
+
+/// `hooks opencode --install` writes the plugin into opencode's global plugin
+/// dir under `XDG_CONFIG_HOME`, is idempotent, replaces an older tutti plugin
+/// behind a `.bak`, and refuses to touch a foreign file of the same name.
+#[test]
+fn hooks_opencode_install_writes_backs_up_and_refuses_foreign_files() {
+    let config = unique_base("ocinstall");
+    let plugin = config.join("opencode/plugins/tutti.js");
+    let install = || {
+        Command::new(env!("CARGO_BIN_EXE_tutti"))
+            .args(["hooks", "opencode", "--install", "--yes"])
+            .env("XDG_CONFIG_HOME", &config)
+            .output()
+            .unwrap()
+    };
+    let printed = Command::new(env!("CARGO_BIN_EXE_tutti"))
+        .args(["hooks", "opencode", "--raw"])
+        .output()
+        .unwrap();
+    let ours = String::from_utf8(printed.stdout).unwrap();
+    assert!(ours.starts_with("// tutti opencode plugin"));
+
+    assert!(install().status.success());
+    assert_eq!(std::fs::read_to_string(&plugin).unwrap(), ours);
+    let again = install();
+    assert!(
+        String::from_utf8(again.stdout)
+            .unwrap()
+            .contains("already installed")
+    );
+
+    std::fs::write(&plugin, "// tutti opencode plugin (older)\n").unwrap();
+    assert!(install().status.success());
+    assert_eq!(std::fs::read_to_string(&plugin).unwrap(), ours);
+    assert_eq!(
+        std::fs::read_to_string(plugin.with_file_name("tutti.js.bak")).unwrap(),
+        "// tutti opencode plugin (older)\n"
+    );
+
+    std::fs::write(&plugin, "export const Mine = async () => ({})\n").unwrap();
+    let refused = install();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8(refused.stderr)
+            .unwrap()
+            .contains("not tutti's plugin")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&plugin).unwrap(),
+        "export const Mine = async () => ({})\n",
+        "a foreign plugin is never overwritten"
+    );
+    let _ = std::fs::remove_dir_all(&config);
 }
 
 #[test]

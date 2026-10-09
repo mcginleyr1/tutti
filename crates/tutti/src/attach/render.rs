@@ -1755,6 +1755,7 @@ fn placeholder_title(pane: PaneId) -> PaneInfo {
         exited: None,
         subagents: Vec::new(),
         checkpoints: Vec::new(),
+        source: None,
     }
 }
 
@@ -2322,6 +2323,7 @@ mod tests {
             exited: None,
             subagents: Vec::new(),
             checkpoints: Vec::new(),
+            source: None,
         };
         assert_eq!(title_text(&info), "claude · blocked");
     }
@@ -2336,6 +2338,7 @@ mod tests {
             exited: None,
             subagents: Vec::new(),
             checkpoints: Vec::new(),
+            source: None,
         };
         assert_eq!(title_text(&info), "claude · ⠋ working");
     }
@@ -2350,6 +2353,7 @@ mod tests {
             exited: None,
             subagents: Vec::new(),
             checkpoints: Vec::new(),
+            source: None,
         };
         assert_eq!(title_text(&info), "zsh", "no `· unknown` suffix");
     }
@@ -2364,6 +2368,7 @@ mod tests {
             exited: Some(0),
             subagents: Vec::new(),
             checkpoints: Vec::new(),
+            source: None,
         };
         assert_eq!(
             title_text(&info),
@@ -3315,6 +3320,7 @@ mod tests {
             exited: None,
             subagents: Vec::new(),
             checkpoints: Vec::new(),
+            source: None,
         };
         let focused = pane_title_line(&info, true, ' ');
         assert_eq!(

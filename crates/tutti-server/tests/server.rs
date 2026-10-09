@@ -14,7 +14,7 @@ use tokio::time::{sleep, timeout};
 
 use tutti_core::{
     AgentHookEvent, AgentState, Checkpoint, Direction, Event, Frame, Layout, PaneData, PaneId,
-    Request, Response, SubagentInfo, WorkspaceId,
+    PaneInfo, Request, Response, StateSource, SubagentInfo, WorkspaceId,
 };
 use tutti_server::{PaneSize, serve};
 
@@ -835,6 +835,120 @@ async fn hook_driven_pane_ignores_screen_classification() {
             Response::Panes { panes } if panes.iter().any(|p| p.id == pane && p.state == AgentState::Blocked)
         ),
         "a hook-driven pane must ignore the screen classifier and stay Blocked"
+    );
+
+    server.stop().await;
+}
+
+/// Poll `pane list` until `pane` satisfies `want` or the deadline elapses.
+async fn wait_pane(conn: &mut Conn, pane: PaneId, want: impl Fn(&PaneInfo) -> bool) -> bool {
+    timeout(DEADLINE, async {
+        loop {
+            if let Response::Panes { panes } = conn.request(Request::PaneList).await
+                && panes.iter().any(|p| p.id == pane && want(p))
+            {
+                return true;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Type a `printf` of `OSC <body> ST` into the shell in `pane`. The echoed
+/// command line holds no raw ESC — only printf's output does.
+async fn printf_osc(conn: &mut Conn, pane: PaneId, body: &str) {
+    let sent = conn
+        .request(Request::PaneSend {
+            pane,
+            text: Some(format!("printf '\\033]{body}\\033\\\\'\n")),
+            keys: None,
+            expect: None,
+        })
+        .await;
+    assert_eq!(sent, Response::Ok);
+}
+
+/// A plain shell pane's own status reports drive its state: OSC 9;4 progress
+/// works and clears, OSC 7501 works and finishes with a `msg` notification,
+/// each listed under its label while it speaks — and no 9;4 ever surfaces as a
+/// notification (it used to, as an OSC 9 with body `4;1;40`).
+#[tokio::test]
+async fn a_shell_panes_own_status_reports_drive_its_state() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    new_workspace(&mut control).await;
+    let pane = pane_id(
+        control
+            .request(Request::PaneRun {
+                tab: None,
+                cmd: vec!["/bin/sh".into()],
+                ephemeral: false,
+            })
+            .await,
+    );
+    let mut viewer = server.connect().await;
+    viewer.send(&Request::Attach).await;
+    let label = |p: &PaneInfo| p.agent.as_ref().map(ToString::to_string);
+
+    printf_osc(&mut control, pane, "9;4;1;40").await;
+    assert!(
+        wait_pane(&mut control, pane, |p| p.state == AgentState::Working
+            && p.source == Some(StateSource::Progress)
+            && label(p).as_deref() == Some("sh"))
+        .await,
+        "9;4;1 claims Working for Progress and lists the pane under its title"
+    );
+    printf_osc(&mut control, pane, "9;4;0").await;
+    assert!(
+        wait_pane(&mut control, pane, |p| p.state == AgentState::Idle
+            && p.source.is_none()
+            && p.agent.is_none())
+        .await,
+        "9;4;0 ends the claim, settles to Idle and unlists the pane"
+    );
+    printf_osc(&mut control, pane, "7501;state=working:app=build").await;
+    assert!(
+        wait_pane(&mut control, pane, |p| p.state == AgentState::Working
+            && p.source == Some(StateSource::Program)
+            && label(p).as_deref() == Some("build"))
+        .await,
+        "7501 working claims the pane for Program under its app label"
+    );
+    printf_osc(&mut control, pane, "7501;state=done:app=build:msg=QnVpbHQ=").await;
+    assert!(
+        wait_pane(&mut control, pane, |p| p.state == AgentState::Done
+            && p.source == Some(StateSource::Program))
+        .await,
+        "7501 done lands Done"
+    );
+
+    let mut notes = Vec::new();
+    timeout(DEADLINE, async {
+        loop {
+            if let Frame::Control(json) = viewer.read_frame().await
+                && let Ok(Event::PaneNotification {
+                    pane: p,
+                    title,
+                    body,
+                }) = serde_json::from_slice::<Event>(&json)
+                && p == pane
+            {
+                let done = body.as_deref() == Some("Built");
+                notes.push((title, body));
+                if done {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .expect("the 7501 msg should arrive as a notification");
+    assert_eq!(
+        notes,
+        vec![(Some("build".to_string()), Some("Built".to_string()))],
+        "only the 7501 msg notifies — no 9;4 report became a notification"
     );
 
     server.stop().await;
@@ -2454,6 +2568,44 @@ async fn a_turn_checkpoints_its_diff_and_restores_round_trip() {
         "one\nTWO\nthree\n"
     );
     assert!(dir.join("b.txt").exists() && dir.join("c.txt").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+    server.stop().await;
+}
+
+/// A turn a program reports itself (OSC 7501) checkpoints like a hook's: its
+/// transitions go through the same funnel, and entering `Working` probes too,
+/// so the baseline is taken before the turn's edits rather than at its end.
+/// Skips cleanly without `jj`.
+#[tokio::test]
+async fn a_self_reported_turn_checkpoints_its_diff() {
+    if !jj_on_path() {
+        eprintln!("skipping: jj is not on PATH");
+        return;
+    }
+    let dir = jj_git_init("osc-ckpt");
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    conn.request(Request::WorkspaceNew { dir: dir.clone() })
+        .await;
+    let pane = pane_id(
+        conn.request(Request::PaneRun {
+            tab: None,
+            cmd: vec!["/bin/sh".into()],
+            ephemeral: false,
+        })
+        .await,
+    );
+
+    printf_osc(&mut conn, pane, "7501;state=working:app=build").await;
+    let start = wait_checkpoints(&mut conn, pane, 1).await.remove(0);
+    assert_eq!(start.label, "start");
+    std::fs::write(dir.join("out.txt"), "built\n").unwrap();
+    printf_osc(&mut conn, pane, "7501;state=done:app=build").await;
+    let turn = wait_checkpoints(&mut conn, pane, 2).await.remove(1);
+    assert_eq!(turn.label, "done");
+    assert_eq!(turn.from.as_ref(), Some(&start.commit));
+    assert_eq!((turn.files, turn.insertions), (1, 1), "just out.txt");
 
     let _ = std::fs::remove_dir_all(&dir);
     server.stop().await;

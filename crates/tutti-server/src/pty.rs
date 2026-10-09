@@ -9,8 +9,11 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use base64::Engine;
+use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::watch;
+use tutti_core::{AgentState, StateSource};
 
 const SCROLLBACK_LINES: usize = 10_000;
 
@@ -89,9 +92,10 @@ pub struct PtyPane {
     exit_rx: watch::Receiver<Option<PaneExit>>,
     output_rx: watch::Receiver<u64>,
     /// Bells and OSC 9 / 777 desktop notifications pulled from the raw output
-    /// stream, drained by the broadcast tick. A parallel attention channel that
-    /// never feeds state classification.
-    notifications: Arc<Mutex<Vec<Notification>>>,
+    /// stream, drained by the broadcast tick — interleaved, in stream order,
+    /// with the program's own status reports (OSC 9;4 / 7501), the one signal
+    /// here that does feed pane state (under the source ranking).
+    notifications: Arc<Mutex<Vec<Signal>>>,
     reader_thread: Option<JoinHandle<()>>,
     wait_thread: Option<JoinHandle<()>>,
 }
@@ -341,8 +345,9 @@ impl PtyPane {
         self.output_rx.clone()
     }
 
-    /// Drain the bells and desktop notifications seen since the last call.
-    pub fn take_notifications(&self) -> Vec<Notification> {
+    /// Drain the bells, desktop notifications and status reports seen since
+    /// the last call, in stream order.
+    pub fn take_notifications(&self) -> Vec<Signal> {
         std::mem::take(
             &mut *self
                 .notifications
@@ -445,7 +450,7 @@ fn read_loop(
     mut reader: Box<dyn Read + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
     output_tx: watch::Sender<u64>,
-    notifications: Arc<Mutex<Vec<Notification>>>,
+    notifications: Arc<Mutex<Vec<Signal>>>,
 ) {
     let mut buf = [0u8; 8192];
     let mut scanner = NotifyScanner::default();
@@ -486,12 +491,48 @@ pub struct Notification {
     pub body: Option<String>,
 }
 
+/// A program's own word on its state, from its output: an OSC 9;4 progress
+/// report (`source` Progress) or an OSC 7501 program status (`source`
+/// Program). `state: None` is a clear — it ends that source's claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusReport {
+    pub source: StateSource,
+    pub state: Option<AgentState>,
+    /// The OSC 7501 `app`: the label the pane shows under where agent state
+    /// does, when no agent was detected there.
+    pub app: Option<String>,
+    /// The decoded OSC 7501 `msg`: the notification body on a move to
+    /// done/blocked.
+    pub msg: Option<String>,
+}
+
+/// What the scanner pulls from a raw pty stream: an attention signal, or the
+/// program's word on its state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Signal {
+    Notify(Notification),
+    Status(StatusReport),
+}
+
 /// Largest OSC payload buffered; a longer sequence is consumed but discarded so
-/// a runaway sequence cannot grow memory without bound.
+/// a runaway sequence cannot grow memory without bound. Doubles as OSC 7501's
+/// whole-report cap.
 const OSC_CAP: usize = 4096;
 /// Cap on pending notifications per pane, bounding the queue when a burst
 /// arrives with no client draining it.
 const NOTIFY_QUEUE_CAP: usize = 256;
+/// OSC 7501 limits from the program-status spec: the longest key and `app`,
+/// and the base64 `msg`/`title` as (encoded, decoded) bytes.
+const KEY_MAX: usize = 16;
+const APP_MAX: usize = 32;
+const MSG_MAX: (usize, usize) = (2732, 2048);
+const TITLE_MAX: (usize, usize) = (256, 192);
+/// Standard-alphabet base64 that takes padding or leaves it off, as OSC 7501
+/// allows.
+const BASE64: GeneralPurpose = GeneralPurpose::new(
+    &base64::alphabet::STANDARD,
+    GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+);
 
 #[derive(Default)]
 enum ScanState {
@@ -505,9 +546,10 @@ enum ScanState {
     OscEsc,
 }
 
-/// Incremental scanner pulling bells and OSC 9 / OSC 777 desktop-notification
-/// sequences from a raw pty byte stream. State persists across `feed` calls, so
-/// a sequence split over read-chunk boundaries is still recognised.
+/// Incremental scanner pulling bells, OSC 9 / OSC 777 desktop-notification
+/// sequences, and OSC 9;4 / OSC 7501 status reports from a raw pty byte
+/// stream. State persists across `feed` calls, so a sequence split over
+/// read-chunk boundaries is still recognised.
 #[derive(Default)]
 struct NotifyScanner {
     state: ScanState,
@@ -516,19 +558,19 @@ struct NotifyScanner {
 }
 
 impl NotifyScanner {
-    fn feed(&mut self, bytes: &[u8], out: &mut Vec<Notification>) {
+    fn feed(&mut self, bytes: &[u8], out: &mut Vec<Signal>) {
         for &b in bytes {
             self.step(b, out);
         }
     }
 
-    fn step(&mut self, b: u8, out: &mut Vec<Notification>) {
+    fn step(&mut self, b: u8, out: &mut Vec<Signal>) {
         match self.state {
             ScanState::Ground => match b {
-                0x07 => out.push(Notification {
+                0x07 => out.push(Signal::Notify(Notification {
                     title: None,
                     body: None,
-                }),
+                })),
                 0x1b => self.state = ScanState::Esc,
                 _ => {}
             },
@@ -579,25 +621,32 @@ impl NotifyScanner {
         }
     }
 
-    fn finish_osc(&mut self, out: &mut Vec<Notification>) {
+    fn finish_osc(&mut self, out: &mut Vec<Signal>) {
         let overflow = std::mem::take(&mut self.overflow);
         let buf = std::mem::take(&mut self.buf);
-        if !overflow && let Some(note) = parse_osc(&buf) {
-            out.push(note);
+        if !overflow && let Some(signal) = parse_osc(&buf) {
+            out.push(signal);
         }
     }
 }
 
 /// Parse an OSC payload (the bytes between `ESC ]` and the terminator) for the
-/// two commands surfaced as notifications: `9;<body>` and
-/// `777;notify;<title>;<body>`. Anything else yields `None`.
-fn parse_osc(buf: &[u8]) -> Option<Notification> {
+/// commands tutti surfaces: notifications `9;<body>` and
+/// `777;notify;<title>;<body>`, and status reports `9;4;…` and `7501;…`.
+/// Anything else yields `None`.
+fn parse_osc(buf: &[u8]) -> Option<Signal> {
     let text = std::str::from_utf8(buf).ok()?;
     let (cmd, rest) = text.split_once(';')?;
     match cmd {
-        "9" => non_empty(rest).map(|body| Notification {
-            title: None,
-            body: Some(body),
+        // ConEmu's progress subcommand, never a notification — even malformed.
+        "9" if rest == "4" || rest.starts_with("4;") => {
+            parse_progress(rest.get(2..).unwrap_or_default()).map(Signal::Status)
+        }
+        "9" => non_empty(rest).map(|body| {
+            Signal::Notify(Notification {
+                title: None,
+                body: Some(body),
+            })
         }),
         "777" => {
             let mut fields = rest.splitn(3, ';');
@@ -606,10 +655,105 @@ fn parse_osc(buf: &[u8]) -> Option<Notification> {
             }
             let title = fields.next().and_then(non_empty);
             let body = fields.next().and_then(non_empty);
-            (title.is_some() || body.is_some()).then_some(Notification { title, body })
+            (title.is_some() || body.is_some())
+                .then_some(Signal::Notify(Notification { title, body }))
         }
+        "7501" => parse_program_status(rest).map(Signal::Status),
         _ => None,
     }
+}
+
+/// Parse an OSC 9;4 progress body (after `9;4;`): `<state>[;<percent>]`.
+/// States 1 (normal), 3 (indeterminate) and 4 (paused/warning) are Working; 2
+/// (error) is Done — tutti has no errored state, and Done queues it for
+/// attention; 0 clears. The percentage is not shown, so it is not read.
+fn parse_progress(body: &str) -> Option<StatusReport> {
+    let state = match body.split(';').next()? {
+        "0" => None,
+        "1" | "3" | "4" => Some(AgentState::Working),
+        "2" => Some(AgentState::Done),
+        _ => return None,
+    };
+    Some(StatusReport {
+        source: StateSource::Progress,
+        state,
+        app: None,
+        msg: None,
+    })
+}
+
+/// Parse an OSC 7501 program-status body: `key=value` pairs joined by `:`
+/// (tuios.dev/docs/program-status.md). Only the root record is tracked, so a
+/// report naming an `id` is ignored, as is the `?` support probe (answering
+/// means writing into the pty). Per the spec, a report with a missing/unknown
+/// `state`, a `kind` on a non-blocked state, or a `progress` outside 0–100 is
+/// ignored; one breaking a length limit, or whose `msg`/`title` is not base64
+/// of control-free UTF-8, is discarded whole. A malformed pair is skipped and
+/// the rest still read; a repeated key's last value wins.
+fn parse_program_status(body: &str) -> Option<StatusReport> {
+    let mut pairs: Vec<(&str, &str)> = Vec::new();
+    for pair in body.split(':') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        let (key, value) = (key.trim(), value.trim());
+        let well_formed = !key.is_empty()
+            && key.bytes().all(|b| b.is_ascii_lowercase())
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.,+/=-".contains(&b));
+        if !well_formed {
+            continue;
+        }
+        if key.len() > KEY_MAX {
+            return None;
+        }
+        pairs.push((key, value));
+    }
+    let get = |key: &str| pairs.iter().rev().find(|(k, _)| *k == key).map(|(_, v)| *v);
+    let state = match get("state")? {
+        "idle" => Some(AgentState::Idle),
+        "working" => Some(AgentState::Working),
+        "blocked" => Some(AgentState::Blocked),
+        "done" | "error" => Some(AgentState::Done),
+        "clear" => None,
+        _ => return None,
+    };
+    let percent =
+        |p: &str| p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u8>().is_ok_and(|p| p <= 100);
+    if get("id").is_some()
+        || (get("kind").is_some() && state != Some(AgentState::Blocked))
+        || get("progress").is_some_and(|p| !percent(p))
+    {
+        return None;
+    }
+    let app = get("app");
+    if app.is_some_and(|app| app.len() > APP_MAX) {
+        return None;
+    }
+    let msg = match get("msg") {
+        Some(msg) => Some(decode_text(msg, MSG_MAX)?),
+        None => None,
+    };
+    if let Some(title) = get("title") {
+        decode_text(title, TITLE_MAX)?;
+    }
+    Some(StatusReport {
+        source: StateSource::Program,
+        state,
+        app: app.map(str::to_string),
+        msg,
+    })
+}
+
+/// Decode a base64 `msg`/`title` within its (encoded, decoded) byte caps into
+/// control-free UTF-8; `None` discards the report.
+fn decode_text(encoded: &str, (encoded_max, decoded_max): (usize, usize)) -> Option<String> {
+    if encoded.len() > encoded_max {
+        return None;
+    }
+    let text = String::from_utf8(BASE64.decode(encoded).ok()?).ok()?;
+    (text.len() <= decoded_max && !text.chars().any(char::is_control)).then_some(text)
 }
 
 fn non_empty(s: &str) -> Option<String> {
@@ -630,20 +774,251 @@ const _: fn() = || {
 mod tests {
     use super::*;
 
-    fn scan(input: &[u8]) -> Vec<Notification> {
+    fn signals(input: &[u8]) -> Vec<Signal> {
         let mut scanner = NotifyScanner::default();
         let mut out = Vec::new();
         scanner.feed(input, &mut out);
         out
     }
 
+    fn notes(signals: Vec<Signal>) -> Vec<Notification> {
+        signals
+            .into_iter()
+            .filter_map(|s| match s {
+                Signal::Notify(note) => Some(note),
+                Signal::Status(_) => None,
+            })
+            .collect()
+    }
+
+    fn scan(input: &[u8]) -> Vec<Notification> {
+        notes(signals(input))
+    }
+
+    /// The status reports in `input`, one entry per report.
+    fn scan_status(input: &[u8]) -> Vec<StatusReport> {
+        signals(input)
+            .into_iter()
+            .filter_map(|s| match s {
+                Signal::Status(report) => Some(report),
+                Signal::Notify(_) => None,
+            })
+            .collect()
+    }
+
     /// Feed `input` in two chunks split at `cut`, exercising cross-chunk state.
-    fn scan_split(input: &[u8], cut: usize) -> Vec<Notification> {
+    fn signals_split(input: &[u8], cut: usize) -> Vec<Signal> {
         let mut scanner = NotifyScanner::default();
         let mut out = Vec::new();
         scanner.feed(&input[..cut], &mut out);
         scanner.feed(&input[cut..], &mut out);
         out
+    }
+
+    fn scan_split(input: &[u8], cut: usize) -> Vec<Notification> {
+        notes(signals_split(input, cut))
+    }
+
+    fn progress(state: Option<AgentState>) -> StatusReport {
+        StatusReport {
+            source: StateSource::Progress,
+            state,
+            app: None,
+            msg: None,
+        }
+    }
+
+    fn program(state: Option<AgentState>, app: Option<&str>, msg: Option<&str>) -> StatusReport {
+        StatusReport {
+            source: StateSource::Program,
+            state,
+            app: app.map(Into::into),
+            msg: msg.map(Into::into),
+        }
+    }
+
+    /// Regression: an OSC 9;4 progress report used to surface as an OSC 9
+    /// notification with body `4;1;50`.
+    #[test]
+    fn osc9_4_progress_is_never_a_notification() {
+        for input in [
+            b"\x1b]9;4;1;50\x07".as_slice(),
+            b"\x1b]9;4;0\x1b\\",
+            b"\x1b]9;4;9;10\x07",
+            b"\x1b]9;4\x07",
+            b"\x1b]9;4;\x07",
+        ] {
+            assert!(scan(input).is_empty(), "{input:?} became a notification");
+        }
+    }
+
+    #[test]
+    fn osc9_4_states_map_onto_progress_reports() {
+        use AgentState::*;
+        let cases: &[(&[u8], Option<StatusReport>)] = &[
+            (b"\x1b]9;4;0\x1b\\", Some(progress(None))),
+            (b"\x1b]9;4;0;0\x07", Some(progress(None))),
+            (b"\x1b]9;4;1;40\x1b\\", Some(progress(Some(Working)))),
+            (b"\x1b]9;4;1\x07", Some(progress(Some(Working)))),
+            (b"\x1b]9;4;2;100\x07", Some(progress(Some(Done)))),
+            (b"\x1b]9;4;3\x07", Some(progress(Some(Working)))),
+            (b"\x1b]9;4;4;70\x1b\\", Some(progress(Some(Working)))),
+            (b"\x1b]9;4;5\x07", None),
+            (b"\x1b]9;4\x07", None),
+        ];
+        for (input, want) in cases {
+            assert_eq!(scan_status(input).pop(), *want, "for {input:?}");
+        }
+    }
+
+    #[test]
+    fn osc9_4_is_incremental_across_every_cut_point() {
+        let input = b"a\x1b]9;4;1;40\x1b\\b\x1b]9;4;0\x07";
+        let whole = signals(input);
+        assert_eq!(
+            whole,
+            vec![
+                Signal::Status(progress(Some(AgentState::Working))),
+                Signal::Status(progress(None)),
+            ]
+        );
+        for cut in 0..=input.len() {
+            assert_eq!(
+                signals_split(input, cut),
+                whole,
+                "mismatch cutting at {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn osc7501_valid_reports_with_bel_and_st() {
+        use AgentState::*;
+        // "Compiling" / "Built" in standard base64, padded and not.
+        assert_eq!(
+            scan_status(b"\x1b]7501;state=working:app=build:progress=40:msg=Q29tcGlsaW5n\x1b\\"),
+            vec![program(Some(Working), Some("build"), Some("Compiling"))]
+        );
+        assert_eq!(
+            scan_status(b"\x1b]7501;state=done:app=build:msg=QnVpbHQ=\x07"),
+            vec![program(Some(Done), Some("build"), Some("Built"))]
+        );
+        assert_eq!(
+            scan_status(b"\x1b]7501;state=done:msg=QnVpbHQ\x07"),
+            vec![program(Some(Done), None, Some("Built"))]
+        );
+        assert_eq!(
+            scan_status(b"\x1b]7501;state=blocked:kind=permission\x07"),
+            vec![program(Some(Blocked), None, None)]
+        );
+        assert_eq!(
+            scan_status(b"\x1b]7501;state=error\x07"),
+            vec![program(Some(Done), None, None)]
+        );
+        assert_eq!(
+            scan_status(b"\x1b]7501;state=idle:title=QnVpbGQ=\x07"),
+            vec![program(Some(Idle), None, None)]
+        );
+        assert_eq!(
+            scan_status(b"\x1b]7501;state=clear\x1b\\"),
+            vec![program(None, None, None)]
+        );
+        // Whitespace is trimmed, unknown keys are ignored, a malformed pair (no
+        // `=`, or a byte outside the value set) is skipped while the rest still
+        // counts, and a repeated key's last value wins.
+        assert_eq!(
+            scan_status(b"\x1b]7501; state = idle :future=1:junk:app=a b:state=working\x07"),
+            vec![program(Some(Working), None, None)]
+        );
+        assert_eq!(
+            scan_status(b"\x1b]7501;state=done:msg=Zm9v$\x07"),
+            vec![program(Some(Done), None, None)]
+        );
+        assert!(
+            scan(b"\x1b]7501;state=working\x07").is_empty(),
+            "no notification"
+        );
+    }
+
+    #[test]
+    fn osc7501_invalid_reports_are_dropped() {
+        let long_key = format!("\x1b]7501;state=working:{}=1\x07", "k".repeat(KEY_MAX + 1));
+        let long_app = format!(
+            "\x1b]7501;state=working:app={}\x07",
+            "a".repeat(APP_MAX + 1)
+        );
+        let long_msg = format!(
+            "\x1b]7501;state=done:msg={}\x07",
+            BASE64.encode("m".repeat(MSG_MAX.1 + 1))
+        );
+        let long_title = format!(
+            "\x1b]7501;state=done:title={}\x07",
+            BASE64.encode("t".repeat(TITLE_MAX.1 + 1))
+        );
+        let control_msg = format!("\x1b]7501;state=done:msg={}\x07", BASE64.encode("a\nb"));
+        let non_utf8_msg = format!(
+            "\x1b]7501;state=done:msg={}\x07",
+            BASE64.encode([0xff, 0xfe])
+        );
+        let control_title = format!(
+            "\x1b]7501;state=done:title={}\x07",
+            BASE64.encode("\x1b[2J")
+        );
+        // Ignored: no/unknown state, kind off blocked, progress outside 0–100,
+        // a non-root record, the support probe. Discarded: a broken limit, or a
+        // msg/title that is not base64 of control-free UTF-8.
+        for input in [
+            "\x1b]7501;app=build\x07",
+            "\x1b]7501;state=sleeping\x07",
+            "\x1b]7501;state=working:kind=permission\x07",
+            "\x1b]7501;state=working:progress=101\x07",
+            "\x1b]7501;state=working:progress=-1\x07",
+            "\x1b]7501;state=working:progress=+5\x07",
+            "\x1b]7501;state=working:id=build/test\x07",
+            "\x1b]7501;?\x1b\\",
+            "\x1b]7501;state=done:msg=Z\x07",
+            &long_key,
+            &long_app,
+            &long_msg,
+            &long_title,
+            &control_msg,
+            &non_utf8_msg,
+            &control_title,
+        ] {
+            let reports = scan_status(input.as_bytes());
+            assert!(
+                reports.is_empty(),
+                "{input:?} should be dropped: {reports:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn osc7501_is_incremental_across_every_cut_point() {
+        let input = b"x\x1b]7501;state=working:app=build\x1b\\y\x1b]7501;state=clear\x07";
+        let whole = signals(input);
+        assert_eq!(
+            whole,
+            vec![
+                Signal::Status(program(Some(AgentState::Working), Some("build"), None)),
+                Signal::Status(program(None, None, None)),
+            ]
+        );
+        for cut in 0..=input.len() {
+            assert_eq!(
+                signals_split(input, cut),
+                whole,
+                "mismatch cutting at {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_osc7501_is_discarded() {
+        let mut input = b"\x1b]7501;state=working:app=x:pad=".to_vec();
+        input.resize(OSC_CAP + 10, b'a');
+        input.push(0x07);
+        assert!(scan_status(&input).is_empty());
     }
 
     fn bell() -> Notification {

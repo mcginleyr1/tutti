@@ -59,7 +59,9 @@ Two optional finishing touches:
 - `tutti hooks claude --install` upgrades Claude Code state detection from
   screen heuristics to exact hook signals — recommended; see
   [Claude Code integration](#claude-code-integration). It shows the merge and
-  asks before touching `~/.claude/settings.json`.
+  asks before touching `~/.claude/settings.json`. `tutti hooks opencode
+  --install` does the same for opencode via a plugin — see
+  [opencode integration](#opencode-integration).
 - Using a Nerd Font? Set `icons = "nerdfont"` in the config for crisper
   sidebar glyphs (see [Configuration](#configuration)).
 
@@ -554,7 +556,10 @@ OSC 777). Tutti captures these from each pane's output and, for a **background**
 an OSC 9 to *your* real terminal — so wezterm/kitty/etc. raise an actual desktop
 notification naming the pane. The focused pane is left alone (you are already
 looking). The status flash and re-emit are gated by `notifications = true`
-(default); the sidebar 🔔 mark is always on regardless.
+(default); the sidebar 🔔 mark is always on regardless. An `OSC 9;4` is a
+progress report, never a notification (see
+[Agent state sources](#agent-state-sources)); an OSC 7501 report's `msg`
+notifies when it finishes or blocks the pane, at most once per 30 s per pane.
 
 ### Workspaces
 
@@ -628,6 +633,66 @@ they block or finish. The alpha registry detects `claude` and `codex`; adding an
 agent is one data-table row in `crates/tutti-agents` (codex screen patterns are
 seeds pending live tuning).
 
+### Agent state sources
+
+A pane's state can come from five sources, ranked highest first:
+
+1. **hook** — the agent's own hooks (`tutti hooks claude`, `tutti hooks
+   opencode`): exact lifecycle signals.
+2. **program** — the pane's program reporting itself with OSC 7501.
+3. **progress** — an OSC 9;4 progress report (ConEmu / Windows Terminal /
+   Ghostty).
+4. **screen** — the classifier reading a detected agent's screen.
+5. **activity** — output flowing (a finished agent that prints again is working).
+
+Hook, program and progress are *claims*: a claim holds the state until its own
+source ends it, and nothing ranked below may move it meanwhile — so a build that
+reports `done` stays done while it keeps printing, and a hook-driven agent's own
+progress bar never fights its hooks. The one exception: a screen **blocked**
+match (a visible permission dialog) overrides a program/progress **working**
+claim, which is likelier stale than right. Hook claims hold for the pane's
+lifetime; a program/progress claim ends when that source clears it, when the
+pane's child exits, or when its detected agent changes. `tutti --json pane list`
+shows each pane's `source`.
+
+**Any pane may report**, not just a detected agent. A shell pane whose program
+reports shows wherever agent state does — the sidebar row with its dot, the
+waiting queue, the app-bar census, the pane border — labelled by its OSC 7501
+`app`, else the pane title, for as long as the report has something to say (a
+live claim, or a done/blocked you have not looked at yet).
+
+**OSC 9;4** — `ESC ] 9 ; 4 ; <state> [; <percent>]` then ST or BEL. States 1
+(normal), 3 (indeterminate) and 4 (paused) are **working**; 2 (error) is
+**done** (tutti has no errored state; done puts it in the waiting queue); 0
+clears — a pane it held working settles to **idle**. The percentage is not
+shown.
+
+```sh
+printf '\e]9;4;1;40\e\\'   # working, 40%
+printf '\e]9;4;0\e\\'      # clear
+```
+
+**OSC 7501** ([program status](https://tuios.dev/docs/program-status.md)) —
+`ESC ] 7501 ; key=value:key=value… ST` (or BEL). `state` is required: `idle`,
+`working`, `done`, `blocked`, `error` (shown as done) or `clear` (ends the
+claim; working/blocked settle to idle, an unseen done stays). `app` labels the
+pane; `msg` (base64) becomes a notification on a move to done/blocked, at most
+every 30 s; `kind` (blocked only), `progress` (0–100) and `title` (base64) are
+validated but not shown. A malformed report — missing/unknown state, `kind`
+off blocked, out-of-range `progress`, an over-long field, or a `msg`/`title`
+that is not base64 of control-free UTF-8 — is dropped whole. tutti tracks only
+the root record (a report with an `id` is ignored) and does not answer the `?`
+support probe.
+
+```sh
+printf '\e]7501;state=working:app=build\e\\'
+printf '\e]7501;state=done:app=build:msg=%s\e\\' "$(printf 'Built' | base64)"
+```
+
+**Stall timer.** A **working** pane not held by a hook that goes 30 s with no
+output and no classifier working match drops to **unknown**, ending its claim —
+a build killed mid-report never says clear, and a wedged agent never says done.
+
 ## Claude Code integration
 
 Every pane tutti spawns exports `TUTTI_PANE` (the pane id) and `TUTTI_SESSION`
@@ -665,10 +730,42 @@ The one caveat: if you ever uninstall tutti while the hooks remain, Claude Code
 will surface a non-blocking "command not found" warning on every tool call —
 remove the entries (restore `settings.json.bak` or delete them) when you go.
 
-Hooks are ground truth: once a pane reports one, tutti stops classifying that
-pane's state from its screen (the heuristics would only fight the exact signals).
+Hooks are ground truth: once a pane reports one, its state is the hook's alone
+— tutti stops classifying that pane's screen, and the agent's own OSC 9;4 /
+7501 reports are ignored (see [Agent state sources](#agent-state-sources)).
 Agent **detection** (which kind of agent runs there) is unaffected, so the badge
 still appears. Display only — tutti never manages a foreign agent's subagents.
+
+## opencode integration
+
+opencode reports to tutti through a plugin. Install it (shows the plugin and
+asks first):
+
+```
+tutti hooks opencode --install            # into ~/.config/opencode/plugins/tutti.js ($XDG_CONFIG_HOME honoured)
+tutti hooks opencode --install --project  # …into ./.opencode/plugins/tutti.js instead
+tutti hooks opencode --install --yes      # skip the confirmation (scripts)
+tutti hooks opencode                      # or just print the plugin (JavaScript)…
+tutti hooks opencode --raw                # …without the stderr instructions, for piping
+```
+
+`--install` is idempotent, backs a previous tutti plugin up to `tutti.js.bak`,
+writes atomically, and refuses to overwrite a `tutti.js` that is not tutti's.
+Inside a tutti pane the plugin pipes each relevant opencode event to `tutti
+agent-event opencode` (outside one it does nothing):
+
+- `session.status` **busy**/**retry** keeps the agent **working**; **idle**
+  (and `session.idle`, `session.error`) marks it **done**;
+- `permission.asked` and `question.asked` mark it **blocked**; the matching
+  `permission.replied` / `question.replied` / `question.rejected` puts it back
+  to **working**;
+- a subagent's child session never moves the pane on its own busy/idle (its
+  permission prompts still block it).
+
+`agent-event opencode` is fail-safe in the same way as for Claude: it exits 0
+and sends nothing outside a tutti pane, on an irrelevant event, or when the
+daemon is unreachable. Remove `tutti.js` from the plugins directory if you
+uninstall tutti.
 
 ## CLI surface
 
@@ -691,8 +788,9 @@ tutti pane read <pane> [--lines N] [--unwrapped] | --fingerprint # --fingerprint
 tutti pane checkpoints <pane>        # the pane's per-turn checkpoints, newest first (n, age, label, stat, commit)
 tutti pane checkpoint-diff <pane> [N] [--stat]  # one turn's diff (default: the newest)
 tutti pane restore <pane> <N> [--force]         # restore the working copy to turn N (--force mid-turn)
-tutti hooks claude [--raw]           # print the Claude Code hooks snippet to wire agent-event
-tutti agent-event claude             # forward a Claude Code hook event (JSON on stdin) — used by hooks
+tutti hooks claude|opencode [--raw]  # print the Claude Code hooks snippet / the opencode plugin
+tutti hooks claude|opencode --install [--project] [--yes]  # install them (shows the change, asks first)
+tutti agent-event claude|opencode    # forward an agent hook event (JSON on stdin) — used by the hooks/plugin
 tutti [attach]                       # bare `tutti` attaches; a fresh session asks where to start
 ```
 

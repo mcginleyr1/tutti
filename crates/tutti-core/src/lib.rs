@@ -15,4 +15,4 @@ pub use protocol::{
     AgentHookEvent, Checkpoint, DIFF_RANGE, Event, FileStat, PaneInfo, Request, Response,
     SubagentInfo, TabInfo, TabView, WIRE_REV, WorkspaceInfo, WorkspaceView,
 };
-pub use state::{AgentState, Observation, StateEvent};
+pub use state::{AgentState, Observation, StateEvent, StateSource};

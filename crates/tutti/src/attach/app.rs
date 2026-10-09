@@ -3394,6 +3394,7 @@ fn placeholder_info(pane: PaneId) -> PaneInfo {
         exited: None,
         subagents: Vec::new(),
         checkpoints: Vec::new(),
+        source: None,
     }
 }
 

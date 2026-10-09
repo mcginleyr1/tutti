@@ -1,17 +1,58 @@
-//! Claude Code hook integration: map a hook-event JSON object (delivered on the
-//! hook command's stdin) to a tutti `AgentHookEvent`, and print the settings.json
-//! snippet that wires the events to `tutti agent-event claude`.
+//! Agent hook integrations: map a Claude Code hook-event JSON object, or an
+//! opencode bus event forwarded by tutti's opencode plugin (each delivered on
+//! `tutti agent-event`'s stdin), to a tutti `AgentHookEvent`; print the
+//! settings.json snippet that wires Claude Code's events to `tutti agent-event
+//! claude`, and the opencode plugin that pipes to `tutti agent-event opencode`.
 //!
-//! The mapping reads only the fields tutti reacts to and ignores everything else,
-//! so it tolerates Claude Code's evolving hook schema. It never fails: an
+//! The mappings read only the fields tutti reacts to and ignore everything else,
+//! so they tolerate each tool's evolving schema. They never fail: an
 //! unrecognized or irrelevant event maps to `None` (send nothing), and the CLI
-//! path around it swallows all errors so a hook can never break a Claude session.
+//! path around them swallows all errors so a hook can never break a session.
 
 use serde_json::{Value, json};
 use tutti_core::AgentHookEvent;
 
 /// The command a hook runs; also the addressable verb this module documents.
 pub const HOOK_COMMAND: &str = "tutti agent-event claude";
+
+/// The opencode plugin `tutti hooks opencode` prints and installs.
+pub const OPENCODE_PLUGIN: &str = include_str!("opencode_plugin.js");
+/// The plugin's first line: marks a file of the plugin's name as tutti's to
+/// replace — anything else there is never overwritten.
+pub const OPENCODE_PLUGIN_MARKER: &str = "// tutti opencode plugin";
+
+/// Map one opencode bus event, as the plugin forwards it (`{type,
+/// properties}`), to a tutti `AgentHookEvent`, or `None` when irrelevant.
+/// Verified against opencode 1.18.5's event schemas: `session.status` carries
+/// `properties.status.type` (`busy` | `retry` | `idle`); `session.idle` and
+/// `session.error` end the turn; `permission.asked` names its `permission`,
+/// `question.asked` its `questions[].question`; a `*.replied` or
+/// `question.rejected` means you answered and the agent goes on.
+pub fn map_opencode_event(v: &Value) -> Option<AgentHookEvent> {
+    let text = |pointer: &str| {
+        v.pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    match v.get("type")?.as_str()? {
+        "session.status" => match v.pointer("/properties/status/type")?.as_str()? {
+            "busy" | "retry" => Some(AgentHookEvent::Activity { detail: None }),
+            "idle" => Some(AgentHookEvent::Done),
+            _ => None,
+        },
+        "session.idle" | "session.error" => Some(AgentHookEvent::Done),
+        "permission.asked" => Some(AgentHookEvent::Blocked {
+            message: text("/properties/permission"),
+        }),
+        "question.asked" => Some(AgentHookEvent::Blocked {
+            message: text("/properties/questions/0/question"),
+        }),
+        "permission.replied" | "question.replied" | "question.rejected" => {
+            Some(AgentHookEvent::Activity { detail: None })
+        }
+        _ => None,
+    }
+}
 
 /// Map one Claude Code hook event to a tutti `AgentHookEvent`, or `None` when the
 /// event is irrelevant (nothing is sent). Verified against the hooks reference:
@@ -322,6 +363,123 @@ mod tests {
         partial["hooks"].as_object_mut().unwrap().remove("Stop");
         let (_, added) = merge_claude_hooks(&partial).unwrap().unwrap();
         assert_eq!(added, vec!["Stop".to_string()]);
+    }
+
+    fn oc(json: &str) -> Option<AgentHookEvent> {
+        map_opencode_event(&serde_json::from_str(json).unwrap())
+    }
+
+    #[test]
+    fn opencode_session_status_maps_busy_retry_and_idle() {
+        let working = Some(AgentHookEvent::Activity { detail: None });
+        assert_eq!(
+            oc(
+                r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":{"type":"busy"}}}"#
+            ),
+            working
+        );
+        assert_eq!(
+            oc(
+                r#"{"type":"session.status","properties":{"sessionID":"ses_1",
+                "status":{"type":"retry","attempt":2,"message":"overloaded","next":1}}}"#
+            ),
+            working
+        );
+        assert_eq!(
+            oc(
+                r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":{"type":"idle"}}}"#
+            ),
+            Some(AgentHookEvent::Done)
+        );
+        assert_eq!(
+            oc(r#"{"type":"session.status","properties":{"status":{"type":"later"}}}"#),
+            None,
+            "an unknown status type sends nothing"
+        );
+    }
+
+    #[test]
+    fn opencode_idle_and_error_end_the_turn() {
+        assert_eq!(
+            oc(r#"{"type":"session.idle","properties":{"sessionID":"ses_1"}}"#),
+            Some(AgentHookEvent::Done)
+        );
+        assert_eq!(
+            oc(
+                r#"{"type":"session.error","properties":{"sessionID":"ses_1",
+                "error":{"name":"MessageAbortedError","data":{"message":"aborted"}}}}"#
+            ),
+            Some(AgentHookEvent::Done)
+        );
+    }
+
+    #[test]
+    fn opencode_permission_and_question_block_until_answered() {
+        assert_eq!(
+            oc(
+                r#"{"type":"permission.asked","properties":{"id":"per_1","sessionID":"ses_1",
+                "permission":"bash","patterns":["rm -rf build"],"metadata":{},"always":[]}}"#
+            ),
+            Some(AgentHookEvent::Blocked {
+                message: Some("bash".into())
+            })
+        );
+        assert_eq!(
+            oc(
+                r#"{"type":"question.asked","properties":{"id":"que_1","sessionID":"ses_1",
+                "questions":[{"header":"Scope","question":"Which crate?","options":[]}]}}"#
+            ),
+            Some(AgentHookEvent::Blocked {
+                message: Some("Which crate?".into())
+            })
+        );
+        for answered in [
+            r#"{"type":"permission.replied","properties":{"sessionID":"ses_1","requestID":"per_1","reply":"once"}}"#,
+            r#"{"type":"question.replied","properties":{"sessionID":"ses_1","requestID":"que_1","answers":[]}}"#,
+            r#"{"type":"question.rejected","properties":{"sessionID":"ses_1","requestID":"que_1"}}"#,
+        ] {
+            assert_eq!(
+                oc(answered),
+                Some(AgentHookEvent::Activity { detail: None }),
+                "{answered}"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_irrelevant_or_malformed_events_map_to_nothing() {
+        assert_eq!(
+            oc(r#"{"type":"message.part.updated","properties":{}}"#),
+            None
+        );
+        assert_eq!(oc(r#"{"type":"session.status","properties":{}}"#), None);
+        assert_eq!(oc(r#"{"properties":{"status":{"type":"busy"}}}"#), None);
+    }
+
+    /// The plugin forwards exactly the event types the mapper speaks, so a
+    /// renamed event cannot silently drop out of one side.
+    #[test]
+    fn the_opencode_plugin_forwards_what_the_mapper_maps() {
+        assert!(OPENCODE_PLUGIN.starts_with(OPENCODE_PLUGIN_MARKER));
+        assert!(OPENCODE_PLUGIN.contains("tutti agent-event opencode"));
+        assert!(OPENCODE_PLUGIN.contains("process.env.TUTTI_PANE"));
+        for (event, sample) in [
+            ("session.status", r#"{"status":{"type":"idle"}}"#),
+            ("session.idle", "{}"),
+            ("session.error", "{}"),
+            ("permission.asked", "{}"),
+            ("permission.replied", "{}"),
+            ("question.asked", "{}"),
+            ("question.replied", "{}"),
+            ("question.rejected", "{}"),
+        ] {
+            assert!(
+                OPENCODE_PLUGIN.contains(&format!("\"{event}\"")),
+                "the plugin forwards {event}"
+            );
+            let payload = format!(r#"{{"type":"{event}","properties":{sample}}}"#);
+            assert!(oc(&payload).is_some(), "the mapper handles {event}");
+        }
     }
 
     #[test]
