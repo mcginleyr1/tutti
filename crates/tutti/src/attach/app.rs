@@ -65,6 +65,11 @@ const MAX_COMPLETIONS: usize = 8;
 /// to jump in: 62 columns padded) fits between the borders over a narrow pane.
 const PEEK_MIN_WIDTH: u16 = 64;
 
+/// How long the approval overlay ignores answers after opening itself over
+/// the pane in view: about a reaction time, so keys already on their way from
+/// someone typing into that pane can never allow or deny on their behalf.
+const APPROVAL_GRACE: Duration = Duration::from_millis(800);
+
 /// The notifications panel's widest width — a comfortable reading line; a
 /// narrower terminal takes all but a margin.
 const NOTES_WIDTH: u16 = 100;
@@ -345,6 +350,10 @@ pub struct App {
     /// The mode the approval overlay hands back to on closing: the sidebar it
     /// was opened from, or the terminal of the pane it opened over.
     approval_back: Mode,
+    /// When the approval overlay last opened itself over the pane in view —
+    /// answers wait out `APPROVAL_GRACE` from then. `None` for an overlay
+    /// opened on purpose (the sidebar's `p`), which answers at once.
+    approval_opened: Option<Instant>,
     /// The go-to overlay's filter text.
     navigate_query: String,
     /// The highlighted go-to row's identity, captured whenever the highlight
@@ -503,6 +512,7 @@ impl App {
             peek_rect: None,
             approval_shown: None,
             approval_back: Mode::Terminal,
+            approval_opened: None,
             navigate_query: String::new(),
             navigate_anchor: None,
             navigate_rect: None,
@@ -1903,6 +1913,7 @@ impl App {
         self.mode = Mode::Approval(pane);
         self.approval_shown = Some(id);
         self.approval_back = back;
+        self.approval_opened = None;
         self.status = None;
     }
 
@@ -1919,17 +1930,22 @@ impl App {
             .filter(|id| Some(*id) != self.approval_shown)
         {
             self.open_approval(pane, id, Mode::Terminal);
+            self.approval_opened = Some(Instant::now());
         }
     }
 
     /// Keys over the approval overlay: `y` allows the held tool call, `n`
     /// denies it, `esc` passes it on to Claude's own dialog — each answers the
     /// approval the overlay shows, by id, and closes it. Anything else, chords
-    /// included, is dropped.
+    /// included, is dropped — as is every key in the grace after the overlay
+    /// opened itself over the pane being typed into.
     fn on_key_approval(&mut self, key: KeyEvent, pane: PaneId) -> Vec<WireFrame> {
         if key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            || self
+                .approval_opened
+                .is_some_and(|at| at.elapsed() < APPROVAL_GRACE)
         {
             return Vec::new();
         }
@@ -6302,6 +6318,14 @@ mod tests {
 
         layout_changed(&mut app, view_holding(Some(8)));
         assert_eq!(app.mode, Mode::Approval(PaneId(3)), "the next one opens it");
+        assert!(
+            app.on_key(plain('y')).is_empty(),
+            "a key typed into the pane as it asked never answers"
+        );
+        assert_eq!(app.mode, Mode::Approval(PaneId(3)));
+        app.approval_opened = app
+            .approval_opened
+            .map(|at| at - APPROVAL_GRACE - Duration::from_millis(1));
         assert_eq!(app.on_key(plain('y')), answer(8, ApprovalDecision::Allow));
         assert_eq!(app.mode, Mode::Terminal);
         layout_changed(&mut app, view_holding(Some(8)));

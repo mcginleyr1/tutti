@@ -2188,6 +2188,10 @@ async fn a_held_approval_waits_for_the_answer_naming_it() {
     assert_eq!(approval(hook.response().await), deny);
     assert_eq!(view_approval(&mut viewer, pane, false).await, None);
     assert!(wait_pane(&mut control, pane, |p| p.approval.is_none()).await);
+    assert!(
+        wait_state(&mut control, pane, AgentState::Working).await,
+        "an answer sets the agent going — no Blocked through the tool's run"
+    );
 
     server.stop().await;
 }

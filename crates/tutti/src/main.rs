@@ -68,7 +68,8 @@ enum Command {
     /// Run a command in a fresh tab and print the new pane's id — the one
     /// call an orchestrator makes: `p=$(tutti run -- claude "fix the tests")`.
     Run {
-        /// The workspace to run in (default: the current one).
+        /// The workspace to run in (default: inside a tutti pane, that pane's
+        /// own workspace; elsewhere, the current one).
         #[arg(long, conflicts_with = "dir")]
         workspace: Option<u64>,
         /// Run in the workspace open at this directory, mounting it if none is.
@@ -175,8 +176,10 @@ enum SandboxAction {
         profile: String,
         /// The sandbox's name, which the daemon picks per pane: it names the
         /// k8s object and, as `tutti/<name>`, the branch the sandbox pushes to.
+        /// A daemon from before names existed passes none; one is derived the
+        /// way that daemon expects, so a mid-upgrade sandbox still starts.
         #[arg(long)]
-        name: String,
+        name: Option<String>,
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
     },
@@ -531,7 +534,20 @@ fn run(cli: Cli) -> Result<i32> {
         }) => run_wait(&cli.session, cli.json, &panes, &until, next, timeout),
         Some(Command::Sandbox {
             action: SandboxAction::Run { profile, name, cmd },
-        }) => tutti::sandbox::run(Config::load()?.sandbox(&profile)?, &name, &cmd),
+        }) => {
+            let name = name.unwrap_or_else(|| {
+                let pane: String = std::env::var("TUTTI_PANE")
+                    .unwrap_or_default()
+                    .chars()
+                    .filter(char::is_ascii_digit)
+                    .collect();
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos() as u64);
+                format!("tutti-p{pane}-{nanos:x}")
+            });
+            tutti::sandbox::run(Config::load()?.sandbox(&profile)?, &name, &cmd)
+        }
         Some(Command::Issue { action }) => run_issue(action, &cli.session, cli.json),
         Some(Command::Watch) => run_watch(&cli.session),
         Some(Command::Hooks {
@@ -2344,11 +2360,18 @@ mod tests {
             run.unwrap().command,
             Some(Command::Sandbox {
                 action: SandboxAction::Run { name, cmd, .. },
-            }) if name == "tutti-p3-ab" && cmd == ["claude"]
+            }) if name.as_deref() == Some("tutti-p3-ab") && cmd == ["claude"]
         ));
         assert!(
-            Cli::try_parse_from(["tutti", "sandbox", "run", "orb", "--", "claude"]).is_err(),
-            "the daemon names every sandbox it runs"
+            matches!(
+                Cli::try_parse_from(["tutti", "sandbox", "run", "orb", "--", "claude"])
+                    .unwrap()
+                    .command,
+                Some(Command::Sandbox {
+                    action: SandboxAction::Run { name: None, .. },
+                })
+            ),
+            "a daemon from before names existed still launches the wrapper"
         );
     }
 

@@ -1240,6 +1240,7 @@ impl Session {
                                         argv: slot.argv.clone(),
                                         agent: slot.meta.agent.clone(),
                                         conversation: slot.meta.conversation.clone(),
+                                        issue: slot.meta.issue.clone(),
                                         turns: slot.turns.clone(),
                                     }
                                 })
@@ -1336,6 +1337,7 @@ impl Session {
                         slot.turns = pane.turns;
                         if revived.is_some() {
                             slot.meta.conversation = pane.conversation;
+                            slot.meta.issue = pane.issue;
                         }
                     }
                     if revived.is_some() {
@@ -2427,6 +2429,13 @@ mod tests {
         s.pane_rename(agent, "fixer".into()).unwrap();
         s.set_agent(agent, Some("claude".into()));
         s.apply_agent_event(agent, AgentHookEvent::SessionStarted, Some("c1".into()));
+        let issue = tutti_core::IssueRef {
+            source: "gh".into(),
+            id: "123".into(),
+            title: "the tests fail".into(),
+            url: None,
+        };
+        s.panes.get_mut(&agent).unwrap().meta.issue = Some(Box::new(issue.clone()));
         let edit = [FileStat {
             path: "a.rs".into(),
             insertions: 3,
@@ -2499,6 +2508,11 @@ mod tests {
         let info = r.pane(revived).unwrap();
         assert_eq!(info.agent, Some("claude".into()));
         assert_eq!(info.conversation.as_deref(), Some("c1"));
+        assert_eq!(
+            info.issue.as_deref(),
+            Some(&issue),
+            "a revived agent stays linked to its issue"
+        );
         assert_eq!(
             r.panes[&revived].argv,
             sleep_cmd(),

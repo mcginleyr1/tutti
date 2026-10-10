@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
-use tutti_core::{AgentKind, Layout, PaneId, RestoreSummary, TabId};
+use tutti_core::{AgentKind, IssueRef, Layout, PaneId, RestoreSummary, TabId};
 
 use crate::checkpoints::Turns;
 use crate::session::ForkMeta;
@@ -64,6 +64,10 @@ pub struct SavedPane {
     pub agent: Option<AgentKind>,
     /// The agent's own id for the conversation it held.
     pub conversation: Option<String>,
+    /// The tracker issue the agent was deployed on, kept so a revived agent
+    /// stays linked to it. Absent from files saved before issue links.
+    #[serde(default)]
+    pub issue: Option<Box<IssueRef>>,
     pub turns: Turns,
 }
 
@@ -228,6 +232,7 @@ mod tests {
             argv: vec!["claude".into(), "fix the tests".into()],
             agent: agent.map(Into::into),
             conversation: conversation.map(Into::into),
+            issue: None,
             turns: Turns::default(),
         }
     }

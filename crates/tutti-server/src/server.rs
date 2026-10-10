@@ -1303,7 +1303,11 @@ fn approval_hold(
 /// Answer `pane`'s held approval — `id`'s, or whichever it holds when `None`:
 /// end it, send the decision down its channel to the hook holding the
 /// request (one that has just hung up hears nothing, which is fine), and
-/// broadcast the view without it. Error when the pane holds no such approval.
+/// broadcast the view without it. An allow or a deny sets the agent going
+/// again — the tool runs, or the model hears the refusal — and Claude sends
+/// no hook until that tool is done, so the pane moves to Working here rather
+/// than sitting Blocked through it; a pass hands the request to Claude's own
+/// dialog, still blocked. Error when the pane holds no such approval.
 fn approval_answer(
     hub: &Arc<Hub>,
     pane: PaneId,
@@ -1319,11 +1323,15 @@ fn approval_answer(
     };
     let view = session.view();
     drop(session);
+    let resumes = !matches!(decision, ApprovalDecision::Pass);
     let answer = hub.approvals().remove(&held);
     if let Some(answer) = answer {
         let _ = answer.send(decision);
     }
     broadcast_event(hub, Event::LayoutChanged { workspaces: view });
+    if resumes {
+        agent_event(hub, pane, AgentHookEvent::Activity { detail: None }, None);
+    }
     Response::Ok
 }
 

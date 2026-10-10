@@ -97,7 +97,14 @@ tutti pane wait 7 --next --until done,blocked --timeout 120
 ```sh
 tutti pane read 7 --lines 40               # the last 40 lines
 tutti pane read 7 --lines 400 --unwrapped  # logical lines, soft wraps joined
+tutti pane read 7 --since 0                # everything held, then `next cursor: N` on stderr
+tutti pane read 7 --since 1834             # only what scrolled off since cursor 1834, then the screen
 ```
+
+To follow a busy agent without rereading its whole history, keep the
+`next cursor: N` each `--since` read prints on stderr and pass it to the next
+one. The live screen comes back every time, because it is not final until it
+scrolls.
 
 ## Answer a blocked agent
 
@@ -116,6 +123,17 @@ and nothing is typed. Taking the fingerprint before reading keeps that safe.
 `enter`, `esc`, `tab`, `space`, `backspace`, `up`, `down`, `left`, `right`,
 `ctrl-c`. A permission prompt is your user's to grant: answer only what you are
 sure they would approve, and ask them about the rest.
+
+When your user runs tutti with `approvals = "hold"`, a Claude permission
+request waits in tutti instead of Claude's own dialog, and `tutti pane list
+--json` shows it as the pane's `approval` (tool and summary). Answer it with:
+
+```sh
+tutti pane approve 7                                   # allow the held tool call
+tutti pane approve 7 --deny --message "not on main"    # refuse it, telling the agent why
+```
+
+The same rule applies: approve only what your user would.
 
 To give a waiting agent a follow-up instruction, type it, then press enter:
 
