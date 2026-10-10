@@ -1,6 +1,6 @@
 ---
 name: tutti
-description: Coordinate sub-agents from inside tutti, the terminal multiplexer for coding agents - start Claude Code (or any agent CLI) in new panes or isolated jj workspaces, wait until they finish or need input, read their screens, answer their prompts safely, review their diffs and per-turn checkpoints, and merge their work. Use when the TUTTI_PANE environment variable is set and you want to spawn, parallelize, wait on, check on, answer, review, merge, or clean up other agents.
+description: Coordinate sub-agents from inside tutti, the terminal multiplexer for coding agents - start Claude Code (or any agent CLI) in new panes or isolated jj workspaces, wait until they finish or need input, read their screens, answer their prompts safely, review their diffs and per-turn checkpoints, and merge their work. Use when the TUTTI_PANE environment variable is set and you want to spawn, parallelize, wait on, check on, answer, review, merge, or clean up other agents, or hand them issues from the user's trackers.
 ---
 
 # Coordinating sub-agents with tutti
@@ -70,6 +70,26 @@ be a jj repo, and the name takes letters, digits, `-` and `_`.
 tutti workspace add 2 --name spike -r main --dest /srv/repos/api-spike
 ```
 
+## Hand an issue to an agent
+
+When your user's config lists issue trackers (`[[issues]]`), an issue becomes
+a sub-agent in one call:
+
+```sh
+tutti issue list                          # every source's open issues: SOURCE ID TITLE LABELS URL
+tutti issue list --source gh              # one source, by its configured name
+tutti issue deploy gh 123                 # an agent on issue 123, in its own workspace
+tutti issue deploy linear ENG-42 --here   # ...or in a fresh tab of the project itself
+```
+
+A deploy prints the new pane's id, like `run`. Without `--here` it creates a
+workspace named after the issue (`gh-123`) under the project open at your
+working directory (`--project` names another; one that is not a jj repo gets a
+fresh tab instead), and starts `claude` there (`--agent` picks another) with
+the issue as its first message. From then on it is a sub-agent like any other.
+tutti only reads trackers: it never comments on, assigns, or closes an issue,
+so report the outcome to your user.
+
 ## Wait for them
 
 ```sh
@@ -91,6 +111,17 @@ in:
 ```sh
 tutti pane wait 7 --next --until done,blocked --timeout 120
 ```
+
+To catch up on what happened while you were busy (which agents blocked,
+finished a turn, or rang the bell), read the notification history, newest
+first:
+
+```sh
+tutti notes --unread
+```
+
+Leave `notes read` and `notes clear` to your user: the history is theirs, and
+a note marked read takes its pane's 🔔 out of their sidebar.
 
 ## Read their screens
 
@@ -191,6 +222,7 @@ again).
 - Never send keys to your own pane (`$TUTTI_PANE`), and never wait on it.
 - Only kill panes and workspaces you created; the rest belong to your user or
   to other agents.
+- Read the notification history; never mark it read or clear it.
 - Wait with `--until done,blocked`, and always pass `--timeout`.
 - Answer prompts with `--expect`; ask your user about anything you would not
   approve yourself.

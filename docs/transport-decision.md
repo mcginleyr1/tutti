@@ -168,8 +168,9 @@ budget.
 model — pane-originated OSC 52 clipboard, sixel, and kitty-graphics escapes are not
 represented (the same "trapped escape" limitation any grid-rendered multiplexer has).
 The plan already defers OSC 52 to beta and handles copy at the tutti layer, so this
-costs us nothing at alpha. The server also keeps one cloned "last broadcast" `Screen`
-per pane for diffing — modest, bounded memory.
+costs us nothing at alpha. The server also keeps one "last broadcast" screen per pane
+for diffing — a scrollback-free mirror of the visible state, formatted under the
+pane's lock and replayed, never a clone of the 10k-row ring — modest, bounded memory.
 
 ## Recommendation
 
@@ -216,6 +217,11 @@ Control payload (`kind = 0x01`), one JSON object per frame:
 {"t":"detach"}
 ```
 
+A control frame may also carry a top-level `"req": <u64>` beside its tag; the
+daemon echoes it on that request's response, async ones included, so a client
+can tell which request a reply or a refusal answers. Events never carry one.
+(`id` was taken by some variants' own fields.)
+
 Pane-data payload (`kind = 0x02` snapshot / `0x03` delta):
 
 ```
@@ -244,9 +250,11 @@ forwarded verbatim to the PTY (kept binary for the lowest-latency keystroke path
    last broadcast, Server → `Frame{PaneDelta, pane_id, rows, cols, seq++,
    contents_diff(last_broadcast)}`; client `process`es it, marks the pane damaged, and
    redraws only damaged panes. The focused pane may be flushed sub-tick for instant echo.
-6. **Resize:** client → `Frame{Control,{"t":"resize","size"}}`; server recomputes layout
-   (smallest-client-wins), `set_size`s the affected parsers, and replies with the new
-   layout plus fresh `PaneSnapshot` frames for resized panes.
+6. **Resize:** client → `Frame{Control,{"t":"view_sizes","panes":[…]}}`, every pane it
+   shows at the size it shows it, sent whenever that set changes; the server sizes
+   each pane to the smallest rows and columns among the clients showing it
+   (re-arbitrating when a client leaves), `set_size`s the affected parsers, and sends
+   fresh `PaneSnapshot` frames for resized panes.
 7. **Scroll:** client → `Frame{Control,{"t":"scroll","pane","offset"}}`; server ships a
    snapshot of the scrolled region from the authoritative scrollback ring.
 8. **Detach:** client → `Frame{Control,{"t":"detach"}}`; server drops the client and

@@ -30,7 +30,7 @@ cargo fmt --check
 - Server integration tests must each finish well under 10s; a test "running
   over 60 seconds" means a deadlock, not slowness.
 
-## Correctness landmines (each shipped a real bug once)
+## Correctness landmines (break one and a real bug ships)
 
 - **Session-mutex guards**: never let a `hub.session()` guard live inside a
   `for`-iterator expression or `if let` scrutinee — both extend the guard
@@ -60,13 +60,43 @@ cargo fmt --check
   site that broadcasts `StateChanged` directly, or only refreshes on turn ends,
   silently loses checkpoints (the first turn's baseline would be snapshotted at
   its end and deduped away).
+- **`tutti agent-event` never writes stdout**: Claude Code feeds a
+  `UserPromptSubmit`/`SessionStart` hook's stdout to the model as context. The
+  one exception is a held `PermissionRequest`'s decision JSON — that is the
+  hook's answer. Errors go to stderr; the exit is always 0.
+- **The pty parser's scrollback offset doubles as the scroll counter**
+  (`Term::process`, pty.rs): armed to 1 per run, and back at 0 whenever the lock
+  is released — never `set_scrollback` on the live parser outside one lock hold
+  that resets it. Entering the alt screen zeroes the primary's offset, so screen
+  switches (`CSI … h|l`), `CSI … S` and `ESC c` stay lone-byte runs.
+- **Shutdown order** (`serve`, server.rs): abort *and await* the layout saver,
+  write the final save, then `kill_all`. A save after `kill_all` — or a saver
+  tick racing the final write — records a layout with every pane gone. An empty
+  session never writes the live save: it would push the pending restore offer
+  aside.
+- **Every client exit goes through `drop_client`** (server.rs), which
+  re-arbitrates the panes that client voted a size for. Removing a client from
+  `hub.clients` any other way leaves its panes stuck at a departed client's
+  size.
+- **Panics cost one pass, never the daemon**: hub locks go through the
+  poison-recovering accessors (`hub.session()`, `hub.clients()`, … — never
+  `.lock().expect()`), and background passes run inside `guarded` (or as their
+  own task if async). In the TUI, any new `catch_unwind` must set `FEEDING` as
+  `fed()` does, or the panic hook restores the terminal under a TUI that keeps
+  running.
+- **A TUI request whose reply drives a follow-up goes out through
+  `App::follow`** (tagged with a `req`), never behind a bare flag — an
+  unrelated refusal would cancel it (it did, to a merge's cleanup offer).
 
 ## Product vocabulary and rules
 
 - User-facing: **project** (top-level sidebar entry) and **workspace** (a jj
   checkout nested under it). The word "fork" is banned from UI text — git
-  baggage. CLI verbs still say `workspace` for projects: known vocabulary
-  debt, tracked in PLAN.md; don't half-rename it.
+  baggage. The CLI matches: `project add|list|kill`, `workspace
+  add|list|kill|merge|update|diff`. The pre-rename `workspace new --dir` /
+  `workspace fork` spellings are hidden aliases (tests pin them to the same
+  requests), and a test keeps "fork" out of every help screen. The wire keeps
+  `WorkspaceNew`/`WorkspaceFork`: never rename protocol variants.
 - **No human-facing capability may ship CLI-only** (PLAN ground rule). The CLI
   is the agent/script API; the TUI is the human surface. A wave adding a
   human-relevant verb lands its TUI path in the same wave.
@@ -106,8 +136,10 @@ cargo fmt --check
 - Glyphs: safe-unicode set by default, nerd-font set behind `icons =
   "nerdfont"`. No private-use codepoints in the default set.
 - Which-key, the help overlay, and the bottom-bar hints all render from the
-  live keymap table — new bindings go through that table or they won't appear
-  in the discoverability surfaces (there's a test pinning table == dispatch).
+  live keymap tables — the prefix table and the panels' `config::SIDEBAR_TABLE`
+  / `CHANGES_TABLE` (`hint` marks a binding the bottom bar shows). New bindings
+  go through a table or they won't appear in the discoverability surfaces
+  (tests pin each table == dispatch).
 
 ## Testing rituals
 
@@ -123,12 +155,19 @@ cargo fmt --check
   binaries (broken signatures), so `cp /bin/sh fake-claude` hangs forever.
 - jj-integration tests run against throwaway `jj git init` tempdir repos with
   an explicit `main` bookmark — never against this repo.
+- Inside a pane, `-s` defaults to `$TUTTI_SESSION` and `tutti run` names its
+  caller from `$TUTTI_PANE`: tests that drive the real binary must
+  `env_remove` both (cli.rs's scenario runner does) or set them, or they break
+  when the suite runs inside tutti.
+- `skills/tutti/SKILL.md` is drift-tested against clap: its fenced `tutti`
+  lines must stay literal (no `<placeholder>`, no `$var`).
 
 ## Dev loop
 
 - `just install` kills ALL running daemons then reinstalls both binaries —
   deliberate dev behavior so you're always testing the code you just built.
   End users get the non-killing flow documented in README.
-- Claude Code hooks integration: `tutti hooks claude --install` merges into
-  `~/.claude/settings.json` with confirm + backup; never write that file
-  without the confirm flow.
+- Installs — `hooks … --install`, `skill --install`, the setup panel (prefix
+  `i`) — all go through `tutti::integrations`: plan, confirm, then `apply`
+  with a backup and a changed-since-inspected guard. Never write
+  `~/.claude/settings.json` (or the plugin and skill files) outside that flow.
