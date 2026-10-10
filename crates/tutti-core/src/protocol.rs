@@ -10,7 +10,7 @@ use crate::state::{AgentState, StateSource};
 /// Response / Event shapes (including additive fields): the daemon reports it
 /// on attach and mismatched clients tell the user to restart the daemon —
 /// binaries upgrade on install, running daemons do not.
-pub const WIRE_REV: u32 = 6;
+pub const WIRE_REV: u32 = 7;
 
 /// The revset every workspace-delta surface diffs against: the fork point of
 /// the trunk bookmark (local `main`, else `master`, else `trunk`; `root()` when
@@ -313,6 +313,11 @@ pub struct WorkspaceInfo {
     pub id: WorkspaceId,
     pub name: String,
     pub dir: PathBuf,
+    /// The entry this one is nested under, resolved as `WorkspaceView::parent`
+    /// is: `None` for a top-level project — what `project list` keeps.
+    /// Defaults `None` for older servers.
+    #[serde(default)]
+    pub parent: Option<WorkspaceId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1022,6 +1027,34 @@ mod tests {
             .unwrap(),
             r#"{"type":"state_changed","pane":1,"from":"working","to":"idle"}"#
         );
+    }
+
+    #[test]
+    fn a_workspace_listing_names_each_entrys_parent() {
+        let project = WorkspaceInfo {
+            id: WorkspaceId(1),
+            name: "api".into(),
+            dir: PathBuf::from("/srv/api"),
+            parent: None,
+        };
+        let workspace = WorkspaceInfo {
+            id: WorkspaceId(2),
+            name: "api-fix".into(),
+            dir: PathBuf::from("/srv/api-fix"),
+            parent: Some(WorkspaceId(1)),
+        };
+        roundtrip(&Response::Workspaces {
+            workspaces: vec![project, workspace],
+        });
+        // A listing from before `parent` existed reads as all top-level.
+        let old: Response = serde_json::from_str(
+            r#"{"type":"workspaces","workspaces":[{"id":1,"name":"api","dir":"/srv/api"}]}"#,
+        )
+        .unwrap();
+        let Response::Workspaces { workspaces } = old else {
+            panic!("expected a workspace listing");
+        };
+        assert_eq!(workspaces[0].parent, None);
     }
 
     #[test]

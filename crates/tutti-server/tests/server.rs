@@ -2063,6 +2063,45 @@ async fn workspace_diff_non_repo_errors() {
     server.stop().await;
 }
 
+/// `workspace list` names a jj workspace's parent project — what `project
+/// list` filters on and `workspace list` prints — and the project itself has
+/// none. Skips cleanly without `jj`.
+#[tokio::test]
+async fn a_workspace_lists_the_project_it_was_added_to() {
+    let Some(origin) = init_jj_repo() else {
+        return;
+    };
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let project = workspace_id(
+        conn.request(Request::WorkspaceNew {
+            dir: origin.clone(),
+        })
+        .await,
+    );
+    let workspace = workspace_id(
+        conn.request(Request::WorkspaceFork {
+            id: project,
+            name: "nested".into(),
+            revision: None,
+            dest: None,
+        })
+        .await,
+    );
+
+    match conn.request(Request::WorkspaceList).await {
+        Response::Workspaces { workspaces } => {
+            let parents: Vec<_> = workspaces.iter().map(|w| (w.id, w.parent)).collect();
+            assert_eq!(parents, [(project, None), (workspace, Some(project))]);
+        }
+        other => panic!("expected Workspaces, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&origin);
+    let _ = std::fs::remove_dir_all(fork_sibling(&origin, "nested"));
+    server.stop().await;
+}
+
 /// An ephemeral pane leaves no corpse: when its child exits it is removed from
 /// the pane list entirely, and an attached client sees a `LayoutChanged` that no
 /// longer carries it (rather than an exited-marked row).

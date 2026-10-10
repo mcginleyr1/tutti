@@ -235,10 +235,35 @@ impl Session {
     pub fn workspace_list(&self) -> Vec<WorkspaceInfo> {
         self.workspaces
             .iter()
-            .map(|w| WorkspaceInfo {
+            .zip(self.parents())
+            .map(|(w, parent)| WorkspaceInfo {
                 id: w.id,
                 name: w.name.clone(),
                 dir: w.dir.clone(),
+                parent,
+            })
+            .collect()
+    }
+
+    /// Each workspace's parent, in workspace order: a forked child resolves to
+    /// whichever workspace currently owns its origin repo, or `None` when that
+    /// origin has been killed — the child then stands top-level. Every jj repo
+    /// root is computed once. The one answer `view` and `workspace_list` share.
+    fn parents(&self) -> Vec<Option<WorkspaceId>> {
+        let roots: Vec<(WorkspaceId, Option<PathBuf>)> = self
+            .workspaces
+            .iter()
+            .map(|w| (w.id, crate::jj::workspace_root(&w.dir)))
+            .collect();
+        self.workspaces
+            .iter()
+            .map(|w| {
+                w.fork.as_ref().and_then(|fork| {
+                    roots.iter().find_map(|(id, root)| {
+                        (*id != w.id && root.as_deref() == Some(fork.origin_root.as_path()))
+                            .then_some(*id)
+                    })
+                })
             })
             .collect()
     }
@@ -426,17 +451,10 @@ impl Session {
     /// The whole session as the attach protocol's view: workspaces, their tabs,
     /// each tab's layout tree and the `PaneInfo` for the panes it holds.
     pub fn view(&self) -> Vec<WorkspaceView> {
-        // Each workspace's jj repo root, computed once, so a forked child can be
-        // resolved to whichever workspace currently owns its origin repo (or None
-        // when that origin has been killed — the child then renders top-level).
-        let roots: Vec<(WorkspaceId, Option<PathBuf>)> = self
-            .workspaces
-            .iter()
-            .map(|w| (w.id, crate::jj::workspace_root(&w.dir)))
-            .collect();
         self.workspaces
             .iter()
-            .map(|w| WorkspaceView {
+            .zip(self.parents())
+            .map(|(w, parent)| WorkspaceView {
                 id: w.id,
                 name: w.name.clone(),
                 dir: w.dir.clone(),
@@ -444,12 +462,7 @@ impl Session {
                 changes: w.changes.clone(),
                 changed_files: w.changed_files.clone(),
                 stale: w.stale,
-                parent: w.fork.as_ref().and_then(|fork| {
-                    roots.iter().find_map(|(id, root)| {
-                        (*id != w.id && root.as_deref() == Some(fork.origin_root.as_path()))
-                            .then_some(*id)
-                    })
-                }),
+                parent,
                 tabs: w
                     .tabs
                     .iter()
@@ -1544,6 +1557,49 @@ mod tests {
     fn stop_subagent_with_nothing_running_is_a_noop() {
         let mut subs = vec![sub("a", false)];
         assert!(!stop_subagent(&mut subs, "a"));
+    }
+
+    /// A workspace tutti checked out of a project lists that project as its
+    /// parent — the same answer the view nests it by — and stands top-level
+    /// once the project is gone.
+    #[test]
+    fn a_nested_workspace_lists_its_parent_project() {
+        let tmp = TempDir::new();
+        let origin = tmp.path().join("api");
+        std::fs::create_dir_all(origin.join(".jj")).unwrap();
+        let child = tmp.path().join("api-fix");
+        std::fs::create_dir_all(child.join(".jj")).unwrap();
+        let mut session = Session::new(PaneSize::new(24, 80), "test");
+        let project = session.workspace_new(origin.clone());
+        let fork = super::ForkMeta {
+            origin_root: origin,
+            jj_name: "fix".into(),
+        };
+        let (workspace, _) = session.workspace_new_forked(child, fork);
+
+        let parents = |s: &Session| {
+            s.workspace_list()
+                .into_iter()
+                .map(|w| (w.id, w.parent))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            parents(&session),
+            [(project, None), (workspace, Some(project))]
+        );
+        let view: Vec<_> = session
+            .view()
+            .into_iter()
+            .map(|w| (w.id, w.parent))
+            .collect();
+        assert_eq!(
+            view,
+            parents(&session),
+            "the listing nests as the view does"
+        );
+
+        session.workspace_kill(project).unwrap();
+        assert_eq!(parents(&session), [(workspace, None)]);
     }
 
     #[test]

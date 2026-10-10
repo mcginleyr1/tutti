@@ -73,9 +73,12 @@ fn run_scenario_with(
         stream.flush().unwrap();
     });
 
+    // A pane's own session would otherwise steer the binary off the fake
+    // server's `tutti` socket when the suite runs inside tutti.
     let mut child = Command::new(env!("CARGO_BIN_EXE_tutti"))
         .args(args)
         .env("XDG_RUNTIME_DIR", &base)
+        .env_remove("TUTTI_SESSION")
         .envs(envs.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -391,14 +394,28 @@ fn run_prints_the_bare_pane_id() {
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "7\n");
 }
 
-#[test]
-fn workspace_list_json_round_trips() {
-    let expected = Response::Workspaces {
-        workspaces: vec![WorkspaceInfo {
+/// A project and the workspace nested under it, as the daemon lists them.
+fn project_and_workspace() -> Vec<WorkspaceInfo> {
+    vec![
+        WorkspaceInfo {
             id: WorkspaceId(1),
             name: "api".into(),
             dir: "/srv/api".into(),
-        }],
+            parent: None,
+        },
+        WorkspaceInfo {
+            id: WorkspaceId(2),
+            name: "api-fix".into(),
+            dir: "/srv/api-fix".into(),
+            parent: Some(WorkspaceId(1)),
+        },
+    ]
+}
+
+#[test]
+fn workspace_list_json_round_trips() {
+    let expected = Response::Workspaces {
+        workspaces: project_and_workspace(),
     };
     let output = run_scenario(
         "wslist",
@@ -411,6 +428,203 @@ fn workspace_list_json_round_trips() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let parsed: Response = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(parsed, expected);
+}
+
+/// `workspace list` shows every entry with its parent; `project list` asks
+/// the same question and keeps the top-level entries, `--json` included.
+#[test]
+fn project_list_keeps_the_top_level_entries() {
+    let reply = || Response::Workspaces {
+        workspaces: project_and_workspace(),
+    };
+    let listed = |label, args: &[&str]| {
+        let output = run_scenario(
+            label,
+            args,
+            |req| assert_eq!(*req, Request::WorkspaceList),
+            reply(),
+        );
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert_eq!(
+        listed("wstable", &["workspace", "list"]),
+        "ID  NAME     PARENT  DIR\n\
+         1   api      -       /srv/api\n\
+         2   api-fix  1       /srv/api-fix\n"
+    );
+    assert_eq!(
+        listed("pjtable", &["project", "list"]),
+        "ID  NAME  DIR\n\
+         1   api   /srv/api\n"
+    );
+    let json: Response =
+        serde_json::from_str(listed("pjjson", &["--json", "project", "list"]).trim()).unwrap();
+    assert_eq!(
+        json,
+        Response::Workspaces {
+            workspaces: project_and_workspace()[..1].to_vec()
+        }
+    );
+}
+
+/// `project add` opens a directory and says so in project words.
+#[test]
+fn project_add_prints_the_new_project() {
+    let output = run_scenario(
+        "pjadd",
+        &["project", "add", "/srv/api"],
+        |req| {
+            assert_eq!(
+                *req,
+                Request::WorkspaceNew {
+                    dir: "/srv/api".into()
+                }
+            );
+        },
+        Response::WorkspaceCreated { id: WorkspaceId(3) },
+    );
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "project 3 added\n"
+    );
+}
+
+/// `tutti skill` prints the skill (`--raw` without the stderr notes), and
+/// `skill --install --yes` writes it under `$HOME` — idempotently, replacing
+/// an older tutti skill behind a `.bak`, never a skill that is not tutti's.
+#[test]
+fn skill_prints_and_installs_under_home() {
+    let home = unique_base("skill");
+    std::fs::create_dir_all(&home).unwrap();
+    let skill = home.join(".claude/skills/tutti/SKILL.md");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_tutti"))
+            .args(args)
+            .env("HOME", &home)
+            .output()
+            .unwrap()
+    };
+
+    let raw = run(&["skill", "--raw"]);
+    assert!(raw.status.success() && raw.stderr.is_empty());
+    let ours = String::from_utf8(raw.stdout).unwrap();
+    assert_eq!(ours, tutti::integrations::SKILL);
+    let printed = run(&["skill"]);
+    assert_eq!(String::from_utf8(printed.stdout).unwrap(), ours);
+    assert!(
+        String::from_utf8(printed.stderr)
+            .unwrap()
+            .contains("tutti skill --install")
+    );
+
+    let installed = run(&["skill", "--install", "--yes"]);
+    assert!(installed.status.success());
+    let stdout = String::from_utf8(installed.stdout).unwrap();
+    assert!(
+        stdout.starts_with(&format!("{}: adding the tutti skill\n", skill.display()))
+            && stdout.ends_with(&format!(
+                "installed the tutti skill into {}\n",
+                skill.display()
+            )),
+        "{stdout}"
+    );
+    assert_eq!(std::fs::read_to_string(&skill).unwrap(), ours);
+    let again = run(&["skill", "--install", "--yes"]);
+    assert_eq!(
+        String::from_utf8(again.stdout).unwrap(),
+        format!("tutti skill already installed at {}\n", skill.display())
+    );
+
+    let older = "---\nname: tutti\ndescription: older\n---\n";
+    std::fs::write(&skill, older).unwrap();
+    assert!(run(&["skill", "--install", "--yes"]).status.success());
+    assert_eq!(std::fs::read_to_string(&skill).unwrap(), ours);
+    assert_eq!(
+        std::fs::read_to_string(skill.with_file_name("SKILL.md.bak")).unwrap(),
+        older
+    );
+
+    let mine = "---\nname: deploy\ndescription: mine\n---\n";
+    std::fs::write(&skill, mine).unwrap();
+    let refused = run(&["skill", "--install", "--yes"]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(
+        String::from_utf8(refused.stderr)
+            .unwrap()
+            .contains("is not tutti's skill; refusing to overwrite it")
+    );
+    assert_eq!(std::fs::read_to_string(&skill).unwrap(), mine);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// `skill --install --project` writes into the cwd's `.claude/skills`, and
+/// answering anything but yes writes nothing.
+#[test]
+fn skill_install_into_a_project_asks_first() {
+    let project = unique_base("skillproj");
+    std::fs::create_dir_all(&project).unwrap();
+    let install = |answer: &str| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_tutti"))
+            .args(["skill", "--install", "--project"])
+            .current_dir(&project)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(answer.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let declined = install("n\n");
+    assert_eq!(declined.status.code(), Some(1));
+    assert!(
+        String::from_utf8(declined.stderr)
+            .unwrap()
+            .ends_with("Write .claude/skills/tutti/SKILL.md? [y/N] aborted; nothing written\n")
+    );
+    assert!(!project.join(".claude").exists());
+
+    assert!(install("y\n").status.success());
+    assert_eq!(
+        std::fs::read_to_string(project.join(".claude/skills/tutti/SKILL.md")).unwrap(),
+        tutti::integrations::SKILL
+    );
+    let _ = std::fs::remove_dir_all(&project);
+}
+
+/// Inside a pane of session `work`, bare `tutti`, `attach`, and an explicit
+/// `-s work` all refuse to attach `work` — it would nest the session inside
+/// its own pane — and exit 1 having started nothing.
+#[test]
+fn attach_refuses_to_nest_a_session_inside_its_own_pane() {
+    // A socket dir too long for sun_path: should the guard ever regress, the
+    // connect fails outright rather than auto-starting a daemon.
+    let runtime = unique_base("nest").join("x".repeat(100));
+    for args in [&[][..], &["attach"][..], &["-s", "work", "attach"][..]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_tutti"))
+            .args(args)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("TUTTI_PANE", "7")
+            .env("TUTTI_SESSION", "work")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            "error: this pane is inside tutti session 'work' — attaching here would nest \
+             the session inside itself (use -s <other-session>)\n",
+            "{args:?}"
+        );
+    }
+    assert!(!runtime.exists(), "nothing started");
 }
 
 #[test]

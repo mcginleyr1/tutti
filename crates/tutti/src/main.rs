@@ -12,13 +12,15 @@ use tutti_core::{
 use tutti::client::{self, Client, StopOutcome};
 use tutti::config::Config;
 use tutti::hooks;
+use tutti::integrations::{self, Dirs, Integration, Status};
 use tutti::render;
 
 #[derive(Parser)]
 #[command(name = "tutti", version, about = "Terminal-native agent multiplexer")]
 struct Cli {
-    /// Session name (one daemon + socket per session).
-    #[arg(short, long, global = true, default_value = "tutti")]
+    /// Session name (one daemon + socket per session). Inside a tutti pane it
+    /// defaults to that pane's own session.
+    #[arg(short, long, global = true, default_value_t = session_from(std::env::var("TUTTI_SESSION").ok()))]
     session: String,
     /// Print raw JSON responses instead of formatted output.
     #[arg(long, global = true)]
@@ -36,7 +38,14 @@ enum Command {
         #[command(subcommand)]
         action: ServerAction,
     },
-    /// Create, list, and remove workspaces.
+    /// Open, list, and remove projects: the directories you work in, the
+    /// sidebar's top rows.
+    Project {
+        #[command(subcommand)]
+        action: ProjectAction,
+    },
+    /// Add, list, merge, and remove workspaces: jj checkouts nested under a
+    /// project, so an agent works on its own copy of the tree.
     Workspace {
         #[command(subcommand)]
         action: WorkspaceAction,
@@ -102,6 +111,23 @@ enum Command {
         #[arg(long, requires = "install")]
         yes: bool,
     },
+    /// Print or install the tutti skill, which teaches a Claude Code agent in
+    /// a tutti pane to run, wait on, answer, and review its own sub-agents.
+    Skill {
+        /// Print only the skill (omit the install instructions on stderr).
+        #[arg(long, conflicts_with = "install")]
+        raw: bool,
+        /// Install it (shows the change, asks first).
+        #[arg(long)]
+        install: bool,
+        /// Install into the project (./.claude/skills/) instead of the user
+        /// config.
+        #[arg(long, requires = "install")]
+        project: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long, requires = "install")]
+        yes: bool,
+    },
 }
 
 /// The agent whose hook schema `agent-event`/`hooks` speak.
@@ -135,47 +161,73 @@ enum ServerAction {
     Stop,
 }
 
+/// Project verbs. A project is a top-level workspace entry, so each maps onto
+/// a workspace request; its id works wherever a workspace id does.
+#[derive(Subcommand)]
+enum ProjectAction {
+    /// Open an existing directory as a project.
+    Add { dir: PathBuf },
+    /// List the projects (`workspace list` adds the workspaces under them).
+    List,
+    /// Remove a project and its panes from tutti; the directory stays.
+    Kill { id: u64 },
+}
+
 #[derive(Subcommand)]
 enum WorkspaceAction {
-    New {
+    /// Add a workspace under a project: `jj workspace add` a named checkout and
+    /// open it with a shell pane.
+    #[command(alias = "fork")]
+    Add {
+        /// The project (or workspace) to check out from.
+        project: u64,
+        /// The workspace's name, `[A-Za-z0-9_-]+`: it names the jj workspace
+        /// and the default checkout directory.
         #[arg(long)]
-        dir: PathBuf,
+        name: String,
+        /// The revision to check out (`jj workspace add --revision`).
+        #[arg(long, short = 'r')]
+        revision: Option<String>,
+        /// Where the checkout goes, which must not exist yet (default:
+        /// `<repo>-<name>` beside the project's repo).
+        #[arg(long)]
+        dest: Option<PathBuf>,
     },
+    /// List every project and workspace, each with the entry it is nested
+    /// under.
     List,
+    /// Remove a workspace and its panes from tutti; its checkout stays unless
+    /// `--discard`.
     Kill {
         id: u64,
-        /// Discard a forked workspace's checkout: `jj workspace forget` it and
-        /// delete its directory. Refused for a workspace tutti did not fork.
+        /// Also discard the checkout: `jj workspace forget` it and delete its
+        /// directory. Refused for a checkout tutti did not create.
         #[arg(long)]
         discard: bool,
     },
-    /// Fork a jj workspace into a named sibling checkout (`jj workspace add`) and
-    /// mount it with a shell pane.
-    Fork {
-        id: u64,
-        #[arg(long)]
-        name: String,
-        /// The revision to check out in the fork (`jj workspace add --revision`).
-        #[arg(long, short = 'r')]
-        revision: Option<String>,
-    },
-    /// Update a stale forked workspace (`jj workspace update-stale`).
-    Update {
-        id: u64,
-    },
-    /// Merge a child workspace's work back into its origin's trunk bookmark
+    /// Update a stale workspace (`jj workspace update-stale`).
+    Update { id: u64 },
+    /// Merge a workspace's work back into its project's trunk bookmark
     /// (`main`, else `master`). Only valid for a workspace tutti created.
     Merge {
         id: u64,
-        /// Also `jj git push` the advanced bookmark when the origin has a remote.
+        /// Also `jj git push` the advanced bookmark when the project has a
+        /// remote.
         #[arg(long)]
         push: bool,
     },
-    /// Show the workspace's jj diff (`--stat` for the summary only).
+    /// Show the workspace's jj diff against trunk (`--stat` for the summary
+    /// only).
     Diff {
         id: u64,
         #[arg(long)]
         stat: bool,
+    },
+    /// The old spelling of `project add`, kept so scripts keep working.
+    #[command(hide = true)]
+    New {
+        #[arg(long)]
+        dir: PathBuf,
     },
 }
 
@@ -371,8 +423,12 @@ fn run(cli: Cli) -> Result<i32> {
             project,
             yes,
         }) => match (agent, install) {
-            (HookAgent::Claude, true) => install_hooks(project, yes),
-            (HookAgent::Opencode, true) => install_opencode_plugin(project, yes),
+            (HookAgent::Claude, true) => {
+                install_integration(Integration::ClaudeHooks, project, yes)
+            }
+            (HookAgent::Opencode, true) => {
+                install_integration(Integration::OpencodePlugin, project, yes)
+            }
             (HookAgent::Claude, false) => {
                 emit_hooks(raw);
                 Ok(0)
@@ -382,21 +438,49 @@ fn run(cli: Cli) -> Result<i32> {
                 Ok(0)
             }
         },
+        Some(Command::Skill {
+            install: true,
+            project,
+            yes,
+            ..
+        }) => install_integration(Integration::Skill, project, yes),
+        Some(Command::Skill { raw, .. }) => {
+            emit_skill(raw);
+            Ok(0)
+        }
         Some(command) => {
+            let project = matches!(command, Command::Project { .. });
             let request = to_request(command)?;
             let mut client = Client::connect_or_start(&cli.session)?;
             let response = client.request(&request)?;
-            Ok(emit(response, cli.json))
+            Ok(if project {
+                emit_project(response, cli.json)
+            } else {
+                emit(response, cli.json)
+            })
         }
     }
+}
+
+/// The session a command targets unless `-s` names one: inside a tutti pane
+/// that pane's own (`TUTTI_SESSION`, exported into every pane), so an agent
+/// driving tutti reaches the daemon running it instead of auto-starting a
+/// stray one; else `tutti`.
+fn session_from(pane_session: Option<String>) -> String {
+    pane_session
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "tutti".into())
 }
 
 /// Load config, mount any configured startup projects (idempotently), and
 /// attach. An empty session with no configured projects attaches straight into
 /// the first-run prompt (prefilled with the cwd) rather than assuming it —
 /// `first_run` carries that prefill. A project that fails to start yields a
-/// `notice` surfaced after attach; the rest still mount.
+/// `notice` surfaced after attach; the rest still mount. Inside one of the
+/// session's own panes it refuses before loading or starting anything.
 fn attach_session(session: &str) -> Result<()> {
+    let pane_session = std::env::var_os("TUTTI_PANE").and(std::env::var("TUTTI_SESSION").ok());
+    refuse_nested_attach(session, pane_session.as_deref())?;
     let config = Config::load()?;
     // Absolutize project dirs client-side so the daemon (which has its own cwd)
     // records the real directory and its git-branch probe hits.
@@ -424,6 +508,19 @@ fn attach_session(session: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refuse to attach `session` from inside one of its own panes —
+/// `pane_session` is the enclosing pane's `TUTTI_SESSION`, `None` outside
+/// tutti — since the TUI would nest the session inside itself. A pane of
+/// another session may attach this one.
+fn refuse_nested_attach(session: &str, pane_session: Option<&str>) -> Result<()> {
+    if pane_session == Some(session) {
+        bail!(
+            "this pane is inside tutti session '{session}' — attaching here would nest the session inside itself (use -s <other-session>)"
+        );
+    }
+    Ok(())
+}
+
 /// Resolve `dir` to an absolute path client-side. Canonicalize when it exists
 /// (collapsing `.`/`..`/symlinks); otherwise join a relative path onto the
 /// client's cwd. The daemon has its own cwd, so a relative `--dir .` would
@@ -436,6 +533,17 @@ fn absolutize(dir: &Path) -> PathBuf {
         dir.to_path_buf()
     } else {
         std::env::current_dir().map_or_else(|_| dir.to_path_buf(), |cwd| cwd.join(dir))
+    }
+}
+
+/// Resolve `workspace add --dest` client-side, as the TUI's `where:` step
+/// does: absolute, its parent canonicalized when it exists, the leaf kept — it
+/// must not exist yet.
+fn absolutize_dest(dest: &Path) -> PathBuf {
+    let dest = std::path::absolute(dest).unwrap_or_else(|_| dest.to_path_buf());
+    match (dest.parent(), dest.file_name()) {
+        (Some(parent), Some(leaf)) => absolutize(parent).join(leaf),
+        _ => dest,
     }
 }
 
@@ -532,7 +640,28 @@ fn run_server(action: ServerAction, session: &str) -> Result<i32> {
 
 fn to_request(command: Command) -> Result<Request> {
     match command {
+        Command::Project { action } => Ok(match action {
+            ProjectAction::Add { dir } => Request::WorkspaceNew {
+                dir: absolutize(&dir),
+            },
+            ProjectAction::List => Request::WorkspaceList,
+            ProjectAction::Kill { id } => Request::WorkspaceKill {
+                id: WorkspaceId(id),
+                discard: false,
+            },
+        }),
         Command::Workspace { action } => Ok(match action {
+            WorkspaceAction::Add {
+                project,
+                name,
+                revision,
+                dest,
+            } => Request::WorkspaceFork {
+                id: WorkspaceId(project),
+                name,
+                revision,
+                dest: dest.as_deref().map(absolutize_dest),
+            },
             WorkspaceAction::New { dir } => Request::WorkspaceNew {
                 dir: absolutize(&dir),
             },
@@ -540,14 +669,6 @@ fn to_request(command: Command) -> Result<Request> {
             WorkspaceAction::Kill { id, discard } => Request::WorkspaceKill {
                 id: WorkspaceId(id),
                 discard,
-            },
-            WorkspaceAction::Fork { id, name, revision } => Request::WorkspaceFork {
-                id: WorkspaceId(id),
-                name,
-                revision,
-                // The CLI keeps the sibling-default placement; the guided TUI flow
-                // is the only path that chooses a destination.
-                dest: None,
             },
             WorkspaceAction::Update { id } => Request::WorkspaceUpdate {
                 id: WorkspaceId(id),
@@ -662,7 +783,8 @@ fn to_request(command: Command) -> Result<Request> {
         | Command::Attach
         | Command::Sandbox { .. }
         | Command::AgentEvent { .. }
-        | Command::Hooks { .. } => bail!("not a protocol request"),
+        | Command::Hooks { .. }
+        | Command::Skill { .. } => bail!("not a protocol request"),
     }
 }
 
@@ -781,53 +903,51 @@ fn emit_opencode_plugin(raw: bool) {
     }
 }
 
-/// Write the opencode plugin into opencode's global plugin dir
-/// (`$XDG_CONFIG_HOME/opencode/plugins`, else `~/.config/opencode/plugins`, as
-/// opencode resolves it) or, with `--project`, `./.opencode/plugins`: show it,
-/// ask (unless `--yes`), back up an older tutti plugin, write atomically. A
-/// file of that name that is not tutti's is never touched.
-fn install_opencode_plugin(project: bool, yes: bool) -> Result<i32> {
-    let config = if project {
-        PathBuf::from(".opencode")
-    } else {
-        match std::env::var_os("XDG_CONFIG_HOME").filter(|dir| !dir.is_empty()) {
-            Some(dir) => PathBuf::from(dir).join("opencode"),
-            None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?)
-                .join(".config/opencode"),
-        }
-    };
-    let path = config.join("plugins/tutti.js");
-    match std::fs::read_to_string(&path) {
-        Ok(text) if text == hooks::OPENCODE_PLUGIN => {
-            println!("tutti plugin already installed at {}", path.display());
-            return Ok(0);
-        }
-        Ok(text) if !text.starts_with(hooks::OPENCODE_PLUGIN_MARKER) => bail!(
-            "{} exists and is not tutti's plugin; refusing to overwrite it",
-            path.display()
-        ),
-        Ok(_) => println!("{}: replacing an older tutti plugin\n", path.display()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!("{}: adding the tutti plugin\n", path.display())
-        }
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+/// Print the tutti skill: the markdown to stdout, plus — unless `--raw` —
+/// where it goes on stderr, so the skill pipes cleanly on its own.
+fn emit_skill(raw: bool) {
+    print!("{}", integrations::SKILL);
+    if !raw {
+        eprintln!("# Save the skill above as ~/.claude/skills/tutti/SKILL.md (or");
+        eprintln!("# .claude/skills/tutti/SKILL.md in a project) — or let tutti do it:");
+        eprintln!("# `tutti skill --install`.");
     }
-    println!("--- plugin ---\n{}", hooks::OPENCODE_PLUGIN);
-    let code = confirm_and_write(&path, hooks::OPENCODE_PLUGIN, yes)?;
-    if code == 0 {
-        println!("installed the tutti plugin into {}", path.display());
-    }
-    Ok(code)
 }
 
-/// Ask (unless `yes`), then write `contents` to `path`: create its directory,
-/// back an existing file up to `<name>.bak`, and write `<name>.tmp` beside it
-/// before renaming it into place. Shared by every `hooks <agent> --install`.
-fn confirm_and_write(path: &Path, contents: &str, yes: bool) -> Result<i32> {
+/// `hooks <agent> --install` and `skill --install`: into the user config, or
+/// with `--project` the cwd's — show what changes, ask (unless `--yes`), then
+/// back the old file up and write the new one atomically. A file that is not
+/// tutti's, or one tutti cannot read, is never touched.
+fn install_integration(integration: Integration, project: bool, yes: bool) -> Result<i32> {
     use std::io::Write;
 
+    let dirs = Dirs {
+        project: project.then(PathBuf::new),
+        ..Dirs::from_env()
+    };
+    let plan = integration.plan(&dirs)?;
+    let path = plan.path.display();
+    // Hooks merge into a file of Claude's; the plugin and skill are files of tutti's.
+    let (noun, the, at) = match integration {
+        Integration::ClaudeHooks => ("hooks", "", "in"),
+        Integration::OpencodePlugin => ("plugin", "the ", "at"),
+        Integration::Skill => ("skill", "the ", "at"),
+    };
+    let change = match &plan.status {
+        Status::Missing(change) | Status::Outdated(change) => change,
+        Status::Installed => {
+            println!("tutti {noun} already installed {at} {path}");
+            return Ok(0);
+        }
+        Status::Foreign => {
+            bail!("{path} exists and is not tutti's {noun}; refusing to overwrite it")
+        }
+        Status::Unreadable(why) => bail!("{why}"),
+    };
+    println!("{path}: {}\n", change.summary);
+    println!("{}", change.preview);
     if !yes {
-        eprint!("Write {}? [y/N] ", path.display());
+        eprint!("Write {path}? [y/N] ");
         std::io::stderr().flush().ok();
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer)?;
@@ -836,66 +956,32 @@ fn confirm_and_write(path: &Path, contents: &str, yes: bool) -> Result<i32> {
             return Ok(1);
         }
     }
-    let beside = |suffix: &str| {
-        let mut name = path.as_os_str().to_owned();
-        name.push(suffix);
-        PathBuf::from(name)
-    };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    if path.exists() {
-        let backup = beside(".bak");
-        std::fs::copy(path, &backup)
-            .with_context(|| format!("backing up to {}", backup.display()))?;
+    if let Some(backup) = integrations::apply(&plan)? {
         eprintln!("backed up existing file to {}", backup.display());
     }
-    let tmp = beside(".tmp");
-    std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+    println!("installed {the}tutti {noun} into {path}");
     Ok(0)
 }
 
-/// Merge the hooks into settings.json: show before/after, ask (unless `--yes`),
-/// back up the old file, write atomically.
-fn install_hooks(project: bool, yes: bool) -> Result<i32> {
-    let path = if project {
-        PathBuf::from(".claude/settings.json")
-    } else {
-        let home = std::env::var_os("HOME").context("HOME is not set")?;
-        PathBuf::from(home).join(".claude/settings.json")
-    };
-    let existing = match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(&text)
-            .with_context(|| format!("{} is not valid JSON", path.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-
-    let Some((merged, added)) = hooks::merge_claude_hooks(&existing)? else {
-        println!("tutti hooks already installed in {}", path.display());
-        return Ok(0);
-    };
-
-    let before = existing
-        .get("hooks")
-        .map(|h| serde_json::to_string_pretty(h).expect("hooks serialize"))
-        .unwrap_or_else(|| "(no hooks yet)".into());
-    let after = serde_json::to_string_pretty(&merged["hooks"]).expect("hooks serialize");
-    println!(
-        "{}: adding tutti hooks for {}\n",
-        path.display(),
-        added.join(", ")
-    );
-    println!("--- hooks before ---\n{before}\n--- hooks after ---\n{after}\n");
-
-    let settings = serde_json::to_string_pretty(&merged).expect("settings serialize");
-    let code = confirm_and_write(&path, &settings, yes)?;
-    if code == 0 {
-        println!("installed tutti hooks into {}", path.display());
+/// Print a project verb's answer as `emit` would, in project words: a new
+/// project is added, and a listing keeps only the top-level entries — with
+/// `--json` too.
+fn emit_project(response: Response, json: bool) -> i32 {
+    match response {
+        Response::WorkspaceCreated { id } if !json => {
+            println!("project {id} added");
+            0
+        }
+        Response::Workspaces { mut workspaces } => {
+            workspaces.retain(|w| w.parent.is_none());
+            if json {
+                return emit(Response::Workspaces { workspaces }, true);
+            }
+            print!("{}", render::projects(&workspaces));
+            0
+        }
+        response => emit(response, json),
     }
-    Ok(code)
 }
 
 fn emit(response: Response, json: bool) -> i32 {
@@ -1038,12 +1124,37 @@ mod tests {
     #[test]
     fn global_flags_default_and_override() {
         let cli = Cli::try_parse_from(["tutti", "pane", "list"]).unwrap();
-        assert_eq!(cli.session, "tutti");
+        assert_eq!(
+            cli.session,
+            session_from(std::env::var("TUTTI_SESSION").ok())
+        );
         assert!(!cli.json);
 
         let cli = Cli::try_parse_from(["tutti", "-s", "work", "--json", "pane", "list"]).unwrap();
         assert_eq!(cli.session, "work");
         assert!(cli.json);
+    }
+
+    #[test]
+    fn the_session_defaults_to_the_panes_own() {
+        assert_eq!(session_from(None), "tutti");
+        assert_eq!(session_from(Some("work".into())), "work");
+        assert_eq!(session_from(Some(String::new())), "tutti");
+    }
+
+    #[test]
+    fn attaching_is_refused_only_from_the_sessions_own_pane() {
+        assert_eq!(
+            refuse_nested_attach("work", Some("work"))
+                .unwrap_err()
+                .to_string(),
+            "this pane is inside tutti session 'work' — attaching here would nest the session inside itself (use -s <other-session>)"
+        );
+        assert!(
+            refuse_nested_attach("tutti", Some("work")).is_ok(),
+            "another session's pane may attach it"
+        );
+        assert!(refuse_nested_attach("tutti", None).is_ok(), "outside tutti");
     }
 
     #[test]
@@ -1059,12 +1170,63 @@ mod tests {
     }
 
     #[test]
-    fn workspace_verbs_parse() {
+    fn project_verbs_parse() {
         assert_eq!(
-            request_of(&["tutti", "workspace", "new", "--dir", "/srv/api"]),
+            request_of(&["tutti", "project", "add", "/srv/api"]),
             Request::WorkspaceNew {
                 dir: PathBuf::from("/srv/api")
             }
+        );
+        assert_eq!(
+            request_of(&["tutti", "project", "list"]),
+            Request::WorkspaceList
+        );
+        assert_eq!(
+            request_of(&["tutti", "project", "kill", "4"]),
+            Request::WorkspaceKill {
+                id: WorkspaceId(4),
+                discard: false,
+            }
+        );
+        assert!(
+            Cli::try_parse_from(["tutti", "project", "kill", "4", "--discard"]).is_err(),
+            "a project's directory is the user's: there is nothing to discard"
+        );
+        assert!(Cli::try_parse_from(["tutti", "project", "add"]).is_err());
+    }
+
+    #[test]
+    fn workspace_verbs_parse() {
+        assert_eq!(
+            request_of(&["tutti", "workspace", "add", "2", "--name", "feature"]),
+            Request::WorkspaceFork {
+                id: WorkspaceId(2),
+                name: "feature".into(),
+                revision: None,
+                dest: None,
+            }
+        );
+        assert_eq!(
+            request_of(&[
+                "tutti",
+                "workspace",
+                "add",
+                "2",
+                "--name",
+                "feature",
+                "-r",
+                "@-"
+            ]),
+            Request::WorkspaceFork {
+                id: WorkspaceId(2),
+                name: "feature".into(),
+                revision: Some("@-".into()),
+                dest: None,
+            }
+        );
+        assert!(
+            Cli::try_parse_from(["tutti", "workspace", "add", "2"]).is_err(),
+            "a workspace needs a name"
         );
         assert_eq!(
             request_of(&["tutti", "workspace", "list"]),
@@ -1077,42 +1239,11 @@ mod tests {
                 discard: false,
             }
         );
-    }
-
-    #[test]
-    fn workspace_fork_update_and_discard_parse() {
         assert_eq!(
             request_of(&["tutti", "workspace", "kill", "4", "--discard"]),
             Request::WorkspaceKill {
                 id: WorkspaceId(4),
                 discard: true,
-            }
-        );
-        assert_eq!(
-            request_of(&["tutti", "workspace", "fork", "2", "--name", "feature"]),
-            Request::WorkspaceFork {
-                id: WorkspaceId(2),
-                name: "feature".into(),
-                revision: None,
-                dest: None,
-            }
-        );
-        assert_eq!(
-            request_of(&[
-                "tutti",
-                "workspace",
-                "fork",
-                "2",
-                "--name",
-                "feature",
-                "-r",
-                "@-"
-            ]),
-            Request::WorkspaceFork {
-                id: WorkspaceId(2),
-                name: "feature".into(),
-                revision: Some("@-".into()),
-                dest: None,
             }
         );
         assert_eq!(
@@ -1133,6 +1264,200 @@ mod tests {
                 push: true,
             }
         );
+    }
+
+    /// `--dest` reaches the daemon as the TUI's `where:` step sends it:
+    /// absolute, the parent canonicalized, the not-yet-existing leaf kept.
+    #[test]
+    fn workspace_add_resolves_its_dest_client_side() {
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let dest = |path: &str| match request_of(&[
+            "tutti",
+            "workspace",
+            "add",
+            "2",
+            "--name",
+            "x",
+            "--dest",
+            path,
+        ]) {
+            Request::WorkspaceFork { dest, .. } => dest,
+            other => panic!("expected a workspace add, got {other:?}"),
+        };
+        assert_eq!(dest("api-x"), Some(cwd.join("api-x")));
+        assert_eq!(
+            dest("../api-x"),
+            Some(cwd.parent().unwrap().join("api-x")),
+            "the parent is canonicalized, `..` and all"
+        );
+        assert_eq!(
+            dest("/nowhere/api-x"),
+            Some(PathBuf::from("/nowhere/api-x")),
+            "a parent missing on disk is left for the server to refuse"
+        );
+    }
+
+    /// The pre-rename spellings still parse — hidden from `--help` — to
+    /// exactly the requests their new names send, so scripts keep working.
+    #[test]
+    fn the_legacy_workspace_spellings_send_the_same_requests() {
+        assert_eq!(
+            request_of(&["tutti", "workspace", "new", "--dir", "/srv/api"]),
+            request_of(&["tutti", "project", "add", "/srv/api"]),
+        );
+        assert_eq!(
+            request_of(&["tutti", "workspace", "new", "--dir", "/srv/api"]),
+            Request::WorkspaceNew {
+                dir: PathBuf::from("/srv/api")
+            }
+        );
+        for (legacy, new) in [
+            (
+                &["tutti", "workspace", "fork", "2", "--name", "feature"][..],
+                &["tutti", "workspace", "add", "2", "--name", "feature"][..],
+            ),
+            (
+                &[
+                    "tutti",
+                    "workspace",
+                    "fork",
+                    "2",
+                    "--name",
+                    "feature",
+                    "-r",
+                    "@-",
+                ][..],
+                &[
+                    "tutti",
+                    "workspace",
+                    "add",
+                    "2",
+                    "--name",
+                    "feature",
+                    "-r",
+                    "@-",
+                ][..],
+            ),
+        ] {
+            assert_eq!(request_of(legacy), request_of(new), "{legacy:?}");
+        }
+        assert_eq!(
+            request_of(&["tutti", "workspace", "fork", "2", "--name", "feature"]),
+            Request::WorkspaceFork {
+                id: WorkspaceId(2),
+                name: "feature".into(),
+                revision: None,
+                dest: None,
+            }
+        );
+    }
+
+    /// "fork" is banned from user-facing text: no visible help screen says
+    /// it, and the legacy spellings that still run are listed nowhere.
+    #[test]
+    fn no_help_screen_says_fork() {
+        fn walk(cmd: &mut clap::Command, path: &str) {
+            let help = cmd.render_long_help().to_string();
+            assert!(!help.to_lowercase().contains("fork"), "{path}:\n{help}");
+            for sub in cmd.get_subcommands_mut().filter(|sub| !sub.is_hide_set()) {
+                let path = format!("{path} {}", sub.get_name());
+                walk(sub, &path);
+            }
+        }
+        walk(&mut <Cli as clap::CommandFactory>::command(), "tutti");
+
+        let cli = <Cli as clap::CommandFactory>::command();
+        let workspace = cli.find_subcommand("workspace").unwrap();
+        let visible: Vec<&str> = workspace
+            .get_subcommands()
+            .filter(|sub| !sub.is_hide_set())
+            .map(|sub| sub.get_name())
+            .collect();
+        assert_eq!(visible, ["add", "list", "kill", "update", "merge", "diff"]);
+        assert!(
+            workspace
+                .get_subcommands()
+                .all(|sub| sub.get_visible_aliases().next().is_none())
+        );
+    }
+
+    #[test]
+    fn skill_parses_like_the_hooks_verbs() {
+        assert!(matches!(
+            Cli::try_parse_from(["tutti", "skill"]).unwrap().command,
+            Some(Command::Skill {
+                raw: false,
+                install: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["tutti", "skill", "--install", "--project", "--yes"])
+                .unwrap()
+                .command,
+            Some(Command::Skill {
+                install: true,
+                project: true,
+                yes: true,
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from(["tutti", "skill", "--yes"]).is_err());
+        assert!(Cli::try_parse_from(["tutti", "skill", "--raw", "--install"]).is_err());
+    }
+
+    /// Every `tutti …` line in the skill's code blocks parses against this
+    /// CLI, so the skill can never teach a verb or flag that is gone. The
+    /// lines hold literal values an agent can adapt — no `<placeholder>`s, no
+    /// shell variables (its commands do not share a shell).
+    #[test]
+    fn the_skill_teaches_only_commands_that_parse() {
+        let mut fenced = false;
+        let mut parsed = 0;
+        for (number, line) in integrations::SKILL.lines().enumerate() {
+            if line.trim_start().starts_with("```") {
+                fenced = !fenced;
+                continue;
+            }
+            if !fenced || !line.trim_start().starts_with("tutti ") {
+                continue;
+            }
+            let words = shell_words(line);
+            assert!(
+                words.iter().all(|word| !word.contains(['<', '$'])),
+                "line {}: use literal values: {line}",
+                number + 1
+            );
+            if let Err(e) = Cli::try_parse_from(&words) {
+                panic!("line {} does not parse: {line}\n{e}", number + 1);
+            }
+            parsed += 1;
+        }
+        assert!(!fenced, "an unclosed code block");
+        assert!(parsed >= 20, "only {parsed} commands found in the skill");
+    }
+
+    /// Split a documented command line as a shell would — words, '…' and "…"
+    /// quoting — dropping a trailing `# comment`.
+    fn shell_words(line: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut word: Option<String> = None;
+        let mut quote = None;
+        for c in line.chars() {
+            match (quote, c) {
+                (Some(q), c) if c == q => quote = None,
+                (Some(_), c) => word.get_or_insert_with(String::new).push(c),
+                (None, '\'' | '"') => {
+                    quote = Some(c);
+                    word.get_or_insert_with(String::new);
+                }
+                (None, '#') if word.is_none() => break,
+                (None, c) if c.is_whitespace() => words.extend(word.take()),
+                (None, c) => word.get_or_insert_with(String::new).push(c),
+            }
+        }
+        words.extend(word);
+        words
     }
 
     #[test]
@@ -1611,18 +1936,22 @@ mod tests {
     }
 
     #[test]
-    fn workspace_new_absolutizes_a_relative_dir() {
-        // A relative `--dir .` must reach the daemon as an absolute path so its
+    fn project_add_absolutizes_a_relative_dir() {
+        // A relative `.` must reach the daemon as an absolute path so its
         // git-branch probe resolves against the client's directory, not the
         // daemon's.
-        let req = request_of(&["tutti", "workspace", "new", "--dir", "."]);
-        let Request::WorkspaceNew { dir } = req else {
-            panic!("expected a workspace-new request");
-        };
-        assert!(
-            dir.is_absolute(),
-            "the dir is absolutized client-side: {dir:?}"
-        );
+        for args in [
+            &["tutti", "project", "add", "."][..],
+            &["tutti", "workspace", "new", "--dir", "."][..],
+        ] {
+            let Request::WorkspaceNew { dir } = request_of(args) else {
+                panic!("expected a workspace-new request");
+            };
+            assert!(
+                dir.is_absolute(),
+                "the dir is absolutized client-side: {dir:?}"
+            );
+        }
     }
 
     #[test]

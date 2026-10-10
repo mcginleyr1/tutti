@@ -1,6 +1,25 @@
 use tutti_core::{AgentState, Checkpoint, PaneInfo, TabInfo, WorkspaceInfo};
 
+/// Every entry, projects and the workspaces nested under them, each with the
+/// id of the entry it is nested under (`-` for a top-level project).
 pub fn workspaces(items: &[WorkspaceInfo]) -> String {
+    let rows: Vec<Vec<String>> = items
+        .iter()
+        .map(|w| {
+            vec![
+                w.id.to_string(),
+                w.name.clone(),
+                w.parent.map_or_else(|| "-".to_string(), |p| p.to_string()),
+                w.dir.display().to_string(),
+            ]
+        })
+        .collect();
+    table(&["ID", "NAME", "PARENT", "DIR"], &rows)
+}
+
+/// Projects — the top-level entries `project list` keeps — with no parent
+/// column, since none has one.
+pub fn projects(items: &[WorkspaceInfo]) -> String {
     let rows: Vec<Vec<String>> = items
         .iter()
         .map(|w| {
@@ -144,25 +163,43 @@ mod tests {
     use super::*;
     use tutti_core::{PaneId, TabId, WorkspaceId};
 
-    #[test]
-    fn workspace_table_aligns_columns() {
-        let rendered = workspaces(&[
+    fn entries() -> Vec<WorkspaceInfo> {
+        vec![
             WorkspaceInfo {
                 id: WorkspaceId(1),
                 name: "api".into(),
                 dir: "/srv/api".into(),
+                parent: None,
             },
             WorkspaceInfo {
                 id: WorkspaceId(22),
-                name: "frontend".into(),
-                dir: "/srv/web".into(),
+                name: "api-fix".into(),
+                dir: "/srv/api-fix".into(),
+                parent: Some(WorkspaceId(1)),
             },
-        ]);
+        ]
+    }
+
+    #[test]
+    fn workspace_table_names_each_entrys_parent() {
         assert_eq!(
-            rendered,
+            workspaces(&entries()),
+            "ID  NAME     PARENT  DIR\n\
+             1   api      -       /srv/api\n\
+             22  api-fix  1       /srv/api-fix\n"
+        );
+    }
+
+    #[test]
+    fn project_table_aligns_columns_without_a_parent() {
+        let mut items = entries();
+        items[1].parent = None;
+        items[1].name = "frontend".into();
+        assert_eq!(
+            projects(&items),
             "ID  NAME      DIR\n\
              1   api       /srv/api\n\
-             22  frontend  /srv/web\n"
+             22  frontend  /srv/api-fix\n"
         );
     }
 
@@ -277,6 +314,7 @@ mod tests {
 
     #[test]
     fn empty_list_renders_header_only() {
-        assert_eq!(workspaces(&[]), "ID  NAME  DIR\n");
+        assert_eq!(workspaces(&[]), "ID  NAME  PARENT  DIR\n");
+        assert_eq!(projects(&[]), "ID  NAME  DIR\n");
     }
 }
