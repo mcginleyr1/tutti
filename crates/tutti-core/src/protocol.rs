@@ -10,7 +10,7 @@ use crate::state::{AgentState, StateSource};
 /// Response / Event shapes (including additive fields): the daemon reports it
 /// on attach and mismatched clients tell the user to restart the daemon —
 /// binaries upgrade on install, running daemons do not.
-pub const WIRE_REV: u32 = 7;
+pub const WIRE_REV: u32 = 8;
 
 /// The revset every workspace-delta surface diffs against: the fork point of
 /// the trunk bookmark (local `main`, else `master`, else `trunk`; `root()` when
@@ -260,8 +260,21 @@ pub enum Request {
         #[serde(default)]
         force: bool,
     },
-    Attach,
+    /// Join the attached-client set. `terminal` names the terminal app the
+    /// client runs in — macOS's `__CFBundleIdentifier`, e.g.
+    /// `com.mitchellh.ghostty` — which watchers are told so they can raise it.
+    /// `None` off macOS and from older clients.
+    Attach {
+        #[serde(default)]
+        terminal: Option<String>,
+    },
     Detach,
+    /// Subscribe this connection to `Event::Snapshot`s: one at once, then one
+    /// whenever anything a snapshot carries changes. Read-only, and not an
+    /// attached client: a watcher gets no pane frames and never moves sizes,
+    /// focus, or a `Done` pane's seen state, so it sits beside an attached TUI
+    /// without touching it.
+    Watch,
 }
 
 /// A single agent-lifecycle signal mapped from a Claude Code hook event. Kept a
@@ -412,6 +425,27 @@ pub struct Checkpoint {
     pub files: usize,
     pub insertions: u64,
     pub deletions: u64,
+}
+
+/// One pane in a watcher's `Event::Snapshot`, flat: where it lives, by name,
+/// and its agent state — the shape `tutti watch` prints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchPane {
+    pub id: PaneId,
+    /// The workspace (project) name and its absolute directory.
+    pub workspace: String,
+    pub dir: PathBuf,
+    /// The tab's display name.
+    pub tab: String,
+    pub title: String,
+    /// As `PaneInfo::agent`: the detected agent, else a self-reporting pane's
+    /// label, else `None` for a plain shell.
+    pub agent: Option<AgentKind>,
+    pub state: AgentState,
+    pub source: Option<StateSource>,
+    pub exited: Option<i32>,
+    /// Whether this is the attached client's focused pane.
+    pub focused: bool,
 }
 
 /// One subagent row under a hook-driven agent in the sidebar: a short
@@ -624,6 +658,22 @@ pub enum Event {
         title: Option<String>,
         body: Option<String>,
     },
+    /// Someone other than an attached client focused `pane` — a script's
+    /// `pane focus`, a notch app's click: the attached client shows it,
+    /// switching workspace and tab. Never sent for a client's own focus.
+    PaneFocused {
+        pane: PaneId,
+    },
+    /// The whole session as a watcher (`Request::Watch`) sees it, replacing
+    /// the previous snapshot: every pane flat, in sidebar order.
+    /// `attached_terminal` is the newest attached client's `terminal` — `None`
+    /// with nobody attached — and `focused` marks that client's pane.
+    Snapshot {
+        session: String,
+        wire_rev: u32,
+        attached_terminal: Option<String>,
+        panes: Vec<WatchPane>,
+    },
 }
 
 #[cfg(test)]
@@ -824,7 +874,11 @@ mod tests {
             n: 1,
             force: true,
         });
-        roundtrip(&Request::Attach);
+        roundtrip(&Request::Attach { terminal: None });
+        roundtrip(&Request::Attach {
+            terminal: Some("com.mitchellh.ghostty".into()),
+        });
+        roundtrip(&Request::Watch);
     }
 
     fn sample_checkpoint() -> Checkpoint {
@@ -1073,6 +1127,48 @@ mod tests {
             title: Some("agent".into()),
             body: Some("ready to merge".into()),
         });
+        roundtrip(&Event::PaneFocused { pane: PaneId(3) });
+        roundtrip(&sample_snapshot());
+        roundtrip(&Event::Snapshot {
+            session: "tutti".into(),
+            wire_rev: WIRE_REV,
+            attached_terminal: None,
+            panes: Vec::new(),
+        });
+    }
+
+    fn sample_snapshot() -> Event {
+        Event::Snapshot {
+            session: "tutti".into(),
+            wire_rev: 6,
+            attached_terminal: Some("com.mitchellh.ghostty".into()),
+            panes: vec![WatchPane {
+                id: PaneId(3),
+                workspace: "smartnotch".into(),
+                dir: PathBuf::from("/Users/me/develop/smartnotch"),
+                tab: "main".into(),
+                title: "claude".into(),
+                agent: Some("claude".into()),
+                state: AgentState::Working,
+                source: Some(StateSource::Hook),
+                exited: None,
+                focused: true,
+            }],
+        }
+    }
+
+    /// `tutti watch` prints snapshots verbatim, and a notch app is written
+    /// against this exact line.
+    #[test]
+    fn a_snapshot_is_the_watch_contract_line() {
+        assert_eq!(
+            serde_json::to_string(&sample_snapshot()).unwrap(),
+            concat!(
+                r#"{"type":"snapshot","session":"tutti","wire_rev":6,"attached_terminal":"com.mitchellh.ghostty","#,
+                r#""panes":[{"id":3,"workspace":"smartnotch","dir":"/Users/me/develop/smartnotch","tab":"main","#,
+                r#""title":"claude","agent":"claude","state":"working","source":"hook","exited":null,"focused":true}]}"#
+            )
+        );
     }
 
     #[test]
@@ -1260,6 +1356,20 @@ mod tests {
                 since: None,
             }
         );
+        // `attach` from before `terminal` existed names no terminal.
+        let attach: Request = serde_json::from_str(r#"{"type":"attach"}"#).unwrap();
+        assert_eq!(attach, Request::Attach { terminal: None });
+        // ...and an older daemon, whose `Attach` is a unit variant, still
+        // accepts an attach that names one.
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldRequest {
+            Attach,
+        }
+        let old: OldRequest =
+            serde_json::from_str(r#"{"type":"attach","terminal":"com.mitchellh.ghostty"}"#)
+                .unwrap();
+        assert_eq!(old, OldRequest::Attach);
         // `workspace_fork` without a revision or dest defaults both to `None`.
         let fork: Request =
             serde_json::from_str(r#"{"type":"workspace_fork","id":1,"name":"x"}"#).unwrap();

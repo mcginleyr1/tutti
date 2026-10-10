@@ -14,7 +14,7 @@ use tokio::time::{sleep, timeout};
 
 use tutti_core::{
     AgentHookEvent, AgentState, Checkpoint, Direction, Event, Frame, Layout, PaneData, PaneId,
-    PaneInfo, Request, Response, StateSource, SubagentInfo, WorkspaceId,
+    PaneInfo, Request, Response, StateSource, SubagentInfo, WatchPane, WorkspaceId,
 };
 use tutti_server::{PaneSize, serve};
 
@@ -900,7 +900,7 @@ async fn attach_receives_snapshot_then_delta() {
     );
 
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach).await;
+    viewer.send(&Request::Attach { terminal: None }).await;
     match viewer.response().await {
         Response::Attached { workspaces, .. } => {
             assert!(
@@ -955,7 +955,7 @@ async fn snapshot_carries_mouse_reporting_mode() {
     );
 
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach).await;
+    viewer.send(&Request::Attach { terminal: None }).await;
     let _ = viewer.response().await;
 
     let bytes = expect_pane_frame(&mut viewer, pane, true).await.bytes;
@@ -992,7 +992,7 @@ async fn attach_resize_reseeds_at_new_size() {
     );
 
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach).await;
+    viewer.send(&Request::Attach { terminal: None }).await;
     let _ = viewer.response().await;
     let first = expect_pane_frame(&mut viewer, pane, true).await;
     assert_eq!((first.rows, first.cols), (24, 80));
@@ -1048,7 +1048,7 @@ async fn attach(
     Vec<tutti_core::WorkspaceView>,
     Option<tutti_core::RestoreSummary>,
 ) {
-    conn.send(&Request::Attach).await;
+    conn.send(&Request::Attach { terminal: None }).await;
     loop {
         if let Frame::Control(json) = conn.read_frame().await
             && let Ok(Response::Attached {
@@ -1246,7 +1246,7 @@ async fn resize_split_adjusts_ratio_and_broadcasts() {
 
     // Attach after the split so the only LayoutChanged the viewer sees is ours.
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach).await;
+    viewer.send(&Request::Attach { terminal: None }).await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
 
     assert_eq!(
@@ -1296,7 +1296,7 @@ async fn split_ratio_sets_the_separating_split_and_broadcasts() {
 
     // Attach after the split so the only LayoutChanged the viewer sees is ours.
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach).await;
+    viewer.send(&Request::Attach { terminal: None }).await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
 
     let drag = |a, b, ratio| Request::PaneSplitRatio { a, b, ratio };
@@ -1383,11 +1383,11 @@ async fn wedged_client_is_dropped_but_others_keep_flowing() {
 
     // Attaches, then never reads again: its bounded queue will fill.
     let mut wedged = server.connect().await;
-    wedged.send(&Request::Attach).await;
+    wedged.send(&Request::Attach { terminal: None }).await;
 
     // Attaches and will keep draining.
     let mut good = server.connect().await;
-    good.send(&Request::Attach).await;
+    good.send(&Request::Attach { terminal: None }).await;
     assert!(matches!(good.response().await, Response::Attached { .. }));
 
     // Flood a pane with bells; each becomes a broadcast frame, so the
@@ -1515,7 +1515,7 @@ async fn agent_event_blocks_and_broadcasts() {
     let pane = run_sleeper(&mut control).await;
 
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach).await;
+    viewer.send(&Request::Attach { terminal: None }).await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
 
     assert_eq!(
@@ -1719,7 +1719,7 @@ async fn a_shell_panes_own_status_reports_drive_its_state() {
             .await,
     );
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach).await;
+    viewer.send(&Request::Attach { terminal: None }).await;
     let label = |p: &PaneInfo| p.agent.as_ref().map(ToString::to_string);
 
     printf_osc(&mut control, pane, "9;4;1;40").await;
@@ -1919,7 +1919,7 @@ async fn agent_state_changes_working_then_blocked() {
     );
 
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach).await;
+    viewer.send(&Request::Attach { terminal: None }).await;
 
     let mut order = Vec::new();
 
@@ -2119,7 +2119,7 @@ async fn a_mirror_fingerprints_like_the_live_grid() {
     assert!(read_until(&mut control, pane, "phase one").await);
 
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach).await;
+    viewer.send(&Request::Attach { terminal: None }).await;
     let mut mirror = None;
     let live = fingerprint(&mut control, pane).await;
     mirror_until(&mut viewer, pane, &mut mirror, &live).await;
@@ -2358,7 +2358,7 @@ async fn ephemeral_pane_vanishes_on_child_exit() {
     new_workspace(&mut control).await;
 
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach).await;
+    viewer.send(&Request::Attach { terminal: None }).await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
 
     let pane = pane_id(
@@ -2455,6 +2455,188 @@ async fn focus_transitions_done_pane_to_idle() {
     server.stop().await;
 }
 
+/// Snapshots off a watcher until one satisfies `want`, returning it as
+/// `(attached_terminal, panes)`. A watcher must be sent nothing else — no pane
+/// frame, no event — so anything else fails the test.
+async fn snapshot_until(
+    watcher: &mut Conn,
+    want: impl Fn(&Option<String>, &[WatchPane]) -> bool,
+) -> (Option<String>, Vec<WatchPane>) {
+    timeout(DEADLINE, async {
+        loop {
+            let Frame::Control(json) = watcher.read_frame().await else {
+                panic!("a watcher was sent a pane frame");
+            };
+            match serde_json::from_slice(&json).unwrap() {
+                Event::Snapshot {
+                    session,
+                    wire_rev,
+                    attached_terminal,
+                    panes,
+                } => {
+                    assert_eq!((session.as_str(), wire_rev), ("s", tutti_core::WIRE_REV));
+                    if want(&attached_terminal, &panes) {
+                        return (attached_terminal, panes);
+                    }
+                }
+                other => panic!("a watcher was sent {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("no snapshot matched within the deadline")
+}
+
+/// A watcher gets a whole-session snapshot on connect and another on each
+/// change, beside an attached client it never disturbs: the client still gets
+/// its frames and events, the snapshot carries the client's terminal and
+/// focus while it is attached, and a `Done` stays unseen however many watchers
+/// come and go.
+#[tokio::test]
+async fn a_watcher_snapshots_the_session_beside_an_attached_client() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    new_workspace(&mut control).await;
+    let pane = pane_id(
+        control
+            .request(Request::PaneRun {
+                tab: None,
+                cmd: vec!["/bin/cat".into()],
+                ephemeral: false,
+                sandbox: None,
+            })
+            .await,
+    );
+
+    let mut watcher = server.connect().await;
+    watcher.send(&Request::Watch).await;
+    let (terminal, panes) = snapshot_until(&mut watcher, |_, _| true).await;
+    assert_eq!(terminal, None, "nobody is attached yet");
+    let dir = std::env::temp_dir();
+    assert_eq!(
+        panes,
+        vec![WatchPane {
+            id: pane,
+            workspace: dir.file_name().unwrap().to_string_lossy().into_owned(),
+            dir,
+            tab: "cat".into(),
+            title: "cat".into(),
+            agent: None,
+            state: AgentState::Unknown,
+            source: None,
+            exited: None,
+            focused: false,
+        }]
+    );
+
+    let mut viewer = server.connect().await;
+    viewer
+        .send(&Request::Attach {
+            terminal: Some("com.mitchellh.ghostty".into()),
+        })
+        .await;
+    viewer.send(&Request::PaneFocus { pane }).await;
+    snapshot_until(&mut watcher, |terminal, panes| {
+        terminal.as_deref() == Some("com.mitchellh.ghostty") && panes[0].focused
+    })
+    .await;
+
+    for (event, state) in [
+        (
+            AgentHookEvent::Activity { detail: None },
+            AgentState::Working,
+        ),
+        (AgentHookEvent::Done, AgentState::Done),
+    ] {
+        assert_eq!(
+            control
+                .request(Request::AgentEvent {
+                    pane,
+                    event,
+                    conversation: None,
+                })
+                .await,
+            Response::Ok
+        );
+        snapshot_until(&mut watcher, |_, panes| {
+            panes[0].state == state && panes[0].source == Some(StateSource::Hook)
+        })
+        .await;
+        wait_state_event(&mut viewer, pane, state, &mut Vec::new()).await;
+    }
+
+    let mut second = server.connect().await;
+    second.send(&Request::Watch).await;
+    let (_, panes) = snapshot_until(&mut second, |_, _| true).await;
+    assert_eq!(panes[0].state, AgentState::Done, "watching is not viewing");
+
+    viewer.send(&Request::Detach).await;
+    let (_, panes) = snapshot_until(&mut watcher, |terminal, _| terminal.is_none()).await;
+    assert!(!panes[0].focused, "nobody attached, nothing focused");
+    assert_eq!(panes[0].state, AgentState::Done);
+
+    server.stop().await;
+}
+
+/// A script's `pane focus` is relayed to the attached client as `PaneFocused`
+/// so it can jump there; the client's own focus reports are never echoed.
+#[tokio::test]
+async fn a_scripted_focus_is_relayed_to_the_attached_client() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    new_workspace(&mut control).await;
+    let mut panes = Vec::new();
+    for _ in 0..2 {
+        let run = Request::PaneRun {
+            tab: None,
+            cmd: vec!["/bin/cat".into()],
+            ephemeral: false,
+            sandbox: None,
+        };
+        panes.push(pane_id(control.request(run).await));
+    }
+    let (own, scripted) = (panes[0], panes[1]);
+
+    let mut viewer = server.connect().await;
+    viewer.send(&Request::Attach { terminal: None }).await;
+    viewer.send(&Request::PaneFocus { pane: own }).await;
+    let relayed = |json: &[u8]| match serde_json::from_slice(json) {
+        Ok(Event::PaneFocused { pane }) => Some(pane),
+        _ => None,
+    };
+    timeout(DEADLINE, async {
+        loop {
+            if let Frame::Control(json) = viewer.read_frame().await {
+                assert_eq!(relayed(&json), None, "the client's own focus was echoed");
+                if serde_json::from_slice::<Response>(&json).is_ok_and(|r| r == Response::Ok) {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .expect("the focus was never answered");
+
+    assert_eq!(
+        control.request(Request::PaneFocus { pane: scripted }).await,
+        Response::Ok
+    );
+    timeout(DEADLINE, async {
+        loop {
+            if let Frame::Control(json) = viewer.read_frame().await
+                && let Some(pane) = relayed(&json)
+            {
+                assert_eq!(pane, scripted);
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the scripted focus was never relayed");
+
+    server.stop().await;
+}
+
 /// Run a `jj` subcommand in `dir` and return its output (helpers below drive a
 /// real repo directly to set up stale/forget scenarios).
 fn run_jj(dir: &Path, args: &[&str]) -> std::process::Output {
@@ -2517,7 +2699,7 @@ async fn a_shell_side_jj_operation_refreshes_the_change_stat() {
             .await,
     );
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach).await;
+    viewer.send(&Request::Attach { terminal: None }).await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
     // Let the watch take the repo's first mark, so the operation below is a
     // change it can see rather than its baseline.
@@ -2554,7 +2736,7 @@ async fn the_watch_ignores_the_probes_own_snapshot() {
             .await,
     );
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach).await;
+    viewer.send(&Request::Attach { terminal: None }).await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
     sleep(Duration::from_millis(1500)).await;
 
@@ -2566,7 +2748,7 @@ async fn the_watch_ignores_the_probes_own_snapshot() {
     )
     .unwrap();
     let mut second = server.connect().await;
-    second.send(&Request::Attach).await;
+    second.send(&Request::Attach { terminal: None }).await;
     assert!(matches!(second.response().await, Response::Attached { .. }));
     assert!(
         wait_workspace_changes(&mut viewer, ws, "3 files", DEADLINE).await,
@@ -2675,7 +2857,7 @@ async fn fork_creates_sibling_checkout_with_a_shell_pane() {
     );
 
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach).await;
+    viewer.send(&Request::Attach { terminal: None }).await;
     let workspaces = match viewer.response().await {
         Response::Attached { workspaces, .. } => workspaces,
         other => panic!("expected Attached, got {other:?}"),
@@ -2842,7 +3024,7 @@ async fn fork_goes_stale_then_update_clears_it() {
 
     // Attaching triggers a refresh across all workspaces, flipping the stale flag.
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach).await;
+    viewer.send(&Request::Attach { terminal: None }).await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
     assert!(
         wait_workspace_stale(&mut viewer, fork, true).await,
@@ -3406,7 +3588,7 @@ async fn a_turn_checkpoints_its_diff_and_restores_round_trip() {
     }
 
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach).await;
+    viewer.send(&Request::Attach { terminal: None }).await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
 
     // An edit no turn recorded is saved as `before restore` on the way back.

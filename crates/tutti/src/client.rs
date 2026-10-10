@@ -48,6 +48,28 @@ impl Client {
         }
     }
 
+    /// Subscribe to the session's snapshots (`Request::Watch`), handing each
+    /// Control frame's JSON to `each` as it lands, until the daemon closes the
+    /// connection.
+    pub fn watch(&mut self, mut each: impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        let json = serde_json::to_vec(&Request::Watch)?;
+        self.stream.write_all(&Frame::Control(json).encode())?;
+        loop {
+            while let Some((frame, consumed)) = Frame::decode(&self.buf)? {
+                self.buf.drain(..consumed);
+                if let Frame::Control(json) = frame {
+                    each(&json)?;
+                }
+            }
+            let mut chunk = [0u8; 8192];
+            let n = self.stream.read(&mut chunk)?;
+            if n == 0 {
+                return Ok(());
+            }
+            self.buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+
     fn read_frame(&mut self) -> Result<Frame> {
         loop {
             if let Some((frame, consumed)) = Frame::decode(&self.buf)? {

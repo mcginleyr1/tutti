@@ -13,7 +13,7 @@ pub use paths::{socket_dir, socket_path, state_dir};
 pub use prompt::{PROMPT_LINES, prompt_fingerprint, prompt_rows};
 pub use protocol::{
     AgentHookEvent, Checkpoint, DIFF_RANGE, Event, FileStat, PaneInfo, Request, Response,
-    RestoreSummary, SubagentInfo, TabInfo, TabView, WIRE_REV, WaitFor, WorkspaceInfo,
+    RestoreSummary, SubagentInfo, TabInfo, TabView, WIRE_REV, WaitFor, WatchPane, WorkspaceInfo,
     WorkspaceView,
 };
 pub use state::{AgentState, Observation, StateEvent, StateSource};

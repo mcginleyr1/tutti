@@ -12,8 +12,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tutti_core::{
     AgentHookEvent, AgentKind, AgentState, Direction, FileStat, Layout, Observation, PaneId,
-    PaneInfo, StateEvent, StateSource, SubagentInfo, TabId, TabInfo, TabView, WorkspaceId,
-    WorkspaceInfo, WorkspaceView, prompt_fingerprint,
+    PaneInfo, StateEvent, StateSource, SubagentInfo, TabId, TabInfo, TabView, WatchPane,
+    WorkspaceId, WorkspaceInfo, WorkspaceView, prompt_fingerprint,
 };
 
 use crate::checkpoints::{Noted, Turns};
@@ -496,6 +496,43 @@ impl Session {
                             .collect(),
                     })
                     .collect(),
+            })
+            .collect()
+    }
+
+    /// Every pane flat, in sidebar order, as a watcher's snapshot lists it:
+    /// its workspace and tab by name, and whether it is `focused`. Read
+    /// straight off the model — `view` probes git and jj, and this runs on
+    /// the render tick.
+    pub fn watch_panes(&self, focused: Option<PaneId>) -> Vec<WatchPane> {
+        self.workspaces
+            .iter()
+            .flat_map(|w| w.tabs.iter().map(move |t| (w, t)))
+            .flat_map(|(w, t)| {
+                t.layout
+                    .as_ref()
+                    .map(Layout::panes)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|id| self.panes.get(&id))
+                    .map(move |slot| WatchPane {
+                        id: slot.meta.id,
+                        workspace: w.name.clone(),
+                        dir: w.dir.clone(),
+                        tab: self.tab_display_name(t),
+                        title: slot.meta.title.clone(),
+                        // As `pane_info` presents it, without cloning the
+                        // checkpoints on every tick.
+                        agent: slot
+                            .meta
+                            .agent
+                            .clone()
+                            .or_else(|| slot.label.clone().map(AgentKind)),
+                        state: slot.meta.state,
+                        source: slot.meta.source,
+                        exited: slot.meta.exited,
+                        focused: focused == Some(slot.meta.id),
+                    })
             })
             .collect()
     }
@@ -1742,6 +1779,11 @@ mod tests {
                 .relisted
         );
         assert_eq!(info(&s, pane).agent, Some("build".into()));
+        assert_eq!(
+            s.watch_panes(None)[0].agent,
+            Some("build".into()),
+            "watchers see the label too"
+        );
         assert!(
             !s.apply_report(pane, app_report(Some(Done), "build", None), t0)
                 .relisted

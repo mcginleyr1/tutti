@@ -836,6 +836,41 @@ sandbox's work, so sandbox panes record no turns. Resume rows are hidden in a
 sandbox launcher because those conversations live on this machine. An exited
 sandbox pane's `r` reopens the launcher on the same sandbox.
 
+## Watching state from other tools
+
+`tutti watch [-s <session>]` streams the session's state to another program —
+a menu-bar or notch app, a status line — as JSON lines on stdout, each flushed
+as it lands. Every line is a full snapshot of the session (replace, don't
+merge). The first comes at once, then one on each change to any pane's state,
+agent, title or exit, to the workspace/tab/pane structure, or to the attached
+TUI's focus or terminal; bursts coalesce.
+
+```json
+{"type":"snapshot","session":"tutti","wire_rev":6,"attached_terminal":"com.mitchellh.ghostty",
+ "panes":[{"id":3,"workspace":"smartnotch","dir":"/Users/me/develop/smartnotch","tab":"main",
+           "title":"claude","agent":"claude","state":"working","source":"hook","exited":null,"focused":true}]}
+```
+
+- `id` is the pane id `tutti pane focus` takes; `workspace` and `dir` are its
+  project's name and absolute directory; `tab` is its tab's name.
+- `agent` is the detected agent (`claude`, `codex`, …), a self-reporting
+  pane's OSC 7501 `app` label, or `null` for a plain shell.
+- `state` is `blocked`, `working`, `done`, `idle` or `unknown`; `source` is
+  `hook`, `program`, `progress`, `screen`, `activity` or `null` (see
+  [Agent state sources](#agent-state-sources)).
+- `exited` is the exit code, `null` while running; `focused` marks the attached
+  TUI's focused pane.
+- `attached_terminal` is the terminal app the attached TUI runs in (macOS's
+  `__CFBundleIdentifier`), `null` with nobody attached or off macOS;
+  `wire_rev` is the daemon's protocol revision.
+
+A watcher is read-only and is not an attached client: it sits beside the TUI
+without touching its sizes or focus, and watching a **done** pane never marks
+it seen. `watch` never starts a daemon — with none running it says so on stderr
+and exits 1 — and exits 0 when the daemon goes away. To jump from such a tool to
+a pane, run `tutti -s <session> pane focus <id>`: the attached TUI switches to
+that pane's workspace and tab.
+
 ## CLI surface
 
 Every TUI action is also a CLI verb over the daemon socket — if it isn't
@@ -852,7 +887,7 @@ tutti tab new | list | select <id>
 tutti pane run [--tab <id>] [--ephemeral] [--sandbox <profile>] -- <cmd...>
 tutti sandbox run <profile> -- <cmd...>  # provision, kubectl exec, delete — what a --sandbox pane runs
 tutti pane split <pane> right|down
-tutti pane list | kill | rename | focus <pane>
+tutti pane list | kill | rename | focus <pane>   # focus: the attached TUI jumps to the pane
 tutti pane send <pane> --text <s> | --keys <s> [--expect <fp>]   # --expect: answer a blocked agent, refused if its prompt moved on
 tutti pane read <pane> [--lines N] [--unwrapped] | --fingerprint # --fingerprint: the prompt fingerprint --expect takes
 tutti pane checkpoints <pane>        # the pane's per-turn checkpoints, newest first (n, age, label, stat, commit)
@@ -861,6 +896,7 @@ tutti pane restore <pane> <N> [--force]         # restore the working copy to tu
 tutti hooks claude|opencode [--raw]  # print the Claude Code hooks snippet / the opencode plugin
 tutti hooks claude|opencode --install [--project] [--yes]  # install them (shows the change, asks first)
 tutti agent-event claude|opencode    # forward an agent hook event (JSON on stdin) — used by the hooks/plugin
+tutti watch                          # JSON-line snapshots of every pane's state, one per change (read-only; never starts a daemon)
 tutti [attach]                       # bare `tutti` attaches; a fresh session asks where to start
 ```
 
@@ -877,6 +913,7 @@ crates/tutti-agents   agent registry & screen-state classifier (data-driven)
 
 ## Alpha limitations (deliberate — see PLAN.md)
 
-Single attached client; no layout persistence across daemon restarts; mouse
-limited to focus + scroll; worktree workspaces and the orchestration verbs
+Single attached client (`tutti watch` watchers don't count); no layout
+persistence across daemon restarts; mouse limited to focus + scroll; worktree
+workspaces and the orchestration verbs
 (`pane wait`, composite `run`) come next.

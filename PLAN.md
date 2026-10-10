@@ -213,7 +213,10 @@ Goal: the differentiator. Tutti knows which panes are agents and what state they
    navigate mode grouped by state (Blocked first), optional terminal bell / OSC 9
    desktop notification on `Working → Blocked/Done`.
 4. **API**: `pane list --json` includes agent + state; emit state-change events on the
-   socket event stream.
+   socket event stream. ✅ For tools outside tutti (a notch app): `tutti watch`
+   (the socket's `Watch`) streams whole-session snapshots, one per change,
+   beside the attached TUI without touching it; a scripted `pane focus` jumps
+   that TUI to the pane.
 
 **Acceptance:** start a Claude Code task; badge shows Working; when it asks for
 permission the pane flags Blocked within ~1s; when it finishes, Done until you focus it.

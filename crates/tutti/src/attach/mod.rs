@@ -48,7 +48,9 @@ pub fn run(
     notice: Option<String>,
 ) -> Result<()> {
     let mut conn = Connection::open(session)?;
-    conn.send(&control(&Request::Attach))
+    // macOS names the GUI app a process was launched under; watchers raise it.
+    let terminal = std::env::var("__CFBundleIdentifier").ok();
+    conn.send(&control(&Request::Attach { terminal }))
         .context("send attach request")?;
 
     if config.theme == crate::config::Theme::Terminal {

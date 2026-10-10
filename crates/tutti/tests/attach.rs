@@ -163,7 +163,7 @@ fn attach_seeds_app_and_input_updates_grid() {
 
     // Attach a viewer and drive its App from the wire.
     let mut viewer = daemon.connect();
-    viewer.send(&Request::Attach);
+    viewer.send(&Request::Attach { terminal: None });
 
     let mut app = App::new();
     match viewer.response() {
@@ -201,6 +201,65 @@ fn attach_seeds_app_and_input_updates_grid() {
             "grid never showed the typed input"
         );
     }
+}
+
+/// A scripted `pane focus` — a notch app's click — jumps the attached client to
+/// that pane, switching its workspace and tab, and the client reports the new
+/// focus back as its own.
+#[test]
+fn a_scripted_pane_focus_jumps_the_attached_client() {
+    let daemon = Daemon::start();
+
+    let mut control = daemon.connect();
+    let mut cat_in_new_workspace = || {
+        control.send(&Request::WorkspaceNew {
+            dir: std::env::temp_dir(),
+        });
+        assert!(matches!(
+            control.response(),
+            Response::WorkspaceCreated { .. }
+        ));
+        control.send(&Request::PaneRun {
+            tab: None,
+            cmd: vec!["/bin/cat".into()],
+            ephemeral: false,
+            sandbox: None,
+        });
+        match control.response() {
+            Response::PaneCreated { id } => id,
+            other => panic!("expected PaneCreated, got {other:?}"),
+        }
+    };
+    let first = cat_in_new_workspace();
+    let second = cat_in_new_workspace();
+
+    let mut viewer = daemon.connect();
+    viewer.send(&Request::Attach { terminal: None });
+    let mut app = App::new();
+    let response = viewer.response();
+    app.handle_frame(Frame::Control(serde_json::to_vec(&response).unwrap()));
+    assert_eq!(app.focused, Some(second), "attach lands on the newest pane");
+    let home = app.active_tab;
+    if let Some(frame) = app.focus_change() {
+        viewer.write(&frame);
+    }
+
+    control.send(&Request::PaneFocus { pane: first });
+    assert_eq!(control.response(), Response::Ok);
+
+    let deadline = Instant::now() + DEADLINE;
+    while app.focused != Some(first) {
+        app.handle_frame(viewer.read_frame());
+        assert!(Instant::now() < deadline, "the client never jumped");
+    }
+    assert_ne!(app.active_tab, home, "the jump switched workspace and tab");
+    assert_eq!(
+        app.focus_change(),
+        Some(Frame::Control(
+            serde_json::to_vec(&Request::PaneFocus { pane: first }).unwrap()
+        )),
+        "the client reports the jumped-to pane as its focus"
+    );
 }
 
 fn seed_from_snapshot(viewer: &mut Wire, app: &mut App, pane: PaneId) {

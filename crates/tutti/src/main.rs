@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use tutti_core::{
-    AgentHookEvent, Direction, PaneId, Request, Response, TabId, WaitFor, WorkspaceId,
+    AgentHookEvent, Direction, Event, PaneId, Request, Response, TabId, WaitFor, WorkspaceId,
 };
 
 use tutti::client::{self, Client, StopOutcome};
@@ -85,6 +85,10 @@ enum Command {
         #[command(subcommand)]
         action: SandboxAction,
     },
+    /// Stream the session's state as JSON lines: a full snapshot of every pane
+    /// now and on each change, until the daemon exits. Read-only, beside any
+    /// attached TUI; never starts a daemon.
+    Watch,
     /// Forward an agent's hook event to tutti (reads its JSON on stdin): a
     /// Claude Code hook payload, or an opencode event from tutti's plugin.
     /// Wired up by `tutti hooks <agent>`; a silent no-op outside a tutti pane.
@@ -423,6 +427,7 @@ fn run(cli: Cli) -> Result<i32> {
         Some(Command::Sandbox {
             action: SandboxAction::Run { profile, cmd },
         }) => tutti::sandbox::run(Config::load()?.sandbox(&profile)?, &cmd),
+        Some(Command::Watch) => run_watch(&cli.session),
         Some(Command::Hooks {
             agent,
             raw,
@@ -795,6 +800,7 @@ fn to_request(command: Command) -> Result<Request> {
         Command::Server { .. }
         | Command::Attach
         | Command::Sandbox { .. }
+        | Command::Watch
         | Command::AgentEvent { .. }
         | Command::Hooks { .. }
         | Command::Skill { .. } => bail!("not a protocol request"),
@@ -890,6 +896,36 @@ fn send_agent_event(
         conversation,
     })?;
     Ok(())
+}
+
+/// Print the session's snapshots to stdout, one JSON object per line, flushed
+/// as each lands, until the daemon closes the connection (exit 0). Never
+/// auto-starts a daemon: with none running there is nothing to watch (exit 1).
+fn run_watch(session: &str) -> Result<i32> {
+    use std::io::Write;
+
+    let mut client = match Client::connect(session) {
+        Ok(client) => client,
+        Err(e) if client::not_running(&e) => {
+            eprintln!("tutti watch: no tutti-server is running for session '{session}'");
+            return Ok(1);
+        }
+        Err(e) => return Err(e).context("connecting to tutti-server"),
+    };
+    let mut out = std::io::stdout().lock();
+    client.watch(|json| {
+        // The one reply a `Watch` can get is a daemon that predates it.
+        if let Ok(Response::Error { message }) = serde_json::from_slice(json) {
+            bail!("the daemon cannot watch ({message}); restart it: `tutti server stop`");
+        }
+        if let Ok(Event::Snapshot { .. }) = serde_json::from_slice(json) {
+            out.write_all(json)?;
+            out.write_all(b"\n")?;
+            out.flush()?;
+        }
+        Ok(())
+    })?;
+    Ok(0)
 }
 
 /// Print the Claude Code hooks snippet: the JSON to stdout, plus — unless
@@ -1905,6 +1941,9 @@ mod tests {
             Cli::try_parse_from(["tutti", "attach"]).unwrap().command,
             Some(Command::Attach)
         ));
+        let cli = Cli::try_parse_from(["tutti", "watch", "-s", "work"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Watch)));
+        assert_eq!(cli.session, "work");
     }
 
     #[test]

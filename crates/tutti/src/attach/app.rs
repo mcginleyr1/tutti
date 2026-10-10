@@ -553,7 +553,23 @@ impl App {
             Event::PaneNotification { pane, title, body } => {
                 self.on_notification(pane, title, body)
             }
-            Event::PaneOutput { .. } => {}
+            // A script focused `pane` (a notch app's click): show it as an
+            // agent-row jump does — its tab, wherever that lives, focused.
+            Event::PaneFocused { pane } => {
+                let tab = self
+                    .all_tabs()
+                    .into_iter()
+                    .find(|t| t.layout.as_ref().is_some_and(|l| l.contains(pane)))
+                    .map(|t| t.id);
+                if let Some(tab) = tab {
+                    self.mode = Mode::Terminal;
+                    self.status = None;
+                    self.active_tab = Some(tab);
+                    self.zoom = false;
+                    self.focused = Some(pane);
+                }
+            }
+            Event::PaneOutput { .. } | Event::Snapshot { .. } => {}
         }
     }
 
@@ -4588,6 +4604,31 @@ mod tests {
                 )],
             ),
         ]
+    }
+
+    #[test]
+    fn a_scripted_focus_jumps_across_workspaces() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_workspaces());
+        assert_eq!(app.active_tab, Some(TabId(1)));
+        app.focus_change();
+        let focused =
+            |pane| WireFrame::Control(serde_json::to_vec(&Event::PaneFocused { pane }).unwrap());
+
+        app.handle_frame(focused(PaneId(3)));
+        assert_eq!(app.active_tab, Some(TabId(2)));
+        assert_eq!(app.focused, Some(PaneId(3)));
+        assert_eq!(
+            app.focus_change(),
+            Some(control(&Request::PaneFocus { pane: PaneId(3) }))
+        );
+
+        app.handle_frame(focused(PaneId(9)));
+        assert_eq!(
+            app.focused,
+            Some(PaneId(3)),
+            "an unknown pane moves nothing"
+        );
     }
 
     fn focus_sidebar(app: &mut App) {

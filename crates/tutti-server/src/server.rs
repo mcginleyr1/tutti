@@ -1,7 +1,8 @@
 //! The daemon: a `UnixListener` fronting shared `Session` state. Each accepted
 //! connection is a request/response loop; a connection that sends `Attach` also
 //! joins the broadcast set and receives pane snapshots, coalesced deltas, and
-//! control events until it detaches or disconnects.
+//! control events until it detaches or disconnects. One that sends `Watch` is
+//! pushed a whole-session snapshot whenever it changes, outside that set.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
@@ -33,7 +34,8 @@ use crate::persist::{self, SavedPane};
 use crate::pty::{PaneSize, PtyPane, Signal, StatusReport};
 use crate::session::{Restored, Session};
 
-/// Cadence of the render tick: coalesced pane deltas to attached clients.
+/// Cadence of the render tick: coalesced pane deltas to attached clients, and
+/// snapshots to watchers.
 const TICK: Duration = Duration::from_millis(16);
 /// Cadence of the agent-detection pass. Process trees change rarely, so this is
 /// deliberately slow and kept off the render tick.
@@ -78,11 +80,24 @@ struct Client {
     /// Panes this client has already been sent a snapshot for; the rest of its
     /// panes fall into the shared delta cadence.
     seen: HashSet<PaneId>,
+    /// The terminal app the client runs in, from its `Attach`, for watchers.
+    terminal: Option<String>,
+    /// The pane the client last reported focused — what it shows, for watchers.
+    focused: Option<PaneId>,
+}
+
+/// A `Watch` connection: read-only, outside the attached-client set.
+struct Watcher {
+    tx: mpsc::Sender<Vec<u8>>,
+    writer: tokio::task::AbortHandle,
+    /// The encoded snapshot last sent, so an unchanged session sends nothing.
+    last: Vec<u8>,
 }
 
 pub struct Hub {
     session: Mutex<Session>,
     clients: Mutex<HashMap<u64, Client>>,
+    watchers: Mutex<HashMap<u64, Watcher>>,
     /// Last screen broadcast per pane — a scrollback-free `Mirror` parser,
     /// cheap to keep and diff — with its running delta sequence number and the
     /// pty output generation it was captured at.
@@ -167,6 +182,7 @@ pub async fn serve(
     let hub = Arc::new(Hub {
         session: Mutex::new(Session::new(size, name.clone())),
         clients: Mutex::new(HashMap::new()),
+        watchers: Mutex::new(HashMap::new()),
         last: Mutex::new(HashMap::new()),
         next_client: AtomicU64::new(0),
         name,
@@ -183,6 +199,7 @@ pub async fn serve(
         loop {
             interval.tick().await;
             broadcast_tick(&tick_hub);
+            snapshot_watchers(&tick_hub);
         }
     });
 
@@ -316,6 +333,7 @@ async fn handle_conn(hub: Arc<Hub>, stream: tokio::net::UnixStream) -> Result<()
     };
 
     hub.clients.lock().expect("clients poisoned").remove(&cid);
+    hub.watchers.lock().expect("watchers poisoned").remove(&cid);
     if wedged {
         // The client's own reply queue backed up: it is not draining, so abort
         // the writer to drop the socket rather than block awaiting a flush.
@@ -377,7 +395,7 @@ fn handle_frame(
 ) -> ControlFlow<()> {
     match frame {
         Frame::Control(json) => match serde_json::from_slice::<Request>(&json) {
-            Ok(Request::Attach) => {
+            Ok(Request::Attach { terminal }) => {
                 // Register this client before snapshotting the view, so a
                 // StateChanged/LayoutChanged broadcast in the gap is delivered
                 // (an early or duplicate event the client applies idempotently)
@@ -392,6 +410,8 @@ fn handle_frame(
                         writer: writer.clone(),
                         ready: false,
                         seen: HashSet::new(),
+                        terminal,
+                        focused: None,
                     },
                 );
                 let workspaces = hub.session().view();
@@ -418,6 +438,23 @@ fn handle_frame(
             Ok(Request::Detach) => {
                 hub.clients.lock().expect("clients poisoned").remove(&cid);
                 send_reply(hub, cid, tx, encode_json(&Response::Ok))
+            }
+            Ok(Request::Watch) => {
+                hub.watchers.lock().expect("watchers poisoned").insert(
+                    cid,
+                    Watcher {
+                        tx: tx.clone(),
+                        writer: writer.clone(),
+                        last: Vec::new(),
+                    },
+                );
+                // The first snapshot goes out now, not on the next tick.
+                snapshot_watchers(hub);
+                ControlFlow::Continue(())
+            }
+            Ok(Request::PaneFocus { pane }) => {
+                let response = focus_pane(hub, cid, pane);
+                send_reply(hub, cid, tx, encode_json(&response))
             }
             Ok(Request::PaneScroll { pane, offset }) => scroll(hub, cid, tx, pane, offset),
             Ok(Request::WorkspaceDiff { id, stat }) => workspace_diff(hub, tx, id, stat),
@@ -633,7 +670,6 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
                 (Err(err), _) => error(err),
             }
         }
-        Request::PaneFocus { pane } => focus_pane(hub, pane),
         Request::PaneResizeSplit {
             pane,
             direction,
@@ -655,8 +691,10 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             }
         }
         // Handled in `handle_frame`; unreachable here.
-        Request::Attach
+        Request::Attach { .. }
         | Request::Detach
+        | Request::Watch
+        | Request::PaneFocus { .. }
         | Request::PaneScroll { .. }
         | Request::WorkspaceDiff { .. }
         | Request::PaneWait { .. }
@@ -705,8 +743,10 @@ fn split_ratio(hub: &Arc<Hub>, a: PaneId, b: PaneId, ratio: f32) -> Response {
 /// Focus a pane: record it active and apply a `Focused` state event, flipping a
 /// `Done` pane to `Idle` (marked seen). Broadcasts the transition if it changed
 /// — and the view, when that settles a self-reported pane out of the agent
-/// surfaces.
-fn focus_pane(hub: &Arc<Hub>, pane: PaneId) -> Response {
+/// surfaces. An attached client's focus is recorded as what it shows; anyone
+/// else's (a script, a notch app's click) is relayed as `PaneFocused`, so the
+/// attached client jumps there.
+fn focus_pane(hub: &Arc<Hub>, cid: u64, pane: PaneId) -> Response {
     let mut session = hub.session();
     if session.set_active_pane(pane).is_err() {
         return Response::Error {
@@ -722,6 +762,16 @@ fn focus_pane(hub: &Arc<Hub>, pane: PaneId) -> Response {
         broadcast_event(hub, Event::LayoutChanged { workspaces: view });
     }
     publish_transition(hub, pane, from, to);
+    let attached = match hub.clients.lock().expect("clients poisoned").get_mut(&cid) {
+        Some(client) => {
+            client.focused = Some(pane);
+            true
+        }
+        None => false,
+    };
+    if !attached {
+        broadcast_event(hub, Event::PaneFocused { pane });
+    }
     Response::Ok
 }
 
@@ -1837,6 +1887,47 @@ fn broadcast_tick(hub: &Arc<Hub>) {
         }
     }
     disconnect(hub, doomed);
+}
+
+/// Send each watcher the session's snapshot when it differs from the last one
+/// that watcher got. Run on the render tick, so a burst of changes coalesces
+/// into one snapshot, and on `Watch`, so the first goes out at once. "The"
+/// attached client is the newest. A watcher whose queue is full is dropped,
+/// as a wedged client is.
+fn snapshot_watchers(hub: &Hub) {
+    if hub.watchers.lock().expect("watchers poisoned").is_empty() {
+        return;
+    }
+    let (attached_terminal, focused) = hub
+        .clients
+        .lock()
+        .expect("clients poisoned")
+        .iter()
+        .max_by_key(|(cid, _)| **cid)
+        .map_or((None, None), |(_, client)| {
+            (client.terminal.clone(), client.focused)
+        });
+    let panes = hub.session().watch_panes(focused);
+    let snapshot = encode_json(&Event::Snapshot {
+        session: hub.name.clone(),
+        wire_rev: tutti_core::WIRE_REV,
+        attached_terminal,
+        panes,
+    });
+    hub.watchers
+        .lock()
+        .expect("watchers poisoned")
+        .retain(|_, watcher| {
+            if watcher.last == snapshot {
+                return true;
+            }
+            if watcher.tx.try_send(snapshot.clone()).is_err() {
+                watcher.writer.abort();
+                return false;
+            }
+            watcher.last.clone_from(&snapshot);
+            true
+        });
 }
 
 /// One agent-detection pass: snapshot the process tree, walk each live local

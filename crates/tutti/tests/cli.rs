@@ -9,7 +9,10 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::thread;
 
-use tutti_core::{AgentHookEvent, Frame, PaneId, Request, Response, WorkspaceId, WorkspaceInfo};
+use tutti_core::{
+    AgentHookEvent, AgentState, Event, Frame, PaneId, Request, Response, WatchPane, WorkspaceId,
+    WorkspaceInfo,
+};
 
 fn unique_base(label: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -434,6 +437,102 @@ fn server_restore_reports_what_came_back_and_what_did_not() {
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         "discarded the saved layout\n"
+    );
+}
+
+/// `watch` never starts a daemon: with none running it says so on stderr and
+/// exits 1, having created nothing.
+#[test]
+fn watch_without_a_daemon_exits_1() {
+    let base = unique_base("watchnone");
+    let output = Command::new(env!("CARGO_BIN_EXE_tutti"))
+        .args(["watch", "-s", "nobody"])
+        .env("XDG_RUNTIME_DIR", &base)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("no tutti-server is running for session 'nobody'"),
+        "stderr was: {stderr}"
+    );
+    assert!(!base.exists(), "no daemon was started");
+}
+
+/// `watch` prints each snapshot as one line, verbatim, and exits 0 when the
+/// daemon closes the connection.
+#[test]
+fn watch_prints_snapshot_lines_until_the_daemon_goes() {
+    let base = unique_base("watch");
+    let sock_dir = base.join("tutti");
+    std::fs::create_dir_all(&sock_dir).unwrap();
+    let listener = UnixListener::bind(sock_dir.join("tutti.sock")).unwrap();
+    let snapshot = |state| Event::Snapshot {
+        session: "tutti".into(),
+        wire_rev: tutti_core::WIRE_REV,
+        attached_terminal: None,
+        panes: vec![WatchPane {
+            id: PaneId(1),
+            workspace: "api".into(),
+            dir: "/srv/api".into(),
+            tab: "claude".into(),
+            title: "claude".into(),
+            agent: Some("claude".into()),
+            state,
+            source: None,
+            exited: None,
+            focused: false,
+        }],
+    };
+    let lines: Vec<String> = [AgentState::Working, AgentState::Blocked]
+        .into_iter()
+        .map(|state| serde_json::to_string(&snapshot(state)).unwrap())
+        .collect();
+    let sent = lines.clone();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        assert_eq!(read_request(&mut stream), Request::Watch);
+        for line in sent {
+            stream
+                .write_all(&Frame::Control(line.into_bytes()).encode())
+                .unwrap();
+        }
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tutti"))
+        .arg("watch")
+        .env("XDG_RUNTIME_DIR", &base)
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    let _ = std::fs::remove_dir_all(&base);
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{}\n{}\n", lines[0], lines[1])
+    );
+}
+
+/// A daemon that predates `watch` answers it with an error: exit 1, and say
+/// what to do on stderr.
+#[test]
+fn watch_against_an_older_daemon_exits_1() {
+    let output = run_scenario(
+        "watchold",
+        &["watch"],
+        |req| assert_eq!(*req, Request::Watch),
+        Response::Error {
+            message: "bad request: unknown variant `watch`".into(),
+        },
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("unknown variant `watch`") && stderr.contains("tutti server stop"),
+        "stderr was: {stderr}"
     );
 }
 
