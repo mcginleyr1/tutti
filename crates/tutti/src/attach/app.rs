@@ -2590,6 +2590,11 @@ impl App {
             }
             return Vec::new();
         }
+        // The restore offer is answered from the keyboard only: a stray click
+        // must neither dismiss it nor focus whatever lies beneath.
+        if self.mode == Mode::RestoreOffer {
+            return Vec::new();
+        }
         // The peek overlay is modal: a press inside it is swallowed — the pane
         // beneath must not take focus — and a press outside dismisses it.
         if matches!(self.mode, Mode::Peek(_)) {
@@ -6373,19 +6378,23 @@ mod tests {
         // common parent with a trailing slash — the user types just the name.
         assert_eq!(app.sidebar_prompt(), "/tmp/w/");
 
-        for c in "api".chars() {
+        // A name of this process's own, so suites running at once (one per
+        // workspace) never race on the directory created below.
+        let name = format!("api{}", std::process::id());
+        let path = format!("/tmp/w/{name}");
+        for c in name.chars() {
             app.on_key(plain(c));
         }
         app.on_key(plain('x'));
-        assert_eq!(app.sidebar_prompt(), "/tmp/w/apix");
+        assert_eq!(app.sidebar_prompt(), format!("{path}x"));
         app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-        assert_eq!(app.sidebar_prompt(), "/tmp/w/api");
+        assert_eq!(app.sidebar_prompt(), path);
 
         // Enter only mounts a directory that exists on disk, so make it real.
-        std::fs::create_dir_all("/tmp/w/api").unwrap();
+        std::fs::create_dir_all(&path).unwrap();
         let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let dir = std::fs::canonicalize("/tmp/w/api").unwrap();
-        let _ = std::fs::remove_dir_all("/tmp/w/api");
+        let dir = std::fs::canonicalize(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&path);
         assert_eq!(
             out,
             vec![control(&Request::WorkspaceNew { dir })],
@@ -6555,6 +6564,25 @@ mod tests {
         assert_eq!(app.on_key(enter), restore(false));
         assert_eq!(app.mode, Mode::Terminal);
         assert_eq!(app.restore_offer(), None);
+    }
+
+    #[test]
+    fn the_restore_offer_ignores_the_mouse() {
+        let mut app = App::new();
+        attach_offering(&mut app, view_one_pane());
+        app.sync_sizes(Rect::new(0, 0, 120, 40));
+        let (_, rect) = app.rects[0];
+        let click = MouseEventKind::Down(MouseButton::Left);
+        assert!(app.on_mouse(click, rect.x + 2, rect.y + 3).is_empty());
+        assert_eq!(
+            app.mode,
+            Mode::RestoreOffer,
+            "a click neither dismisses it…"
+        );
+        assert!(
+            app.selection.is_none(),
+            "…nor reaches the pane beneath (a press there starts a selection)"
+        );
     }
 
     #[test]
