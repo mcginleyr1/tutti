@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use tutti_core::{
     AgentHookEvent, AgentKind, AgentState, Direction, FileStat, Layout, Observation, PaneId,
     PaneInfo, StateEvent, StateSource, SubagentInfo, TabId, TabInfo, TabView, WorkspaceId,
@@ -16,6 +17,7 @@ use tutti_core::{
 };
 
 use crate::checkpoints::{Noted, Turns};
+use crate::persist::{self, Saved, SavedPane, SavedTab, SavedWorkspace};
 use crate::pty::{PaneSize, PtyPane, PtySpec, StatusReport};
 
 /// The most subagent rows kept per pane before the oldest is dropped, bounding
@@ -60,7 +62,7 @@ struct WorkspaceEntry {
 
 /// What a forked workspace remembers about its origin, so `kill --discard` can
 /// forget it from the repo it was forked out of and remove its checkout.
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ForkMeta {
     /// The `.jj` repo root the fork was added from — where `jj workspace forget`
     /// must run (a workspace cannot forget itself).
@@ -73,6 +75,10 @@ struct PaneSlot {
     meta: PaneInfo,
     pty: Arc<PtyPane>,
     tab: TabId,
+    /// What the pane was spawned with: a `pane run`'s command as given (before
+    /// any sandbox wrapping), a split's login shell, a restore's recipe.
+    /// Saved with the layout to say what ran here; a restore never re-runs it.
+    argv: Vec<String>,
     /// An ephemeral pane is removed outright when its child exits (the reaper
     /// drops it from the layout) instead of being kept as an exited corpse.
     ephemeral: bool,
@@ -357,8 +363,8 @@ impl Session {
         let tab = self.resolve_tab(tab)?;
         let title = pane_title(cmd.first().context("empty command")?);
         let argv = match &sandbox {
-            Some(profile) => sandbox_argv(&client_exe()?, profile, cmd),
-            None => cmd,
+            Some(profile) => sandbox_argv(&client_exe()?, profile, cmd.clone()),
+            None => cmd.clone(),
         };
         let (program, args) = argv.split_first().context("empty command")?;
         let dir = self.tab_workspace_dir(tab)?;
@@ -366,7 +372,7 @@ impl Session {
         spec.args = args.to_vec();
         spec.cwd = Some(dir);
         spec.env = vec![("TERM".into(), "xterm-256color".into())];
-        let id = self.spawn_into_tab(tab, spec, title, None, ephemeral)?;
+        let id = self.spawn_into_tab(tab, spec, cmd, title, None, ephemeral)?;
         if let Some(slot) = self.panes.get_mut(&id) {
             slot.meta.sandbox = sandbox;
         }
@@ -386,7 +392,14 @@ impl Session {
         spec.cwd = Some(dir);
         spec.env = vec![("TERM".into(), "xterm-256color".into())];
         let title = pane_title(&shell);
-        self.spawn_into_tab(tab, spec, title, Some((pane, direction)), false)
+        self.spawn_into_tab(
+            tab,
+            spec,
+            vec![shell],
+            title,
+            Some((pane, direction)),
+            false,
+        )
     }
 
     /// `tutti run` under one guard: resolve the workspace — `workspace`, else
@@ -983,6 +996,177 @@ impl Session {
         self.panes.clear();
     }
 
+    /// The session as `persist` saves it: each workspace's directory, name and
+    /// fork meta; each tab's layout, active pane and own name; each pane's
+    /// title, argv, agent, conversation and checkpoints; and the current tab.
+    /// Exited and ephemeral panes are left out, and so are sandbox panes —
+    /// their pods die with them. A tab left with no panes goes too; a
+    /// workspace left with no tabs stays, a bare mount. `None` for an empty
+    /// session, which has nothing to offer back.
+    pub fn snapshot(&self) -> Option<Saved> {
+        if self.workspaces.is_empty() {
+            return None;
+        }
+        let kept = |id: &PaneId| {
+            self.panes.get(id).is_some_and(|s| {
+                s.meta.exited.is_none() && !s.ephemeral && s.meta.sandbox.is_none()
+            })
+        };
+        let workspaces = self
+            .workspaces
+            .iter()
+            .map(|w| SavedWorkspace {
+                dir: w.dir.clone(),
+                name: w.name.clone(),
+                fork: w.fork.clone(),
+                tabs: w
+                    .tabs
+                    .iter()
+                    .filter_map(|t| {
+                        let layout = t.layout.as_ref()?;
+                        let ids: HashMap<PaneId, PaneId> = layout
+                            .panes()
+                            .into_iter()
+                            .filter(kept)
+                            .map(|id| (id, id))
+                            .collect();
+                        let layout = rename_leaves(layout, &ids)?;
+                        Some(SavedTab {
+                            id: t.id,
+                            name: (t.name != t.id.to_string()).then(|| t.name.clone()),
+                            active_pane: t.active_pane.filter(|p| ids.contains_key(p)),
+                            panes: layout
+                                .panes()
+                                .into_iter()
+                                .map(|id| {
+                                    let slot = &self.panes[&id];
+                                    SavedPane {
+                                        id,
+                                        title: slot.meta.title.clone(),
+                                        argv: slot.argv.clone(),
+                                        agent: slot.meta.agent.clone(),
+                                        conversation: slot.meta.conversation.clone(),
+                                        turns: slot.turns.clone(),
+                                    }
+                                })
+                                .collect(),
+                            layout,
+                        })
+                    })
+                    .collect(),
+            })
+            .collect();
+        Some(Saved {
+            format: persist::FORMAT,
+            workspaces,
+            current_tab: self.current_tab,
+        })
+    }
+
+    /// Bring a saved session back. Each saved workspace is mounted with its
+    /// fork meta — so a restored workspace still merges and discards — or, when
+    /// one is already open at the same directory (compared canonically), its
+    /// tabs join that one; a workspace whose directory is gone is skipped. Each
+    /// saved tab comes back as a new tab with the same split tree, ratios, name
+    /// and active pane, every leaf a freshly spawned pane. A pane `revive` maps
+    /// to an argv — an agent's own resume recipe, `SavedPane::revive` — runs it
+    /// under its old title, keeping its agent and conversation; every other one
+    /// is a login shell in the workspace's directory. A saved command is never
+    /// re-run — re-running `claude "fix the tests"` would re-issue the prompt.
+    /// Each pane's checkpoints carry over, numbering and head intact; a revived
+    /// agent notes its start, as a detected one does. A pane that fails to
+    /// spawn is dropped from its tree and named in `skipped`. The saved current
+    /// tab becomes current again.
+    pub fn restore(
+        &mut self,
+        saved: Saved,
+        revive: impl Fn(&SavedPane) -> Option<Vec<String>>,
+    ) -> Restored {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let previous = self.current_tab;
+        let mut current = None;
+        let mut out = Restored::default();
+        for saved_ws in saved.workspaces {
+            let dir = saved_ws.dir;
+            if !dir.is_dir() {
+                out.skipped
+                    .push(format!("{}: the directory is gone", dir.display()));
+                continue;
+            }
+            let wanted = canon(&dir);
+            let (workspace, mut fresh_tab) =
+                match self.workspaces.iter_mut().find(|w| canon(&w.dir) == wanted) {
+                    Some(open) => {
+                        open.fork = open.fork.take().or(saved_ws.fork);
+                        (open.id, None)
+                    }
+                    None => {
+                        let (id, tab) = self.push_workspace(dir.clone(), saved_ws.fork);
+                        if let Some(mounted) = self.workspaces.last_mut() {
+                            mounted.name = saved_ws.name;
+                        }
+                        (id, Some(tab))
+                    }
+                };
+            if !out.workspaces.contains(&workspace) {
+                out.workspaces.push(workspace);
+            }
+            for saved_tab in saved_ws.tabs {
+                // A fresh mount's own first tab takes its first saved tab.
+                let tab = match fresh_tab.take() {
+                    Some(tab) => tab,
+                    None => self.tab_new(Some(workspace)).expect("the workspace exists"),
+                };
+                let mut ids = HashMap::new();
+                for pane in saved_tab.panes {
+                    let revived = revive(&pane);
+                    let (argv, title) = match &revived {
+                        Some(cmd) => (cmd.clone(), pane.title.clone()),
+                        None => (vec![shell.clone()], pane_title(&shell)),
+                    };
+                    let mut spec = PtySpec::new(&argv[0]);
+                    spec.args = argv[1..].to_vec();
+                    spec.cwd = Some(dir.clone());
+                    spec.env = vec![("TERM".into(), "xterm-256color".into())];
+                    let id = match self.spawn_into_tab(tab, spec, argv, title, None, false) {
+                        Ok(id) => id,
+                        Err(err) => {
+                            out.skipped.push(format!("{}: {err:#}", pane.title));
+                            continue;
+                        }
+                    };
+                    ids.insert(pane.id, id);
+                    out.panes.push(id);
+                    if let Some(slot) = self.panes.get_mut(&id) {
+                        slot.turns = pane.turns;
+                        if revived.is_some() {
+                            slot.meta.conversation = pane.conversation;
+                        }
+                    }
+                    if revived.is_some() {
+                        self.set_agent(id, pane.agent);
+                        out.revived += 1;
+                    }
+                }
+                let entry = self.tab_mut(tab).expect("the tab exists");
+                entry.layout = rename_leaves(&saved_tab.layout, &ids);
+                entry.active_pane = saved_tab
+                    .active_pane
+                    .and_then(|p| ids.get(&p).copied())
+                    .or_else(|| entry.layout.as_ref().map(|l| l.panes()[0]));
+                if let Some(name) = saved_tab.name {
+                    entry.name = name;
+                }
+                if saved.current_tab == Some(saved_tab.id) && entry.layout.is_some() {
+                    current = Some(tab);
+                }
+            }
+        }
+        self.current_tab = current.or(previous).or(self.current_tab);
+        out
+    }
+
     /// The name a tab presents: one still carrying its default numeric name
     /// borrows its active pane's title (tmux-style automatic naming), so the
     /// app-bar chip says what the tab holds instead of repeating its position.
@@ -1049,6 +1233,7 @@ impl Session {
         &mut self,
         tab: TabId,
         mut spec: PtySpec,
+        argv: Vec<String>,
         title: String,
         split: Option<(PaneId, Direction)>,
         ephemeral: bool,
@@ -1089,6 +1274,7 @@ impl Session {
                 },
                 pty,
                 tab,
+                argv,
                 ephemeral,
                 answered: None,
                 turns: Turns::default(),
@@ -1120,6 +1306,20 @@ pub struct ReportOutcome {
     pub relisted: bool,
     /// A `(title, body)` notification from the report's `msg`.
     pub notify: Option<(Option<String>, String)>,
+}
+
+/// What `Session::restore` brought back, so the server can wire it up.
+#[derive(Debug, Default)]
+pub struct Restored {
+    /// Each workspace the saved ones landed in, mounted or joined — the ones
+    /// to refresh.
+    pub workspaces: Vec<WorkspaceId>,
+    /// The panes it spawned, each needing a reaper.
+    pub panes: Vec<PaneId>,
+    /// How many of those revived an agent's conversation.
+    pub revived: usize,
+    /// What could not come back, one line each.
+    pub skipped: Vec<String>,
 }
 
 /// Mark a subagent stopped. Prefers the running entry whose id matches; failing
@@ -1156,6 +1356,30 @@ fn pane_title(program: &str) -> String {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| program.to_string())
+}
+
+/// `layout` with every leaf renamed through `ids` and a leaf missing from it
+/// dropped, its split collapsing into the sibling, ratios untouched — how a
+/// snapshot leaves unsaved panes out and a restore maps saved panes onto fresh
+/// ones. `None` once no leaf is left.
+fn rename_leaves(layout: &Layout, ids: &HashMap<PaneId, PaneId>) -> Option<Layout> {
+    match layout {
+        Layout::Leaf(id) => ids.get(id).map(|id| Layout::Leaf(*id)),
+        Layout::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => match (rename_leaves(first, ids), rename_leaves(second, ids)) {
+            (Some(first), Some(second)) => Some(Layout::Split {
+                direction: *direction,
+                ratio: *ratio,
+                first: Box::new(first),
+                second: Box::new(second),
+            }),
+            (first, second) => first.or(second),
+        },
+    }
 }
 
 /// The `tutti` client binary a sandbox pane runs: the daemon's sibling (the
@@ -1220,15 +1444,21 @@ fn parse_head(contents: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{STALL_AFTER, Session, git_branch, parse_head, sandbox_argv, stop_subagent};
+    use super::{
+        ForkMeta, STALL_AFTER, Session, git_branch, pane_title, parse_head, rename_leaves,
+        sandbox_argv, stop_subagent,
+    };
+    use crate::persist::{Saved, SavedPane};
     use crate::pty::{PaneSize, StatusReport};
     use AgentState::{Blocked, Done, Idle, Unknown, Working};
     use StateSource::{Hook, Program, Progress, Screen};
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
     use tutti_core::{
-        AgentHookEvent, AgentState, Observation, PaneId, PaneInfo, StateSource, SubagentInfo,
+        AgentHookEvent, AgentState, Direction, FileStat, Layout, Observation, PaneId, PaneInfo,
+        StateSource, SubagentInfo,
     };
 
     /// A session holding one live `sleep` pane (titled `sleep`). The temp dir is
@@ -1658,6 +1888,210 @@ mod tests {
         assert!(
             session.take_turns(workspace).is_empty(),
             "no checkpoints: the agent edits the pod's checkout, not this one"
+        );
+    }
+
+    fn sleep_cmd() -> Vec<String> {
+        vec!["/bin/sleep".into(), "30".into()]
+    }
+
+    /// Revive exactly the panes the real recipe would, but run `sleep` in
+    /// place of their agent tool: no real agent ever starts under test.
+    fn revive_as_sleep(pane: &SavedPane) -> Option<Vec<String>> {
+        pane.revive().map(|_| sleep_cmd())
+    }
+
+    /// `saved` through the JSON the live file holds, as the next daemon reads
+    /// it back.
+    fn reread(saved: Saved) -> Saved {
+        serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_snapshot_restores_its_layout_agents_and_turns() {
+        let (one, two) = (TempDir::new(), TempDir::new());
+        let mut s = Session::new(PaneSize::new(24, 80), "test");
+        assert!(s.snapshot().is_none(), "an empty session saves nothing");
+        let a = s.workspace_new(one.path().to_path_buf());
+        let agent = s.pane_run(None, sleep_cmd(), false, None).unwrap();
+        let shell = s.pane_split(agent, Direction::Vertical).unwrap();
+        s.pane_resize_split(agent, Direction::Vertical, 0.15)
+            .unwrap();
+        s.pane_rename(agent, "fixer".into()).unwrap();
+        s.set_agent(agent, Some("claude".into()));
+        s.apply_agent_event(agent, AgentHookEvent::SessionStarted, Some("c1".into()));
+        let edit = [FileStat {
+            path: "a.rs".into(),
+            insertions: 3,
+            deletions: 1,
+        }];
+        let turns = s.turns(agent).unwrap();
+        turns.take_pending();
+        turns.record(None, "k1", "start", None, 1, &[]).unwrap();
+        let fix = Some("fix it");
+        turns
+            .record(Some("k1".into()), "k2", "done", fix, 2, &edit)
+            .unwrap();
+        let logs = s.tab_new(Some(a)).unwrap();
+        s.pane_run(Some(logs), sleep_cmd(), false, None).unwrap();
+        s.tab_mut(logs).unwrap().name = "logs".into();
+        let fork = ForkMeta {
+            origin_root: one.path().to_path_buf(),
+            jj_name: "feature".into(),
+        };
+        s.workspace_new_forked(two.path().to_path_buf(), fork.clone());
+        s.pane_run(None, sleep_cmd(), false, None).unwrap();
+        s.set_active_pane(shell).unwrap();
+
+        let mut r = Session::new(PaneSize::new(24, 80), "test");
+        let out = r.restore(reread(s.snapshot().unwrap()), revive_as_sleep);
+        assert_eq!(
+            (out.workspaces.len(), out.panes.len(), out.revived),
+            (2, 4, 1)
+        );
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+
+        let (before, after) = (s.view(), r.view());
+        assert_eq!(after.len(), 2);
+        for (was, now) in before.iter().zip(&after) {
+            assert_eq!((&was.dir, &was.name), (&now.dir, &now.name));
+            assert_eq!(was.tabs.len(), now.tabs.len());
+            for (was, now) in was.tabs.iter().zip(&now.tabs) {
+                let (old, new) = (was.layout.as_ref().unwrap(), now.layout.as_ref().unwrap());
+                let ids: HashMap<PaneId, PaneId> =
+                    old.panes().into_iter().zip(new.panes()).collect();
+                assert_eq!(
+                    rename_leaves(old, &ids).as_ref(),
+                    Some(new),
+                    "the same tree, ratios exact"
+                );
+                assert_eq!(was.active_pane.map(|p| ids[&p]), now.active_pane);
+                assert_eq!(was.active, now.active, "the current tab is current again");
+            }
+        }
+        assert_eq!(
+            after[0].tabs[1].name, "logs",
+            "a renamed tab keeps its name"
+        );
+        assert_eq!(r.workspace_fork_meta(after[1].id), Some(fork));
+
+        let shell_program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let shell_title = pane_title(&shell_program);
+        let titles: Vec<&str> = after
+            .iter()
+            .flat_map(|w| &w.tabs)
+            .flat_map(|t| &t.panes)
+            .map(|p| p.title.as_str())
+            .collect();
+        assert_eq!(
+            titles,
+            ["fixer", &shell_title, &shell_title, &shell_title],
+            "a revived agent keeps its title; the rest are shells"
+        );
+        let (revived, respawned) = (after[0].tabs[0].panes[0].id, after[0].tabs[0].panes[1].id);
+        let info = r.pane(revived).unwrap();
+        assert_eq!(info.agent, Some("claude".into()));
+        assert_eq!(info.conversation.as_deref(), Some("c1"));
+        assert_eq!(
+            r.panes[&revived].argv,
+            sleep_cmd(),
+            "the revive recipe ran, not the saved command"
+        );
+        assert_eq!(r.panes[&respawned].argv, [shell_program]);
+        assert_eq!(r.pane(respawned).unwrap().agent, None);
+
+        let turns = r.turns(revived).unwrap();
+        let listed: Vec<(u64, Option<&str>)> = turns
+            .entries()
+            .iter()
+            .map(|c| (c.n, c.prompt.as_deref()))
+            .collect();
+        assert_eq!(listed, [(1, None), (2, fix)]);
+        assert_eq!(
+            turns.take_pending(),
+            [("start".to_string(), None)],
+            "a revived agent notes where it starts, as a detected one does"
+        );
+        assert_eq!(
+            turns.record(Some("k2".into()), "k3", "done", None, 3, &edit),
+            Some(3),
+            "the numbering and the head carry on"
+        );
+    }
+
+    #[test]
+    fn exited_ephemeral_and_sandbox_panes_are_left_out_of_a_snapshot() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let exited = s.pane_split(pane, Direction::Horizontal).unwrap();
+        s.mark_exited(exited, 0);
+        s.pane_run(None, sleep_cmd(), true, None).unwrap();
+        let sandboxed = s.pane_split(pane, Direction::Vertical).unwrap();
+        s.panes.get_mut(&sandboxed).unwrap().meta.sandbox = Some("gke".into());
+        let lone = s.tab_new(None).unwrap();
+        let dead = s.pane_run(Some(lone), sleep_cmd(), false, None).unwrap();
+        s.mark_exited(dead, 1);
+        let bare = TempDir::new();
+        s.workspace_new(bare.path().to_path_buf());
+
+        let saved = s.snapshot().unwrap();
+        let tabs = &saved.workspaces[0].tabs;
+        assert_eq!(tabs.len(), 1, "a tab left with no panes is dropped");
+        assert_eq!(tabs[0].layout, Layout::Leaf(pane), "their splits collapse");
+        assert_eq!(
+            tabs[0].panes.iter().map(|p| p.id).collect::<Vec<_>>(),
+            [pane]
+        );
+        assert!(
+            saved.workspaces[1].tabs.is_empty(),
+            "a workspace left with no panes is still saved"
+        );
+
+        let mut r = Session::new(PaneSize::new(24, 80), "test");
+        let out = r.restore(saved, |_| None);
+        assert_eq!((out.workspaces.len(), out.panes.len()), (2, 1));
+        assert_eq!(
+            r.tab_list(Some(out.workspaces[1])).unwrap().len(),
+            1,
+            "it comes back a bare mount, its own empty tab and nothing else"
+        );
+    }
+
+    #[test]
+    fn a_workspace_whose_directory_is_gone_is_skipped() {
+        let (mut s, _pane, _tmp) = session_with_pane();
+        let gone = TempDir::new();
+        s.workspace_new(gone.path().to_path_buf());
+        let saved = s.snapshot().unwrap();
+        let path = gone.path().display().to_string();
+        drop(gone);
+
+        let mut r = Session::new(PaneSize::new(24, 80), "test");
+        let out = r.restore(saved, |_| None);
+        assert_eq!((out.workspaces.len(), out.panes.len()), (1, 1));
+        assert_eq!(out.skipped.len(), 1);
+        assert!(out.skipped[0].contains(&path), "{:?}", out.skipped);
+        assert_eq!(r.workspace_list().len(), 1);
+    }
+
+    #[test]
+    fn a_saved_workspace_joins_the_one_already_open_at_its_directory() {
+        let (s, _pane, tmp) = session_with_pane();
+        let saved = s.snapshot().unwrap();
+
+        let mut r = Session::new(PaneSize::new(24, 80), "test");
+        let open = r.workspace_new(tmp.path().join("."));
+        r.pane_run(None, sleep_cmd(), false, None).unwrap();
+        let out = r.restore(saved, |_| None);
+        assert_eq!(out.workspaces, [open]);
+        assert_eq!(
+            r.workspace_list().len(),
+            1,
+            "no second mount of the same directory"
+        );
+        assert_eq!(
+            r.tab_list(Some(open)).unwrap().len(),
+            2,
+            "the saved tab joined the open workspace's own"
         );
     }
 

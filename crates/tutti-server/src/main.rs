@@ -7,7 +7,7 @@
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
-use tutti_core::socket_path;
+use tutti_core::{socket_path, state_dir};
 use tutti_server::PaneSize;
 
 fn main() -> Result<()> {
@@ -36,7 +36,7 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .context("build tokio runtime")?;
-    runtime.block_on(tutti_server::run(path, PaneSize::new(24, 80)))
+    runtime.block_on(tutti_server::run(path, PaneSize::new(24, 80), state_dir()))
 }
 
 fn daemonize(session: &str) -> Result<()> {

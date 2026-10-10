@@ -1,6 +1,7 @@
 pub mod checkpoints;
 pub mod jj;
 pub mod keys;
+pub mod persist;
 pub mod pty;
 pub mod server;
 pub mod session;

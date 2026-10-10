@@ -46,6 +46,7 @@ impl Daemon {
                     listener,
                     served.clone(),
                     PaneSize::new(24, 80),
+                    None,
                     async move {
                         let _ = rx.await;
                     },

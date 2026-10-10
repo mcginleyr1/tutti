@@ -95,6 +95,30 @@ fn turn_stat(c: &Checkpoint) -> String {
     format!("{} {unit} +{} −{}", c.files, c.insertions, c.deletions)
 }
 
+/// A `SessionRestore`'s outcome on one line — `restored 3 projects · revived 2
+/// agents`, plus how many entries were skipped — shared by the CLI and the
+/// TUI's flash. A discard answers all zero with nothing skipped, which no real
+/// restore does (an empty layout is never saved).
+pub fn restored(workspaces: usize, revived: usize, skipped: usize) -> String {
+    if workspaces == 0 && skipped == 0 {
+        return "discarded the saved layout".into();
+    }
+    let mut line = format!(
+        "restored {} · revived {}",
+        count(workspaces, "project"),
+        count(revived, "agent")
+    );
+    if skipped > 0 {
+        line.push_str(&format!(" · skipped {skipped}"));
+    }
+    line
+}
+
+/// `n` and its `unit`, pluralised past one: `1 project`, `3 projects`.
+pub(crate) fn count(n: usize, unit: &str) -> String {
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
 /// A compact age from `then` to `now`, both unix seconds: `now`, `Nm`, `Nh`,
 /// or `Nd`.
 pub(crate) fn age(then: u64, now: u64) -> String {
@@ -274,6 +298,21 @@ mod tests {
             "N   AGE  STAT            COMMIT        LABEL\n\
              #3  now  2 files +14 −3  0fe66d0872aa  fix the failing sidebar test\n"
         );
+    }
+
+    #[test]
+    fn a_restore_reports_what_came_back_and_a_discard_says_so() {
+        assert_eq!(restored(3, 2, 0), "restored 3 projects · revived 2 agents");
+        assert_eq!(
+            restored(1, 0, 1),
+            "restored 1 project · revived 0 agents · skipped 1"
+        );
+        assert_eq!(
+            restored(0, 0, 2),
+            "restored 0 projects · revived 0 agents · skipped 2",
+            "every saved directory gone is still a restore"
+        );
+        assert_eq!(restored(0, 0, 0), "discarded the saved layout");
     }
 
     #[test]

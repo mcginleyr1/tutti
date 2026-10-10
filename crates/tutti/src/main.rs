@@ -159,6 +159,13 @@ enum ServerAction {
     },
     /// Stop the running daemon.
     Stop,
+    /// Bring back the layout the daemon saved before it last stopped — agents
+    /// resuming their own conversations, every other pane a fresh shell.
+    Restore {
+        /// Drop the saved layout instead of restoring it.
+        #[arg(long)]
+        discard: bool,
+    },
 }
 
 /// Project verbs. A project is a top-level workspace entry, so each maps onto
@@ -397,7 +404,7 @@ fn main() {
 
 fn run(cli: Cli) -> Result<i32> {
     match cli.command {
-        Some(Command::Server { action }) => run_server(action, &cli.session),
+        Some(Command::Server { action }) => run_server(action, &cli.session, cli.json),
         // Bare `tutti` and `tutti attach` both attach, mounting startup projects.
         None | Some(Command::Attach) => {
             attach_session(&cli.session)?;
@@ -608,7 +615,7 @@ fn mount_projects(
     Ok(notices)
 }
 
-fn run_server(action: ServerAction, session: &str) -> Result<i32> {
+fn run_server(action: ServerAction, session: &str, json: bool) -> Result<i32> {
     match action {
         ServerAction::Start { foreground: true } => {
             client::exec_foreground(session)?;
@@ -635,6 +642,12 @@ fn run_server(action: ServerAction, session: &str) -> Result<i32> {
                 Ok(0)
             }
         },
+        // A daemon this auto-starts offers its predecessor's layout at once.
+        ServerAction::Restore { discard } => {
+            let mut client = Client::connect_or_start(session)?;
+            let response = client.request(&Request::SessionRestore { discard })?;
+            Ok(emit(response, json))
+        }
     }
 }
 
@@ -1103,6 +1116,18 @@ fn emit(response: Response, json: bool) -> i32 {
                 Some(saved) => println!("restored to #{n} (the state it replaced is #{saved})"),
                 None => println!("restored to #{n}"),
             }
+            0
+        }
+        Response::SessionRestored {
+            workspaces,
+            revived,
+            skipped,
+            ..
+        } => {
+            for entry in &skipped {
+                eprintln!("skipped {entry}");
+            }
+            println!("{}", render::restored(workspaces, revived, skipped.len()));
             0
         }
         // The attach handshake reply is consumed by the TUI, never the CLI.
@@ -1858,6 +1883,22 @@ mod tests {
                 .command,
             Some(Command::Server {
                 action: ServerAction::Stop
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["tutti", "server", "restore"])
+                .unwrap()
+                .command,
+            Some(Command::Server {
+                action: ServerAction::Restore { discard: false }
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["tutti", "server", "restore", "--discard"])
+                .unwrap()
+                .command,
+            Some(Command::Server {
+                action: ServerAction::Restore { discard: true }
             })
         ));
         assert!(matches!(

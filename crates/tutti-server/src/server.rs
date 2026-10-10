@@ -29,8 +29,9 @@ use tutti_core::{
 
 use crate::jj;
 use crate::keys;
+use crate::persist::{self, SavedPane};
 use crate::pty::{PaneSize, PtyPane, Signal, StatusReport};
-use crate::session::Session;
+use crate::session::{Restored, Session};
 
 /// Cadence of the render tick: coalesced pane deltas to attached clients.
 const TICK: Duration = Duration::from_millis(16);
@@ -47,6 +48,9 @@ const CLIENT_QUEUE_CAP: usize = 256;
 /// Depth of the pane-signal broadcast `pane wait` subscribes to. A waiter that
 /// falls this far behind re-checks its pane's current state instead.
 const SIGNAL_CAP: usize = 256;
+/// Cadence of the layout save. A daemon that dies without a graceful shutdown
+/// loses at most this much of its layout's history.
+const SAVE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// One pane's news, broadcast to every `pane wait`.
 #[derive(Debug, Clone, Copy)]
@@ -93,6 +97,9 @@ pub struct Hub {
     /// Every pane's transitions, exits and removals, for `pane wait` to
     /// subscribe to. With nobody waiting a send fails, harmlessly.
     signals: broadcast::Sender<PaneSignal>,
+    /// Where the layout is saved and the previous daemon's is offered back
+    /// (`persist`); `None` with persistence off.
+    state: Option<PathBuf>,
 }
 
 /// One workspace's VCS-watch state: `mark` is the op-heads mtime as of the last
@@ -117,8 +124,8 @@ impl Hub {
 }
 
 /// Bootstrap the socket, install a SIGTERM/SIGINT shutdown, and serve until it
-/// fires. This is the binary's entry point.
-pub async fn run(socket_path: PathBuf, size: PaneSize) -> Result<()> {
+/// fires, saving the layout under `state`. This is the binary's entry point.
+pub async fn run(socket_path: PathBuf, size: PaneSize, state: Option<PathBuf>) -> Result<()> {
     prepare_socket(&socket_path)?;
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("bind {}", socket_path.display()))?;
@@ -130,15 +137,18 @@ pub async fn run(socket_path: PathBuf, size: PaneSize) -> Result<()> {
             _ = int.recv() => {},
         }
     };
-    serve(listener, socket_path, size, shutdown).await
+    serve(listener, socket_path, size, state, shutdown).await
 }
 
-/// Serve connections on `listener` until `shutdown` resolves, then kill every
-/// pane and remove the socket file.
+/// Serve connections on `listener` until `shutdown` resolves, then save the
+/// layout, kill every pane and remove the socket file. With a `state`
+/// directory the layout is saved there as it changes and the previous
+/// daemon's save is offered back (`persist`); `None` turns that off.
 pub async fn serve(
     listener: UnixListener,
     socket_path: PathBuf,
     size: PaneSize,
+    state: Option<PathBuf>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     // The listener is already bound; advertise our pid so `tutti server stop`
@@ -151,6 +161,9 @@ pub async fn serve(
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "tutti".to_string());
+    // Before the first request is read: a `server restore` that auto-started
+    // this daemon finds the offer already in place.
+    let state = state.filter(|dir| persist::offer_previous(dir, &name));
     let hub = Arc::new(Hub {
         session: Mutex::new(Session::new(size, name.clone())),
         clients: Mutex::new(HashMap::new()),
@@ -160,6 +173,7 @@ pub async fn serve(
         registry: Registry::default(),
         vcs: Mutex::new(HashMap::new()),
         signals: broadcast::channel(SIGNAL_CAP).0,
+        state,
     });
 
     let tick_hub = Arc::clone(&hub);
@@ -203,6 +217,21 @@ pub async fn serve(
         }
     });
 
+    let saver = hub.state.as_deref().map(|dir| {
+        let path = persist::live_path(dir, &hub.name);
+        let save_hub = Arc::clone(&hub);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(SAVE_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last = None;
+            loop {
+                interval.tick().await;
+                let saved = save_hub.session().snapshot();
+                persist::save_changed(&path, &mut last, saved.as_ref());
+            }
+        })
+    });
+
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -223,6 +252,18 @@ pub async fn serve(
     detector.abort();
     vcs_watcher.abort();
     classifier.abort();
+    // The last save lands before the panes die — a dead pane is not saved —
+    // and after the saver has wound down, so none of its writes can land
+    // after this one. It writes even when nothing moved, dating the save to
+    // the shutdown.
+    if let Some(saver) = saver {
+        saver.abort();
+        let _ = saver.await;
+    }
+    if let Some(dir) = &hub.state {
+        let saved = hub.session().snapshot();
+        persist::save(&persist::live_path(dir, &hub.name), saved.as_ref());
+    }
     hub.session().kill_all();
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(&pid_path);
@@ -358,6 +399,10 @@ fn handle_frame(
                     session: hub.name.clone(),
                     workspaces,
                     wire_rev: tutti_core::WIRE_REV,
+                    restorable: hub
+                        .state
+                        .as_deref()
+                        .and_then(|dir| persist::summary(dir, &hub.name)),
                 });
                 let flow = send_reply(hub, cid, tx, reply);
                 if flow.is_continue()
@@ -451,6 +496,7 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
         Request::WorkspaceList => Response::Workspaces {
             workspaces: hub.session().workspace_list(),
         },
+        Request::SessionRestore { discard } => session_restore(hub, discard),
         Request::TabNew { workspace } => {
             let r = hub.session().tab_new(workspace);
             match r {
@@ -818,6 +864,58 @@ fn run_in_fresh_tab(
             }
         }
         (response, _) => response,
+    }
+}
+
+/// Bring back the layout the previous daemon saved (`Session::restore`), or
+/// with `discard` drop it. The offer is read, restored and deleted under one
+/// session guard, so two clients racing to restore bring it back once. The
+/// fresh panes get their reapers, the clients one `LayoutChanged`, and each
+/// workspace it touched a change probe — which also records where each
+/// revived agent starts.
+fn session_restore(hub: &Arc<Hub>, discard: bool) -> Response {
+    let nothing = || Response::Error {
+        message: "nothing to restore".into(),
+    };
+    let Some(dir) = hub.state.as_deref() else {
+        return nothing();
+    };
+    let mut session = hub.session();
+    let restored = if discard {
+        Restored::default()
+    } else {
+        match persist::read_offer(dir, &hub.name) {
+            Some(saved) => session.restore(saved, SavedPane::revive),
+            None => return nothing(),
+        }
+    };
+    match std::fs::remove_file(persist::offer_path(dir, &hub.name)) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+            eprintln!("tutti: cannot remove the offered layout: {err}");
+        }
+        _ => {}
+    }
+    let reapers: Vec<(PaneId, Arc<PtyPane>)> = restored
+        .panes
+        .iter()
+        .filter_map(|&pane| session.pty(pane).map(|pty| (pane, pty)))
+        .collect();
+    let view = (!restored.workspaces.is_empty()).then(|| session.view());
+    drop(session);
+    for (pane, pty) in reapers {
+        spawn_reaper(hub, pane, pty);
+    }
+    if let Some(view) = view {
+        broadcast_event(hub, Event::LayoutChanged { workspaces: view });
+    }
+    for &workspace in &restored.workspaces {
+        refresh_changes(hub, workspace);
+    }
+    Response::SessionRestored {
+        workspaces: restored.workspaces.len(),
+        panes: restored.panes.len(),
+        revived: restored.revived,
+        skipped: restored.skipped,
     }
 }
 

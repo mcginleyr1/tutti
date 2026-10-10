@@ -17,7 +17,7 @@ use super::navigate::{self, Marker};
 use super::sidebar::{AgentRow, SidebarEntry, WorkspaceRow};
 use super::theme;
 use crate::config::{self, Config, Icons, PrefixAction};
-use crate::render::{age, state_label, unix_now};
+use crate::render::{age, count, state_label, unix_now};
 
 /// The accent colour of the active theme — the one thing that marks the
 /// focused or active thing. Everything else renders muted so it is
@@ -210,6 +210,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     if app.mode == Mode::Help {
         draw_help(frame, app, area);
+    }
+    if app.mode == Mode::RestoreOffer {
+        draw_restore_offer(frame, app, area);
     }
     if app.mode == Mode::Launcher {
         draw_launcher(frame, app, area);
@@ -1356,6 +1359,7 @@ fn mode_label(mode: Mode) -> Option<&'static str> {
         | Mode::ConfirmRestore(..) => Some("CONFIRM"),
         Mode::Scroll(_) => Some("SCROLL"),
         Mode::Help => Some("HELP"),
+        Mode::RestoreOffer => Some("RESTORE"),
         Mode::Sidebar => Some("SIDEBAR"),
         Mode::DiffFiles => Some("CHANGES"),
         Mode::SidebarPrompt => Some("ADD PROJECT"),
@@ -1489,6 +1493,29 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
     let popup = Rect::new(x, y, width, height);
     clear(frame, popup, theme::current().pane_bg);
     frame.render_widget(Paragraph::new(lines).block(popup_block(" help ")), popup);
+}
+
+/// The restore offer: a centred panel over everything asking whether to bring
+/// back the layout a previous daemon saved — what it holds and how old it is —
+/// over its two-tone keys.
+fn draw_restore_offer(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(offer) = app.restore_offer() else {
+        return;
+    };
+    let saved = match age(offer.saved_at, unix_now()).as_str() {
+        "now" => "saved just now".to_string(),
+        ago => format!("saved {ago} ago"),
+    };
+    let summary = format!(
+        " {} · {} · {} to revive · {saved} ",
+        count(offer.workspaces, "project"),
+        count(offer.panes, "pane"),
+        count(offer.agents, "agent"),
+    );
+    let mut keys = vec![Span::raw(" ")];
+    keys.extend(two_tone(&[("enter", "restore"), ("d", "discard"), ("esc", "later")]).0);
+    let lines = vec![Line::from(summary), Line::from(""), Line::from(keys)];
+    draw_centered_popup(frame, area, " restore last session? ", lines);
 }
 
 /// The agent launcher overlay: a centred rounded panel titled
@@ -1979,6 +2006,7 @@ mod tests {
                         vec![pane(1, "shell", None, AgentState::Idle)],
                     )],
                 )],
+                restorable: None,
             })
             .unwrap(),
         ));
@@ -2072,6 +2100,7 @@ mod tests {
                         )],
                     ),
                 ],
+                restorable: None,
             })
             .unwrap(),
         ));
@@ -2132,6 +2161,7 @@ mod tests {
                 wire_rev: tutti_core::WIRE_REV,
                 session: "demo".into(),
                 workspaces: view,
+                restorable: None,
             })
             .unwrap(),
         ));
@@ -2202,6 +2232,7 @@ mod tests {
                 wire_rev: tutti_core::WIRE_REV,
                 session: "demo".into(),
                 workspaces: view,
+                restorable: None,
             })
             .unwrap(),
         ));
@@ -2239,6 +2270,7 @@ mod tests {
                 wire_rev: tutti_core::WIRE_REV,
                 session: "demo".into(),
                 workspaces: view,
+                restorable: None,
             })
             .unwrap(),
         ));
@@ -2280,6 +2312,7 @@ mod tests {
                         vec![pane(1, "zsh", None, AgentState::Idle)],
                     )],
                 )],
+                restorable: None,
             })
             .unwrap(),
         ));
@@ -2312,6 +2345,7 @@ mod tests {
                     Some("main"),
                     vec![tab(1, "1", true, leaf(1), vec![agent_pane])],
                 )],
+                restorable: None,
             })
             .unwrap(),
         ));
@@ -2599,6 +2633,7 @@ mod tests {
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
                 wire_rev: tutti_core::WIRE_REV,
+                restorable: None,
                 session: "demo".into(),
                 workspaces: vec![workspace(
                     1,
@@ -2806,6 +2841,36 @@ mod tests {
     }
 
     #[test]
+    fn the_restore_offer_floats_its_summary_and_keys_over_everything() {
+        let mut app = App::new();
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Response::Attached {
+                wire_rev: tutti_core::WIRE_REV,
+                session: "demo".into(),
+                workspaces: Vec::new(),
+                restorable: Some(tutti_core::RestoreSummary {
+                    workspaces: 3,
+                    panes: 7,
+                    agents: 2,
+                    saved_at: unix_now() - 2 * 3600,
+                }),
+            })
+            .unwrap(),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        for needle in [
+            " restore last session? ",
+            "3 projects · 7 panes · 2 agents to revive · saved 2h ago",
+            "enter restore  d discard  esc later",
+            " RESTORE ",
+        ] {
+            assert!(text.contains(needle), "{needle:?} missing: {text:?}");
+        }
+    }
+
+    #[test]
     fn sidebar_workspace_prompt_walks_from_name_to_where() {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = app_two_workspaces();
@@ -2872,6 +2937,7 @@ mod tests {
                 wire_rev: tutti_core::WIRE_REV,
                 session: "demo".into(),
                 workspaces: view,
+                restorable: None,
             })
             .unwrap(),
         ));
@@ -3090,6 +3156,7 @@ mod tests {
                     Some("main"),
                     vec![tab(1, "1", true, leaf(1), vec![agent_pane])],
                 )],
+                restorable: None,
             })
             .unwrap(),
         ));
@@ -3393,6 +3460,7 @@ mod tests {
                 wire_rev: tutti_core::WIRE_REV,
                 session: "demo".into(),
                 workspaces: view,
+                restorable: None,
             })
             .unwrap(),
         ));

@@ -11,8 +11,8 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, Mo
 use ratatui::layout::Rect;
 use tutti_core::{
     AgentKind, AgentState, Checkpoint, DIFF_RANGE, Direction, Event, FileStat, Frame as WireFrame,
-    Layout, PaneId, PaneInfo, Request, Response, TabId, TabView, WorkspaceId, WorkspaceView,
-    prompt_fingerprint, prompt_rows,
+    Layout, PaneId, PaneInfo, Request, Response, RestoreSummary, TabId, TabView, WorkspaceId,
+    WorkspaceView, prompt_fingerprint, prompt_rows,
 };
 
 use tutti_agents::Registry;
@@ -139,6 +139,9 @@ pub enum Mode {
     ConfirmRestore(PaneId, u64),
     Scroll(PaneId),
     Help,
+    /// The attach-time offer to bring back the layout a previous daemon saved:
+    /// `enter` restores it, `d` discards it, `esc` leaves it for next time.
+    RestoreOffer,
     /// Navigating the sidebar; keys drive the selection instead of the pane.
     Sidebar,
     /// Navigating the changed-files panel; `enter` opens the highlighted file's
@@ -282,6 +285,10 @@ pub struct App {
     /// The child workspace a `WorkspaceMerge` is in flight for, so the `Merged`
     /// reply knows which workspace the follow-up cleanup confirm targets.
     merge_pending: Option<WorkspaceId>,
+    /// The saved layout the attach offered back (`Mode::RestoreOffer`), with
+    /// the mode it opened over — the first-run prompt, when armed — for `esc`
+    /// to return to.
+    restore_offer: Option<(RestoreSummary, Mode)>,
     /// Panes that raised a notification while unfocused; their sidebar entry
     /// shows a bell mark until the pane is focused.
     notified: HashSet<PaneId>,
@@ -364,6 +371,7 @@ impl App {
             new_workspace_name: String::new(),
             fork_pending: false,
             merge_pending: None,
+            restore_offer: None,
             notified: HashSet::new(),
             terminal_out: Vec::new(),
             collapsed_projects: false,
@@ -382,6 +390,11 @@ impl App {
     /// The active configuration, for the renderer (hint, which-key, help).
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// The saved layout on offer, for the renderer's restore modal.
+    pub fn restore_offer(&self) -> Option<&RestoreSummary> {
+        self.restore_offer.as_ref().map(|(offer, _)| offer)
     }
 
     /// Arm the first-run prompt: open the sidebar's new-project prompt prefilled
@@ -597,6 +610,7 @@ impl App {
                 session,
                 workspaces,
                 wire_rev,
+                restorable,
             } => {
                 self.session = session;
                 self.set_view(workspaces);
@@ -605,6 +619,11 @@ impl App {
                         "daemon is running an older build (wire rev {wire_rev}, client {}) — `tutti server stop`, reinstall, and reattach",
                         tutti_core::WIRE_REV
                     ));
+                }
+                // The offer comes first, over a first-run prompt too.
+                if let Some(offer) = restorable {
+                    self.restore_offer = Some((offer, self.mode));
+                    self.mode = Mode::RestoreOffer;
                 }
             }
             Response::PaneCreated { id } => {
@@ -657,6 +676,21 @@ impl App {
                 Some(saved) => format!("restored to #{n} — the state it replaced is #{saved}"),
                 None => format!("restored to #{n}"),
             }),
+            Response::SessionRestored {
+                workspaces,
+                revived,
+                skipped,
+                ..
+            } => {
+                // The view carrying the restored layout landed just before
+                // this reply: follow it to the tab that was current.
+                if workspaces > 0 {
+                    self.active_tab = self.flagged_active_tab().or(self.active_tab);
+                    self.zoom = false;
+                    self.refocus();
+                }
+                self.set_status(crate::render::restored(workspaces, revived, skipped.len()));
+            }
             Response::Error { message } => {
                 // A failed new-workspace, guided-create, or merge request must not
                 // later hijack the tab, the launcher, or the cleanup confirm.
@@ -729,6 +763,7 @@ impl App {
             Mode::ConfirmMerge(id) => self.on_key_confirm_merge(key, id),
             Mode::ConfirmCleanup(id) => self.on_key_confirm_cleanup(key, id),
             Mode::ConfirmRestore(pane, n) => self.on_key_confirm_restore(key, pane, n),
+            Mode::RestoreOffer => self.on_key_restore_offer(key),
             Mode::Scroll(pane) => self.on_key_scroll(key, pane),
             Mode::Sidebar => self.on_key_sidebar(key),
             Mode::DiffFiles => self.on_key_diff_files(key),
@@ -1712,6 +1747,36 @@ impl App {
             n,
             force: false,
         })]
+    }
+
+    /// Answer the restore offer: `enter` brings the saved layout back, `d`
+    /// discards it, `esc` closes the offer — still pending, it comes back on
+    /// the next attach — onto whatever it opened over, a first-run prompt
+    /// included. Enter and `d` cancel that prompt instead: the session is no
+    /// longer empty, or was emptied on purpose and drops to the sidebar, as the
+    /// prompt's own `esc` would. Every other key waits for an answer.
+    fn on_key_restore_offer(&mut self, key: KeyEvent) -> Vec<WireFrame> {
+        let discard = match key.code {
+            KeyCode::Enter => false,
+            KeyCode::Char('d') => true,
+            KeyCode::Esc => {
+                self.mode = self.restore_offer.take().map_or(Mode::Terminal, |(_, m)| m);
+                return Vec::new();
+            }
+            _ => return Vec::new(),
+        };
+        let under = self.restore_offer.take().map_or(Mode::Terminal, |(_, m)| m);
+        self.mode = if under == Mode::SidebarPrompt {
+            self.clear_prompt();
+            if discard {
+                Mode::Sidebar
+            } else {
+                Mode::Terminal
+            }
+        } else {
+            under
+        };
+        vec![control(&Request::SessionRestore { discard })]
     }
 
     /// The directory of the workspace owning `tab`, from the current view.
@@ -3790,6 +3855,7 @@ mod tests {
                 wire_rev: tutti_core::WIRE_REV,
                 session: "tutti".into(),
                 workspaces: view_one_pane(),
+                restorable: None,
             })
             .unwrap(),
         ));
@@ -4067,6 +4133,7 @@ mod tests {
                 wire_rev: tutti_core::WIRE_REV,
                 session: "t".into(),
                 workspaces: view_two_panes(),
+                restorable: None,
             })
             .unwrap(),
         ));
@@ -4140,6 +4207,7 @@ mod tests {
                 wire_rev: tutti_core::WIRE_REV,
                 session: "t".into(),
                 workspaces,
+                restorable: None,
             })
             .unwrap(),
         ));
@@ -6368,6 +6436,7 @@ mod tests {
             session: "t".into(),
             workspaces: Vec::new(),
             wire_rev: 0,
+            restorable: None,
         });
         let warning = app.transient().unwrap_or_default().to_string();
         assert!(
@@ -6450,6 +6519,126 @@ mod tests {
         assert!(out.is_empty(), "esc creates nothing");
         assert_eq!(app.mode, Mode::Sidebar);
         assert!(app.sidebar_prompt().is_empty());
+    }
+
+    /// Attach to a daemon that has a saved layout to offer back.
+    fn attach_offering(app: &mut App, workspaces: Vec<WorkspaceView>) {
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Response::Attached {
+                wire_rev: tutti_core::WIRE_REV,
+                session: "t".into(),
+                workspaces,
+                restorable: Some(RestoreSummary {
+                    workspaces: 3,
+                    panes: 7,
+                    agents: 2,
+                    saved_at: 0,
+                }),
+            })
+            .unwrap(),
+        ));
+    }
+
+    fn restore(discard: bool) -> Vec<WireFrame> {
+        vec![control(&Request::SessionRestore { discard })]
+    }
+
+    #[test]
+    fn an_offered_layout_opens_the_restore_offer_and_enter_restores_it() {
+        let mut app = App::new();
+        attach_offering(&mut app, view_one_pane());
+        assert_eq!(app.mode, Mode::RestoreOffer);
+        assert_eq!(app.restore_offer().map(|offer| offer.panes), Some(7));
+        assert!(app.on_key(plain('x')).is_empty(), "other keys wait");
+        assert_eq!(app.mode, Mode::RestoreOffer);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.on_key(enter), restore(false));
+        assert_eq!(app.mode, Mode::Terminal);
+        assert_eq!(app.restore_offer(), None);
+    }
+
+    #[test]
+    fn d_discards_the_offer_and_esc_leaves_it_for_the_next_attach() {
+        let mut app = App::new();
+        attach_offering(&mut app, view_one_pane());
+        assert_eq!(app.on_key(plain('d')), restore(true));
+        assert_eq!(app.mode, Mode::Terminal);
+
+        let mut app = App::new();
+        attach_offering(&mut app, view_one_pane());
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(
+            app.on_key(esc).is_empty(),
+            "esc sends nothing: the offer stays pending on the daemon"
+        );
+        assert_eq!(app.mode, Mode::Terminal);
+        assert_eq!(app.restore_offer(), None);
+    }
+
+    #[test]
+    fn the_restore_offer_comes_before_the_first_run_prompt() {
+        let offered = || {
+            let mut app = App::new();
+            app.start_first_run_prompt("/tmp/proj".into());
+            attach_offering(&mut app, vec![]);
+            assert_eq!(app.mode, Mode::RestoreOffer);
+            app
+        };
+        let mut app = offered();
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            app.sidebar_prompt_active(),
+            "esc falls through to the prompt"
+        );
+        assert_eq!(app.sidebar_prompt(), "/tmp/proj");
+
+        let mut app = offered();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.on_key(enter), restore(false));
+        assert_eq!(app.mode, Mode::Terminal, "the restored panes take the keys");
+        assert!(app.sidebar_prompt().is_empty(), "the prompt is cancelled");
+
+        let mut app = offered();
+        assert_eq!(app.on_key(plain('d')), restore(true));
+        assert_eq!(app.mode, Mode::Sidebar, "as the prompt's own esc would");
+        assert!(app.sidebar_prompt().is_empty(), "the prompt is cancelled");
+    }
+
+    #[test]
+    fn a_restore_reply_flashes_its_outcome_and_follows_the_restored_current_tab() {
+        let mut app = App::new();
+        attached(&mut app);
+        let mut restored = view_two_workspaces();
+        restored[0].tabs[0].active = false;
+        restored[1].tabs[0].active = true;
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Event::LayoutChanged {
+                workspaces: restored,
+            })
+            .unwrap(),
+        ));
+        assert_eq!(app.active_tab, Some(TabId(1)), "a view alone keeps the tab");
+        app.handle_response(Response::SessionRestored {
+            workspaces: 2,
+            panes: 3,
+            revived: 2,
+            skipped: vec!["/srv/gone: the directory is gone".into()],
+        });
+        assert_eq!(app.active_tab, Some(TabId(2)));
+        assert_eq!(app.focused, Some(PaneId(2)));
+        assert_eq!(
+            app.transient(),
+            Some("restored 2 projects · revived 2 agents · skipped 1")
+        );
+
+        app.handle_response(Response::SessionRestored {
+            workspaces: 0,
+            panes: 0,
+            revived: 0,
+            skipped: Vec::new(),
+        });
+        assert_eq!(app.transient(), Some("discarded the saved layout"));
+        assert_eq!(app.active_tab, Some(TabId(2)), "a discard moves nothing");
     }
 
     #[test]

@@ -31,6 +31,16 @@ pub enum Request {
         dir: PathBuf,
     },
     WorkspaceList,
+    /// Bring back the layout the previous daemon saved — the offer an attach
+    /// reports as `Response::Attached::restorable` — answered with
+    /// `Response::SessionRestored`. Agent panes holding a conversation their
+    /// tool can resume come back resuming it; every other pane comes back a
+    /// login shell, since re-running a saved command could re-issue an agent's
+    /// prompt. `discard` drops the offer instead, answering with zeros.
+    SessionRestore {
+        #[serde(default)]
+        discard: bool,
+    },
     WorkspaceKill {
         id: WorkspaceId,
         /// Discard a *forked* workspace's checkout on kill: `jj workspace forget`
@@ -546,16 +556,42 @@ pub enum Response {
         n: u64,
         saved: Option<u64>,
     },
+    /// A `SessionRestore` landed: how many workspaces the saved layout came
+    /// back into, the panes it spawned, how many of those revived an agent's
+    /// conversation, and what could not come back (a workspace whose directory
+    /// is gone, a pane that failed to spawn). All zero for a discard.
+    SessionRestored {
+        workspaces: usize,
+        panes: usize,
+        revived: usize,
+        skipped: Vec<String>,
+    },
     /// The attach handshake reply: the session name and its full view. The
     /// pane snapshots that seed the client's parsers follow as pane frames.
     /// `wire_rev` is the server's `WIRE_REV`; a client warns on mismatch (an
     /// old daemon defaults to 0, which correctly reads as outdated).
+    /// `restorable` summarises the layout a previous daemon left to offer back
+    /// (`Request::SessionRestore`); `None` when there is none, and from older
+    /// servers.
     Attached {
         session: String,
         workspaces: Vec<WorkspaceView>,
         #[serde(default)]
         wire_rev: u32,
+        #[serde(default)]
+        restorable: Option<RestoreSummary>,
     },
+}
+
+/// What a pending restore would bring back, as an attach offers it: the saved
+/// workspaces and panes, how many of the panes are agents it would revive in
+/// their own conversation, and when the layout was saved (unix seconds).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreSummary {
+    pub workspaces: usize,
+    pub panes: usize,
+    pub agents: usize,
+    pub saved_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -606,6 +642,8 @@ mod tests {
     #[test]
     fn request_roundtrip() {
         roundtrip(&Request::WorkspaceList);
+        roundtrip(&Request::SessionRestore { discard: false });
+        roundtrip(&Request::SessionRestore { discard: true });
         roundtrip(&Request::WorkspaceNew {
             dir: PathBuf::from("/tmp/project"),
         });
@@ -961,6 +999,12 @@ mod tests {
             saved: Some(3),
         });
         roundtrip(&Response::Restored { n: 2, saved: None });
+        roundtrip(&Response::SessionRestored {
+            workspaces: 2,
+            panes: 5,
+            revived: 1,
+            skipped: vec!["/srv/gone: directory is gone".into()],
+        });
         roundtrip(&Response::Content {
             lines: vec!["line one".into(), "line two".into()],
         });
@@ -989,6 +1033,18 @@ mod tests {
             wire_rev: WIRE_REV,
             session: "tutti".into(),
             workspaces: sample_view(),
+            restorable: None,
+        });
+        roundtrip(&Response::Attached {
+            wire_rev: WIRE_REV,
+            session: "tutti".into(),
+            workspaces: Vec::new(),
+            restorable: Some(RestoreSummary {
+                workspaces: 3,
+                panes: 7,
+                agents: 2,
+                saved_at: 1_760_000_000,
+            }),
         });
     }
 
@@ -1240,6 +1296,23 @@ mod tests {
                 cmd: vec!["claude".into()],
                 sandbox: None,
                 title: None,
+            }
+        );
+        // A bare `session_restore` restores rather than discards.
+        let restore: Request = serde_json::from_str(r#"{"type":"session_restore"}"#).unwrap();
+        assert_eq!(restore, Request::SessionRestore { discard: false });
+        // An `attached` from before `restorable` existed offers nothing.
+        let attached: Response = serde_json::from_str(
+            r#"{"type":"attached","session":"tutti","workspaces":[],"wire_rev":6}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            attached,
+            Response::Attached {
+                session: "tutti".into(),
+                workspaces: Vec::new(),
+                wire_rev: 6,
+                restorable: None,
             }
         );
     }

@@ -30,6 +30,13 @@ struct TestServer {
 
 impl TestServer {
     fn start() -> Self {
+        Self::saving(None)
+    }
+
+    /// A server whose layout persistence lives in `state` (`None`: off). Every
+    /// test server's session is `s`, so a second one on the same `state` is
+    /// the first one restarted.
+    fn saving(state: Option<PathBuf>) -> Self {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("tutti-test-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -38,7 +45,7 @@ impl TestServer {
         let (shutdown, rx) = oneshot::channel::<()>();
         let served = path.clone();
         let handle = tokio::spawn(async move {
-            serve(listener, served, PaneSize::new(24, 80), async move {
+            serve(listener, served, PaneSize::new(24, 80), state, async move {
                 let _ = rx.await;
             })
             .await
@@ -1032,6 +1039,181 @@ async fn pidfile_tracks_server_lifetime() {
 
     server.stop().await;
     assert!(!pid_path.exists(), "pidfile should be removed on shutdown");
+}
+
+/// Attach `conn` and return the handshake's view and restore offer.
+async fn attach(
+    conn: &mut Conn,
+) -> (
+    Vec<tutti_core::WorkspaceView>,
+    Option<tutti_core::RestoreSummary>,
+) {
+    conn.send(&Request::Attach).await;
+    loop {
+        if let Frame::Control(json) = conn.read_frame().await
+            && let Ok(Response::Attached {
+                workspaces,
+                restorable,
+                ..
+            }) = serde_json::from_slice(&json)
+        {
+            return (workspaces, restorable);
+        }
+    }
+}
+
+/// `layout` with its pane ids blanked: what a restore must reproduce — the
+/// same splits at the same ratios — though every pane in it is new.
+fn shape(layout: &Layout) -> Layout {
+    match layout {
+        Layout::Leaf(_) => Layout::Leaf(PaneId(0)),
+        Layout::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => Layout::Split {
+            direction: *direction,
+            ratio: *ratio,
+            first: Box::new(shape(first)),
+            second: Box::new(shape(second)),
+        },
+    }
+}
+
+/// Each workspace's directory and the shapes of its tabs.
+fn shapes(view: &[tutti_core::WorkspaceView]) -> Vec<(PathBuf, Vec<Layout>)> {
+    view.iter()
+        .map(|w| {
+            let tabs = w.tabs.iter().filter_map(|t| t.layout.as_ref());
+            (w.dir.clone(), tabs.map(shape).collect())
+        })
+        .collect()
+}
+
+fn sleeper_in(tab: Option<tutti_core::TabId>) -> Request {
+    Request::PaneRun {
+        tab,
+        cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+        ephemeral: false,
+        sandbox: None,
+    }
+}
+
+/// A daemon with a state dir saves its layout, and once more as it stops; the
+/// next one on the same dir offers it on attach rather than restoring on its
+/// own, and `session restore` brings back the workspaces, their tabs, the
+/// splits at their exact ratios and a pane per leaf — then the offer is gone.
+#[tokio::test]
+async fn a_restarted_daemon_offers_its_layout_and_restores_it() {
+    let state = fresh_dir("state");
+    let (one, two) = (fresh_dir("saved-a"), fresh_dir("saved-b"));
+    let server = TestServer::saving(Some(state.clone()));
+    let mut conn = server.connect().await;
+    let a = workspace_id(
+        conn.request(Request::WorkspaceNew { dir: one.clone() })
+            .await,
+    );
+    let first = pane_id(conn.request(sleeper_in(None)).await);
+    let split = Request::PaneSplit {
+        pane: first,
+        direction: Direction::Vertical,
+    };
+    pane_id(conn.request(split).await);
+    let resize = Request::PaneResizeSplit {
+        pane: first,
+        direction: Direction::Vertical,
+        delta: 0.15,
+    };
+    assert_eq!(conn.request(resize).await, Response::Ok);
+    let logs = match conn.request(Request::TabNew { workspace: Some(a) }).await {
+        Response::TabCreated { id } => id,
+        other => panic!("expected TabCreated, got {other:?}"),
+    };
+    pane_id(conn.request(sleeper_in(Some(logs))).await);
+    workspace_id(
+        conn.request(Request::WorkspaceNew { dir: two.clone() })
+            .await,
+    );
+    pane_id(conn.request(sleeper_in(None)).await);
+    let (saved, _) = attach(&mut server.connect().await).await;
+    server.stop().await;
+    assert!(state.join("s.json").exists(), "the stop saved the layout");
+
+    let server = TestServer::saving(Some(state.clone()));
+    let (view, offer) = attach(&mut server.connect().await).await;
+    assert!(
+        view.is_empty(),
+        "a restarted daemon never restores on its own"
+    );
+    let offer = offer.expect("the saved layout is offered");
+    assert_eq!((offer.workspaces, offer.panes, offer.agents), (2, 4, 0));
+    assert!(state.join("s.restore.json").exists() && !state.join("s.json").exists());
+
+    let mut conn = server.connect().await;
+    let restore = Request::SessionRestore { discard: false };
+    assert_eq!(
+        conn.request(restore.clone()).await,
+        Response::SessionRestored {
+            workspaces: 2,
+            panes: 4,
+            revived: 0,
+            skipped: Vec::new(),
+        }
+    );
+    assert!(
+        !state.join("s.restore.json").exists(),
+        "a restore consumes the offer"
+    );
+    let (restored, offer) = attach(&mut server.connect().await).await;
+    assert_eq!(offer, None);
+    assert_eq!(shapes(&restored), shapes(&saved));
+    assert_eq!(pane_ids(&mut conn).await.len(), 4, "a live pane per leaf");
+    assert_eq!(
+        error_message(conn.request(restore).await),
+        "nothing to restore"
+    );
+
+    server.stop().await;
+    for dir in [state, one, two] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// Discarding the offer deletes it: the next attach offers nothing and a
+/// restore finds nothing to bring back.
+#[tokio::test]
+async fn discarding_the_offered_layout_deletes_it() {
+    let state = fresh_dir("state");
+    let server = TestServer::saving(Some(state.clone()));
+    run_sleeper(&mut server.connect().await).await;
+    server.stop().await;
+
+    let server = TestServer::saving(Some(state.clone()));
+    let mut conn = server.connect().await;
+    assert_eq!(
+        conn.request(Request::SessionRestore { discard: true })
+            .await,
+        Response::SessionRestored {
+            workspaces: 0,
+            panes: 0,
+            revived: 0,
+            skipped: Vec::new(),
+        }
+    );
+    assert!(!state.join("s.restore.json").exists());
+    assert_eq!(attach(&mut server.connect().await).await.1, None);
+    assert_eq!(
+        error_message(
+            conn.request(Request::SessionRestore { discard: false })
+                .await
+        ),
+        "nothing to restore"
+    );
+    assert!(workspace_ids(&mut conn).await.is_empty());
+
+    server.stop().await;
+    let _ = std::fs::remove_dir_all(state);
 }
 
 /// A `PaneResizeSplit` nudges the ratio of the focused pane's enclosing split

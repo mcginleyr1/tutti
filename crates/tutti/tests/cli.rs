@@ -394,6 +394,49 @@ fn run_prints_the_bare_pane_id() {
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "7\n");
 }
 
+/// `server restore` prints what came back on one line and names each skipped
+/// entry on stderr; `--discard` says the saved layout is gone.
+#[test]
+fn server_restore_reports_what_came_back_and_what_did_not() {
+    let output = run_scenario(
+        "restore",
+        &["server", "restore"],
+        |req| assert_eq!(*req, Request::SessionRestore { discard: false }),
+        Response::SessionRestored {
+            workspaces: 2,
+            panes: 5,
+            revived: 1,
+            skipped: vec!["/srv/gone: the directory is gone".into()],
+        },
+    );
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "restored 2 projects · revived 1 agent · skipped 1\n"
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "skipped /srv/gone: the directory is gone\n"
+    );
+
+    let output = run_scenario(
+        "discard",
+        &["server", "restore", "--discard"],
+        |req| assert_eq!(*req, Request::SessionRestore { discard: true }),
+        Response::SessionRestored {
+            workspaces: 0,
+            panes: 0,
+            revived: 0,
+            skipped: Vec::new(),
+        },
+    );
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "discarded the saved layout\n"
+    );
+}
+
 /// A project and the workspace nested under it, as the daemon lists them.
 fn project_and_workspace() -> Vec<WorkspaceInfo> {
     vec![

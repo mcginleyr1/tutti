@@ -2,8 +2,10 @@
 //! workspace held each time an agent turn ended. Recording rides the change
 //! probe — the probe's own snapshot of `@` is the checkpoint, so tutti never
 //! takes a snapshot just for this. Pure bookkeeping; the server drives the jj
-//! side. Not persisted: a restarted daemon starts every pane's list empty.
+//! side. The list is saved with the layout (`persist`), so a pane a restart
+//! restores keeps its turns, numbering and head.
 
+use serde::{Deserialize, Serialize};
 use tutti_core::{AgentState, Checkpoint, FileStat};
 
 /// The most checkpoints kept per pane; the oldest drops first.
@@ -14,7 +16,10 @@ pub const KEEP: usize = 50;
 pub type Noted = (String, Option<String>);
 
 /// One pane's checkpoints plus what the next change probe must record for it.
-#[derive(Default)]
+/// Saved as its list, numbering and head; what is in flight (the noted
+/// checkpoints, the running turn's prompt) belonged to a process that is gone
+/// by the time a save is restored.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Turns {
     entries: Vec<Checkpoint>,
     /// The last `n` handed out, so numbers are never reused after a drop.
@@ -23,8 +28,10 @@ pub struct Turns {
     /// working copy a restore left behind. `None` before anything is recorded.
     head: Option<String>,
     /// Checkpoints noted since the last probe drained them, oldest first.
+    #[serde(skip)]
     pending: Vec<Noted>,
     /// The prompt that started the turn in flight, as a hook reported it.
+    #[serde(skip)]
     prompt: Option<String>,
 }
 
