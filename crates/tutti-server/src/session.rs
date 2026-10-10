@@ -364,6 +364,65 @@ impl Session {
         self.spawn_into_tab(tab, spec, title, Some((pane, direction)), false)
     }
 
+    /// `tutti run` under one guard: resolve the workspace — `workspace`, else
+    /// the one with `dir` open (compared canonically), else a fresh mount of
+    /// `dir`, which must exist, else the current one — and spawn `cmd`, titled
+    /// `title` when given, in a fresh tab there: a new tab, or a fresh mount's
+    /// own empty one. The
+    /// session's current tab stays where it was (an empty session's aside), so
+    /// an attached client's launches still land in the tab it is looking at.
+    /// A failed spawn leaves nothing behind. Returns the workspace, tab and
+    /// pane, and whether the workspace was mounted.
+    pub fn run_in_fresh_tab(
+        &mut self,
+        workspace: Option<WorkspaceId>,
+        dir: Option<PathBuf>,
+        cmd: Vec<String>,
+        sandbox: Option<String>,
+        title: Option<String>,
+    ) -> Result<(WorkspaceId, TabId, PaneId, bool)> {
+        let current = self.current_tab;
+        let (workspace, tab, mounted) = match (workspace, dir) {
+            (Some(_), Some(_)) => bail!("run takes a workspace or a directory, not both"),
+            (None, Some(dir)) => {
+                let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+                let wanted = canon(&dir);
+                let open = self.workspaces.iter().find(|w| canon(&w.dir) == wanted);
+                match open.map(|w| w.id) {
+                    Some(id) => (id, self.tab_new(Some(id))?, false),
+                    None if !dir.is_dir() => bail!("directory does not exist: {}", dir.display()),
+                    None => {
+                        let (id, tab) = self.push_workspace(dir, None);
+                        (id, tab, true)
+                    }
+                }
+            }
+            (workspace, None) => {
+                let id = self.resolve_workspace(workspace)?;
+                (id, self.tab_new(Some(id))?, false)
+            }
+        };
+        let spawned = self.pane_run(Some(tab), cmd, false, sandbox);
+        match &spawned {
+            Ok(pane) => {
+                self.current_tab = current.or(Some(tab));
+                if let Some(title) = title
+                    && let Some(slot) = self.panes.get_mut(pane)
+                {
+                    slot.meta.title = title;
+                }
+            }
+            Err(_) => {
+                self.current_tab = current;
+                for w in &mut self.workspaces {
+                    w.tabs.retain(|t| t.id != tab);
+                }
+                self.workspaces.retain(|w| !(mounted && w.id == workspace));
+            }
+        }
+        Ok((workspace, tab, spawned?, mounted))
+    }
+
     /// The whole session as the attach protocol's view: workspaces, their tabs,
     /// each tab's layout tree and the `PaneInfo` for the panes it holds.
     pub fn view(&self) -> Vec<WorkspaceView> {
@@ -826,6 +885,11 @@ impl Session {
 
     pub fn pane_state(&self, pane: PaneId) -> Option<AgentState> {
         self.panes.get(&pane).map(|s| s.meta.state)
+    }
+
+    /// One pane's wire metadata, as `pane_list` shows it; `None` once gone.
+    pub fn pane(&self, pane: PaneId) -> Option<PaneInfo> {
+        self.panes.get(&pane).map(pane_info)
     }
 
     /// Overwrite a pane's state. Returns whether the pane exists; the caller

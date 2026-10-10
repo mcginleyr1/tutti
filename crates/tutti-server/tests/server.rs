@@ -191,6 +191,460 @@ async fn pane_survives_client_disconnect() {
     server.stop().await;
 }
 
+fn wait_for(
+    pane: PaneId,
+    until: &[tutti_core::WaitFor],
+    next: bool,
+    timeout_ms: Option<u64>,
+) -> Request {
+    Request::PaneWait {
+        pane,
+        until: until.to_vec(),
+        next,
+        timeout_ms,
+    }
+}
+
+/// The state a wait answered with, and whether it timed out.
+fn waited(response: Response) -> (AgentState, bool) {
+    match response {
+        Response::Waited { pane, timed_out } => (pane.state, timed_out),
+        other => panic!("expected Waited, got {other:?}"),
+    }
+}
+
+fn error_message(response: Response) -> String {
+    match response {
+        Response::Error { message } => message,
+        other => panic!("expected Error, got {other:?}"),
+    }
+}
+
+/// Send a wait on `waiter` and return once the server has subscribed it: one
+/// connection's frames are handled in order, so a later request's reply
+/// proves the wait is in place — still pending, its own reply comes after.
+async fn start_wait(waiter: &mut Conn, wait: Request) {
+    waiter.send(&wait).await;
+    assert!(matches!(
+        waiter.request(Request::PaneList).await,
+        Response::Panes { .. }
+    ));
+}
+
+/// `pane wait` is level-triggered: a pane already in an `until` state answers
+/// at once, and one that is not runs out the timeout, answering with the state
+/// it is still in. A missing pane and an empty `until` are errors.
+#[tokio::test]
+async fn pane_wait_answers_at_once_or_times_out() {
+    use tutti_core::WaitFor;
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let pane = run_sleeper(&mut conn).await;
+
+    hook(&mut conn, pane, AgentHookEvent::Activity { detail: None }).await;
+    assert_eq!(
+        waited(
+            conn.request(wait_for(pane, &[WaitFor::Done], false, Some(200)))
+                .await
+        ),
+        (AgentState::Working, true),
+        "a working pane runs out the timeout"
+    );
+    assert_eq!(
+        waited(
+            conn.request(wait_for(
+                pane,
+                &[WaitFor::Blocked, WaitFor::Working],
+                false,
+                None
+            ))
+            .await
+        ),
+        (AgentState::Working, false),
+        "a pane already in a wanted state answers at once"
+    );
+    hook(&mut conn, pane, AgentHookEvent::Done).await;
+    assert_eq!(
+        waited(
+            conn.request(wait_for(pane, &[WaitFor::Done], false, None))
+                .await
+        ),
+        (AgentState::Done, false)
+    );
+
+    let missing = error_message(
+        conn.request(wait_for(PaneId(999), &[WaitFor::Done], false, None))
+            .await,
+    );
+    assert!(missing.contains("no pane 999"), "{missing}");
+    let empty = error_message(conn.request(wait_for(pane, &[], false, None)).await);
+    assert!(empty.contains("a state to wait for"), "{empty}");
+
+    server.stop().await;
+}
+
+/// A wait not yet satisfied answers on the transition that satisfies it,
+/// driven here by hook events on another connection.
+#[tokio::test]
+async fn pane_wait_answers_on_a_later_transition() {
+    use tutti_core::WaitFor;
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let pane = run_sleeper(&mut control).await;
+    hook(
+        &mut control,
+        pane,
+        AgentHookEvent::Activity { detail: None },
+    )
+    .await;
+
+    let mut waiter = server.connect().await;
+    start_wait(
+        &mut waiter,
+        wait_for(pane, &[WaitFor::Done, WaitFor::Blocked], false, None),
+    )
+    .await;
+    hook(
+        &mut control,
+        pane,
+        AgentHookEvent::Blocked { message: None },
+    )
+    .await;
+    assert_eq!(
+        waited(waiter.response().await),
+        (AgentState::Blocked, false)
+    );
+
+    server.stop().await;
+}
+
+/// `next` waits for a fresh transition: it ignores the state the pane is
+/// already in, and a human focusing a Done pane (Done → Idle) is no fresh
+/// finish — though it is exactly what `--until idle --next` waits for.
+#[tokio::test]
+async fn pane_wait_next_ignores_the_current_state_and_a_focus() {
+    use tutti_core::WaitFor;
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let pane = run_sleeper(&mut control).await;
+    hook(&mut control, pane, AgentHookEvent::Done).await;
+    assert_eq!(
+        waited(
+            control
+                .request(wait_for(pane, &[WaitFor::Done], true, Some(200)))
+                .await
+        ),
+        (AgentState::Done, true),
+        "a pane done before the wait began is no fresh finish"
+    );
+
+    let mut waiter = server.connect().await;
+    start_wait(&mut waiter, wait_for(pane, &[WaitFor::Done], true, None)).await;
+    let focus = Request::PaneFocus { pane };
+    assert_eq!(control.request(focus.clone()).await, Response::Ok);
+    hook(
+        &mut control,
+        pane,
+        AgentHookEvent::Activity { detail: None },
+    )
+    .await;
+    hook(&mut control, pane, AgentHookEvent::Done).await;
+    assert_eq!(
+        waited(waiter.response().await),
+        (AgentState::Done, false),
+        "the focus (it would answer idle) is skipped for the next turn's done"
+    );
+
+    start_wait(&mut waiter, wait_for(pane, &[WaitFor::Idle], true, None)).await;
+    assert_eq!(control.request(focus).await, Response::Ok);
+    assert_eq!(waited(waiter.response().await), (AgentState::Idle, false));
+
+    server.stop().await;
+}
+
+/// The child exiting ends a wait, since the pane can move no more: a matching
+/// final state answers — even when the exit moved nothing (a Done pane
+/// exiting) — and anything else is an error naming the exit. An exited pane
+/// answers at once: by its final state, or under `next` with an error, as it
+/// can never finish again. A wait for idle outlives the exit: a look still
+/// turns the pane's Done into Idle.
+#[tokio::test]
+async fn a_child_exit_ends_a_wait() {
+    use tutti_core::WaitFor;
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let mut waiter = server.connect().await;
+    let exit_with = |pane, code: &str| Request::PaneSend {
+        pane,
+        text: Some(format!("{code}\n")),
+        keys: None,
+        expect: None,
+    };
+
+    let done = run_marker(&mut control, "read code; exit $code").await;
+    hook(&mut control, done, AgentHookEvent::Done).await;
+    start_wait(&mut waiter, wait_for(done, &[WaitFor::Done], true, None)).await;
+    assert_eq!(control.request(exit_with(done, "0")).await, Response::Ok);
+    assert_eq!(waited(waiter.response().await), (AgentState::Done, false));
+
+    let busy = run_marker(&mut control, "read code; exit $code").await;
+    hook(
+        &mut control,
+        busy,
+        AgentHookEvent::Activity { detail: None },
+    )
+    .await;
+    start_wait(
+        &mut waiter,
+        wait_for(busy, &[WaitFor::Blocked], false, None),
+    )
+    .await;
+    assert_eq!(control.request(exit_with(busy, "3")).await, Response::Ok);
+    let exited = error_message(waiter.response().await);
+    assert!(
+        exited.contains(&format!("pane {busy} exited with code 3 (state: done)")),
+        "{exited}"
+    );
+
+    assert_eq!(
+        waited(
+            control
+                .request(wait_for(busy, &[WaitFor::Done], false, None))
+                .await
+        ),
+        (AgentState::Done, false)
+    );
+    let never = error_message(
+        control
+            .request(wait_for(busy, &[WaitFor::Done], true, None))
+            .await,
+    );
+    assert!(never.contains("exited with code 3"), "{never}");
+    start_wait(&mut waiter, wait_for(busy, &[WaitFor::Idle], false, None)).await;
+    assert_eq!(
+        control.request(Request::PaneFocus { pane: busy }).await,
+        Response::Ok
+    );
+    assert_eq!(waited(waiter.response().await), (AgentState::Idle, false));
+
+    server.stop().await;
+}
+
+/// A waited-on pane leaving the session ends the wait with an error, whether
+/// it is killed or its workspace is.
+#[tokio::test]
+async fn a_killed_pane_ends_its_wait() {
+    use tutti_core::WaitFor;
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let mut waiter = server.connect().await;
+    let sleeper = Request::PaneRun {
+        tab: None,
+        cmd: vec!["/bin/sleep".into(), "30".into()],
+        ephemeral: false,
+        sandbox: None,
+    };
+
+    let workspace = new_workspace(&mut control).await;
+    let pane = pane_id(control.request(sleeper.clone()).await);
+    start_wait(&mut waiter, wait_for(pane, &[WaitFor::Done], false, None)).await;
+    assert_eq!(
+        control.request(Request::PaneKill { pane }).await,
+        Response::Ok
+    );
+    let gone = error_message(waiter.response().await);
+    assert!(gone.contains(&format!("pane {pane} is gone")), "{gone}");
+
+    let pane = pane_id(control.request(sleeper).await);
+    start_wait(&mut waiter, wait_for(pane, &[WaitFor::Done], false, None)).await;
+    assert_eq!(
+        control
+            .request(Request::WorkspaceKill {
+                id: workspace,
+                discard: false,
+            })
+            .await,
+        Response::Ok
+    );
+    let gone = error_message(waiter.response().await);
+    assert!(gone.contains(&format!("pane {pane} is gone")), "{gone}");
+
+    server.stop().await;
+}
+
+/// A waiter hanging up mid-wait leaves the daemon serving: the pane moves on,
+/// and a fresh wait on another connection still answers.
+#[tokio::test]
+async fn a_waiter_hanging_up_leaves_the_server_serving() {
+    use tutti_core::WaitFor;
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let pane = run_sleeper(&mut control).await;
+    {
+        let mut waiter = server.connect().await;
+        start_wait(&mut waiter, wait_for(pane, &[WaitFor::Done], false, None)).await;
+    }
+    hook(&mut control, pane, AgentHookEvent::Done).await;
+    let mut waiter = server.connect().await;
+    assert_eq!(
+        waited(
+            waiter
+                .request(wait_for(pane, &[WaitFor::Done], false, None))
+                .await
+        ),
+        (AgentState::Done, false)
+    );
+    assert_eq!(pane_ids(&mut control).await, vec![pane]);
+
+    server.stop().await;
+}
+
+fn ran(response: Response) -> (WorkspaceId, tutti_core::TabId, PaneId) {
+    match response {
+        Response::Ran {
+            workspace,
+            tab,
+            pane,
+        } => (workspace, tab, pane),
+        other => panic!("expected Ran, got {other:?}"),
+    }
+}
+
+fn run_sleep(workspace: Option<WorkspaceId>, dir: Option<PathBuf>, title: Option<&str>) -> Request {
+    Request::Run {
+        workspace,
+        dir,
+        cmd: vec!["/bin/sleep".into(), "30".into()],
+        sandbox: None,
+        title: title.map(Into::into),
+    }
+}
+
+/// `run` spawns into a fresh tab on every call — never splitting a tab in use
+/// — titles the pane when asked, and leaves the session's current tab where it
+/// was, so an attached client's next launch still lands where it is looking.
+#[tokio::test]
+async fn run_opens_a_fresh_tab_per_call_and_keeps_the_current_one() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let workspace = new_workspace(&mut conn).await;
+    pane_id(
+        conn.request(Request::PaneRun {
+            tab: None,
+            cmd: vec!["/bin/cat".into()],
+            ephemeral: false,
+            sandbox: None,
+        })
+        .await,
+    );
+
+    let (first_ws, first_tab, _) = ran(conn.request(run_sleep(None, None, Some("worker"))).await);
+    let (second_ws, second_tab, _) =
+        ran(conn.request(run_sleep(Some(workspace), None, None)).await);
+    assert_eq!((first_ws, second_ws), (workspace, workspace));
+    assert_ne!(first_tab, second_tab);
+    match conn.request(Request::TabList { workspace: None }).await {
+        Response::Tabs { tabs } => {
+            let tabs: Vec<_> = tabs.iter().map(|t| (t.name.as_str(), t.active)).collect();
+            assert_eq!(
+                tabs,
+                [("cat", true), ("worker", false), ("sleep", false)],
+                "each run got its own tab; the current one stayed put"
+            );
+        }
+        other => panic!("expected Tabs, got {other:?}"),
+    }
+    assert_eq!(pane_ids(&mut conn).await.len(), 3);
+
+    server.stop().await;
+}
+
+/// `run --dir` reuses the workspace that has the directory open, however it is
+/// spelled, and otherwise mounts it — spawning into the mount's own first tab
+/// rather than leaving it empty beside a second.
+#[tokio::test]
+async fn run_reuses_an_open_dir_and_mounts_a_new_one() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let open = fresh_dir("run-open");
+    let workspace = workspace_id(
+        conn.request(Request::WorkspaceNew { dir: open.clone() })
+            .await,
+    );
+
+    let (reused, _, _) = ran(conn
+        .request(run_sleep(None, Some(open.join(".")), None))
+        .await);
+    assert_eq!(reused, workspace, "the open dir's workspace is reused");
+
+    let fresh = fresh_dir("run-mount");
+    let (mounted, tab, _) = ran(conn
+        .request(run_sleep(None, Some(fresh.clone()), None))
+        .await);
+    assert_ne!(mounted, workspace);
+    assert!(workspace_ids(&mut conn).await.contains(&mounted));
+    match conn
+        .request(Request::TabList {
+            workspace: Some(mounted),
+        })
+        .await
+    {
+        Response::Tabs { tabs } => assert_eq!(
+            tabs.iter().map(|t| t.id).collect::<Vec<_>>(),
+            [tab],
+            "the mount's own tab holds the pane"
+        ),
+        other => panic!("expected Tabs, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&open);
+    let _ = std::fs::remove_dir_all(&fresh);
+    server.stop().await;
+}
+
+/// `run` refuses a directory that is not on disk and a workspace named beside
+/// a directory, and a command that cannot spawn leaves no empty tab or
+/// workspace behind.
+#[tokio::test]
+async fn run_refuses_bad_targets_and_rolls_back_a_failed_spawn() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let workspace = new_workspace(&mut conn).await;
+    let fresh = fresh_dir("run-rollback");
+    let no_program = |dir| Request::Run {
+        workspace: None,
+        dir,
+        cmd: vec!["/nonexistent/tutti-no-such-program".into()],
+        sandbox: None,
+        title: None,
+    };
+
+    for (request, needle) in [
+        (
+            run_sleep(None, Some("/nonexistent/tutti-run-dir".into()), None),
+            "does not exist",
+        ),
+        (
+            run_sleep(Some(workspace), Some(fresh.clone()), None),
+            "not both",
+        ),
+        (no_program(None), "failed to spawn"),
+        (no_program(Some(fresh.clone())), "failed to spawn"),
+    ] {
+        let message = error_message(conn.request(request).await);
+        assert!(message.contains(needle), "{message}");
+    }
+    assert_eq!(
+        workspace_ids(&mut conn).await,
+        [workspace],
+        "no mount was left"
+    );
+    assert_eq!(tab_names(&mut conn).await.len(), 1, "no empty tab was left");
+
+    let _ = std::fs::remove_dir_all(&fresh);
+    server.stop().await;
+}
+
 /// Mounting a directory that is not on disk is refused outright — otherwise
 /// every pane spawned in it would land in $HOME via portable-pty's fallback.
 #[tokio::test]

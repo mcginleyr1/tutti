@@ -17,12 +17,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::mpsc;
+use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use tutti_agents::{ProcessTree, Registry};
 use tutti_core::{
     AgentHookEvent, AgentKind, AgentState, Checkpoint, Direction, Event, Frame, Observation,
-    PaneData, PaneId, Request, Response, StateEvent, WorkspaceId, prompt_fingerprint,
+    PaneData, PaneId, PaneInfo, Request, Response, StateEvent, WaitFor, WorkspaceId,
+    prompt_fingerprint,
 };
 
 use crate::jj;
@@ -42,6 +44,24 @@ const CLASSIFY_INTERVAL: Duration = Duration::from_millis(300);
 /// frames (a lost delta corrupts its grid forever, a lost event is gone), we
 /// disconnect it — it can simply reattach.
 const CLIENT_QUEUE_CAP: usize = 256;
+/// Depth of the pane-signal broadcast `pane wait` subscribes to. A waiter that
+/// falls this far behind re-checks its pane's current state instead.
+const SIGNAL_CAP: usize = 256;
+
+/// One pane's news, broadcast to every `pane wait`.
+#[derive(Debug, Clone, Copy)]
+enum PaneSignal {
+    /// Its state moved — sent by `publish_transition`, the one funnel.
+    Moved {
+        pane: PaneId,
+        from: AgentState,
+        to: AgentState,
+    },
+    /// Its child exited, whether or not that moved its state.
+    Exited(PaneId),
+    /// It left the session: killed, its workspace killed, or ephemeral and done.
+    Gone(PaneId),
+}
 
 struct Client {
     tx: mpsc::Sender<Vec<u8>>,
@@ -69,6 +89,9 @@ pub struct Hub {
     registry: Registry,
     /// The VCS watch's book, one entry per workspace it has seen.
     vcs: Mutex<HashMap<WorkspaceId, VcsMark>>,
+    /// Every pane's transitions, exits and removals, for `pane wait` to
+    /// subscribe to. With nobody waiting a send fails, harmlessly.
+    signals: broadcast::Sender<PaneSignal>,
 }
 
 /// One workspace's VCS-watch state: `mark` is the op-heads mtime as of the last
@@ -135,6 +158,7 @@ pub async fn serve(
         name,
         registry: Registry::default(),
         vcs: Mutex::new(HashMap::new()),
+        signals: broadcast::channel(SIGNAL_CAP).0,
     });
 
     let tick_hub = Arc::clone(&hub);
@@ -227,7 +251,8 @@ async fn handle_conn(hub: Arc<Hub>, stream: tokio::net::UnixStream) -> Result<()
     let cid = hub.next_client.fetch_add(1, Ordering::Relaxed);
     let (mut read_half, write_half) = stream.into_split();
     let (tx, rx) = mpsc::channel::<Vec<u8>>(CLIENT_QUEUE_CAP);
-    let writer = tokio::spawn(writer_loop(write_half, rx));
+    let (hangup, hung_up) = oneshot::channel::<()>();
+    let writer = tokio::spawn(writer_loop(write_half, rx, hung_up));
     let abort = writer.abort_handle();
 
     let mut buf = Vec::new();
@@ -254,14 +279,32 @@ async fn handle_conn(hub: Arc<Hub>, stream: tokio::net::UnixStream) -> Result<()
         // the writer to drop the socket rather than block awaiting a flush.
         writer.abort();
     } else {
-        drop(tx);
+        // Dropping `hangup` tells the writer the peer is gone.
+        drop((tx, hangup));
         let _ = writer.await;
     }
     outcome
 }
 
-async fn writer_loop(mut half: OwnedWriteHalf, mut rx: mpsc::Receiver<Vec<u8>>) {
-    while let Some(bytes) = rx.recv().await {
+/// Write the connection's outbound frames in order. Once the reader sees the
+/// peer hang up the queue closes — what is already queued still drains — so a
+/// task still holding a reply sender (a `pane wait`, which may block for
+/// hours) sees `closed()` and gives up, instead of keeping this writer, and
+/// with it the connection, alive.
+async fn writer_loop(
+    mut half: OwnedWriteHalf,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut hung_up: oneshot::Receiver<()>,
+) {
+    loop {
+        let bytes = tokio::select! {
+            bytes = rx.recv() => bytes,
+            _ = &mut hung_up, if !rx.is_closed() => {
+                rx.close();
+                continue;
+            }
+        };
+        let Some(bytes) = bytes else { break };
         if half.write_all(&bytes).await.is_err() {
             break;
         }
@@ -332,6 +375,12 @@ fn handle_frame(
             }
             Ok(Request::PaneScroll { pane, offset }) => scroll(hub, cid, tx, pane, offset),
             Ok(Request::WorkspaceDiff { id, stat }) => workspace_diff(hub, tx, id, stat),
+            Ok(Request::PaneWait {
+                pane,
+                until,
+                next,
+                timeout_ms,
+            }) => pane_wait(hub, tx, pane, until, next, timeout_ms),
             Ok(Request::WorkspaceKill { id, discard }) => workspace_kill(hub, cid, tx, id, discard),
             Ok(Request::WorkspaceFork {
                 id,
@@ -422,19 +471,20 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
                 Err(err) => error(err),
             }
         }
+        Request::Run {
+            workspace,
+            dir,
+            cmd,
+            sandbox,
+            title,
+        } => run_in_fresh_tab(hub, workspace, dir, cmd, sandbox, title),
         Request::PaneRun {
             tab,
             cmd,
             ephemeral,
             sandbox,
         } => {
-            // A sandbox pane's agent runs in a pod, out of detection's sight,
-            // so it is declared from the command at spawn instead.
-            let declared = sandbox
-                .as_ref()
-                .and(cmd.first())
-                .and_then(|program| hub.registry.match_process(program))
-                .map(|spec| spec.kind.clone());
+            let declared = declared_agent(hub, sandbox.as_deref(), &cmd);
             spawn_pane(hub, |s| {
                 let pane = s.pane_run(tab, cmd, ephemeral, sandbox)?;
                 s.set_agent(pane, declared);
@@ -455,6 +505,7 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
                     let view = session.view();
                     drop(session);
                     hub.last.lock().expect("last poisoned").remove(&pane);
+                    let _ = hub.signals.send(PaneSignal::Gone(pane));
                     broadcast_event(hub, Event::LayoutChanged { workspaces: view });
                     Response::Ok
                 }
@@ -547,6 +598,7 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
         | Request::Detach
         | Request::PaneScroll { .. }
         | Request::WorkspaceDiff { .. }
+        | Request::PaneWait { .. }
         | Request::WorkspaceKill { .. }
         | Request::WorkspaceFork { .. }
         | Request::WorkspaceMerge { .. }
@@ -597,17 +649,19 @@ fn focus_pane(hub: &Arc<Hub>, pane: PaneId) -> Response {
 }
 
 /// Publish one pane's state transition — the single funnel every transition
-/// source goes through, so each one gets checkpoints for free: broadcast
-/// `StateChanged` and note the turn edge on the pane (leaving `Working` ends a
-/// turn; entering it with nothing recorded takes the baseline). The caller then
-/// refreshes the pane's workspace (batched per pass where it can): that probe's
-/// snapshot of `@` is what gets recorded. A no-op when `from == to`.
+/// source goes through, so each one gets checkpoints and waiters for free:
+/// broadcast `StateChanged`, signal the `pane wait`s, and note the turn edge on
+/// the pane (leaving `Working` ends a turn; entering it with nothing recorded
+/// takes the baseline). The caller then refreshes the pane's workspace
+/// (batched per pass where it can): that probe's snapshot of `@` is what gets
+/// recorded. A no-op when `from == to`.
 fn publish_transition(hub: &Hub, pane: PaneId, from: AgentState, to: AgentState) {
     if from == to {
         return;
     }
     hub.session().note_transition(pane, from, to);
     broadcast_event(hub, Event::StateChanged { pane, from, to });
+    let _ = hub.signals.send(PaneSignal::Moved { pane, from, to });
 }
 
 /// Fold a program's own status report (OSC 9;4 / 7501, pulled from `pane`'s
@@ -688,6 +742,51 @@ fn spawn_pane(hub: &Arc<Hub>, op: impl FnOnce(&mut Session) -> Result<PaneId>) -
             Response::PaneCreated { id: pane }
         }
         Err(err) => error(err),
+    }
+}
+
+/// The agent a sandbox pane declares from its command: it runs in a pod, out
+/// of detection's sight. `None` for a local pane, which detection finds.
+fn declared_agent(hub: &Hub, sandbox: Option<&str>, cmd: &[String]) -> Option<AgentKind> {
+    sandbox
+        .and(cmd.first())
+        .and_then(|program| hub.registry.match_process(program))
+        .map(|spec| spec.kind.clone())
+}
+
+/// `tutti run`: spawn `cmd` in a fresh tab of the target workspace (see
+/// `Session::run_in_fresh_tab`) through `spawn_pane`, so the reaper and the
+/// one `LayoutChanged` come with it. A workspace it mounted gets its change
+/// stat seeded, as `WorkspaceNew` does.
+fn run_in_fresh_tab(
+    hub: &Arc<Hub>,
+    workspace: Option<WorkspaceId>,
+    dir: Option<PathBuf>,
+    cmd: Vec<String>,
+    sandbox: Option<String>,
+    title: Option<String>,
+) -> Response {
+    let declared = declared_agent(hub, sandbox.as_deref(), &cmd);
+    let mut ran = None;
+    let response = spawn_pane(hub, |s| {
+        let (workspace, tab, pane, mounted) =
+            s.run_in_fresh_tab(workspace, dir, cmd, sandbox, title)?;
+        s.set_agent(pane, declared);
+        ran = Some((workspace, tab, mounted));
+        Ok(pane)
+    });
+    match (response, ran) {
+        (Response::PaneCreated { id }, Some((workspace, tab, mounted))) => {
+            if mounted {
+                refresh_changes(hub, workspace);
+            }
+            Response::Ran {
+                workspace,
+                tab,
+                pane: id,
+            }
+        }
+        (response, _) => response,
     }
 }
 
@@ -772,6 +871,131 @@ fn workspace_diff(
     ControlFlow::Continue(())
 }
 
+/// Serve a `pane wait` on a spawned task, replying on the requester's own
+/// channel like `workspace_diff`. No polling: it subscribes to the pane
+/// signals *before* reading the pane, so a transition landing between the two
+/// is queued rather than lost, then answers on the first move into an `until`
+/// state — or at once, when the pane already holds one and `next` is off.
+/// Under `next` a move counts only when it enters a state from outside it, so
+/// a human focusing a Done pane (Done → Idle) is never a fresh finish. The
+/// child exiting ends the wait (`wait_verdict`); so does the pane leaving. A
+/// lagging subscription re-checks the pane as it is now, level-triggered —
+/// best effort: an edge it skipped is lost. The task gives up silently once
+/// its client hangs up.
+fn pane_wait(
+    hub: &Arc<Hub>,
+    tx: &mpsc::Sender<Vec<u8>>,
+    pane: PaneId,
+    until: Vec<WaitFor>,
+    next: bool,
+    timeout_ms: Option<u64>,
+) -> ControlFlow<()> {
+    let mut signals = hub.signals.subscribe();
+    let start = hub.session().pane(pane);
+    let hub = Arc::clone(hub);
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let gone = || Response::Error {
+            message: format!("pane {pane} is gone"),
+        };
+        let wait = async {
+            if until.is_empty() {
+                return Response::Error {
+                    message: "pane wait needs a state to wait for".into(),
+                };
+            }
+            let Some(info) = start else {
+                return Response::Error {
+                    message: format!("no pane {pane}"),
+                };
+            };
+            if let Some(answer) = wait_verdict(info, &until, !next) {
+                return answer;
+            }
+            loop {
+                let signal = signals.recv().await;
+                let recheck = match signal {
+                    Ok(PaneSignal::Moved { pane: p, from, to }) if p == pane => {
+                        if until
+                            .iter()
+                            .any(|w| w.matches(to) && !(next && w.matches(from)))
+                        {
+                            let info = hub.session().pane(pane);
+                            return match info {
+                                Some(info) => Response::Waited {
+                                    pane: PaneInfo { state: to, ..info },
+                                    timed_out: false,
+                                },
+                                None => gone(),
+                            };
+                        }
+                        false
+                    }
+                    Ok(PaneSignal::Exited(p)) => p == pane,
+                    Ok(PaneSignal::Gone(p)) if p == pane => return gone(),
+                    Ok(PaneSignal::Moved { .. } | PaneSignal::Gone(_)) => false,
+                    Err(RecvError::Lagged(_)) => true,
+                    Err(RecvError::Closed) => unreachable!("the hub owns the sender"),
+                };
+                if !recheck {
+                    continue;
+                }
+                let info = hub.session().pane(pane);
+                let Some(info) = info else {
+                    return gone();
+                };
+                if let Some(answer) = wait_verdict(info, &until, true) {
+                    return answer;
+                }
+            }
+        };
+        let bounded = async {
+            match timeout_ms {
+                Some(ms) => tokio::time::timeout(Duration::from_millis(ms), wait)
+                    .await
+                    .ok(),
+                None => Some(wait.await),
+            }
+        };
+        let response = tokio::select! {
+            () = tx.closed() => return,
+            outcome = bounded => match outcome {
+                Some(response) => response,
+                None => {
+                    let info = hub.session().pane(pane);
+                    info.map_or_else(gone, |pane| Response::Waited {
+                        pane,
+                        timed_out: true,
+                    })
+                }
+            },
+        };
+        let _ = tx.send(encode_json(&response)).await;
+    });
+    ControlFlow::Continue(())
+}
+
+/// Whether a wait on the pane `info` describes is over, and its answer: a
+/// pane already in an `until` state ends it when `level`. An exited pane ends
+/// it too — as an error naming the exit — unless the one move it has left, a
+/// human's look turning Done into Idle, is what the wait is for.
+fn wait_verdict(info: PaneInfo, until: &[WaitFor], level: bool) -> Option<Response> {
+    if level && until.iter().any(|w| w.matches(info.state)) {
+        return Some(Response::Waited {
+            pane: info,
+            timed_out: false,
+        });
+    }
+    let code = info.exited?;
+    if info.state == AgentState::Done && until.contains(&WaitFor::Idle) {
+        return None;
+    }
+    let state = format!("{:?}", info.state).to_lowercase();
+    Some(Response::Error {
+        message: format!("pane {} exited with code {code} (state: {state})", info.id),
+    })
+}
+
 /// Kill a workspace. `--discard` additionally scrubs a *forked* checkout from
 /// disk: the panes die and tutti drops the workspace right away (a half-cleaned
 /// fork must still disappear), then a spawned task runs `jj workspace forget` at
@@ -808,6 +1032,7 @@ fn workspace_kill(
             let mut last = hub.last.lock().expect("last poisoned");
             for pane in &panes {
                 last.remove(pane);
+                let _ = hub.signals.send(PaneSignal::Gone(*pane));
             }
             drop(last);
             broadcast_event(hub, Event::LayoutChanged { workspaces: view });
@@ -1208,6 +1433,7 @@ fn spawn_reaper(hub: &Arc<Hub>, pane: PaneId, pty: Arc<PtyPane>) {
             let view = session.view();
             drop(session);
             hub.last.lock().expect("last poisoned").remove(&pane);
+            let _ = hub.signals.send(PaneSignal::Gone(pane));
             broadcast_event(&hub, Event::LayoutChanged { workspaces: view });
             if let Some(workspace) = workspace {
                 refresh_changes(&hub, workspace);
@@ -1218,6 +1444,9 @@ fn spawn_reaper(hub: &Arc<Hub>, pane: PaneId, pty: Arc<PtyPane>) {
         if let Some((from, to)) = transition {
             publish_transition(&hub, pane, from, to);
             broadcast_event(&hub, Event::PaneExited { pane, code });
+            // Even when the state did not move (a Done pane exiting): a
+            // waiter must learn the pane can move no more.
+            let _ = hub.signals.send(PaneSignal::Exited(pane));
             // A finished agent likely touched files; refresh its workspace stat.
             refresh_pane_workspace(&hub, pane);
         }
@@ -1646,5 +1875,36 @@ fn encode_json<T: Serialize>(value: &T) -> Vec<u8> {
 fn error(err: anyhow::Error) -> Response {
     Response::Error {
         message: format!("{err:#}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A peer hanging up closes the reply queue once what was queued drains,
+    /// so a task still holding a sender — a pane wait — sees `closed()`
+    /// rather than keeping the writer alive.
+    #[tokio::test]
+    async fn a_hangup_drains_the_reply_queue_then_closes_it() {
+        let (server, mut peer) = tokio::net::UnixStream::pair().unwrap();
+        let (_read, write) = server.into_split();
+        let (tx, rx) = mpsc::channel(4);
+        let (hangup, hung_up) = oneshot::channel();
+        let writer = tokio::spawn(writer_loop(write, rx, hung_up));
+        let waiter = tx.clone();
+        tx.send(b"queued".to_vec()).await.unwrap();
+        drop((tx, hangup));
+        let deadline = Duration::from_secs(5);
+        tokio::time::timeout(deadline, waiter.closed())
+            .await
+            .expect("the hangup closes the queue under a live sender");
+        tokio::time::timeout(deadline, writer)
+            .await
+            .expect("the writer ends")
+            .unwrap();
+        let mut written = Vec::new();
+        peer.read_to_end(&mut written).await.unwrap();
+        assert_eq!(written, b"queued", "what was queued still drained");
     }
 }

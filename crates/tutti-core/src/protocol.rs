@@ -76,6 +76,24 @@ pub enum Request {
     TabSelect {
         id: TabId,
     },
+    /// The orchestrator's one call: spawn `cmd` in a fresh tab and answer
+    /// `Response::Ran`. The workspace is `workspace`, else the one open at
+    /// `dir` (mounted like `WorkspaceNew` when none is), else the current one;
+    /// naming both is an error. A fresh tab because an orchestrated agent must
+    /// never split a tab someone is using — and the session's current tab
+    /// stays put, so an attached client is not yanked over to it. `sandbox`
+    /// works as in `PaneRun`; `title` names the pane.
+    Run {
+        #[serde(default)]
+        workspace: Option<WorkspaceId>,
+        #[serde(default)]
+        dir: Option<PathBuf>,
+        cmd: Vec<String>,
+        #[serde(default)]
+        sandbox: Option<String>,
+        #[serde(default)]
+        title: Option<String>,
+    },
     PaneRun {
         tab: Option<TabId>,
         cmd: Vec<String>,
@@ -123,6 +141,22 @@ pub enum Request {
     /// send's `expect`.
     PaneFingerprint {
         pane: PaneId,
+    },
+    /// Block until `pane` is in one of `until`'s states, answered with
+    /// `Response::Waited`: at once when it already is, or — with `next` — only
+    /// on a fresh transition into one after the request arrives (a human
+    /// focusing a Done pane is never a fresh finish). The child exiting ends
+    /// the wait, `Waited` if its final state matches and Error otherwise —
+    /// unless it waits for `Idle`, which a look can still bring. A killed pane
+    /// is an Error; `timeout_ms` running out answers `Waited` with `timed_out`.
+    /// Served from a server-side subscription, never by polling.
+    PaneWait {
+        pane: PaneId,
+        until: Vec<WaitFor>,
+        #[serde(default)]
+        next: bool,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
     },
     PaneRead {
         pane: PaneId,
@@ -243,6 +277,30 @@ pub enum AgentHookEvent {
         #[serde(default)]
         text: Option<String>,
     },
+}
+
+/// A state `PaneWait` waits for. `Done` reads "finished, seen or not", so it
+/// matches `Idle` too and a wait never hangs on a pane someone already looked
+/// at; `Idle` alone is "finished and seen".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitFor {
+    Working,
+    Blocked,
+    Done,
+    Idle,
+}
+
+impl WaitFor {
+    /// Whether a pane in `state` satisfies this condition.
+    pub fn matches(self, state: AgentState) -> bool {
+        match self {
+            WaitFor::Working => state == AgentState::Working,
+            WaitFor::Blocked => state == AgentState::Blocked,
+            WaitFor::Done => matches!(state, AgentState::Done | AgentState::Idle),
+            WaitFor::Idle => state == AgentState::Idle,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -417,6 +475,18 @@ pub enum Response {
     PaneCreated {
         id: PaneId,
     },
+    /// A `PaneWait` ended: `pane` as it is now, its `state` the one that
+    /// satisfied the wait — or, when `timed_out`, the one it is still in.
+    Waited {
+        pane: PaneInfo,
+        timed_out: bool,
+    },
+    /// A `Run` landed: the workspace it ran in, its fresh tab, the new pane.
+    Ran {
+        workspace: WorkspaceId,
+        tab: TabId,
+        pane: PaneId,
+    },
     Workspaces {
         workspaces: Vec<WorkspaceInfo>,
     },
@@ -556,6 +626,20 @@ mod tests {
             push: false,
         });
         roundtrip(&Request::TabNew { workspace: None });
+        roundtrip(&Request::Run {
+            workspace: Some(WorkspaceId(2)),
+            dir: None,
+            cmd: vec!["claude".into(), "fix the tests".into()],
+            sandbox: Some("gke".into()),
+            title: Some("fixer".into()),
+        });
+        roundtrip(&Request::Run {
+            workspace: None,
+            dir: Some(PathBuf::from("/tmp/project")),
+            cmd: vec!["sh".into()],
+            sandbox: None,
+            title: None,
+        });
         roundtrip(&Request::PaneSplit {
             pane: PaneId(1),
             direction: Direction::Vertical,
@@ -573,6 +657,12 @@ mod tests {
             expect: Some("af63dc4c8601ec8c".into()),
         });
         roundtrip(&Request::PaneFingerprint { pane: PaneId(2) });
+        roundtrip(&Request::PaneWait {
+            pane: PaneId(2),
+            until: vec![WaitFor::Blocked, WaitFor::Done],
+            next: true,
+            timeout_ms: Some(1500),
+        });
         roundtrip(&Request::PaneRead {
             pane: PaneId(2),
             lines: Some(50),
@@ -698,6 +788,22 @@ mod tests {
         assert_eq!(prompt, AgentHookEvent::Prompt { text: None });
     }
 
+    #[test]
+    fn wait_for_done_means_finished_seen_or_not() {
+        use AgentState::*;
+        let matching = |w: WaitFor| {
+            [Unknown, Working, Blocked, Done, Idle]
+                .into_iter()
+                .filter(|s| w.matches(*s))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(matching(WaitFor::Working), [Working]);
+        assert_eq!(matching(WaitFor::Blocked), [Blocked]);
+        assert_eq!(matching(WaitFor::Done), [Done, Idle]);
+        assert_eq!(matching(WaitFor::Idle), [Idle]);
+        assert_eq!(serde_json::to_string(&WaitFor::Idle).unwrap(), r#""idle""#);
+    }
+
     fn sample_view() -> Vec<WorkspaceView> {
         vec![WorkspaceView {
             id: WorkspaceId(1),
@@ -746,6 +852,20 @@ mod tests {
             message: "boom".into(),
         });
         roundtrip(&Response::PaneCreated { id: PaneId(5) });
+        let pane = sample_view()[0].tabs[0].panes[0].clone();
+        roundtrip(&Response::Waited {
+            pane: pane.clone(),
+            timed_out: false,
+        });
+        roundtrip(&Response::Waited {
+            pane,
+            timed_out: true,
+        });
+        roundtrip(&Response::Ran {
+            workspace: WorkspaceId(1),
+            tab: TabId(4),
+            pane: PaneId(9),
+        });
         roundtrip(&Response::Panes {
             panes: vec![PaneInfo {
                 id: PaneId(1),
@@ -1000,6 +1120,32 @@ mod tests {
                 name: "x".into(),
                 revision: None,
                 dest: None,
+            }
+        );
+        // `pane_wait` without `next`/`timeout_ms` is level-triggered and
+        // unbounded.
+        let wait: Request =
+            serde_json::from_str(r#"{"type":"pane_wait","pane":3,"until":["done"]}"#).unwrap();
+        assert_eq!(
+            wait,
+            Request::PaneWait {
+                pane: PaneId(3),
+                until: vec![WaitFor::Done],
+                next: false,
+                timeout_ms: None,
+            }
+        );
+        // `run` with only a command runs locally in the current workspace,
+        // under the command's own title.
+        let run: Request = serde_json::from_str(r#"{"type":"run","cmd":["claude"]}"#).unwrap();
+        assert_eq!(
+            run,
+            Request::Run {
+                workspace: None,
+                dir: None,
+                cmd: vec!["claude".into()],
+                sandbox: None,
+                title: None,
             }
         );
     }

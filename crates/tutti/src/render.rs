@@ -94,7 +94,7 @@ pub fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-pub(crate) fn state_label(state: AgentState) -> &'static str {
+pub fn state_label(state: AgentState) -> &'static str {
     match state {
         AgentState::Unknown => "unknown",
         AgentState::Working => "working",

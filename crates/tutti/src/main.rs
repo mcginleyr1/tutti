@@ -1,10 +1,13 @@
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
-use tutti_core::{AgentHookEvent, Direction, PaneId, Request, Response, TabId, WorkspaceId};
+use tutti_core::{
+    AgentHookEvent, Direction, PaneId, Request, Response, TabId, WaitFor, WorkspaceId,
+};
 
 use tutti::client::{self, Client, StopOutcome};
 use tutti::config::Config;
@@ -50,6 +53,24 @@ enum Command {
     },
     /// Attach the interactive TUI (alias for bare `tutti`).
     Attach,
+    /// Run a command in a fresh tab and print the new pane's id — the one
+    /// call an orchestrator makes: `p=$(tutti run -- claude "fix the tests")`.
+    Run {
+        /// The workspace to run in (default: the current one).
+        #[arg(long, conflicts_with = "dir")]
+        workspace: Option<u64>,
+        /// Run in the workspace open at this directory, mounting it if none is.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Run the command in a k8s sandbox from this config profile.
+        #[arg(long)]
+        sandbox: Option<String>,
+        /// Title the pane (default: the command's name).
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(last = true, required = true)]
+        cmd: Vec<String>,
+    },
     /// Run commands in k8s sandboxes (`[[sandboxes]]` in the config).
     Sandbox {
         #[command(subcommand)]
@@ -229,6 +250,21 @@ enum PaneAction {
     Focus {
         pane: u64,
     },
+    /// Block until each pane reaches a state (`done` unless `--until` says
+    /// otherwise), printing each one's; exits 124 on `--timeout`.
+    Wait {
+        #[arg(required = true)]
+        panes: Vec<u64>,
+        /// The states that end the wait, comma-separated or repeated.
+        #[arg(long, value_enum, value_delimiter = ',', default_value = "done")]
+        until: Vec<Until>,
+        /// Only a fresh transition counts, not the state a pane is already in.
+        #[arg(long)]
+        next: bool,
+        /// Give up after this many seconds, across all the panes.
+        #[arg(long)]
+        timeout: Option<f64>,
+    },
     /// List the pane's per-turn checkpoints, newest first.
     Checkpoints {
         pane: u64,
@@ -268,6 +304,31 @@ impl From<SplitDir> for Direction {
     }
 }
 
+/// A state `pane wait --until` names: `WaitFor`'s CLI face.
+#[derive(Clone, Copy, ValueEnum)]
+enum Until {
+    Working,
+    Blocked,
+    /// Finished, seen or not.
+    Done,
+    /// Finished and seen.
+    Idle,
+}
+
+impl From<Until> for WaitFor {
+    fn from(until: Until) -> WaitFor {
+        match until {
+            Until::Working => WaitFor::Working,
+            Until::Blocked => WaitFor::Blocked,
+            Until::Done => WaitFor::Done,
+            Until::Idle => WaitFor::Idle,
+        }
+    }
+}
+
+/// A wait's exit code when it timed out: coreutils `timeout`'s.
+const TIMED_OUT: i32 = 124;
+
 fn main() {
     match run(Cli::parse()) {
         Ok(code) => std::process::exit(code),
@@ -287,6 +348,15 @@ fn run(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Some(Command::AgentEvent { agent }) => run_agent_event(&cli.session, agent),
+        Some(Command::Pane {
+            action:
+                PaneAction::Wait {
+                    panes,
+                    until,
+                    next,
+                    timeout,
+                },
+        }) => run_wait(&cli.session, cli.json, &panes, &until, next, timeout),
         Some(Command::Sandbox {
             action: SandboxAction::Run { profile, cmd },
         }) => tutti::sandbox::run(Config::load()?.sandbox(&profile)?, &cmd),
@@ -496,6 +566,24 @@ fn to_request(command: Command) -> Result<Request> {
             },
             TabAction::Select { id } => Request::TabSelect { id: TabId(id) },
         }),
+        Command::Run {
+            workspace,
+            dir,
+            sandbox,
+            title,
+            cmd,
+        } => {
+            if let Some(name) = &sandbox {
+                Config::load()?.sandbox(name)?;
+            }
+            Ok(Request::Run {
+                workspace: workspace.map(WorkspaceId),
+                dir: dir.as_deref().map(absolutize),
+                cmd,
+                sandbox,
+                title,
+            })
+        }
         Command::Pane { action } => Ok(match action {
             PaneAction::Run {
                 tab,
@@ -551,6 +639,7 @@ fn to_request(command: Command) -> Result<Request> {
                 unwrapped,
             },
             PaneAction::Focus { pane } => Request::PaneFocus { pane: PaneId(pane) },
+            PaneAction::Wait { .. } => bail!("pane wait sends a request per pane"),
             PaneAction::Checkpoints { pane } => Request::PaneCheckpoints { pane: PaneId(pane) },
             PaneAction::CheckpointDiff { pane, n, stat } => Request::PaneCheckpointDiff {
                 pane: PaneId(pane),
@@ -569,6 +658,44 @@ fn to_request(command: Command) -> Result<Request> {
         | Command::AgentEvent { .. }
         | Command::Hooks { .. } => bail!("not a protocol request"),
     }
+}
+
+/// `pane wait`: wait on each pane in turn, one request apiece on one
+/// connection, all under one overall deadline, printing each answer. The first
+/// that is not a match decides the exit code: 124 timed out, 1 an error.
+fn run_wait(
+    session: &str,
+    json: bool,
+    panes: &[u64],
+    until: &[Until],
+    next: bool,
+    timeout: Option<f64>,
+) -> Result<i32> {
+    let timeout = timeout
+        .map(Duration::try_from_secs_f64)
+        .transpose()
+        .context("invalid --timeout")?;
+    // A deadline past what the clock can represent is no deadline.
+    let deadline = timeout.and_then(|t| Instant::now().checked_add(t));
+    let until: Vec<WaitFor> = until.iter().copied().map(WaitFor::from).collect();
+    let mut client = Client::connect_or_start(session)?;
+    for &pane in panes {
+        let timeout_ms = deadline.map(|d| {
+            let left = d.saturating_duration_since(Instant::now());
+            u64::try_from(left.as_millis()).unwrap_or(u64::MAX)
+        });
+        let response = client.request(&Request::PaneWait {
+            pane: PaneId(pane),
+            until: until.clone(),
+            next,
+            timeout_ms,
+        })?;
+        let code = emit(response, json);
+        if code != 0 {
+            return Ok(code);
+        }
+    }
+    Ok(0)
 }
 
 /// Forward one agent hook event (read as JSON on stdin) to the daemon. Built to
@@ -774,7 +901,18 @@ fn emit(response: Response, json: bool) -> i32 {
         } else {
             println!("{text}");
         }
-        return i32::from(is_error);
+        let timed_out = matches!(
+            response,
+            Response::Waited {
+                timed_out: true,
+                ..
+            }
+        );
+        return if timed_out {
+            TIMED_OUT
+        } else {
+            i32::from(is_error)
+        };
     }
     match response {
         Response::Error { message } => {
@@ -802,6 +940,29 @@ fn emit(response: Response, json: bool) -> i32 {
         }
         Response::PaneCreated { id } => {
             println!("pane {id} created");
+            0
+        }
+        Response::Waited {
+            pane,
+            timed_out: false,
+        } => {
+            println!("{}", render::state_label(pane.state));
+            0
+        }
+        Response::Waited {
+            pane,
+            timed_out: true,
+        } => {
+            eprintln!(
+                "timed out waiting for pane {} (state: {})",
+                pane.id,
+                render::state_label(pane.state)
+            );
+            TIMED_OUT
+        }
+        // Bare, so `p=$(tutti run -- claude)` captures it.
+        Response::Ran { pane, .. } => {
+            println!("{pane}");
             0
         }
         Response::Workspaces { workspaces } => {
@@ -1160,6 +1321,97 @@ mod tests {
         assert_eq!(
             request_of(&["tutti", "pane", "focus", "3"]),
             Request::PaneFocus { pane: PaneId(3) }
+        );
+    }
+
+    #[test]
+    fn pane_wait_parses_panes_states_and_flags() {
+        let wait = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Some(Command::Pane {
+                action:
+                    PaneAction::Wait {
+                        panes,
+                        until,
+                        next,
+                        timeout,
+                    },
+            }) => (
+                panes,
+                until.into_iter().map(WaitFor::from).collect::<Vec<_>>(),
+                next,
+                timeout,
+            ),
+            _ => panic!("expected pane wait"),
+        };
+        assert_eq!(
+            wait(&["tutti", "pane", "wait", "3"]),
+            (vec![3], vec![WaitFor::Done], false, None),
+            "done, level-triggered and unbounded by default"
+        );
+        assert_eq!(
+            wait(&[
+                "tutti",
+                "pane",
+                "wait",
+                "3",
+                "4",
+                "--until",
+                "blocked,done",
+                "--until",
+                "idle",
+                "--next",
+                "--timeout",
+                "1.5"
+            ]),
+            (
+                vec![3, 4],
+                vec![WaitFor::Blocked, WaitFor::Done, WaitFor::Idle],
+                true,
+                Some(1.5)
+            )
+        );
+        assert!(Cli::try_parse_from(["tutti", "pane", "wait"]).is_err());
+        assert!(
+            Cli::try_parse_from(["tutti", "pane", "wait", "3", "--until", "finished"]).is_err()
+        );
+    }
+
+    #[test]
+    fn run_parses_its_target_and_command() {
+        assert_eq!(
+            request_of(&["tutti", "run", "--title", "fixer", "--", "claude", "fix it"]),
+            Request::Run {
+                workspace: None,
+                dir: None,
+                cmd: vec!["claude".into(), "fix it".into()],
+                sandbox: None,
+                title: Some("fixer".into()),
+            }
+        );
+        assert_eq!(
+            request_of(&["tutti", "run", "--workspace", "2", "--", "sh"]),
+            Request::Run {
+                workspace: Some(WorkspaceId(2)),
+                dir: None,
+                cmd: vec!["sh".into()],
+                sandbox: None,
+                title: None,
+            }
+        );
+        let Request::Run { dir: Some(dir), .. } =
+            request_of(&["tutti", "run", "--dir", ".", "--", "sh"])
+        else {
+            panic!("expected a run with a dir");
+        };
+        assert!(dir.is_absolute(), "absolutized client-side: {dir:?}");
+        assert!(
+            Cli::try_parse_from(["tutti", "run", "--workspace", "2", "--dir", ".", "--", "sh"])
+                .is_err(),
+            "one target at most"
+        );
+        assert!(
+            Cli::try_parse_from(["tutti", "run"]).is_err(),
+            "a command is required"
         );
     }
 

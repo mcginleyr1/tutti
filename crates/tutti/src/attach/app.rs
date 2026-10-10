@@ -3824,6 +3824,29 @@ mod tests {
         assert_eq!(app.focused, None);
     }
 
+    /// A tab opened elsewhere — say an orchestrating agent's `tutti run` —
+    /// arrives as a plain `LayoutChanged` and never moves the view, even when
+    /// it flags the new tab current: the client keeps its own tab and focus.
+    #[test]
+    fn a_tab_opened_elsewhere_does_not_yank_the_view() {
+        let mut app = App::new();
+        attached(&mut app);
+        let mut view = view_one_pane();
+        view[0].tabs[0].active = false;
+        view[0]
+            .tabs
+            .push(tab(2, "2", true, leaf(2), vec![shell(2)]));
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Event::LayoutChanged { workspaces: view }).unwrap(),
+        ));
+        assert_eq!(app.active_tab, Some(TabId(1)));
+        assert_eq!(app.focused, Some(PaneId(1)));
+        assert!(
+            app.panes.contains_key(&PaneId(2)),
+            "the new pane is tracked"
+        );
+    }
+
     fn attach_with(app: &mut App, workspaces: Vec<WorkspaceView>) {
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {

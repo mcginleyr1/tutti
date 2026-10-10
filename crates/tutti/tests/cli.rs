@@ -307,6 +307,90 @@ fn pane_run_sandbox_sends_a_configured_profile_and_refuses_an_unknown_one() {
     let _ = std::fs::remove_dir_all(&config);
 }
 
+/// `pane wait` prints the state that ended the wait, and exits 124 — with a
+/// note on stderr — when the daemon answers that it timed out.
+#[test]
+fn pane_wait_prints_the_state_and_exits_124_on_a_timeout() {
+    use tutti_core::{PaneInfo, WaitFor};
+    let pane = |state: &str| -> PaneInfo {
+        serde_json::from_str(&format!(
+            r#"{{"id":3,"title":"claude","agent":"claude","state":"{state}","exited":null}}"#
+        ))
+        .unwrap()
+    };
+    let output = run_scenario(
+        "wait",
+        &["pane", "wait", "3", "--until", "blocked,done"],
+        |req| {
+            assert_eq!(
+                *req,
+                Request::PaneWait {
+                    pane: PaneId(3),
+                    until: vec![WaitFor::Blocked, WaitFor::Done],
+                    next: false,
+                    timeout_ms: None,
+                }
+            );
+        },
+        Response::Waited {
+            pane: pane("blocked"),
+            timed_out: false,
+        },
+    );
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "blocked\n");
+
+    let output = run_scenario(
+        "waitout",
+        &["pane", "wait", "3", "--timeout", "5"],
+        |req| {
+            assert!(
+                matches!(req, Request::PaneWait { timeout_ms: Some(ms), .. } if *ms <= 5000),
+                "the deadline rides along: {req:?}"
+            );
+        },
+        Response::Waited {
+            pane: pane("working"),
+            timed_out: true,
+        },
+    );
+    assert_eq!(output.status.code(), Some(124));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("timed out waiting for pane 3 (state: working)"),
+        "{stderr}"
+    );
+}
+
+/// `run` prints just the new pane's id, so `p=$(tutti run -- …)` captures it.
+#[test]
+fn run_prints_the_bare_pane_id() {
+    let output = run_scenario(
+        "run",
+        &["run", "--", "claude", "fix the tests"],
+        |req| {
+            assert_eq!(
+                *req,
+                Request::Run {
+                    workspace: None,
+                    dir: None,
+                    cmd: vec!["claude".into(), "fix the tests".into()],
+                    sandbox: None,
+                    title: None,
+                }
+            );
+        },
+        Response::Ran {
+            workspace: WorkspaceId(1),
+            tab: tutti_core::TabId(2),
+            pane: PaneId(7),
+        },
+    );
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "7\n");
+}
+
 #[test]
 fn workspace_list_json_round_trips() {
     let expected = Response::Workspaces {
