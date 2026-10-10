@@ -5,8 +5,9 @@ multiple terminal agents (Claude Code, Codex, Cursor CLI, OpenCode, etc.) in per
 panes, understands each agent's state (blocked / working / done / idle), and exposes a
 CLI + socket API so both humans and agents can drive it.
 
-**Out of scope for now (deliberate):** remote/SSH/mobile clients, and a plugin
-system (we'll design a better one later — do not build extension points
+**Out of scope for now (deliberate):** remote/SSH/mobile clients (remote
+*agents* are in: Phase 4 item 10 launches them into Kubernetes sandboxes, with
+the pty still local), and a plugin system (we'll design a better one later — do not build extension points
 speculatively, but keep module boundaries clean so a plugin layer can be added
 without a rewrite). Theming was on this list until 2026-09-01: the default still
 inherits the terminal's palette live, and `theme = "dark" | "light"` are opt-in
@@ -18,7 +19,9 @@ Colour; the design rules live in CLAUDE.md).
 
 ## Architecture
 
-Client/server split, all local:
+Client/server split, all local: the daemon, the client, and every pane's pty.
+Only a sandbox pane's agent runs elsewhere, in a pod its pty `kubectl exec`s
+into.
 
 - **`tutti-server`** — a background daemon that owns all PTYs and state. Panes keep
   running when no client is attached. One server per named session (default session:
@@ -38,7 +41,8 @@ Client/server split, all local:
 Session (named; isolated server instance + socket)
 └── Workspace (one per repo/task; has a working directory)
     └── Tab (a layout of panes: agents / logs / servers ...)
-        └── Pane (one persistent PTY; may host a detected Agent)
+        └── Pane (one persistent PTY; may host an Agent — detected, or
+                  declared when it runs in a sandbox)
 ```
 
 Agent state machine per pane: `Unknown → Working ⇄ Blocked`, `Working → Done`,
@@ -74,6 +78,9 @@ trust versions from memory):
 - `clap` — CLI.
 - `sysinfo` or direct `/proc` + `libproc` — foreground process detection for agent
   identification.
+- `kubectl` — an external tool, not a crate: sandbox panes drive agent-sandbox
+  through the user's own `kubectl`, so kubeconfig contexts and auth plugins
+  (GKE's) just work. No Kubernetes client crate.
 
 ---
 
@@ -172,7 +179,9 @@ Goal: the differentiator. Tutti knows which panes are agents and what state they
 1. **Detection**: identify the foreground process of each pane's PTY (process tree
    walk). Match against a registry in `tutti-agents`: claude, codex, cursor-agent,
    opencode, amp, copilot, etc. Registry is data-driven (a table of process names +
-   heuristics), so adding an agent is a one-line change.
+   heuristics), so adding an agent is a one-line change. Sandbox panes skip the
+   walk (it only ever finds `tutti` and `kubectl`); their kind is declared from
+   the command at spawn.
 2. **State classification** per pane, using layered signals (most→least reliable):
    - agent-specific integrations (e.g. Claude Code hooks writing to a tutti-known
      location, or parsing its status line)
@@ -292,8 +301,10 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    checkpoints | checkpoint-diff [N] [--stat] | restore <N> [--force]` and the
    changes panel's `turns` section (enter = turn diff, `r` = confirmed
    restore). Restores are refused mid-turn and when stale, and save the replaced
-   state first as `before restore`. Open: persist the lists (they are just
-   commit ids), and label turns from hook payloads.
+   state first as `before restore`. Sandbox panes record none: their agent
+   edits the pod's checkout, and a checkpoint of the local one would offer to
+   undo someone else's work. Open: persist the lists (they are just commit
+   ids), and label turns from hook payloads.
 9. **Answer from the queue**: ✅ `p` (or a right-click) on a blocked sidebar row
    opens a peek overlay of that agent's live prompt; answer keys go out as a
    guarded `PaneSend` whose `expect` is the prompt fingerprint (FNV-1a over the
@@ -306,6 +317,24 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    queue), a table-driven sidebar keymap (only prefix keys are table-driven
    today), and correlating responses so a refused answer can't cancel a pending
    fork/merge follow-up.
+10. **Kubernetes sandboxes**: ✅ `[[sandboxes]]` client-config profiles name
+   an agent-sandbox target, either a `SandboxClaim` on a warm pool or a
+   `Sandbox` from an image. `PaneRun { sandbox }` (CLI `pane run --sandbox`,
+   TUI launcher `tab`) runs the command through `tutti sandbox run`, which
+   provisions through the user's `kubectl`, waits for Ready, and `kubectl exec
+   -it`s the agent. The pty stays local, so classification, OSC reports and
+   guarded answers are unchanged. The agent kind is declared from the command
+   (detection skips sandbox panes) and sandbox panes record no turns. Cleanup
+   is a death-pipe watchdog in its own process group, since tutti SIGKILLs a
+   killed pane's whole group, backed by a renewed `shutdownTime` TTL. The
+   sandbox owns the code: the image or template clones it (`TUTTI_GIT_REMOTE`
+   for image sandboxes) and the agent pushes. Verified against agent-sandbox
+   v1.0.2 on a local cluster (OrbStack): exit, pane kill, `server stop` and
+   ctrl-c mid-provisioning each delete the sandbox. Open: hook signals from the
+   pod (an agent's hook could report over OSC 7501, which already rides the
+   pty); `TUTTI_GIT_REMOTE` for claims whose template sets
+   `envVarsInjectionPolicy: Allowed` (the default rejects claim env); and
+   pulling a sandbox's pushed branch into a local workspace for diff/merge.
 
 **Acceptance:** a script (or an agent) can: create 3 worktree workspaces, launch an
 agent in each, `wait --until done` on all three, read back each diff summary.
@@ -352,7 +381,9 @@ turn-end probe racing a restore.
   crashes never harm the server.
 - Perf targets: 60fps redraw with 8 busy panes; `pane read` on 10k-line scrollback
   < 50ms; input latency indistinguishable from raw terminal.
-- Test matrix: macOS + Linux; kitty/alacritty/wezterm/iTerm2/Terminal.app/ghostty.
+- Test matrix: macOS + Linux; kitty/alacritty/wezterm/iTerm2/Terminal.app/ghostty;
+  sandbox panes against a local cluster running agent-sandbox (unit tests cover
+  the manifests, the cluster run covers the cleanup paths).
 - Packaging: `cargo install tutti`, Homebrew tap, curl installer. Windows deferred.
 
 ---

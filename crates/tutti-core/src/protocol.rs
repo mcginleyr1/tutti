@@ -10,7 +10,7 @@ use crate::state::{AgentState, StateSource};
 /// Response / Event shapes (including additive fields): the daemon reports it
 /// on attach and mismatched clients tell the user to restart the daemon —
 /// binaries upgrade on install, running daemons do not.
-pub const WIRE_REV: u32 = 4;
+pub const WIRE_REV: u32 = 5;
 
 /// The revset every workspace-delta surface diffs against: the fork point of
 /// the trunk bookmark (local `main`, else `master`, else `trunk`; `root()` when
@@ -84,6 +84,13 @@ pub enum Request {
         /// the jj diff pane.
         #[serde(default)]
         ephemeral: bool,
+        /// Run `cmd` in a k8s sandbox from this client-config profile instead
+        /// of locally: the pane runs `tutti sandbox run <profile> -- <cmd>`,
+        /// which provisions the sandbox and `kubectl exec`s `cmd` in it. The
+        /// pane declares the agent `cmd` names, since its local process tree
+        /// only ever shows `tutti` and `kubectl`.
+        #[serde(default)]
+        sandbox: Option<String>,
     },
     PaneSplit {
         pane: PaneId,
@@ -260,6 +267,10 @@ pub struct PaneInfo {
     /// has, and after a claim ends. Defaults `None` for older servers.
     #[serde(default)]
     pub source: Option<StateSource>,
+    /// The sandbox profile the pane runs in (`PaneRun::sandbox`); `None` for a
+    /// local pane and from older servers.
+    #[serde(default)]
+    pub sandbox: Option<String>,
 }
 
 /// One agent turn's checkpoint: the commit id of the workspace's `@` right
@@ -471,11 +482,19 @@ mod tests {
             tab: Some(TabId(3)),
             cmd: vec!["claude".into(), "--dangerously".into()],
             ephemeral: false,
+            sandbox: None,
         });
         roundtrip(&Request::PaneRun {
             tab: None,
             cmd: vec!["sh".into()],
             ephemeral: true,
+            sandbox: None,
+        });
+        roundtrip(&Request::PaneRun {
+            tab: None,
+            cmd: vec!["claude".into()],
+            ephemeral: false,
+            sandbox: Some("gke".into()),
         });
         roundtrip(&Request::WorkspaceDiff {
             id: WorkspaceId(2),
@@ -647,6 +666,7 @@ mod tests {
                     subagents: Vec::new(),
                     checkpoints: vec![sample_checkpoint()],
                     source: None,
+                    sandbox: None,
                 }],
             }],
         }]
@@ -673,6 +693,7 @@ mod tests {
                 }],
                 checkpoints: Vec::new(),
                 source: Some(StateSource::Hook),
+                sandbox: Some("gke".into()),
             }],
         });
         roundtrip(&Response::Panes {
@@ -685,6 +706,7 @@ mod tests {
                 subagents: Vec::new(),
                 checkpoints: Vec::new(),
                 source: Some(StateSource::Program),
+                sandbox: None,
             }],
         });
         roundtrip(&Response::Checkpoints {
@@ -781,7 +803,8 @@ mod tests {
 
     #[test]
     fn additive_fields_default_when_omitted() {
-        // `pane_run` from before `ephemeral` existed still parses (non-ephemeral).
+        // `pane_run` from before `ephemeral`/`sandbox` existed still parses
+        // (non-ephemeral, local).
         let run: Request =
             serde_json::from_str(r#"{"type":"pane_run","tab":null,"cmd":["sh"]}"#).unwrap();
         assert_eq!(
@@ -790,6 +813,7 @@ mod tests {
                 tab: None,
                 cmd: vec!["sh".into()],
                 ephemeral: false,
+                sandbox: None,
             }
         );
         // `workspace_diff` without `stat` defaults to the full diff.
@@ -823,6 +847,7 @@ mod tests {
         .unwrap();
         assert!(pane.subagents.is_empty());
         assert_eq!(pane.source, None);
+        assert_eq!(pane.sandbox, None, "and before `sandbox`, a local pane");
         // ...and before `checkpoints` existed, to no checkpoints.
         assert!(pane.checkpoints.is_empty());
         // `pane_checkpoint_diff` without `n`/`stat` is the newest turn's full

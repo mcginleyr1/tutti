@@ -50,6 +50,11 @@ enum Command {
     },
     /// Attach the interactive TUI (alias for bare `tutti`).
     Attach,
+    /// Run commands in k8s sandboxes (`[[sandboxes]]` in the config).
+    Sandbox {
+        #[command(subcommand)]
+        action: SandboxAction,
+    },
     /// Forward an agent's hook event to tutti (reads its JSON on stdin): a
     /// Claude Code hook payload, or an opencode event from tutti's plugin.
     /// Wired up by `tutti hooks <agent>`; a silent no-op outside a tutti pane.
@@ -83,6 +88,18 @@ enum Command {
 enum HookAgent {
     Claude,
     Opencode,
+}
+
+#[derive(Subcommand)]
+enum SandboxAction {
+    /// Provision a sandbox from the profile, `kubectl exec -it` the command
+    /// in it, and delete the sandbox when the command exits — what a `pane run
+    /// --sandbox` pane runs.
+    Run {
+        profile: String,
+        #[arg(last = true, required = true)]
+        cmd: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -165,6 +182,9 @@ enum PaneAction {
         /// Remove the pane entirely when its command exits (no exited row).
         #[arg(long)]
         ephemeral: bool,
+        /// Run the command in a k8s sandbox from this config profile.
+        #[arg(long)]
+        sandbox: Option<String>,
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
     },
@@ -267,6 +287,9 @@ fn run(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Some(Command::AgentEvent { agent }) => run_agent_event(&cli.session, agent),
+        Some(Command::Sandbox {
+            action: SandboxAction::Run { profile, cmd },
+        }) => tutti::sandbox::run(Config::load()?.sandbox(&profile)?, &cmd),
         Some(Command::Hooks {
             agent,
             raw,
@@ -393,6 +416,7 @@ fn mount_projects(
             tab: None,
             cmd: vec![shell.to_string()],
             ephemeral: false,
+            sandbox: None,
         })? {
             Response::PaneCreated { .. } | Response::Ok => {}
             Response::Error { message } => notices.push(format!("{}: {message}", dir.display())),
@@ -476,12 +500,20 @@ fn to_request(command: Command) -> Result<Request> {
             PaneAction::Run {
                 tab,
                 ephemeral,
+                sandbox,
                 cmd,
-            } => Request::PaneRun {
-                tab: tab.map(TabId),
-                cmd,
-                ephemeral,
-            },
+            } => {
+                // Fail here, not in a pane that dies on arrival.
+                if let Some(name) = &sandbox {
+                    Config::load()?.sandbox(name)?;
+                }
+                Request::PaneRun {
+                    tab: tab.map(TabId),
+                    cmd,
+                    ephemeral,
+                    sandbox,
+                }
+            }
             PaneAction::Split { pane, direction } => Request::PaneSplit {
                 pane: PaneId(pane),
                 direction: direction.into(),
@@ -533,6 +565,7 @@ fn to_request(command: Command) -> Result<Request> {
         }),
         Command::Server { .. }
         | Command::Attach
+        | Command::Sandbox { .. }
         | Command::AgentEvent { .. }
         | Command::Hooks { .. } => bail!("not a protocol request"),
     }
@@ -947,6 +980,7 @@ mod tests {
                 tab: Some(TabId(3)),
                 cmd: vec!["claude".to_string(), "--flag".to_string()],
                 ephemeral: false,
+                sandbox: None,
             }
         );
     }
@@ -960,6 +994,7 @@ mod tests {
                 tab: None,
                 cmd: vec!["ls".into()],
                 ephemeral: false,
+                sandbox: None,
             }
         );
     }
@@ -972,6 +1007,7 @@ mod tests {
                 tab: None,
                 cmd: vec!["less".into()],
                 ephemeral: true,
+                sandbox: None,
             }
         );
     }
@@ -1331,6 +1367,7 @@ mod tests {
                     tab: None,
                     cmd: vec!["/bin/zsh".into()],
                     ephemeral: false,
+                    sandbox: None,
                 },
                 Request::WorkspaceNew {
                     dir: PathBuf::from("/b")
@@ -1339,6 +1376,7 @@ mod tests {
                     tab: None,
                     cmd: vec!["/bin/zsh".into()],
                     ephemeral: false,
+                    sandbox: None,
                 },
             ],
         );
@@ -1374,6 +1412,7 @@ mod tests {
                     tab: None,
                     cmd: vec!["/bin/zsh".into()],
                     ephemeral: false,
+                    sandbox: None,
                 },
             ],
             "only the not-yet-mounted /b is created",

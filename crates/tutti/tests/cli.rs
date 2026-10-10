@@ -216,6 +216,63 @@ fn hooks_opencode_install_writes_backs_up_and_refuses_foreign_files() {
     let _ = std::fs::remove_dir_all(&config);
 }
 
+/// `pane run --sandbox <profile>` sends the profile with the command; a
+/// profile the config does not name fails before anything reaches a daemon,
+/// as does `sandbox run` with one.
+#[test]
+fn pane_run_sandbox_sends_a_configured_profile_and_refuses_an_unknown_one() {
+    let config = unique_base("sbcfg");
+    std::fs::create_dir_all(config.join("tutti")).unwrap();
+    std::fs::write(
+        config.join("tutti/config.toml"),
+        "[[sandboxes]]\nname = \"orb\"\nimage = \"i\"\n",
+    )
+    .unwrap();
+    let xdg = config.to_str().unwrap().to_string();
+    let output = run_scenario_with(
+        "sbrun",
+        &["pane", "run", "--sandbox", "orb", "--", "claude"],
+        &[("XDG_CONFIG_HOME", &xdg)],
+        "",
+        |req| {
+            assert_eq!(
+                *req,
+                Request::PaneRun {
+                    tab: None,
+                    cmd: vec!["claude".into()],
+                    ephemeral: false,
+                    sandbox: Some("orb".into()),
+                }
+            );
+        },
+        Response::PaneCreated { id: PaneId(9) },
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for args in [
+        &["pane", "run", "--sandbox", "gke", "--", "claude"][..],
+        &["sandbox", "run", "gke", "--", "claude"][..],
+    ] {
+        let refused = Command::new(env!("CARGO_BIN_EXE_tutti"))
+            .args(args)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_RUNTIME_DIR", unique_base("sbnone"))
+            .output()
+            .unwrap();
+        assert_eq!(refused.status.code(), Some(1), "{args:?}");
+        let stderr = String::from_utf8(refused.stderr).unwrap();
+        assert!(
+            stderr.contains("no sandbox profile \"gke\"") && stderr.contains("configured: orb"),
+            "{args:?}: {stderr}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&config);
+}
+
 #[test]
 fn workspace_list_json_round_trips() {
     let expected = Response::Workspaces {

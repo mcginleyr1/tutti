@@ -320,22 +320,32 @@ impl Session {
 
     /// Spawn `cmd` in `tab` (or the current tab when `None`), placing the
     /// new pane in the tab's layout and focusing it. An `ephemeral` pane is torn
-    /// down entirely when its child exits.
+    /// down entirely when its child exits. With a `sandbox` profile the pane
+    /// runs `cmd` through `tutti sandbox run <profile> --`, titled for `cmd`.
     pub fn pane_run(
         &mut self,
         tab: Option<TabId>,
         cmd: Vec<String>,
         ephemeral: bool,
+        sandbox: Option<String>,
     ) -> Result<PaneId> {
         let tab = self.resolve_tab(tab)?;
-        let (program, args) = cmd.split_first().context("empty command")?;
+        let title = pane_title(cmd.first().context("empty command")?);
+        let argv = match &sandbox {
+            Some(profile) => sandbox_argv(&client_exe()?, profile, cmd),
+            None => cmd,
+        };
+        let (program, args) = argv.split_first().context("empty command")?;
         let dir = self.tab_workspace_dir(tab)?;
         let mut spec = PtySpec::new(program);
         spec.args = args.to_vec();
         spec.cwd = Some(dir);
         spec.env = vec![("TERM".into(), "xterm-256color".into())];
-        let title = pane_title(program);
-        self.spawn_into_tab(tab, spec, title, None, ephemeral)
+        let id = self.spawn_into_tab(tab, spec, title, None, ephemeral)?;
+        if let Some(slot) = self.panes.get_mut(&id) {
+            slot.meta.sandbox = sandbox;
+        }
+        Ok(id)
     }
 
     /// Split `pane`'s cell in its tab, spawning a login shell in the new half.
@@ -530,6 +540,17 @@ impl Session {
             .collect()
     }
 
+    /// The live panes whose agent detection finds by walking their local
+    /// process tree: all but sandbox panes, whose agent runs in a pod — their
+    /// tree only ever holds `tutti` and `kubectl` — and was declared at spawn.
+    pub fn detectable_panes(&self) -> Vec<(PaneId, Arc<PtyPane>)> {
+        self.panes
+            .iter()
+            .filter(|(_, s)| s.meta.exited.is_none() && s.meta.sandbox.is_none())
+            .map(|(id, s)| (*id, Arc::clone(&s.pty)))
+            .collect()
+    }
+
     /// Live panes the classify pass tends, with their detected kind and pty:
     /// detected agents (classified from their screen) plus any pane holding a
     /// program/progress claim (for the stall timer). A hook-driven pane is
@@ -614,7 +635,7 @@ impl Session {
     pub fn set_agent(&mut self, pane: PaneId, agent: Option<AgentKind>) -> bool {
         match self.panes.get_mut(&pane) {
             Some(slot) if slot.meta.agent != agent => {
-                if agent.is_some() {
+                if agent.is_some() && slot.meta.sandbox.is_none() {
                     slot.turns.note_start();
                 }
                 slot.meta.agent = agent;
@@ -630,8 +651,12 @@ impl Session {
 
     /// Note a pane's state transition on its checkpoint list (see
     /// `Turns::note_transition`); its workspace's next change probe records it.
+    /// A sandbox pane notes nothing: its agent edits the pod's checkout, and a
+    /// checkpoint of the local one would offer to "undo" someone else's work.
     pub fn note_transition(&mut self, pane: PaneId, from: AgentState, to: AgentState) {
-        if let Some(slot) = self.panes.get_mut(&pane) {
+        if let Some(slot) = self.panes.get_mut(&pane)
+            && slot.meta.sandbox.is_none()
+        {
             slot.turns.note_transition(from, to);
         }
     }
@@ -947,6 +972,7 @@ impl Session {
                     subagents: Vec::new(),
                     checkpoints: Vec::new(),
                     source: None,
+                    sandbox: None,
                 },
                 pty,
                 tab,
@@ -1018,6 +1044,29 @@ fn pane_title(program: &str) -> String {
         .unwrap_or_else(|| program.to_string())
 }
 
+/// The `tutti` client binary a sandbox pane runs: the daemon's sibling (the
+/// client starts the daemon from its own directory), else `tutti` on PATH.
+fn client_exe() -> Result<String> {
+    let sibling = std::env::current_exe()
+        .context("locating tutti-server")?
+        .with_file_name("tutti");
+    Ok(if sibling.is_file() {
+        sibling.to_string_lossy().into_owned()
+    } else {
+        "tutti".into()
+    })
+}
+
+/// The argv running `cmd` in sandbox `profile`: `<exe> sandbox run <profile>
+/// -- <cmd…>`.
+fn sandbox_argv(exe: &str, profile: &str, cmd: Vec<String>) -> Vec<String> {
+    [exe, "sandbox", "run", profile, "--"]
+        .into_iter()
+        .map(String::from)
+        .chain(cmd)
+        .collect()
+}
+
 /// The current git branch of `dir`, read straight from `.git/HEAD` — no
 /// subprocess. Handles `.git` as a directory and as a worktree/submodule file
 /// (`gitdir: <path>`). Returns `None` when `dir` is not a checkout or HEAD is
@@ -1057,7 +1106,7 @@ fn parse_head(contents: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{STALL_AFTER, Session, git_branch, parse_head, stop_subagent};
+    use super::{STALL_AFTER, Session, git_branch, parse_head, sandbox_argv, stop_subagent};
     use crate::pty::{PaneSize, StatusReport};
     use AgentState::{Blocked, Done, Idle, Unknown, Working};
     use StateSource::{Hook, Program, Progress, Screen};
@@ -1075,7 +1124,7 @@ mod tests {
         let mut session = Session::new(PaneSize::new(24, 80), "test");
         session.workspace_new(tmp.path().to_path_buf());
         let pane = session
-            .pane_run(None, vec!["/bin/sleep".into(), "30".into()], false)
+            .pane_run(None, vec!["/bin/sleep".into(), "30".into()], false, None)
             .unwrap();
         (session, pane, tmp)
     }
@@ -1319,6 +1368,41 @@ mod tests {
     fn stop_subagent_with_nothing_running_is_a_noop() {
         let mut subs = vec![sub("a", false)];
         assert!(!stop_subagent(&mut subs, "a"));
+    }
+
+    #[test]
+    fn a_sandbox_pane_runs_its_command_through_the_wrapper() {
+        assert_eq!(
+            sandbox_argv("/bin/tutti", "gke", vec!["claude".into(), "-c".into()]),
+            ["/bin/tutti", "sandbox", "run", "gke", "--", "claude", "-c"]
+        );
+    }
+
+    #[test]
+    fn detection_skips_sandbox_panes_but_the_tick_still_drains_them() {
+        let (mut session, pane, _tmp) = session_with_pane();
+        session.panes.get_mut(&pane).unwrap().meta.sandbox = Some("gke".into());
+        assert!(
+            session.detectable_panes().is_empty(),
+            "a sandbox pane's agent was declared; its local tree is only kubectl"
+        );
+        assert_eq!(
+            session.live_panes().len(),
+            1,
+            "notifications and status reports still flow from its pty"
+        );
+        assert!(session.set_agent(pane, Some("claude".into())));
+        assert_eq!(
+            session.pane_list()[0].sandbox.as_deref(),
+            Some("gke"),
+            "the profile rides the pane's info"
+        );
+        session.note_transition(pane, Working, Done);
+        let workspace = session.workspace_of_pane(pane).unwrap();
+        assert!(
+            session.take_turns(workspace).is_empty(),
+            "no checkpoints: the agent edits the pod's checkout, not this one"
+        );
     }
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);

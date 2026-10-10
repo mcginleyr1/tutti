@@ -205,6 +205,12 @@ pub struct App {
     /// so the choice's destination is never ambiguous. `None` renders a bare
     /// ` run ` title.
     launcher_target: Option<String>,
+    /// The open launcher's directory, kept so switching where it runs can
+    /// rebuild the local rows (and their resume rows).
+    launcher_dir: Option<PathBuf>,
+    /// Where the open launcher runs its pick: `None` locally, else the index
+    /// of a configured sandbox profile. `Tab` cycles it.
+    launcher_sandbox: Option<usize>,
     /// The root the resume harvest reads the agent tools' session stores under
     /// — the real home directory, pointed at a fixture tree in tests.
     resume_home: Option<PathBuf>,
@@ -305,6 +311,8 @@ impl App {
             launcher_new_tab: None,
             launcher_replace: None,
             launcher_target: None,
+            launcher_dir: None,
+            launcher_sandbox: None,
             resume_home: std::env::var_os("HOME").map(PathBuf::from),
             sidebar_rect: None,
             diff_panel_rect: None,
@@ -1466,6 +1474,7 @@ impl App {
             tab: Some(tab),
             cmd: diff_pager_cmd(None),
             ephemeral: true,
+            sandbox: None,
         })]
     }
 
@@ -1549,6 +1558,7 @@ impl App {
                     tab: Some(tab),
                     cmd: diff_pager_cmd(None),
                     ephemeral: true,
+                    sandbox: None,
                 })];
             }
             KeyCode::Char('l') => {
@@ -1585,6 +1595,7 @@ impl App {
             tab: Some(tab),
             cmd: diff_pager_cmd(Some(&path)),
             ephemeral: true,
+            sandbox: None,
         })]
     }
 
@@ -1605,6 +1616,7 @@ impl App {
             tab: Some(tab),
             cmd: turn_pager_cmd(from, &turn.commit),
             ephemeral: true,
+            sandbox: None,
         })]
     }
 
@@ -1697,6 +1709,13 @@ impl App {
         };
         self.open_launcher(false, Some(name), Some(&dir));
         self.launcher_replace = Some(pane);
+        // A sandbox corpse relaunches where it ran.
+        let profile = self.panes.get(&pane).and_then(|p| p.info.sandbox.clone());
+        self.launcher_sandbox =
+            profile.and_then(|name| self.config.sandboxes.iter().position(|p| p.name == name));
+        if self.launcher_sandbox.is_some() {
+            self.rebuild_launcher();
+        }
         Vec::new()
     }
 
@@ -2081,19 +2100,9 @@ impl App {
     /// `dir` is its directory — when known, conversations harvested from the
     /// agent tools' own session stores append as resume rows at the foot.
     fn open_launcher(&mut self, after_add: bool, target: Option<String>, dir: Option<&Path>) {
-        self.launcher =
-            launcher::build_rows(&Registry::default(), std::env::var_os("PATH").as_deref());
-        if let (Some(dir), Some(home)) = (dir, self.resume_home.as_deref()) {
-            let stores = tutti_agents::Stores::from_env(home);
-            let sessions = tutti_agents::resume_sessions(dir, &stores, 3);
-            let resume =
-                launcher::resume_rows(&sessions, &self.launcher, std::time::SystemTime::now());
-            // Resume rows sit between the fixed rows and the dim uninstalled
-            // catalog, so the actionable part of the picker stays together.
-            let at = launcher::catalog_start(&self.launcher);
-            self.launcher.splice(at..at, resume);
-        }
-        self.launcher_selected = launcher::first_selectable(&self.launcher);
+        self.launcher_dir = dir.map(Path::to_path_buf);
+        self.launcher_sandbox = None;
+        self.rebuild_launcher();
         self.launcher_after_add = after_add;
         self.launcher_command.clear();
         self.launcher_new_tab = None;
@@ -2102,6 +2111,50 @@ impl App {
         self.mode = Mode::Launcher;
         self.prefix_since = None;
         self.status = None;
+    }
+
+    /// Build the rows for where the launcher runs its pick. Locally: the
+    /// agents found on PATH, with resume rows for the directory. In a sandbox:
+    /// the whole catalog, since what an image carries can't be probed from
+    /// here, and no resume rows — those conversations live on this machine.
+    fn rebuild_launcher(&mut self) {
+        let registry = Registry::default();
+        self.launcher = match self.launcher_sandbox {
+            Some(_) => launcher::sandbox_rows(&registry),
+            None => {
+                let mut rows = launcher::build_rows(&registry, std::env::var_os("PATH").as_deref());
+                if let (Some(dir), Some(home)) = (&self.launcher_dir, self.resume_home.as_deref()) {
+                    let stores = tutti_agents::Stores::from_env(home);
+                    let sessions = tutti_agents::resume_sessions(dir, &stores, 3);
+                    let resume =
+                        launcher::resume_rows(&sessions, &rows, std::time::SystemTime::now());
+                    // Resume rows sit between the fixed rows and the dim
+                    // uninstalled catalog, so the actionable part of the picker
+                    // stays together.
+                    let at = launcher::catalog_start(&rows);
+                    rows.splice(at..at, resume);
+                }
+                rows
+            }
+        };
+        self.launcher_selected = launcher::first_selectable(&self.launcher);
+    }
+
+    /// The sandbox profile the open launcher runs its pick in, if any.
+    fn launcher_profile(&self) -> Option<&str> {
+        self.launcher_sandbox
+            .and_then(|i| self.config.sandboxes.get(i))
+            .map(|p| p.name.as_str())
+    }
+
+    /// What `Tab` in the launcher switches to — `sandbox <name>` or `local` —
+    /// for its hint row; `None` when no sandbox is configured.
+    pub fn launcher_tab_hint(&self) -> Option<String> {
+        let next = self.launcher_sandbox.map_or(0, |i| i + 1);
+        (!self.config.sandboxes.is_empty()).then(|| match self.config.sandboxes.get(next) {
+            Some(profile) => format!("sandbox {}", profile.name),
+            None => "local".into(),
+        })
     }
 
     /// The launcher rows as they currently render, for the renderer.
@@ -2121,11 +2174,15 @@ impl App {
 
     /// The launcher panel title, naming the workspace the choice will run in so
     /// the target is never ambiguous — ` run in <name> `, or a bare ` run ` when
-    /// the target is unknown.
+    /// the target is unknown — and the sandbox, when it runs in one.
     pub fn launcher_title(&self) -> String {
-        match &self.launcher_target {
-            Some(name) => format!(" run in {name} "),
-            None => " run ".into(),
+        let place = match &self.launcher_target {
+            Some(name) => format!(" run in {name}"),
+            None => " run".into(),
+        };
+        match self.launcher_profile() {
+            Some(profile) => format!("{place} · sandbox {profile} "),
+            None => format!("{place} "),
         }
     }
 
@@ -2144,8 +2201,17 @@ impl App {
             // Quick-select launches the numbered row outright.
             KeyCode::Char(c @ '1'..='9') => self.launch_index(c as usize - '1' as usize),
             KeyCode::Enter => self.launch_index(self.launcher_selected),
+            // Where the pick runs: local, then each sandbox profile, round.
+            KeyCode::Tab if !self.config.sandboxes.is_empty() => {
+                let next = self.launcher_sandbox.map_or(0, |i| i + 1);
+                self.launcher_sandbox = (next < self.config.sandboxes.len()).then_some(next);
+                self.rebuild_launcher();
+                Vec::new()
+            }
             KeyCode::Esc => {
                 if self.launcher_after_add {
+                    // Backing out keeps today's outcome: a local shell.
+                    self.launcher_sandbox = None;
                     self.launch_shell_and_close()
                 } else {
                     self.close_launcher();
@@ -2176,7 +2242,16 @@ impl App {
     }
 
     fn launch_shell_and_close(&mut self) -> Vec<WireFrame> {
-        self.launch_frames(vec![launcher::login_shell()])
+        self.launch_frames(vec![self.launcher_shell()])
+    }
+
+    /// The shell the launcher's shell and command rows run: the login shell
+    /// locally, `sh` in a sandbox — the one shell every image carries.
+    fn launcher_shell(&self) -> String {
+        match self.launcher_sandbox {
+            Some(_) => "sh".into(),
+            None => launcher::login_shell(),
+        }
     }
 
     /// Close the launcher and produce the frames that start `cmd` where it was
@@ -2188,13 +2263,14 @@ impl App {
     fn launch_frames(&mut self, cmd: Vec<String>) -> Vec<WireFrame> {
         let new_tab = self.launcher_new_tab.take();
         let replace = self.launcher_replace.take();
+        let sandbox = self.launcher_profile().map(String::from);
         self.close_launcher();
         if let Some(workspace) = new_tab {
             return vec![
                 control(&Request::TabNew {
                     workspace: Some(workspace),
                 }),
-                run_pane(cmd),
+                run_pane(cmd, sandbox),
             ];
         }
         if let Some(corpse) = replace
@@ -2205,11 +2281,12 @@ impl App {
                     tab: Some(tab),
                     cmd,
                     ephemeral: false,
+                    sandbox,
                 }),
                 control(&Request::PaneKill { pane: corpse }),
             ];
         }
-        vec![run_pane(cmd)]
+        vec![run_pane(cmd, sandbox)]
     }
 
     /// Dismiss the launcher back to terminal mode, dropping its transient state.
@@ -2221,6 +2298,8 @@ impl App {
         self.launcher_new_tab = None;
         self.launcher_replace = None;
         self.launcher_target = None;
+        self.launcher_dir = None;
+        self.launcher_sandbox = None;
         self.status = None;
     }
 
@@ -2249,7 +2328,7 @@ impl App {
                 if input.is_empty() {
                     return Vec::new();
                 }
-                self.launch_frames(vec![launcher::login_shell(), "-lc".into(), input])
+                self.launch_frames(vec![self.launcher_shell(), "-lc".into(), input])
             }
             _ => Vec::new(),
         }
@@ -3027,12 +3106,14 @@ fn workspace_name_from_dir(dir: &Path) -> Option<String> {
 }
 
 /// A `PaneRun` into the session's current tab (the just-created workspace after
-/// add-project, or the active tab for prefix-`r`), spawning a persistent pane.
-fn run_pane(cmd: Vec<String>) -> WireFrame {
+/// add-project, or the active tab for prefix-`r`), spawning a persistent pane —
+/// in `sandbox` when the launcher was switched to one.
+fn run_pane(cmd: Vec<String>, sandbox: Option<String>) -> WireFrame {
     control(&Request::PaneRun {
         tab: None,
         cmd,
         ephemeral: false,
+        sandbox,
     })
 }
 
@@ -3395,6 +3476,7 @@ fn placeholder_info(pane: PaneId) -> PaneInfo {
         subagents: Vec::new(),
         checkpoints: Vec::new(),
         source: None,
+        sandbox: None,
     }
 }
 
@@ -4545,6 +4627,7 @@ mod tests {
                     tab: None,
                     cmd: vec!["claude".into()],
                     ephemeral: false,
+                    sandbox: None,
                 }),
             ],
             "the run follows a TabNew on the same ordered connection, so it \
@@ -4579,6 +4662,7 @@ mod tests {
                 tab: None,
                 cmd: vec!["claude".into()],
                 ephemeral: false,
+                sandbox: None,
             })],
             "esc dropped the armed TabNew; C-b r still runs in place"
         );
@@ -4611,6 +4695,7 @@ mod tests {
                 tab: Some(TabId(1)),
                 cmd: diff_pager_cmd(None),
                 ephemeral: true,
+                sandbox: None,
             })],
             "d spawns the ephemeral jj-diff pane in the workspace's tab"
         );
@@ -4781,6 +4866,7 @@ mod tests {
                 tab,
                 cmd,
                 ephemeral,
+                sandbox: None,
             } => {
                 assert_eq!(tab, Some(TabId(1)));
                 assert!(ephemeral, "the pager pane vanishes when less quits");
@@ -4997,6 +5083,7 @@ mod tests {
                 tab,
                 cmd,
                 ephemeral,
+                sandbox: None,
             } => {
                 assert_eq!(tab, Some(TabId(1)));
                 assert!(ephemeral, "the pager pane vanishes when less quits");
@@ -5733,6 +5820,7 @@ mod tests {
                 tab: None,
                 cmd: vec![shell],
                 ephemeral: false,
+                sandbox: None,
             })],
             "esc after add-project spawns the shell into the new workspace"
         );
@@ -5828,6 +5916,7 @@ mod tests {
                 tab: None,
                 cmd: vec![shell],
                 ephemeral: false,
+                sandbox: None,
             })],
         );
         assert_eq!(app.mode, Mode::Terminal);
@@ -6249,10 +6338,39 @@ mod tests {
                     tab: Some(TabId(1)),
                     cmd: vec!["claude".into(), "--resume".into(), "abc".into()],
                     ephemeral: false,
+                    sandbox: None,
                 }),
                 control(&Request::PaneKill { pane: PaneId(1) }),
             ],
             "the pick runs in the corpse's tab, then the corpse goes"
+        );
+    }
+
+    #[test]
+    fn r_on_an_exited_sandbox_pane_relaunches_in_its_sandbox() {
+        let mut app = App::with_config(two_sandboxes());
+        let mut view = view_one_exited_agent();
+        view[0].tabs[0].panes[0].sandbox = Some("gke".into());
+        attach_with(&mut app, view);
+        app.on_key(plain('r'));
+        assert_eq!(app.mode, Mode::Launcher);
+        assert!(
+            app.launcher_title().ends_with(" · sandbox gke "),
+            "the launcher opens where the corpse ran: {}",
+            app.launcher_title()
+        );
+        let out = app.on_key(plain('1'));
+        assert_eq!(
+            out,
+            vec![
+                control(&Request::PaneRun {
+                    tab: Some(TabId(1)),
+                    cmd: vec!["claude".into()],
+                    ephemeral: false,
+                    sandbox: Some("gke".into()),
+                }),
+                control(&Request::PaneKill { pane: PaneId(1) }),
+            ]
         );
     }
 
@@ -6633,6 +6751,7 @@ mod tests {
                 tab: None,
                 cmd: vec!["claude".into()],
                 ephemeral: false,
+                sandbox: None,
             })],
             "enter launches the selected agent in a new pane"
         );
@@ -6658,6 +6777,7 @@ mod tests {
                 tab: None,
                 cmd: vec!["claude".into(), "--resume".into(), "abc".into()],
                 ephemeral: false,
+                sandbox: None,
             })],
             "enter resumes the conversation in a new pane"
         );
@@ -6727,6 +6847,7 @@ mod tests {
                 tab: None,
                 cmd: vec![login_shell()],
                 ephemeral: false,
+                sandbox: None,
             })],
             "the shell row's number launches it outright"
         );
@@ -6761,10 +6882,92 @@ mod tests {
                 tab: None,
                 cmd: vec![login_shell(), "-lc".into(), "npm test".into()],
                 ephemeral: false,
+                sandbox: None,
             })],
             "the command runs through the login shell's -lc"
         );
         assert_eq!(app.mode, Mode::Terminal);
+    }
+
+    fn two_sandboxes() -> Config {
+        Config::parse(
+            "[[sandboxes]]\nname = \"orb\"\nimage = \"i\"\n\n\
+             [[sandboxes]]\nname = \"gke\"\nwarm_pool = \"p\"\n",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn launcher_tab_cycles_local_then_each_sandbox_and_launches_there() {
+        let mut app = App::with_config(two_sandboxes());
+        attached(&mut app);
+        app.open_launcher(false, Some("api".into()), None);
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.launcher_title(), " run in api ");
+        assert_eq!(app.launcher_tab_hint().as_deref(), Some("sandbox orb"));
+
+        app.on_key(tab);
+        assert_eq!(app.launcher_title(), " run in api · sandbox orb ");
+        assert!(
+            app.launcher_rows().iter().all(LauncherRow::selectable),
+            "a sandbox offers the whole catalog"
+        );
+        assert_eq!(app.launcher_tab_hint().as_deref(), Some("sandbox gke"));
+        app.on_key(tab);
+        assert_eq!(app.launcher_title(), " run in api · sandbox gke ");
+        assert_eq!(app.launcher_tab_hint().as_deref(), Some("local"));
+        app.on_key(tab);
+        assert_eq!(app.launcher_title(), " run in api ", "and round to local");
+
+        app.on_key(tab);
+        let out = app.on_key(plain('1'));
+        assert_eq!(
+            out,
+            vec![control(&Request::PaneRun {
+                tab: None,
+                cmd: vec!["claude".into()],
+                ephemeral: false,
+                sandbox: Some("orb".into()),
+            })],
+            "the pick runs in the selected sandbox"
+        );
+        assert_eq!(app.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn a_sandbox_shell_row_runs_sh() {
+        let mut app = App::with_config(two_sandboxes());
+        attached(&mut app);
+        app.open_launcher(false, None, None);
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let shell = app
+            .launcher_rows()
+            .iter()
+            .position(|r| matches!(r.kind, LaunchKind::Shell))
+            .unwrap();
+        app.launcher_selected = shell;
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            out,
+            vec![control(&Request::PaneRun {
+                tab: None,
+                cmd: vec!["sh".into()],
+                ephemeral: false,
+                sandbox: Some("orb".into()),
+            })],
+            "an image has sh, not this machine's login shell"
+        );
+    }
+
+    #[test]
+    fn launcher_tab_is_inert_without_sandboxes() {
+        let mut app = App::new();
+        attached(&mut app);
+        app.open_launcher(false, Some("api".into()), None);
+        assert_eq!(app.launcher_tab_hint(), None, "no hint row to show");
+        let out = app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(out.is_empty());
+        assert_eq!(app.launcher_title(), " run in api ");
     }
 
     #[test]

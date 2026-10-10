@@ -10,6 +10,8 @@ use anyhow::{Context, Result, bail};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Deserialize;
 
+use crate::sandbox::{Profile, Source};
+
 /// The default ratio boundary at which the direct nav keys resize a split.
 pub const RESIZE_DELTA: f32 = 0.05;
 
@@ -285,6 +287,9 @@ pub struct Config {
     /// Startup projects: workspace dirs to mount (idempotently) on attach, each
     /// `~`-expanded. Empty by default.
     pub projects: Vec<PathBuf>,
+    /// The k8s sandbox profiles agents may launch into, in config order. Empty
+    /// by default — the launcher then offers only local runs.
+    pub sandboxes: Vec<Profile>,
     prefix_bindings: Vec<PrefixBinding>,
 }
 
@@ -375,6 +380,19 @@ impl Config {
             .map(|p| expand_home(&p.dir, home.as_deref()))
             .collect();
 
+        let sandboxes = raw
+            .sandboxes
+            .into_iter()
+            .map(RawSandbox::into_profile)
+            .collect::<Result<Vec<Profile>>>()?;
+        if let Some(dup) = sandboxes
+            .iter()
+            .enumerate()
+            .find(|(i, p)| sandboxes[..*i].iter().any(|q| q.name == p.name))
+        {
+            bail!("sandboxes: duplicate name {:?}", dup.1.name);
+        }
+
         let mut overrides = raw.keys.into_map();
         let mut bindings = Vec::new();
         for (action, name, default) in DEFAULTS {
@@ -401,8 +419,29 @@ impl Config {
             theme,
             notifications,
             projects,
+            sandboxes,
             prefix_bindings,
         })
+    }
+
+    /// The sandbox profile called `name`, or an error naming what is
+    /// configured.
+    pub fn sandbox(&self, name: &str) -> Result<&Profile> {
+        self.sandboxes
+            .iter()
+            .find(|p| p.name == name)
+            .with_context(|| {
+                let names: Vec<&str> = self.sandboxes.iter().map(|p| p.name.as_str()).collect();
+                format!(
+                    "no sandbox profile {name:?} in {} (configured: {})",
+                    config_path().display(),
+                    if names.is_empty() {
+                        "none".into()
+                    } else {
+                        names.join(", ")
+                    }
+                )
+            })
     }
 
     /// The active prefix binding table — the single source dispatch, the
@@ -444,12 +483,58 @@ struct RawConfig {
     keys: RawKeys,
     #[serde(default)]
     projects: Vec<RawProject>,
+    #[serde(default)]
+    sandboxes: Vec<RawSandbox>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawProject {
     dir: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSandbox {
+    name: String,
+    context: Option<String>,
+    namespace: Option<String>,
+    image: Option<String>,
+    warm_pool: Option<String>,
+    container: Option<String>,
+    ttl_minutes: Option<u64>,
+}
+
+impl RawSandbox {
+    /// Validate into a profile: a name usable as a CLI argument, exactly one
+    /// of `image`/`warm_pool`, and a TTL of at least a minute (default 60).
+    fn into_profile(self) -> Result<Profile> {
+        let name = self.name;
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            bail!("sandboxes: name {name:?} must be [A-Za-z0-9_-]+");
+        }
+        let source = match (self.image, self.warm_pool) {
+            (Some(image), None) => Source::Image(image),
+            (None, Some(pool)) => Source::WarmPool(pool),
+            _ => bail!("sandboxes.{name}: set exactly one of `image` or `warm_pool`"),
+        };
+        let ttl_minutes = self.ttl_minutes.unwrap_or(60);
+        if ttl_minutes == 0 {
+            bail!("sandboxes.{name}: ttl_minutes must be at least 1");
+        }
+        Ok(Profile {
+            name,
+            context: self.context,
+            namespace: self.namespace,
+            source,
+            container: self.container,
+            ttl: std::time::Duration::from_secs(ttl_minutes * 60),
+        })
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -773,6 +858,85 @@ kill_pane    = "A-x"
             format!("{err:#}").contains("dir"),
             "error should name the missing key: {err:#}"
         );
+    }
+
+    #[test]
+    fn sandboxes_default_empty_and_parse_image_and_warm_pool_profiles() {
+        assert!(Config::default().sandboxes.is_empty());
+        let cfg = Config::parse(
+            r#"
+[[sandboxes]]
+name = "orb"
+context = "orbstack"
+image = "ghcr.io/acme/agent:1"
+
+[[sandboxes]]
+name = "gke"
+namespace = "agents"
+warm_pool = "claude-pool"
+container = "agent"
+ttl_minutes = 15
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.sandboxes,
+            vec![
+                Profile {
+                    name: "orb".into(),
+                    context: Some("orbstack".into()),
+                    namespace: None,
+                    source: Source::Image("ghcr.io/acme/agent:1".into()),
+                    container: None,
+                    ttl: std::time::Duration::from_secs(3_600),
+                },
+                Profile {
+                    name: "gke".into(),
+                    context: None,
+                    namespace: Some("agents".into()),
+                    source: Source::WarmPool("claude-pool".into()),
+                    container: Some("agent".into()),
+                    ttl: std::time::Duration::from_secs(900),
+                },
+            ]
+        );
+        assert_eq!(cfg.sandbox("gke").unwrap().name, "gke");
+        let missing = cfg.sandbox("nope").unwrap_err();
+        assert!(
+            format!("{missing:#}").contains("configured: orb, gke"),
+            "a missing profile names the configured ones: {missing:#}"
+        );
+    }
+
+    #[test]
+    fn a_sandbox_profile_is_validated() {
+        let cases = [
+            (
+                "[[sandboxes]]\nname = \"a\"\n",
+                "exactly one of `image` or `warm_pool`",
+            ),
+            (
+                "[[sandboxes]]\nname = \"a\"\nimage = \"i\"\nwarm_pool = \"p\"\n",
+                "exactly one of `image` or `warm_pool`",
+            ),
+            (
+                "[[sandboxes]]\nname = \"a b\"\nimage = \"i\"\n",
+                "[A-Za-z0-9_-]+",
+            ),
+            (
+                "[[sandboxes]]\nname = \"a\"\nimage = \"i\"\nttl_minutes = 0\n",
+                "at least 1",
+            ),
+            (
+                "[[sandboxes]]\nname = \"a\"\nimage = \"i\"\n\n[[sandboxes]]\nname = \"a\"\nimage = \"j\"\n",
+                "duplicate name",
+            ),
+            ("[[sandboxes]]\nname = \"a\"\nimg = \"i\"\n", "img"),
+        ];
+        for (text, needle) in cases {
+            let err = format!("{:#}", Config::parse(text).unwrap_err());
+            assert!(err.contains(needle), "{text:?} → {err}");
+        }
     }
 
     #[test]

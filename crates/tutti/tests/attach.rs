@@ -153,6 +153,7 @@ fn attach_seeds_app_and_input_updates_grid() {
         tab: None,
         cmd: vec!["/bin/cat".into()],
         ephemeral: false,
+        sandbox: None,
     });
     let pane = match control.response() {
         Response::PaneCreated { id } => id,

@@ -426,7 +426,21 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             tab,
             cmd,
             ephemeral,
-        } => spawn_pane(hub, |s| s.pane_run(tab, cmd, ephemeral)),
+            sandbox,
+        } => {
+            // A sandbox pane's agent runs in a pod, out of detection's sight,
+            // so it is declared from the command at spawn instead.
+            let declared = sandbox
+                .as_ref()
+                .and(cmd.first())
+                .and_then(|program| hub.registry.match_process(program))
+                .map(|spec| spec.kind.clone());
+            spawn_pane(hub, |s| {
+                let pane = s.pane_run(tab, cmd, ephemeral, sandbox)?;
+                s.set_agent(pane, declared);
+                Ok(pane)
+            })
+        }
         Request::PaneSplit { pane, direction } => {
             spawn_pane(hub, |s| s.pane_split(pane, direction))
         }
@@ -934,7 +948,7 @@ fn workspace_fork(
             session.workspace_new_forked(dest, meta)
         };
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        spawn_pane(&hub, |s| s.pane_run(Some(tab_id), vec![shell], false));
+        spawn_pane(&hub, |s| s.pane_run(Some(tab_id), vec![shell], false, None));
         // Seed the fork's change stat / stale flag now that it exists.
         refresh_changes(&hub, ws_id);
         let _ = tx
@@ -1459,12 +1473,13 @@ fn broadcast_tick(hub: &Arc<Hub>) {
     disconnect(hub, doomed);
 }
 
-/// One agent-detection pass: snapshot the process tree, walk each live pane's
-/// child subtree, and record the matched agent kind. A change to any pane's
-/// agent broadcasts the fresh view so clients relabel their badges, and an
-/// agent appearing refreshes its workspace so where it started is checkpointed.
+/// One agent-detection pass: snapshot the process tree, walk each live local
+/// pane's child subtree, and record the matched agent kind. A change to any
+/// pane's agent broadcasts the fresh view so clients relabel their badges, and
+/// an agent appearing refreshes its workspace so where it started is
+/// checkpointed.
 async fn detect_pass(hub: &Arc<Hub>) {
-    let panes = hub.session().live_panes();
+    let panes = hub.session().detectable_panes();
     if panes.is_empty() {
         return;
     }

@@ -19,6 +19,9 @@ You need:
   anywhere; the workspace-level VCS features (per-workspace diffs, nested
   [workspaces](#workspaces) on isolated checkouts, merge-back, branch display)
   are prescriptive: they require jj — there are no git/mercurial adapters.
+- **kubectl** — optional, for launching agents into
+  [Kubernetes sandboxes](#kubernetes-sandboxes) (a cluster running
+  [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox)).
 - **The agents themselves** on your `PATH`. Tutti detects and drives them; it
   does not install them. The recognized catalog: [Claude
   Code](https://claude.com/claude-code), [Codex
@@ -190,7 +193,12 @@ workspace the choice lands in, so it is never ambiguous where a pane will
 spawn.
 Move with `j/k`/arrows, press a row's number to launch it outright, `enter`
 launches the highlight, `esc` closes; `command…` opens a one-line input that runs
-whatever you type via your login shell. Adding a project (`n`) opens the launcher
+whatever you type via your login shell. With [sandboxes](#kubernetes-sandboxes)
+configured, `tab` switches where the pick runs — locally, then each sandbox
+profile in turn (a `tab run in …` hint row says what is next). The title
+follows (` run in <project> · sandbox <name> `). A sandbox's rows are the whole
+catalog, since tutti can't see what an image carries, and its shell and
+command rows run `sh`. Adding a project (`n`) opens the launcher
 for the new workspace's first pane too — `esc` there just drops you into a shell,
 exactly as before. (Startup `[[projects]]` still mount plain shells, no launcher.)
 
@@ -289,6 +297,16 @@ dir = "~/develop/tutti"   # required; `~` expands to your home
 
 [[projects]]
 dir = "~/develop/other"
+
+# Kubernetes sandboxes agents can launch into (see "Kubernetes sandboxes").
+[[sandboxes]]
+name = "gke"              # required; [A-Za-z0-9_-]+, what the launcher and --sandbox call it
+context = "gke_acme_prod" # kubectl context; default: the current one
+namespace = "agents"      # default: the context's namespace
+warm_pool = "claude-pool" # a SandboxClaim on this SandboxWarmPool…
+# image = "ghcr.io/acme/agent:1"  # …or a Sandbox running this image (set exactly one)
+container = "agent"       # the container to exec into; default: the pod's default
+ttl_minutes = 60          # how long an orphan outlives a crashed tutti (default 60)
 ```
 
 Chord syntax is `C-<char>` (Ctrl), `A-<char>` (Alt), or a bare printable
@@ -767,6 +785,57 @@ and sends nothing outside a tutti pane, on an irrelevant event, or when the
 daemon is unreachable. Remove `tutti.js` from the plugins directory if you
 uninstall tutti.
 
+## Kubernetes sandboxes
+
+An agent can run in a Kubernetes sandbox instead of on your machine. You get
+tutti's view of the agent unchanged: the pane, its state badge, the waiting
+queue, and answering from the queue. The agent itself runs in a pod. tutti
+drives [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox)
+(`agents.x-k8s.io/v1beta1`) through your own `kubectl`, so your kubeconfig,
+contexts, and auth plugins (GKE's included) work as they already do.
+
+Configure one or more `[[sandboxes]]` profiles (see
+[Configuration](#configuration)). Then press `tab` in the run launcher to
+target one, or from scripts run `tutti pane run --sandbox <profile> -- claude`.
+The pane runs `tutti sandbox run <profile> -- claude`, which:
+
+1. **creates** the sandbox. A `warm_pool` profile creates a `SandboxClaim` on
+   that `SandboxWarmPool`, which is fast because a pod is already waiting. An
+   `image` profile creates a `Sandbox` whose single container, `agent`, runs
+   that image. Either is labelled `app.kubernetes.io/managed-by=tutti` and named
+   `tutti-p<pane>-<hex>`.
+2. **waits** until it is Ready, echoing the controller's status messages into
+   the pane (ctrl-c cancels).
+3. **execs** the agent with `kubectl exec -it` (forwarding `TERM` and
+   `COLORTERM`). The pane's pty stays local, so the screen classifier, OSC
+   9;4/7501 reports, bells, and guarded answers all work as they do for a local
+   agent.
+4. **deletes** the sandbox however the pane ends: the agent exits, the pane is
+   killed, the daemon stops, or you press ctrl-c. A watchdog in its own
+   process group waits on a pipe that only the pane process holds, and runs the
+   delete once that pipe closes. As a backstop, the sandbox's `shutdownTime` is
+   kept a full `ttl_minutes` ahead (renewed every third of it), with
+   `shutdownPolicy: Delete`. If tutti dies hard, the cluster reaps the sandbox
+   within the TTL.
+
+**The sandbox owns the code.** tutti does not copy your checkout in or out. The
+image or template clones the repo, and the agent pushes its work. An `image`
+sandbox's container gets the workspace's git remote as `TUTTI_GIT_REMOTE`
+(`origin`, else the first `jj git remote`). Its entrypoint has to keep running
+for the exec, for example `git clone "$TUTTI_GIT_REMOTE" /work && exec sleep
+infinity`. A warm-pool claim carries no env, because a `SandboxTemplate`'s
+default `envVarsInjectionPolicy` rejects it. The template has to know the repo
+itself.
+
+The pane title and sidebar mark where the agent runs (`claude on gke`). Since
+the local process tree only ever shows `tutti` and `kubectl`, the agent kind
+comes from the command, not from detection. Known limits: hooks
+(`tutti agent-event`) can't reach the daemon from the pod, so state comes from
+the screen. Diffs, turns, and checkpoints stay local and say nothing about the
+sandbox's work, so sandbox panes record no turns. Resume rows are hidden in a
+sandbox launcher because those conversations live on this machine. An exited
+sandbox pane's `r` reopens the launcher on the same sandbox.
+
 ## CLI surface
 
 Every TUI action is also a CLI verb over the daemon socket — if it isn't
@@ -780,7 +849,8 @@ tutti workspace merge <id> [--push]  # merge a workspace back into its project's
 tutti workspace update <id>          # jj workspace update-stale (clears the sidebar's stale tag)
 tutti workspace diff <id> [--stat]   # the workspace's jj diff against trunk (jj is required; --json for raw lines)
 tutti tab new | list | select <id>
-tutti pane run [--tab <id>] [--ephemeral] -- <cmd...>
+tutti pane run [--tab <id>] [--ephemeral] [--sandbox <profile>] -- <cmd...>
+tutti sandbox run <profile> -- <cmd...>  # provision, kubectl exec, delete — what a --sandbox pane runs
 tutti pane split <pane> right|down
 tutti pane list | kill | rename | focus <pane>
 tutti pane send <pane> --text <s> | --keys <s> [--expect <fp>]   # --expect: answer a blocked agent, refused if its prompt moved on

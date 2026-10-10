@@ -1479,6 +1479,9 @@ fn draw_launcher(frame: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(i, row)| launcher_line(i, row, i == selected))
         .collect();
+    if let Some(next) = app.launcher_tab_hint() {
+        lines.push(popup_key_line("tab", &format!("run in {next}")));
+    }
     lines.push(popup_key_line("esc", "cancel"));
     draw_centered_popup(frame, area, &app.launcher_title(), lines);
 }
@@ -1692,16 +1695,20 @@ fn identity(info: &PaneInfo) -> String {
         .unwrap_or_else(|| info.title.clone())
 }
 
-/// The border badge. The name is dim-bold; a detected agent adds a dim `·`
-/// then the state in its colour (a spinner precedes `working`); a plain shell
-/// shows just its name. An exited pane appends a dim `exited <code>` plus the
-/// two keys that act on the corpse, `r` in the accent so the way back to a
-/// dead agent's conversation is visible right where it died.
+/// The border badge. The name is dim-bold, followed by a dim `on <profile>`
+/// for a pane running in a sandbox; a detected agent adds a dim `·` then the
+/// state in its colour (a spinner precedes `working`); a plain shell shows
+/// just its name. An exited pane appends a dim `exited <code>` plus the two
+/// keys that act on the corpse, `r` in the accent so the way back to a dead
+/// agent's conversation is visible right where it died.
 fn border_title(info: &PaneInfo, spinner: char) -> Line<'static> {
     let mut spans = vec![Span::styled(
         identity(info),
         Style::default().add_modifier(Modifier::BOLD),
     )];
+    if let Some(profile) = &info.sandbox {
+        spans.push(Span::styled(format!(" on {profile}"), dim()));
+    }
     if info.agent.is_some() {
         spans.push(Span::styled(" · ", dim()));
         let label = if info.state == AgentState::Working {
@@ -1756,6 +1763,7 @@ fn placeholder_title(pane: PaneId) -> PaneInfo {
         subagents: Vec::new(),
         checkpoints: Vec::new(),
         source: None,
+        sandbox: None,
     }
 }
 
@@ -2324,6 +2332,7 @@ mod tests {
             subagents: Vec::new(),
             checkpoints: Vec::new(),
             source: None,
+            sandbox: None,
         };
         assert_eq!(title_text(&info), "claude · blocked");
     }
@@ -2339,8 +2348,24 @@ mod tests {
             subagents: Vec::new(),
             checkpoints: Vec::new(),
             source: None,
+            sandbox: None,
         };
         assert_eq!(title_text(&info), "claude · ⠋ working");
+    }
+
+    #[test]
+    fn border_title_names_the_sandbox_a_pane_runs_in() {
+        let info = PaneInfo {
+            sandbox: Some("gke".into()),
+            ..crate::attach::fixtures::agent(1, "claude", AgentState::Blocked)
+        };
+        assert_eq!(title_text(&info), "claude on gke · blocked");
+        let line = border_title(&info, '⠋');
+        assert_eq!(
+            line.spans[1].style,
+            dim(),
+            "the sandbox is metadata: dim, after the bright identity"
+        );
     }
 
     #[test]
@@ -2354,6 +2379,7 @@ mod tests {
             subagents: Vec::new(),
             checkpoints: Vec::new(),
             source: None,
+            sandbox: None,
         };
         assert_eq!(title_text(&info), "zsh", "no `· unknown` suffix");
     }
@@ -2369,6 +2395,7 @@ mod tests {
             subagents: Vec::new(),
             checkpoints: Vec::new(),
             source: None,
+            sandbox: None,
         };
         assert_eq!(
             title_text(&info),
@@ -3321,6 +3348,7 @@ mod tests {
             subagents: Vec::new(),
             checkpoints: Vec::new(),
             source: None,
+            sandbox: None,
         };
         let focused = pane_title_line(&info, true, ' ');
         assert_eq!(

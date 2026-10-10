@@ -51,6 +51,10 @@ cargo fmt --check
   `--ignore-working-copy`. Reorder it, or drop the flag, and the VCS watch
   re-triggers on tutti's own snapshot: a working-copy scan per workspace every
   second for as long as an agent keeps editing.
+- **A killed pane gets no signal to clean up on**: `PtyPane::kill` SIGKILLs
+  the pane's whole process group at once — no SIGHUP first. Anything a pane
+  must undo on the way out (the sandbox wrapper's delete) lives in a process
+  outside that group, triggered by a pipe closing, never by a trapped signal.
 - **Every state transition goes through `publish_transition`** (server.rs),
   followed by a refresh of the pane's workspace — on entering `Working` too. A
   site that broadcasts `StateChanged` directly, or only refreshes on turn ends,

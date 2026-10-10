@@ -142,6 +142,7 @@ async fn run_marker(conn: &mut Conn, cmd: &str) -> PaneId {
             tab: None,
             cmd: vec!["/bin/sh".into(), "-c".into(), cmd.into()],
             ephemeral: false,
+            sandbox: None,
         })
         .await,
     )
@@ -225,6 +226,7 @@ async fn pane_send_echoes_into_grid() {
             tab: None,
             cmd: vec!["/bin/cat".into()],
             ephemeral: false,
+            sandbox: None,
         })
         .await,
     );
@@ -260,6 +262,7 @@ async fn kill_removes_panes() {
             tab: None,
             cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
             ephemeral: false,
+            sandbox: None,
         })
         .await,
     );
@@ -268,6 +271,7 @@ async fn kill_removes_panes() {
             tab: None,
             cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
             ephemeral: false,
+            sandbox: None,
         })
         .await,
     );
@@ -314,6 +318,7 @@ async fn attach_receives_snapshot_then_delta() {
                 tab: None,
                 cmd: vec!["/bin/cat".into()],
                 ephemeral: false,
+                sandbox: None,
             })
             .await,
     );
@@ -405,6 +410,7 @@ async fn attach_resize_reseeds_at_new_size() {
                 tab: None,
                 cmd: vec!["/bin/cat".into()],
                 ephemeral: false,
+                sandbox: None,
             })
             .await,
     );
@@ -473,6 +479,7 @@ async fn resize_split_adjusts_ratio_and_broadcasts() {
                 tab: None,
                 cmd: vec!["/bin/cat".into()],
                 ephemeral: false,
+                sandbox: None,
             })
             .await,
     );
@@ -585,6 +592,7 @@ async fn wedged_client_is_dropped_but_others_keep_flowing() {
                         .into(),
                 ],
                 ephemeral: false,
+                sandbox: None,
             })
             .await,
     );
@@ -678,6 +686,7 @@ async fn run_sleeper(conn: &mut Conn) -> PaneId {
             tab: None,
             cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
             ephemeral: false,
+            sandbox: None,
         })
         .await,
     )
@@ -793,6 +802,7 @@ async fn hook_driven_pane_ignores_screen_classification() {
             tab: None,
             cmd: vec![bin.display().to_string()],
             ephemeral: false,
+            sandbox: None,
         })
         .await,
     );
@@ -885,6 +895,7 @@ async fn a_shell_panes_own_status_reports_drive_its_state() {
                 tab: None,
                 cmd: vec!["/bin/sh".into()],
                 ephemeral: false,
+                sandbox: None,
             })
             .await,
     );
@@ -1026,6 +1037,7 @@ async fn detects_agent_process_by_name() {
             tab: None,
             cmd: vec![bin.display().to_string(), "30".into()],
             ephemeral: false,
+            sandbox: None,
         })
         .await,
     );
@@ -1082,6 +1094,7 @@ async fn agent_state_changes_working_then_blocked() {
                 tab: None,
                 cmd: vec![bin.display().to_string()],
                 ephemeral: false,
+                sandbox: None,
             })
             .await,
     );
@@ -1495,6 +1508,7 @@ async fn ephemeral_pane_vanishes_on_child_exit() {
                 tab: None,
                 cmd: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
                 ephemeral: true,
+                sandbox: None,
             })
             .await,
     );
@@ -1560,6 +1574,7 @@ async fn focus_transitions_done_pane_to_idle() {
             tab: None,
             cmd: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
             ephemeral: false,
+            sandbox: None,
         })
         .await,
     );
@@ -2373,6 +2388,7 @@ async fn tab_name_follows_active_pane_title() {
             tab: None,
             cmd: vec!["/bin/cat".into()],
             ephemeral: false,
+            sandbox: None,
         })
         .await,
     );
@@ -2449,6 +2465,7 @@ async fn a_turn_checkpoints_its_diff_and_restores_round_trip() {
             tab: None,
             cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
             ephemeral: false,
+            sandbox: None,
         })
         .await,
     );
@@ -2593,6 +2610,7 @@ async fn a_self_reported_turn_checkpoints_its_diff() {
             tab: None,
             cmd: vec!["/bin/sh".into()],
             ephemeral: false,
+            sandbox: None,
         })
         .await,
     );
@@ -2624,6 +2642,7 @@ async fn checkpoints_stay_empty_outside_jj() {
             tab: None,
             cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
             ephemeral: false,
+            sandbox: None,
         })
         .await,
     );

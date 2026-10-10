@@ -51,23 +51,15 @@ impl LauncherRow {
 /// between the fixed rows and the catalog by the caller.
 pub fn build_rows(registry: &Registry, path: Option<&OsStr>) -> Vec<LauncherRow> {
     let agent_row = |spec: &tutti_agents::AgentSpec, available: bool| {
-        let name = spec.kind.to_string();
-        let mut argv = vec![
-            spec.process_names
-                .first()
-                .cloned()
-                .unwrap_or_else(|| name.clone()),
-        ];
-        argv.extend(spec.launch_args.iter().cloned());
         let role = if available {
             spec.display.clone()
         } else {
             format!("{} · {}", spec.display, short_url(&spec.url))
         };
         LauncherRow {
-            name,
+            name: spec.kind.to_string(),
             role,
-            kind: LaunchKind::Agent(argv),
+            kind: LaunchKind::Agent(agent_argv(spec)),
             available,
         }
     };
@@ -100,6 +92,48 @@ pub fn build_rows(registry: &Registry, path: Option<&OsStr>) -> Vec<LauncherRow>
             .map(|spec| agent_row(spec, false)),
     );
     rows
+}
+
+/// The rows for a launch into a sandbox: every catalog agent, selectable in
+/// registry order — whether an image carries one can't be probed from here —
+/// then the fixed rows, which run `sh` there.
+pub fn sandbox_rows(registry: &Registry) -> Vec<LauncherRow> {
+    registry
+        .specs()
+        .iter()
+        .map(|spec| LauncherRow {
+            name: spec.kind.to_string(),
+            role: spec.display.clone(),
+            kind: LaunchKind::Agent(agent_argv(spec)),
+            available: true,
+        })
+        .chain([
+            LauncherRow {
+                name: "shell".into(),
+                role: "sh".into(),
+                kind: LaunchKind::Shell,
+                available: true,
+            },
+            LauncherRow {
+                name: "command…".into(),
+                role: "type any command".into(),
+                kind: LaunchKind::Command,
+                available: true,
+            },
+        ])
+        .collect()
+}
+
+/// The argv an agent row runs: its binary, plus any launch args.
+fn agent_argv(spec: &tutti_agents::AgentSpec) -> Vec<String> {
+    let binary = spec
+        .process_names
+        .first()
+        .cloned()
+        .unwrap_or_else(|| spec.kind.to_string());
+    std::iter::once(binary)
+        .chain(spec.launch_args.iter().cloned())
+        .collect()
 }
 
 /// Where the caller inserts rows that must stay above the dim uninstalled
@@ -317,6 +351,30 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sandbox_rows_offer_the_whole_catalog_then_sh() {
+        let registry = Registry::default();
+        let rows = sandbox_rows(&registry);
+        assert_eq!(rows.len(), registry.specs().len() + 2);
+        assert!(
+            rows.iter().all(LauncherRow::selectable),
+            "nothing can be probed in an image, so nothing is dimmed"
+        );
+        assert_eq!(rows[0].name, "claude");
+        assert_eq!(rows[0].kind, LaunchKind::Agent(vec!["claude".into()]));
+        let ori = rows.iter().find(|r| r.name == "ori").unwrap();
+        assert_eq!(
+            ori.kind,
+            LaunchKind::Agent(vec!["ori".into(), "code".into()])
+        );
+        let shell = &rows[rows.len() - 2];
+        assert_eq!(
+            (shell.kind.clone(), shell.role.as_str()),
+            (LaunchKind::Shell, "sh")
+        );
+        assert_eq!(rows[rows.len() - 1].kind, LaunchKind::Command);
     }
 
     #[test]

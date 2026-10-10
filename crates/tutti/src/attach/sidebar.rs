@@ -5,7 +5,9 @@
 //! row arithmetic mapping a click to an entry. No rendering, no state, so the
 //! tree order, sort rules, and hit-testing are unit-tested in isolation.
 
-use tutti_core::{AgentState, PaneId, SubagentInfo, TabId, WorkspaceId, WorkspaceView};
+use tutti_core::{
+    AgentKind, AgentState, PaneId, PaneInfo, SubagentInfo, TabId, WorkspaceId, WorkspaceView,
+};
 
 /// One selectable sidebar row: a workspace (jumps to a tab) or an agent pane
 /// (jumps to a tab and focuses the pane).
@@ -330,7 +332,7 @@ pub fn build(workspaces: &[WorkspaceView], active_tab: Option<TabId>) -> Sidebar
                         tab: tab.id,
                         title: pane.title.clone(),
                         state: pane.state,
-                        kind: agent.to_string(),
+                        kind: kind_label(agent, pane),
                         project: project_of(w),
                         project_name: name_of(project_of(w)),
                         guide: None,
@@ -381,7 +383,7 @@ pub fn build(workspaces: &[WorkspaceView], active_tab: Option<TabId>) -> Sidebar
                             tab: tab.id,
                             title: pane.title.clone(),
                             state: pane.state,
-                            kind: agent.to_string(),
+                            kind: kind_label(agent, pane),
                             project: project_of(w),
                             project_name: name_of(project_of(w)),
                             guide: None,
@@ -400,6 +402,15 @@ pub fn build(workspaces: &[WorkspaceView], active_tab: Option<TabId>) -> Sidebar
         tree_count,
         projects_collapsed: false,
         waiting_collapsed: false,
+    }
+}
+
+/// An agent row's kind line: the agent, plus `on <profile>` when it runs in a
+/// sandbox, so a remote agent never passes for a local one.
+fn kind_label(agent: &AgentKind, pane: &PaneInfo) -> String {
+    match &pane.sandbox {
+        Some(profile) => format!("{agent} on {profile}"),
+        None => agent.to_string(),
     }
 }
 
@@ -775,6 +786,28 @@ mod tests {
         assert_eq!(blocked.pane, PaneId(4));
         assert_eq!(blocked.tab, TabId(2), "agent jump carries its owning tab");
         assert_eq!(blocked.state, AgentState::Blocked);
+    }
+
+    #[test]
+    fn a_sandbox_agent_row_says_where_it_runs() {
+        let mut view = two_workspace_view();
+        let pane = &mut view[1].tabs[0].panes[1];
+        assert_eq!(pane.state, AgentState::Blocked);
+        pane.sandbox = Some("gke".into());
+        let sidebar = build(&view, Some(TabId(2)));
+        let kinds: Vec<&str> = sidebar
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                SidebarEntry::Agent(a) if a.pane == PaneId(4) => Some(a.kind.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            ["claude on gke", "claude on gke"],
+            "the tree row and its waiting-queue row both"
+        );
     }
 
     #[test]

@@ -176,6 +176,7 @@ mod tests {
             subagents: Vec::new(),
             checkpoints: Vec::new(),
             source: None,
+            sandbox: None,
         }]);
         assert_eq!(
             rendered,
