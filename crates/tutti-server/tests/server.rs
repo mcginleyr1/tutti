@@ -156,6 +156,7 @@ async fn read_until(conn: &mut Conn, pane: PaneId, needle: &str) -> bool {
                     pane,
                     lines: None,
                     unwrapped: false,
+                    since: None,
                 })
                 .await;
             if let Response::Content { lines } = response
@@ -743,6 +744,79 @@ async fn pane_send_echoes_into_grid() {
     );
 
     server.stop().await;
+}
+
+/// `pane read --since` tails a scrolling pane. From 0 it returns every row
+/// and a cursor counting those committed to scrollback; reread with that
+/// cursor it returns only the rows committed since, then the screen — whose
+/// rows come back once more, as committed rows, when they scroll off.
+#[tokio::test]
+async fn pane_read_since_tails_scrolled_output() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let pane = run_marker(&mut conn, "seq 1 200; read x; seq 201 260; sleep 30").await;
+    assert!(read_until(&mut conn, pane, "200").await);
+
+    let numbers = |range: std::ops::RangeInclusive<u32>| -> Vec<String> {
+        range.map(|n| n.to_string()).collect()
+    };
+    // 200 lines on 24 rows: 177 scrolled off, 178..200 over the cursor row.
+    assert_eq!(
+        read_since(&mut conn, pane, 0).await,
+        (numbers(1..=200), 177, false)
+    );
+    assert_eq!(
+        read_since(&mut conn, pane, 177).await,
+        (numbers(178..=200), 177, false),
+        "caught up, a read is the screen alone"
+    );
+
+    // Answering `read` echoes a newline — one more row scrolls — then 60
+    // more lines print.
+    assert_eq!(
+        conn.request(Request::PaneSend {
+            pane,
+            text: Some("\n".into()),
+            keys: None,
+            expect: None,
+        })
+        .await,
+        Response::Ok
+    );
+    assert!(read_until(&mut conn, pane, "260").await);
+    let mut since_first = numbers(178..=200);
+    since_first.push(String::new());
+    since_first.extend(numbers(201..=260));
+    assert_eq!(
+        read_since(&mut conn, pane, 177).await,
+        (since_first, 238, false)
+    );
+    assert_eq!(
+        read_since(&mut conn, pane, 238).await,
+        (numbers(238..=260), 238, false)
+    );
+
+    server.stop().await;
+}
+
+/// One `pane read --since`, as `(lines, cursor, truncated)`.
+async fn read_since(conn: &mut Conn, pane: PaneId, since: u64) -> (Vec<String>, u64, bool) {
+    match conn
+        .request(Request::PaneRead {
+            pane,
+            lines: None,
+            unwrapped: false,
+            since: Some(since),
+        })
+        .await
+    {
+        Response::Tail {
+            lines,
+            cursor,
+            truncated,
+        } => (lines, cursor, truncated),
+        other => panic!("expected Tail, got {other:?}"),
+    }
 }
 
 /// `pane kill` drops one pane; `workspace kill` tears the rest down.

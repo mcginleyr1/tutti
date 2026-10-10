@@ -3,8 +3,9 @@
 //! running whether or not anything is reading the UI — this is the daemon's core.
 
 use std::io::{Read, Write};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -16,6 +17,10 @@ use tokio::sync::watch;
 use tutti_core::{AgentState, StateSource};
 
 const SCROLLBACK_LINES: usize = 10_000;
+/// The most bytes `Term::process` feeds between two readings of the scroll
+/// count. A byte pushes at most one row (a scroll-up excepted, and it is fed
+/// alone), so no run can push past what the 10k ring's offset counts.
+const RUN_MAX: usize = 8192;
 
 /// What to run in a pane.
 #[derive(Debug, Clone)]
@@ -79,11 +84,260 @@ impl Snapshot {
     }
 }
 
+/// A `pane read` reply: the rows committed to the scrollback from a cursor
+/// on, then the live screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tail {
+    /// The committed rows past the cursor, oldest first, then the screen
+    /// with its trailing blank rows trimmed.
+    pub lines: Vec<String>,
+    /// The next read's `since`: the rows ever committed, as of this read. It
+    /// counts screen rows, not logical lines — `unwrapped` folds each read on
+    /// its own, so a line wrapped across two reads comes back in two pieces.
+    pub cursor: u64,
+    /// Rows past the cursor had already fallen out of the 10k ring.
+    pub truncated: bool,
+}
+
+/// A scrollback-free copy of a pane's live screen: what the broadcast tick
+/// diffs and keeps. Cloning the live screen drags its whole 10k-row ring
+/// along (~0.7 ms at 80×24, ~2.6 ms at 200×50, release); formatting just the
+/// visible state under the lock and replaying it costs ~25–100 µs, and the
+/// replayed screen holds everything a diff reads.
+pub struct Mirror {
+    /// The live screen's `state_formatted` bytes — contents plus input modes,
+    /// a new client's snapshot as is.
+    pub snapshot: Vec<u8>,
+    /// A fresh parser, without scrollback, that replayed `snapshot`.
+    pub parser: vt100::Parser,
+}
+
+impl Mirror {
+    /// Replay `snapshot`, taken from a `size` screen under its parser lock,
+    /// into a fresh parser — off the lock. vt100 can hold a state it cannot
+    /// replay (a wide character a shrink left in a one-column pane panics
+    /// `process`), and the render tick must outlive that: such a mirror falls
+    /// back to a blank screen.
+    fn new(size: PaneSize, snapshot: Vec<u8>) -> Self {
+        let replay = |bytes: &[u8]| {
+            let mut parser = vt100::Parser::new(size.rows, size.cols, 0);
+            parser.process(bytes);
+            parser
+        };
+        let parser = catch_unwind(|| replay(&snapshot)).unwrap_or_else(|_| replay(b""));
+        Self { snapshot, parser }
+    }
+}
+
+/// A pane's terminal behind the parser lock: the vt100 parser and the count
+/// numbering the rows its primary screen commits to scrollback, kept
+/// together so a reader sees a grid and a count that agree.
+struct Term {
+    parser: vt100::Parser,
+    /// Rows ever pushed into the primary screen's scrollback: the absolute
+    /// index one past the newest committed row, and the `--since` cursor.
+    scrolled: u64,
+    /// How far into an escape sequence the bytes fed so far stand.
+    seq: Seq,
+}
+
+impl Term {
+    fn new(size: PaneSize) -> Self {
+        Self {
+            parser: vt100::Parser::new(size.rows, size.cols, SCROLLBACK_LINES),
+            scrolled: 0,
+            seq: Seq::default(),
+        }
+    }
+
+    /// Start over on a blank screen of the same size, after the parser
+    /// panicked mid-read and left its state suspect. The count only moves
+    /// forward — by one, for whatever the failed read pushed uncounted — so
+    /// every outstanding cursor reads as truncated instead of skipping rows
+    /// silently.
+    fn reset(&mut self) {
+        let (rows, cols) = self.parser.screen().size();
+        *self = Self {
+            scrolled: self.scrolled + 1,
+            ..Self::new(PaneSize::new(rows, cols))
+        };
+    }
+
+    /// Feed one read's bytes to the parser, counting the rows they push into
+    /// the primary screen's scrollback.
+    ///
+    /// vt100 keeps no such count, but its scrollback offset can: `scroll_up`
+    /// bumps a non-zero offset once per row it pushes, and the offset only
+    /// steers the read APIs, never drawing. So each run of bytes is fed with
+    /// the primary armed at offset 1, what the offset grew by is the count,
+    /// and it is zeroed again before the lock is released — no reader ever
+    /// sees it.
+    ///
+    /// Three things break that mid-run, each on an escape sequence's final
+    /// byte: entering the alternate screen zeroes the primary's offset
+    /// (`CSI ?47h`/`?1049h`), leaving it lands on a primary that could not be
+    /// armed while hidden (`…l`), and a reset (`ESC c`) replaces the screen,
+    /// ring and all. So `Seq` picks those bytes out and each is fed alone,
+    /// once the run before it is counted. A scroll-up (`CSI n S`) is fed alone
+    /// too: any other byte pushes at most one row and a run is at most
+    /// `RUN_MAX`, while a lone `S` pushes at most a screen height — so the
+    /// count is exact for any pane shorter than the ring.
+    fn process(&mut self, bytes: &[u8]) {
+        let mut start = 0;
+        for (i, &b) in bytes.iter().enumerate() {
+            if self.seq.step(b) {
+                self.run(&bytes[start..i]);
+                self.run(&bytes[i..=i]);
+                start = i + 1;
+            }
+        }
+        self.run(&bytes[start..]);
+    }
+
+    /// Feed bytes that switch screens, if at all, only as a lone byte, adding
+    /// the rows they push to `scrolled`.
+    fn run(&mut self, bytes: &[u8]) {
+        for run in bytes.chunks(RUN_MAX) {
+            let screen = self.parser.screen_mut();
+            let primary = !screen.alternate_screen();
+            if primary {
+                screen.set_scrollback(1);
+            }
+            // An empty ring clamps the offset back to 0; its length after the
+            // run is then the count, as nothing can have been popped.
+            let armed = screen.scrollback() == 1;
+            self.parser.process(run);
+            let screen = self.parser.screen_mut();
+            // Nothing reaches the primary while the alternate screen is up,
+            // and a lone switching byte pushes nothing either way.
+            if !primary || screen.alternate_screen() {
+                continue;
+            }
+            let pushed = if armed {
+                screen.scrollback().saturating_sub(1)
+            } else {
+                screen.set_scrollback(usize::MAX);
+                screen.scrollback()
+            };
+            screen.set_scrollback(0);
+            self.scrolled += pushed as u64;
+        }
+    }
+
+    /// The committed rows from absolute index `since` on, then the screen;
+    /// see `PtyPane::tail`.
+    fn tail(&mut self, since: u64, lines: Option<usize>, unwrapped: bool) -> Result<Tail> {
+        let scrolled = self.scrolled;
+        if since > scrolled {
+            bail!(
+                "cursor {since} is past this pane's {scrolled}: it came from another pane or an \
+                 earlier daemon"
+            );
+        }
+        let screen = self.parser.screen_mut();
+        let alternate = screen.alternate_screen();
+        let (rows, cols) = screen.size();
+        let rows = usize::from(rows);
+        screen.set_scrollback(usize::MAX);
+        // The alternate grid keeps no ring: 0 while it is up.
+        let held = screen.scrollback();
+        let oldest = scrolled - held as u64;
+        let committed = (scrolled - since.max(oldest)) as usize;
+
+        // Tile from the first wanted row to the foot of the screen with
+        // screen-height windows: `visible_rows` shows `rows` rows at a time,
+        // so step the offset and skip what an earlier window yielded.
+        let mut out: Vec<(String, bool)> = Vec::with_capacity(committed + rows);
+        let mut at = held - committed;
+        while at < held + rows {
+            let offset = held.saturating_sub(at);
+            screen.set_scrollback(offset);
+            let view = &*screen;
+            out.extend(
+                view.rows(0, cols)
+                    .zip(0..)
+                    .skip(at - (held - offset))
+                    .map(|(text, row)| (text, view.row_wrapped(row))),
+            );
+            at = held - offset + rows;
+        }
+        screen.set_scrollback(0);
+
+        while out.len() > committed && out.last().is_some_and(|(text, _)| text.is_empty()) {
+            out.pop();
+        }
+        let mut text: Vec<String> = Vec::with_capacity(out.len());
+        let mut continues = false;
+        for (row, wrapped) in out {
+            match text.last_mut() {
+                Some(line) if unwrapped && continues => line.push_str(&row),
+                _ => text.push(row),
+            }
+            continues = wrapped;
+        }
+        if let Some(n) = lines
+            && text.len() > n
+        {
+            text.drain(..text.len() - n);
+        }
+        // vt100 reads only the active grid, so while the alternate screen is
+        // up the ring is out of reach and the cursor holds: nothing is pushed
+        // until it comes down, so the rows past the cursor wait for the next
+        // read rather than being skipped.
+        let (cursor, truncated) = if alternate {
+            (since, false)
+        } else {
+            (scrolled, since < oldest)
+        };
+        Ok(Tail {
+            lines: text,
+            cursor,
+            truncated,
+        })
+    }
+}
+
+/// Where the bytes fed so far stand within an escape sequence — as much of
+/// vte's state machine as `Term::process` needs to pick out the bytes it
+/// feeds alone. It persists across reads, as a sequence can straddle two.
+#[derive(Clone, Copy, Default)]
+enum Seq {
+    #[default]
+    Ground,
+    /// Just after `ESC`.
+    Esc,
+    /// Inside `ESC [`, before the final byte.
+    Csi,
+}
+
+impl Seq {
+    /// Step over `b`: true when it ends a sequence that can switch screens or
+    /// push many rows — `CSI … h`/`l` (the alternate screen is `?47`/`?1049`),
+    /// `CSI … S` (scroll up), `ESC c` (full reset). Liberal on purpose: a
+    /// false hit only splits a run. As in vte, only `ESC` opens a sequence (a
+    /// raw C1 `CSI` byte is executed, not parsed), CAN/SUB abort one, and
+    /// other C0 controls execute inside one without ending it.
+    fn step(&mut self, b: u8) -> bool {
+        let (next, hit) = match (*self, b) {
+            (_, 0x1b) => (Seq::Esc, false),
+            (_, 0x18 | 0x1a) => (Seq::Ground, false),
+            (Seq::Esc, b'[') => (Seq::Csi, false),
+            (Seq::Esc, b'c') => (Seq::Ground, true),
+            (Seq::Esc | Seq::Csi, 0x00..=0x1f) => (*self, false),
+            (Seq::Csi, 0x40..=0x7e) => (Seq::Ground, matches!(b, b'h' | b'l' | b'S')),
+            (Seq::Csi, _) => (Seq::Csi, false),
+            (Seq::Ground | Seq::Esc, _) => (Seq::Ground, false),
+        };
+        *self = next;
+        hit
+    }
+}
+
 /// A persistent pty running a single child process.
 pub struct PtyPane {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
-    parser: Arc<Mutex<vt100::Parser>>,
+    term: Arc<Mutex<Term>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     /// The child's OS process id, the root of the process-tree walk that agent
     /// detection matches against. `None` if the platform did not report one.
@@ -150,21 +404,17 @@ impl PtyPane {
             .take_writer()
             .context("failed to take pty writer")?;
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(
-            size.rows,
-            size.cols,
-            SCROLLBACK_LINES,
-        )));
+        let term = Arc::new(Mutex::new(Term::new(size)));
 
         let (output_tx, output_rx) = watch::channel(0u64);
         let (exit_tx, exit_rx) = watch::channel(None);
         let notifications = Arc::new(Mutex::new(Vec::new()));
 
-        let reader_parser = Arc::clone(&parser);
+        let reader_term = Arc::clone(&term);
         let reader_notifications = Arc::clone(&notifications);
         let reader_thread = std::thread::Builder::new()
             .name("tutti-pty-reader".into())
-            .spawn(move || read_loop(reader, reader_parser, output_tx, reader_notifications))
+            .spawn(move || read_loop(reader, reader_term, output_tx, reader_notifications))
             .context("failed to spawn pty reader thread")?;
 
         let wait_thread = std::thread::Builder::new()
@@ -188,7 +438,7 @@ impl PtyPane {
         Ok(Self {
             master: Mutex::new(pair.master),
             writer: Mutex::new(writer),
-            parser,
+            term,
             killer: Mutex::new(killer),
             pid,
             size: Mutex::new(size),
@@ -202,22 +452,20 @@ impl PtyPane {
 
     /// Forward raw keystrokes to the child.
     pub fn write_input(&self, bytes: &[u8]) -> Result<()> {
-        let mut writer = self.writer.lock().expect("pty writer poisoned");
+        let mut writer = lock(&self.writer);
         writer.write_all(bytes).context("write to pty failed")?;
         writer.flush().context("flush pty failed")?;
         Ok(())
     }
 
     /// Resize both the kernel pty and the vt100 grid. A zero dimension is
-    /// refused: `read` tiles scrollback in screen-height windows and would
+    /// refused: `tail` tiles scrollback in screen-height windows and would
     /// never advance.
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
         if rows == 0 || cols == 0 {
             bail!("pane size must be at least 1x1, got {rows}x{cols}");
         }
-        self.master
-            .lock()
-            .expect("pty master poisoned")
+        lock(&self.master)
             .resize(PtySize {
                 rows,
                 cols,
@@ -225,19 +473,15 @@ impl PtyPane {
                 pixel_height: 0,
             })
             .context("resize pty failed")?;
-        self.parser
-            .lock()
-            .expect("pty parser poisoned")
-            .screen_mut()
-            .set_size(rows, cols);
-        *self.size.lock().expect("pty size poisoned") = PaneSize { rows, cols };
+        lock(&self.term).parser.screen_mut().set_size(rows, cols);
+        *lock(&self.size) = PaneSize { rows, cols };
         Ok(())
     }
 
     /// Current screen contents, cursor position, and size.
     pub fn snapshot(&self) -> Snapshot {
-        let parser = self.parser.lock().expect("pty parser poisoned");
-        let screen = parser.screen();
+        let term = lock(&self.term);
+        let screen = term.parser.screen();
         let (rows, cols) = screen.size();
         let (cursor_row, cursor_col) = screen.cursor_position();
         let lines = screen.rows(0, cols).collect();
@@ -251,66 +495,47 @@ impl PtyPane {
         }
     }
 
-    /// An owned clone of the live screen, for computing `contents_formatted`
-    /// snapshots and `contents_diff` deltas on the broadcast tick.
-    pub fn screen(&self) -> vt100::Screen {
-        self.parser
-            .lock()
-            .expect("pty parser poisoned")
-            .screen()
-            .clone()
+    /// A scrollback-free mirror of the live screen for the broadcast tick:
+    /// the live view's snapshot, taken under the parser lock, replayed off it.
+    pub fn mirror(&self) -> Mirror {
+        let (size, snapshot) = self.scrolled_snapshot(0);
+        Mirror::new(size, snapshot)
     }
 
-    /// A clone of the screen scrolled `offset` rows back into the scrollback
-    /// ring, for serving a scrollback view to an attached client.
-    pub fn screen_scrolled(&self, offset: usize) -> vt100::Screen {
-        let mut screen = self.screen();
+    /// A client snapshot (`state_formatted`) of the screen scrolled `offset`
+    /// rows back into the ring, with its size. The offset is set, the screen
+    /// formatted and the offset put back under one hold of the parser lock,
+    /// so no other reader sees the scrolled view and no clone of the ring is
+    /// made.
+    pub fn scrolled_snapshot(&self, offset: usize) -> (PaneSize, Vec<u8>) {
+        let mut term = lock(&self.term);
+        let screen = term.parser.screen_mut();
         screen.set_scrollback(offset);
-        screen
+        let (rows, cols) = screen.size();
+        let snapshot = screen.state_formatted();
+        screen.set_scrollback(0);
+        (PaneSize::new(rows, cols), snapshot)
     }
 
-    /// The pane's text content, oldest line first, including scrollback.
-    ///
-    /// `unwrapped` joins soft-wrapped rows back into logical lines; `lines`
-    /// caps the result to that many most-recent lines. Reads a throwaway clone
-    /// so scrolling the view does not disturb attached clients.
-    pub fn read(&self, lines: Option<usize>, unwrapped: bool) -> Vec<String> {
-        let mut screen = self.screen();
-        let (rows, cols) = screen.size();
-        let rows = rows as usize;
+    /// The live screen's text, read under the parser lock rather than off a
+    /// clone of the whole ring: the classifier only scans it.
+    pub fn contents(&self) -> String {
+        lock(&self.term).parser.screen().contents()
+    }
 
-        screen.set_scrollback(usize::MAX);
-        let scrollback = screen.scrollback();
-        let total = scrollback + rows;
-
-        // Tile the whole buffer with screen-height windows. `visible_rows`
-        // exposes only `rows` lines at a time, so we step the scrollback
-        // offset and skip the rows an earlier window already yielded.
-        let mut visual: Vec<String> = Vec::with_capacity(total);
-        let mut top = 0usize;
-        while top < total {
-            let offset = scrollback.saturating_sub(top);
-            screen.set_scrollback(offset);
-            let window_top = scrollback - offset;
-            let skip = top - window_top;
-            visual.extend(screen.rows(0, cols).skip(skip));
-            top = window_top + rows;
-        }
-
-        let mut out = if unwrapped {
-            fold_wrapped(visual, cols as usize)
-        } else {
-            visual
-        };
-        while out.last().is_some_and(String::is_empty) {
-            out.pop();
-        }
-        if let Some(n) = lines
-            && out.len() > n
-        {
-            out.drain(..out.len() - n);
-        }
-        out
+    /// The rows committed to the primary scrollback from absolute index
+    /// `since` on (clamped to the oldest the ring still holds), then the live
+    /// screen with its trailing blank rows trimmed — `since: 0` reads it all.
+    /// `lines` keeps only the newest that many; `unwrapped` joins soft-wrapped
+    /// rows back into logical lines by vt100's own wrap flags. While the
+    /// alternate screen is up the ring is out of reach: the reply is the
+    /// screen alone and the cursor holds at `since`. Formats under the parser
+    /// lock, in time proportional to the rows returned: a `--since` tail of a
+    /// few rows holds it for microseconds, the whole 10k ring for a few
+    /// milliseconds (release). A cursor past the pane's count — from another
+    /// pane, or an earlier daemon — is refused.
+    pub fn tail(&self, since: u64, lines: Option<usize>, unwrapped: bool) -> Result<Tail> {
+        lock(&self.term).tail(since, lines, unwrapped)
     }
 
     /// The child's OS process id, if the platform reported one at spawn.
@@ -348,12 +573,7 @@ impl PtyPane {
     /// Drain the bells, desktop notifications and status reports seen since
     /// the last call, in stream order.
     pub fn take_notifications(&self) -> Vec<Signal> {
-        std::mem::take(
-            &mut *self
-                .notifications
-                .lock()
-                .expect("pty notifications poisoned"),
-        )
+        std::mem::take(&mut *lock(&self.notifications))
     }
 
     /// A receiver that resolves to `Some(exit)` when the child terminates.
@@ -377,11 +597,7 @@ impl PtyPane {
         }
         // No pid was reported (not expected on Unix): fall back to the direct
         // child so we at least terminate it.
-        self.killer
-            .lock()
-            .expect("pty killer poisoned")
-            .kill()
-            .context("kill child failed")
+        lock(&self.killer).kill().context("kill child failed")
     }
 }
 
@@ -430,25 +646,18 @@ fn join_or_detach(handle: JoinHandle<()>) {
     let _ = handle.join();
 }
 
-/// Join rows that filled the full width onto their predecessor: `vt100` marks
-/// such rows as soft-wrapped, and a full row is the only signal reachable
-/// through the public screen API. A genuine full-width line is merged too — an
-/// accepted approximation, since the wire snapshot keeps exact wrapping.
-fn fold_wrapped(rows: Vec<String>, cols: usize) -> Vec<String> {
-    let mut out: Vec<String> = Vec::with_capacity(rows.len());
-    for row in rows {
-        if out.last().is_some_and(|prev| prev.chars().count() == cols) {
-            out.last_mut().expect("checked non-empty").push_str(&row);
-        } else {
-            out.push(row);
-        }
-    }
-    out
+/// Lock a pty mutex, recovering it if a panicking thread poisoned it: one
+/// pane's panic must not turn every later lock — the render tick's among them
+/// — into another. The reader resets a parser its own panic left suspect; a
+/// panic in a read path (`tail`, a snapshot) leaves at worst a scrollback
+/// offset, which the reader's next arming overwrites.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn read_loop(
     mut reader: Box<dyn Read + Send>,
-    parser: Arc<Mutex<vt100::Parser>>,
+    term: Arc<Mutex<Term>>,
     output_tx: watch::Sender<u64>,
     notifications: Arc<Mutex<Vec<Signal>>>,
 ) {
@@ -463,7 +672,7 @@ fn read_loop(
                 let mut found = Vec::new();
                 scanner.feed(&buf[..n], &mut found);
                 if !found.is_empty() {
-                    let mut queue = notifications.lock().expect("pty notifications poisoned");
+                    let mut queue = lock(&notifications);
                     queue.extend(found);
                     let overflow = queue.len().saturating_sub(NOTIFY_QUEUE_CAP);
                     if overflow > 0 {
@@ -472,8 +681,15 @@ fn read_loop(
                 }
                 // Bumped under the parser lock, so a `snapshot` sees a grid and
                 // a generation that agree.
-                let mut grid = parser.lock().expect("pty parser poisoned");
-                grid.process(&buf[..n]);
+                let mut term = lock(&term);
+                // A vt100 panic (a wide character in a one-column pane is one)
+                // must neither end this thread nor poison the lock the render
+                // tick takes: caught inside the guard, the pane runs on from a
+                // blank screen.
+                if catch_unwind(AssertUnwindSafe(|| term.process(&buf[..n]))).is_err() {
+                    eprintln!("tutti: a pane's terminal parser panicked; restarting it blank");
+                    term.reset();
+                }
                 output_tx.send_modify(|generation| *generation = generation.wrapping_add(1));
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -1217,5 +1433,423 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// A `rows`×`cols` terminal fed `bytes` in reads of `chunk` bytes, as the
+    /// reader thread would — checking after each that the scrollback offset
+    /// never leaks out of a read.
+    fn fed(rows: u16, cols: u16, bytes: &[u8], chunk: usize) -> Term {
+        let mut term = Term::new(PaneSize::new(rows, cols));
+        for read in bytes.chunks(chunk) {
+            term.process(read);
+            assert_eq!(term.parser.screen().scrollback(), 0, "the offset leaked");
+        }
+        term
+    }
+
+    /// `n` lines `L<first>`, `L<first+1>`, …, each its own row.
+    fn numbered(first: usize, n: usize) -> String {
+        (first..first + n).map(|i| format!("L{i}\r\n")).collect()
+    }
+
+    /// The rows `numbered` printed for `range`, as `tail` returns them.
+    fn rows_of(range: std::ops::Range<usize>) -> Vec<String> {
+        range.map(|i| format!("L{i}")).collect()
+    }
+
+    /// The newest row the ring holds. The count only picks where `tail`
+    /// starts, not which row is newest, so `L<k>` here checks a count of k+1.
+    fn newest_committed(term: &mut Term) -> String {
+        let since = term.scrolled - 1;
+        term.tail(since, None, false).unwrap().lines.remove(0)
+    }
+
+    #[test]
+    fn scroll_count_matches_the_rows_plain_output_commits() {
+        // Five rows: four lines fill the screen, each later one pushes one.
+        let mut term = fed(5, 20, numbered(0, 40).as_bytes(), RUN_MAX);
+        assert_eq!(term.scrolled, 36);
+        assert_eq!(newest_committed(&mut term), "L35");
+    }
+
+    #[test]
+    fn scroll_count_holds_across_a_read_boundary_anywhere() {
+        let stream = [
+            numbered(0, 12),
+            "ABCDEFGHIJKLMNOPQRSTUVWXY\r\n".into(),
+            format!("\x1b[?1049h{}\x1b[?1049l", numbered(100, 9)),
+            numbered(12, 6),
+            "\x1b[2S".into(),
+        ]
+        .concat();
+        // 12 lines push 8; the 25-char line wraps twice on 10 columns and
+        // ends, 3; the alternate screen pushes none; 6 lines, 6; the
+        // scroll-up, 2.
+        assert_eq!(fed(5, 10, stream.as_bytes(), RUN_MAX).scrolled, 19);
+        for cut in 0..=stream.len() {
+            let mut term = Term::new(PaneSize::new(5, 10));
+            term.process(&stream.as_bytes()[..cut]);
+            term.process(&stream.as_bytes()[cut..]);
+            assert_eq!(term.scrolled, 19, "reads split at byte {cut}");
+        }
+        for chunk in [1, 2, 3, 5, 64] {
+            assert_eq!(
+                fed(5, 10, stream.as_bytes(), chunk).scrolled,
+                19,
+                "{chunk}-byte reads"
+            );
+        }
+    }
+
+    /// Entering the alternate screen zeroes the primary's offset, and the
+    /// primary cannot be armed while hidden: rows pushed just before entering
+    /// and just after leaving, in the same read, must still count.
+    #[test]
+    fn scroll_count_skips_the_alternate_screen_within_one_read() {
+        let stream = format!(
+            "{}\x1b[?1049h{}\x1b[?1049l{}",
+            numbered(0, 10),
+            numbered(100, 20),
+            numbered(10, 7)
+        );
+        let mut term = fed(5, 20, stream.as_bytes(), RUN_MAX);
+        assert_eq!(term.scrolled, 13);
+        assert_eq!(newest_committed(&mut term), "L12");
+    }
+
+    #[test]
+    fn scroll_count_skips_the_alternate_screen_across_reads() {
+        let mut term = Term::new(PaneSize::new(5, 20));
+        for read in [
+            format!("{}\x1b[?1049h", numbered(0, 10)),
+            numbered(100, 20),
+            format!("\x1b[?1049l{}", numbered(10, 7)),
+        ] {
+            term.process(read.as_bytes());
+            assert_eq!(term.parser.screen().scrollback(), 0, "the offset leaked");
+        }
+        assert_eq!(term.scrolled, 13);
+        assert_eq!(newest_committed(&mut term), "L12");
+    }
+
+    #[test]
+    fn scroll_count_stays_exact_once_the_ring_is_full() {
+        // 25k lines overflow the 10k ring long before the end; after every
+        // 8 KiB read the count still names the newest row.
+        let mut term = Term::new(PaneSize::new(24, 80));
+        for read in numbered(0, 25_000).as_bytes().chunks(8192) {
+            term.process(read);
+            assert_eq!(term.parser.screen().scrollback(), 0, "the offset leaked");
+            if term.scrolled > 0 {
+                let newest = format!("L{}", term.scrolled - 1);
+                assert_eq!(newest_committed(&mut term), newest);
+            }
+        }
+        assert_eq!(term.scrolled, 25_000 - 23);
+    }
+
+    #[test]
+    fn scroll_count_continues_across_a_resize() {
+        let mut term = fed(24, 80, numbered(0, 100).as_bytes(), RUN_MAX);
+        assert_eq!(term.scrolled, 77);
+        // A shrink drops the screen's foot (L87..L99) without pushing it and
+        // pulls the cursor onto the new last row, over L86: every line pushes
+        // again — L77..L85, then the new lines from L100.
+        term.parser.screen_mut().set_size(10, 40);
+        term.process(numbered(100, 50).as_bytes());
+        assert_eq!(term.scrolled, 127);
+        assert_eq!(newest_committed(&mut term), "L140");
+        // A growth leaves the cursor where it was: 20 lines walk it down to
+        // the new foot, pushing nothing, and the next 5 push 5.
+        term.parser.screen_mut().set_size(30, 40);
+        term.process(numbered(150, 20).as_bytes());
+        assert_eq!(term.scrolled, 127);
+        term.process(numbered(170, 5).as_bytes());
+        assert_eq!(term.scrolled, 132);
+    }
+
+    #[test]
+    fn scroll_count_handles_scroll_up_regions_and_resets() {
+        let mut term = fed(5, 20, numbered(0, 10).as_bytes(), RUN_MAX);
+        assert_eq!(term.scrolled, 6);
+        // A scroll-up pushes up to a screen height per sequence: 3000 in one
+        // read push 15k rows, past anything one run's offset could count.
+        term.process("\x1b[100S".repeat(3000).as_bytes());
+        assert_eq!(term.scrolled, 15_006);
+        // Inside a scroll region nothing reaches the scrollback.
+        term.process(format!("\x1b[2;4r\x1b[4;1H{}", numbered(0, 20)).as_bytes());
+        assert_eq!(term.scrolled, 15_006);
+        // A full reset empties the ring; the count carries on past it.
+        term.process(format!("\x1b[r\x1bc{}", numbered(0, 10)).as_bytes());
+        assert_eq!(term.scrolled, 15_012);
+        assert_eq!(newest_committed(&mut term), "L5");
+        assert!(term.tail(0, None, false).unwrap().truncated);
+    }
+
+    #[test]
+    fn tail_reads_the_rows_committed_since_the_cursor_then_the_screen() {
+        // 26 rows committed (L0..L25); the screen holds L26..L29 over a blank
+        // cursor row, which is trimmed.
+        let mut term = fed(5, 20, numbered(0, 30).as_bytes(), RUN_MAX);
+        let all = term.tail(0, None, false).unwrap();
+        assert_eq!(all.lines, rows_of(0..30));
+        assert_eq!((all.cursor, all.truncated), (26, false));
+        assert_eq!(term.tail(20, None, false).unwrap().lines, rows_of(20..30));
+        // Caught up, a read is the screen alone; `lines` keeps the newest.
+        assert_eq!(term.tail(26, None, false).unwrap().lines, rows_of(26..30));
+        assert_eq!(term.tail(0, Some(3), false).unwrap().lines, rows_of(27..30));
+        // More output: a reread from the old cursor starts where it left off.
+        term.process(numbered(30, 3).as_bytes());
+        let next = term.tail(26, None, false).unwrap();
+        assert_eq!(next.lines, rows_of(26..33));
+        assert_eq!(next.cursor, 29);
+    }
+
+    #[test]
+    fn tail_reports_rows_that_left_the_ring() {
+        // 10_077 rows committed; the ring keeps the newest 10k, from L77.
+        let mut term = fed(24, 80, numbered(0, 10_100).as_bytes(), 8192);
+        let tail = term.tail(50, None, false).unwrap();
+        assert!(tail.truncated);
+        assert_eq!(tail.lines[0], "L77");
+        assert_eq!(tail.cursor, 10_077);
+        assert!(!term.tail(77, None, false).unwrap().truncated);
+    }
+
+    #[test]
+    fn tail_holds_the_cursor_while_the_alternate_screen_is_up() {
+        let mut term = fed(5, 20, numbered(0, 10).as_bytes(), RUN_MAX);
+        term.process(b"\x1b[?1049hfull screen");
+        // The ring is out of reach: the screen alone, and the cursor stays so
+        // the rows past it are read once the alternate screen comes down.
+        let up = term.tail(2, None, false).unwrap();
+        assert_eq!(up.lines, vec!["full screen"]);
+        assert_eq!((up.cursor, up.truncated), (2, false));
+        term.process(b"\x1b[?1049l");
+        let down = term.tail(up.cursor, None, false).unwrap();
+        assert_eq!(down.lines, rows_of(2..10));
+        assert_eq!(down.cursor, 6);
+    }
+
+    #[test]
+    fn tail_refuses_a_cursor_past_the_count() {
+        let mut term = fed(5, 20, numbered(0, 10).as_bytes(), RUN_MAX);
+        let err = term.tail(7, None, false).unwrap_err();
+        assert!(err.to_string().contains("past this pane's 6"), "{err}");
+    }
+
+    #[test]
+    fn unwrapped_joins_exactly_the_soft_wrapped_rows() {
+        // Four rows of ten columns. A line of exactly ten fills its row but
+        // never wraps — the old full-width guess merged it with the next. The
+        // 25-char line wraps onto three rows, and the lines after push all of
+        // it into the ring, across the boundary between two read windows.
+        let mut term = fed(
+            4,
+            10,
+            format!(
+                "0123456789\r\nnext\r\nABCDEFGHIJKLMNOPQRSTUVWXY\r\n{}",
+                numbered(0, 8)
+            )
+            .as_bytes(),
+            RUN_MAX,
+        );
+        let mut want = vec!["0123456789", "next", "ABCDEFGHIJKLMNOPQRSTUVWXY"];
+        let numbers = rows_of(0..8);
+        want.extend(numbers.iter().map(String::as_str));
+        assert_eq!(term.tail(0, None, true).unwrap().lines, want);
+        assert_eq!(
+            term.tail(0, None, false).unwrap().lines[2..5],
+            ["ABCDEFGHIJ", "KLMNOPQRST", "UVWXY"]
+        );
+
+        // A 45-char line whose first row is committed and the rest on screen
+        // joins across that boundary too.
+        let long = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRS";
+        term.process(long.as_bytes());
+        let since = term.scrolled - 1;
+        assert_eq!(term.tail(since, None, true).unwrap().lines, [long]);
+        // Folding is per read: from a cursor inside the line, only its rest.
+        let since = term.scrolled;
+        assert_eq!(term.tail(since, None, true).unwrap().lines, [&long[10..]]);
+    }
+
+    /// The plan's `pane read` target — a full 10k-row scrollback in under 50
+    /// ms — held here in a debug build, best of three to ride out load.
+    #[test]
+    fn reading_a_full_ring_takes_under_50ms() {
+        let dense: String = (0..12_000)
+            .map(|i| {
+                format!(
+                    "\x1b[3{}m{i:>6}\x1b[0m \x1b[1mINFO\x1b[0m compiling crate {i} of the workspace, step {}\r\n",
+                    i % 8,
+                    i * 7
+                )
+            })
+            .collect();
+        let mut term = fed(24, 80, dense.as_bytes(), 8192);
+        let best = (0..3)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                let tail = term.tail(0, None, false).unwrap();
+                assert_eq!(tail.lines.len(), 10_000 + 23);
+                start.elapsed()
+            })
+            .min()
+            .unwrap();
+        assert!(
+            best < Duration::from_millis(50),
+            "a full read took {best:?}"
+        );
+    }
+
+    /// Screens stressing what a snapshot must carry: colours and attributes,
+    /// wide and combining characters, a soft-wrapped row, a moved and a
+    /// hidden cursor, input modes, the alternate screen (with a colour left
+    /// set).
+    const SCREENS: &[&str] = &[
+        "\x1b[1;3;4;7mbold italic under inverse\x1b[0m \x1b[31mred\x1b[38;5;200m idx\x1b[48;2;10;20;30m rgb\x1b[0m",
+        "日本語 wide \u{1f600} emoji, e\u{301} combining",
+        "a soft-wrapped line that runs well past the eighty columns of this screen, onto the next row",
+        "\x1b[5;10Hmoved\x1b[12;40H",
+        "\x1b[?25lhidden cursor",
+        "\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[?1h\x1b=modes",
+        "primary\r\n\x1b[?1049h\x1b[2;3Halternate\x1b[32m green",
+    ];
+
+    #[test]
+    fn mirror_round_trips_the_live_screen() {
+        for (rows, cols) in [(24, 80), (50, 200)] {
+            for screen in SCREENS {
+                let stream = format!("{}{screen}", numbered(0, 30));
+                let term = fed(rows, cols, stream.as_bytes(), RUN_MAX);
+                let live = term.parser.screen();
+                let mirror = Mirror::new(PaneSize::new(rows, cols), live.state_formatted());
+                let mirror = mirror.parser.screen();
+                assert_eq!(
+                    mirror.contents_formatted(),
+                    live.contents_formatted(),
+                    "{screen:?}"
+                );
+                assert_eq!(
+                    mirror.input_mode_formatted(),
+                    live.input_mode_formatted(),
+                    "{screen:?}"
+                );
+            }
+        }
+    }
+
+    /// The render tick's contract: a client seeded with one snapshot and fed
+    /// only the diffs between consecutive mirrors stays level with the live
+    /// screen, step after step.
+    #[test]
+    fn mirror_deltas_keep_a_client_level_with_the_live_screen() {
+        let size = PaneSize::new(24, 80);
+        let mut live = Term::new(size);
+        live.process(numbered(0, 30).as_bytes());
+        let mut prev = Mirror::new(size, live.parser.screen().state_formatted());
+        let mut client = vt100::Parser::new(size.rows, size.cols, 0);
+        client.process(&prev.snapshot);
+        let back = "\x1b[?1049l\x1b[?25h\x1b[?1002l\x1b[0mback on the primary\r\n";
+        for screen in SCREENS.iter().chain([&back]) {
+            live.process(screen.as_bytes());
+            let cur = Mirror::new(size, live.parser.screen().state_formatted());
+            client.process(&cur.parser.screen().state_diff(prev.parser.screen()));
+            let (seen, want) = (client.screen(), live.parser.screen());
+            assert_eq!(
+                seen.contents_formatted(),
+                want.contents_formatted(),
+                "after {screen:?}"
+            );
+            assert_eq!(
+                seen.input_mode_formatted(),
+                want.input_mode_formatted(),
+                "after {screen:?}"
+            );
+            prev = cur;
+        }
+    }
+
+    #[test]
+    fn a_mirror_vt100_cannot_replay_falls_back_to_a_blank_screen() {
+        // A shrink leaves a wide character in a one-column row, and replaying
+        // that panics vt100 — which must not take the render tick down.
+        let mut live = Term::new(PaneSize::new(2, 4));
+        live.process("日本".as_bytes());
+        live.parser.screen_mut().set_size(2, 1);
+        let snapshot = live.parser.screen().state_formatted();
+        let replayed = catch_unwind(|| vt100::Parser::new(2, 1, 0).process(&snapshot));
+        assert!(
+            replayed.is_err(),
+            "vt100 replays this now: drop the fallback"
+        );
+        let mirror = Mirror::new(PaneSize::new(2, 1), snapshot);
+        assert_eq!(mirror.parser.screen().contents(), "");
+    }
+
+    /// Poll `done` for up to three seconds.
+    fn wait_for(done: impl Fn() -> bool, failure: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "{failure}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A vt100 panic on the reader thread — a wide character echoed into a
+    /// one-column pane — restarts the screen blank rather than ending the
+    /// reader or poisoning the parser lock: the pane runs on.
+    #[test]
+    fn a_parser_panic_restarts_the_screen_and_the_pane_runs_on() {
+        let pane = PtyPane::spawn(PtySpec::new("/bin/cat"), PaneSize::new(24, 1)).unwrap();
+        pane.write_input("日\n".as_bytes()).unwrap();
+        // Nothing scrolls a 24-row screen here, so only a restart's bump moves
+        // the count.
+        wait_for(
+            || lock(&pane.term).scrolled > 0,
+            "the parser never restarted",
+        );
+        assert!(!pane.term.is_poisoned());
+        pane.resize(24, 80).unwrap();
+        pane.write_input(b"still-here\n").unwrap();
+        wait_for(
+            || pane.snapshot().text().contains("still-here"),
+            "output stopped after the panic",
+        );
+        pane.kill().unwrap();
+    }
+
+    /// A thread panicking while it holds a pane's locks poisons them; every
+    /// later lock recovers, so the pane still writes, reads and mirrors.
+    #[test]
+    fn poisoned_locks_recover() {
+        let pane =
+            Arc::new(PtyPane::spawn(PtySpec::new("/bin/cat"), PaneSize::new(24, 80)).unwrap());
+        let poisoner = Arc::clone(&pane);
+        let _ = std::thread::spawn(move || {
+            let _term = poisoner.term.lock();
+            let _writer = poisoner.writer.lock();
+            let _notifications = poisoner.notifications.lock();
+            panic!("poisoning the pane's locks");
+        })
+        .join();
+        assert!(pane.term.is_poisoned() && pane.writer.is_poisoned());
+        pane.write_input(b"after-poison\n").unwrap();
+        wait_for(
+            || pane.snapshot().text().contains("after-poison"),
+            "the pane stopped reading after the poison",
+        );
+        let tail = pane.tail(0, None, false).unwrap();
+        assert!(tail.lines.iter().any(|line| line == "after-poison"));
+        assert!(
+            pane.mirror()
+                .parser
+                .screen()
+                .contents()
+                .contains("after-poison")
+        );
+        assert!(pane.take_notifications().is_empty());
+        pane.kill().unwrap();
     }
 }

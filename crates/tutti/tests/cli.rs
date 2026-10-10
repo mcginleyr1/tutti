@@ -425,6 +425,7 @@ fn pane_read_prints_plain_lines() {
                     pane: PaneId(3),
                     lines: Some(2),
                     unwrapped: false,
+                    since: None,
                 }
             );
         },
@@ -435,6 +436,44 @@ fn pane_read_prints_plain_lines() {
 
     assert!(output.status.success());
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "first\nsecond\n");
+}
+
+/// `pane read --since` keeps stdout the pane's text alone: the next cursor,
+/// and the note when rows were lost, go to stderr.
+#[test]
+fn pane_read_since_prints_lines_then_the_cursor_on_stderr() {
+    let output = run_scenario(
+        "panetail",
+        &["pane", "read", "3", "--since", "40"],
+        |req| {
+            assert_eq!(
+                *req,
+                Request::PaneRead {
+                    pane: PaneId(3),
+                    lines: None,
+                    unwrapped: false,
+                    since: Some(40),
+                }
+            );
+        },
+        Response::Tail {
+            lines: vec!["committed".into(), "screen".into()],
+            cursor: 52,
+            truncated: true,
+        },
+    );
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "committed\nscreen\n"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("next cursor: 52"), "stderr was: {stderr}");
+    assert!(
+        stderr.contains("left the pane's scrollback"),
+        "stderr was: {stderr}"
+    );
 }
 
 #[test]

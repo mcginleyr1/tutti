@@ -243,8 +243,12 @@ enum PaneAction {
         unwrapped: bool,
         /// Print the prompt fingerprint `pane send --expect` takes, instead of
         /// the screen.
-        #[arg(long, conflicts_with_all = ["lines", "unwrapped"])]
+        #[arg(long, conflicts_with_all = ["lines", "unwrapped", "since"])]
         fingerprint: bool,
+        /// Tail incrementally: print the rows scrolled off since this cursor,
+        /// then the screen, and the next cursor on stderr. Start from 0.
+        #[arg(long)]
+        since: Option<u64>,
     },
     /// Mark a pane focused (records it active and clears its Done badge).
     Focus {
@@ -633,10 +637,12 @@ fn to_request(command: Command) -> Result<Request> {
                 lines,
                 unwrapped,
                 fingerprint: false,
+                since,
             } => Request::PaneRead {
                 pane: PaneId(pane),
                 lines,
                 unwrapped,
+                since,
             },
             PaneAction::Focus { pane } => Request::PaneFocus { pane: PaneId(pane) },
             PaneAction::Wait { .. } => bail!("pane wait sends a request per pane"),
@@ -983,6 +989,21 @@ fn emit(response: Response, json: bool) -> i32 {
             }
             0
         }
+        // The cursor goes to stderr so stdout stays the pane's text alone.
+        Response::Tail {
+            lines,
+            cursor,
+            truncated,
+        } => {
+            for line in lines {
+                println!("{line}");
+            }
+            if truncated {
+                eprintln!("note: rows past the cursor had already left the pane's scrollback");
+            }
+            eprintln!("next cursor: {cursor}");
+            0
+        }
         Response::Fingerprint { fingerprint } => {
             println!("{fingerprint}");
             0
@@ -1288,6 +1309,7 @@ mod tests {
                 pane: PaneId(5),
                 lines: Some(40),
                 unwrapped: true,
+                since: None,
             }
         );
         assert_eq!(
@@ -1296,6 +1318,7 @@ mod tests {
                 pane: PaneId(5),
                 lines: None,
                 unwrapped: false,
+                since: None,
             }
         );
         assert_eq!(
@@ -1304,6 +1327,41 @@ mod tests {
                 pane: PaneId(5),
                 title: "builder".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn pane_read_since_combines_with_lines_and_unwrapped_but_not_fingerprint() {
+        assert_eq!(
+            request_of(&[
+                "tutti",
+                "pane",
+                "read",
+                "5",
+                "--since",
+                "177",
+                "--lines",
+                "40",
+                "--unwrapped"
+            ]),
+            Request::PaneRead {
+                pane: PaneId(5),
+                lines: Some(40),
+                unwrapped: true,
+                since: Some(177),
+            }
+        );
+        assert!(
+            Cli::try_parse_from([
+                "tutti",
+                "pane",
+                "read",
+                "5",
+                "--since",
+                "0",
+                "--fingerprint"
+            ])
+            .is_err()
         );
     }
 

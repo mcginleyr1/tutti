@@ -79,9 +79,10 @@ struct Client {
 pub struct Hub {
     session: Mutex<Session>,
     clients: Mutex<HashMap<u64, Client>>,
-    /// Last screen broadcast per pane, with its running delta sequence number
-    /// and the pty output generation it was captured at.
-    last: Mutex<HashMap<PaneId, (vt100::Screen, u32, u64)>>,
+    /// Last screen broadcast per pane — a scrollback-free `Mirror` parser,
+    /// cheap to keep and diff — with its running delta sequence number and the
+    /// pty output generation it was captured at.
+    last: Mutex<HashMap<PaneId, (vt100::Parser, u32, u64)>>,
     next_client: AtomicU64,
     /// Session name, reported to attaching clients. Derived from the socket file.
     name: String,
@@ -566,11 +567,24 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             pane,
             lines,
             unwrapped,
+            since,
         } => {
-            let r = hub.session().pane_read(pane, lines, unwrapped);
-            match r {
-                Ok(lines) => Response::Content { lines },
-                Err(err) => error(err),
+            // Bound first: a read can format the whole 10k-row ring, and the
+            // session lock must not be held across it.
+            let pty = hub.session().pty(pane);
+            let Some(pty) = pty else {
+                return Response::Error {
+                    message: format!("no pane {pane}"),
+                };
+            };
+            match (pty.tail(since.unwrap_or(0), lines, unwrapped), since) {
+                (Ok(tail), None) => Response::Content { lines: tail.lines },
+                (Ok(tail), Some(_)) => Response::Tail {
+                    lines: tail.lines,
+                    cursor: tail.cursor,
+                    truncated: tail.truncated,
+                },
+                (Err(err), _) => error(err),
             }
         }
         Request::PaneFocus { pane } => focus_pane(hub, pane),
@@ -833,14 +847,11 @@ fn scroll(
     let Some(pty) = hub.session().pty(pane) else {
         return ControlFlow::Continue(());
     };
-    let screen = pty.screen_scrolled(offset);
-    let (rows, cols) = screen.size();
-    let mut snapshot = screen.contents_formatted();
-    snapshot.extend(screen.input_mode_formatted());
+    let (size, snapshot) = pty.scrolled_snapshot(offset);
     let frame = Frame::PaneSnapshot(PaneData {
         pane,
-        rows,
-        cols,
+        rows: size.rows,
+        cols: size.cols,
         seq: 0,
         bytes: snapshot,
     });
@@ -1633,9 +1644,9 @@ fn broadcast_tick(hub: &Arc<Hub>) {
         let generation = *pty.output_receiver().borrow();
 
         // A quiescent pane (output generation unchanged since we last stored it)
-        // whose screen every client already holds needs no fresh clone/diff this
-        // tick. A fresh client, missing it from `seen`, still gets its snapshot
-        // below, so only skip when every client has already seen it.
+        // whose screen every client already holds needs no fresh mirror/diff
+        // this tick. A fresh client, missing it from `seen`, still gets its
+        // snapshot below, so only skip when every client has already seen it.
         let unchanged = matches!(
             hub.last.lock().expect("last poisoned").get(&pane),
             Some((_, _, stored)) if *stored == generation
@@ -1651,22 +1662,23 @@ fn broadcast_tick(hub: &Arc<Hub>) {
             continue;
         }
 
-        let cur = pty.screen();
-        let (rows, cols) = cur.size();
+        // A scrollback-free mirror, not a clone of the live screen: the clone
+        // would copy the whole 10k-row ring, twice per changed pane per tick.
+        let cur = pty.mirror();
+        let (rows, cols) = cur.parser.screen().size();
 
         let (seq, delta) = {
             let mut last = hub.last.lock().expect("last poisoned");
             let outcome = match last.get(&pane) {
                 None => (0, None),
                 Some((prev, seq, _)) => {
-                    // Content and input modes (alt screen aside — vt100 omits
-                    // it — mouse reporting, its encoding, application cursor,
-                    // bracketed paste) are serialised separately; ship both so
-                    // the client's mirror parser routes the wheel correctly. A
-                    // pure mode flip (mouse reporting toggles, content still)
-                    // must reach the client, so it counts toward emptiness.
-                    let mut diff = cur.contents_diff(prev);
-                    diff.extend(cur.input_mode_diff(prev));
+                    // `state_diff` carries content and input modes (alt screen
+                    // aside — vt100 omits it — mouse reporting, its encoding,
+                    // application cursor, bracketed paste), so the client's
+                    // mirror parser routes the wheel correctly. A pure mode
+                    // flip (mouse reporting toggles, content still) must reach
+                    // the client, so it counts toward emptiness.
+                    let diff = cur.parser.screen().state_diff(prev.screen());
                     if diff.is_empty() {
                         (*seq, None)
                     } else {
@@ -1674,7 +1686,7 @@ fn broadcast_tick(hub: &Arc<Hub>) {
                     }
                 }
             };
-            last.insert(pane, (cur.clone(), outcome.0, generation));
+            last.insert(pane, (cur.parser, outcome.0, generation));
             outcome
         };
 
@@ -1684,14 +1696,12 @@ fn broadcast_tick(hub: &Arc<Hub>) {
                 continue;
             }
             let bytes = if client.seen.insert(pane) {
-                let mut snapshot = cur.contents_formatted();
-                snapshot.extend(cur.input_mode_formatted());
                 Frame::PaneSnapshot(PaneData {
                     pane,
                     rows,
                     cols,
                     seq,
-                    bytes: snapshot,
+                    bytes: cur.snapshot.clone(),
                 })
                 .encode()
             } else if let Some(diff) = &delta {
@@ -1799,7 +1809,7 @@ fn classify_pass(hub: &Arc<Hub>, last_gen: &mut HashMap<PaneId, u64>) {
             let classified = kind
                 .as_ref()
                 .and_then(|kind| hub.registry.spec(kind))
-                .and_then(|spec| spec.classify(&pty.screen().contents()));
+                .and_then(|spec| spec.classify(&pty.contents()));
             (*pane, advanced, classified)
         })
         .collect();

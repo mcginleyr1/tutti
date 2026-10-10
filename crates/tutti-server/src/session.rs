@@ -565,18 +565,6 @@ impl Session {
         Ok(())
     }
 
-    pub fn pane_read(
-        &self,
-        pane: PaneId,
-        lines: Option<usize>,
-        unwrapped: bool,
-    ) -> Result<Vec<String>> {
-        Ok(self
-            .pty(pane)
-            .with_context(|| format!("no pane {pane}"))?
-            .read(lines, unwrapped))
-    }
-
     pub fn pty(&self, pane: PaneId) -> Option<Arc<PtyPane>> {
         self.panes.get(&pane).map(|s| Arc::clone(&s.pty))
     }

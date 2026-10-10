@@ -162,6 +162,11 @@ pub enum Request {
         pane: PaneId,
         lines: Option<usize>,
         unwrapped: bool,
+        /// Tail from this cursor (a previous `Response::Tail`'s): the rows
+        /// committed to scrollback since, then the live screen, answered with
+        /// `Response::Tail`. `None` reads everything as `Response::Content`.
+        #[serde(default)]
+        since: Option<u64>,
     },
     /// Resize a pane's pty and grid to the attached client's rendered size.
     PaneResize {
@@ -499,6 +504,17 @@ pub enum Response {
     Content {
         lines: Vec<String>,
     },
+    /// A `PaneRead { since: Some(_) }` reply: the rows committed to the pane's
+    /// scrollback since that cursor, oldest first, then the live screen (the
+    /// screen alone, cursor held, while its alternate screen is up). `cursor`
+    /// is the next read's `since` — it counts screen rows, so `unwrapped`
+    /// folds each read on its own. `truncated`: rows past the cursor had
+    /// already left the scrollback ring.
+    Tail {
+        lines: Vec<String>,
+        cursor: u64,
+        truncated: bool,
+    },
     /// A `PaneFingerprint` reply: the pane's prompt fingerprint, 16 hex digits.
     Fingerprint {
         fingerprint: String,
@@ -667,6 +683,13 @@ mod tests {
             pane: PaneId(2),
             lines: Some(50),
             unwrapped: true,
+            since: None,
+        });
+        roundtrip(&Request::PaneRead {
+            pane: PaneId(2),
+            lines: None,
+            unwrapped: false,
+            since: Some(10_177),
         });
         roundtrip(&Request::PaneResize {
             pane: PaneId(2),
@@ -921,6 +944,16 @@ mod tests {
         roundtrip(&Response::Content {
             lines: vec!["line one".into(), "line two".into()],
         });
+        roundtrip(&Response::Tail {
+            lines: vec!["committed".into(), "screen".into()],
+            cursor: 238,
+            truncated: false,
+        });
+        roundtrip(&Response::Tail {
+            lines: Vec::new(),
+            cursor: 0,
+            truncated: true,
+        });
         roundtrip(&Response::Fingerprint {
             fingerprint: "af63dc4c8601ec8c".into(),
         });
@@ -1108,6 +1141,19 @@ mod tests {
                 text: Some("y".into()),
                 keys: None,
                 expect: None,
+            }
+        );
+        // `pane_read` from before `since` existed reads everything, as Content.
+        let read: Request =
+            serde_json::from_str(r#"{"type":"pane_read","pane":2,"lines":null,"unwrapped":false}"#)
+                .unwrap();
+        assert_eq!(
+            read,
+            Request::PaneRead {
+                pane: PaneId(2),
+                lines: None,
+                unwrapped: false,
+                since: None,
             }
         );
         // `workspace_fork` without a revision or dest defaults both to `None`.

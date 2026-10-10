@@ -28,3 +28,9 @@ base64 = "0.22"
 tutti-core = { path = "crates/tutti-core" }
 tutti-server = { path = "crates/tutti-server" }
 tutti-agents = { path = "crates/tutti-agents" }
+
+# vt100 formats every render tick and every `pane read`; optimized even in dev
+# builds, a debug daemon and the read perf test see its real cost rather than
+# its unoptimized iterator chains (a full 10k-row read: ~30 ms → a few ms).
+[profile.dev.package.vt100]
+opt-level = 3
