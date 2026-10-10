@@ -9,6 +9,10 @@ use tutti_core::{AgentState, Checkpoint, FileStat};
 /// The most checkpoints kept per pane; the oldest drops first.
 pub const KEEP: usize = 50;
 
+/// A checkpoint noted for the next change probe to record: its label, and the
+/// prompt that started its turn when a hook reported one.
+pub type Noted = (String, Option<String>);
+
 /// One pane's checkpoints plus what the next change probe must record for it.
 #[derive(Default)]
 pub struct Turns {
@@ -18,31 +22,48 @@ pub struct Turns {
     /// The commit the next turn diffs from: the newest checkpoint, or the
     /// working copy a restore left behind. `None` before anything is recorded.
     head: Option<String>,
-    /// Labels noted since the last probe drained them, oldest first.
-    pending: Vec<String>,
+    /// Checkpoints noted since the last probe drained them, oldest first.
+    pending: Vec<Noted>,
+    /// The prompt that started the turn in flight, as a hook reported it.
+    prompt: Option<String>,
 }
 
 impl Turns {
     /// Note a state transition: leaving `Working` ends a turn (labelled with the
-    /// state it ended in), and entering it with nothing recorded yet takes the
-    /// baseline turn 1 diffs against.
+    /// state it ended in, and the prompt that started it), and entering it with
+    /// nothing recorded yet takes the baseline turn 1 diffs against. A turn
+    /// that blocked is still the prompt's — once answered the agent carries on
+    /// with it — so only an end in any other state lets the prompt go.
     pub fn note_transition(&mut self, from: AgentState, to: AgentState) {
         if to == AgentState::Working && self.head.is_none() {
             self.note_start();
         }
         if ends_turn(from, to) {
-            self.pending.push(format!("{to:?}").to_lowercase());
+            let label = format!("{to:?}").to_lowercase();
+            let prompt = match to {
+                AgentState::Blocked => self.prompt.clone(),
+                _ => self.prompt.take(),
+            };
+            self.pending.push((label, prompt));
         }
+    }
+
+    /// Note the prompt that starts the next turn — replacing one whose turn
+    /// never closed (an interrupted agent sends no stop) — or, with `None`,
+    /// forget it.
+    pub fn set_prompt(&mut self, prompt: Option<String>) {
+        self.prompt = prompt;
     }
 
     /// Note that an agent just started in the pane: where it began becomes a
     /// checkpoint, so its first turn has a "before" to diff and restore to.
     pub fn note_start(&mut self) {
-        self.pending.push("start".into());
+        self.pending.push(("start".into(), None));
     }
 
-    /// Hand the noted labels to a probe about to snapshot, which records them.
-    pub fn take_pending(&mut self) -> Vec<String> {
+    /// Hand the noted checkpoints to a probe about to snapshot, which records
+    /// them.
+    pub fn take_pending(&mut self) -> Vec<Noted> {
         std::mem::take(&mut self.pending)
     }
 
@@ -74,6 +95,7 @@ impl Turns {
         from: Option<String>,
         commit: &str,
         label: &str,
+        prompt: Option<&str>,
         time: u64,
         files: &[FileStat],
     ) -> Option<u64> {
@@ -87,6 +109,7 @@ impl Turns {
             from,
             time,
             label: label.to_string(),
+            prompt: prompt.map(str::to_string),
             files: files.len(),
             insertions: files.iter().map(|f| f.insertions).sum(),
             deletions: files.iter().map(|f| f.deletions).sum(),
@@ -117,6 +140,11 @@ mod tests {
         }
     }
 
+    /// The labels of what `turns` noted, draining them.
+    fn labels(turns: &mut Turns) -> Vec<String> {
+        turns.take_pending().into_iter().map(|(l, _)| l).collect()
+    }
+
     #[test]
     fn a_turn_ends_on_leaving_working_only() {
         for to in [Unknown, Blocked, Done, Idle] {
@@ -136,28 +164,72 @@ mod tests {
         let mut turns = Turns::default();
         turns.note_transition(Unknown, Working);
         turns.note_transition(Working, Blocked);
-        assert_eq!(turns.take_pending(), vec!["start", "blocked"]);
+        assert_eq!(labels(&mut turns), vec!["start", "blocked"]);
         assert!(turns.take_pending().is_empty(), "taking drains");
 
-        turns.record(None, "c1", "start", 1, &[]).unwrap();
+        turns.record(None, "c1", "start", None, 1, &[]).unwrap();
         turns.note_transition(Blocked, Working);
         turns.note_transition(Working, Done);
         assert_eq!(
-            turns.take_pending(),
+            labels(&mut turns),
             vec!["done"],
             "a pane with a head takes no second baseline"
         );
     }
 
     #[test]
+    fn a_prompt_rides_each_end_of_its_turn_until_the_turn_finishes() {
+        let mut turns = Turns::default();
+        turns.set_prompt(Some("fix the sidebar".into()));
+        turns.note_transition(Idle, Working);
+        assert_eq!(
+            turns.take_pending(),
+            vec![("start".to_string(), None)],
+            "the baseline predates the prompt"
+        );
+        turns.record(None, "c1", "start", None, 1, &[]).unwrap();
+
+        let prompt = Some("fix the sidebar".to_string());
+        turns.note_transition(Working, Blocked);
+        turns.note_transition(Blocked, Working);
+        turns.note_transition(Working, Done);
+        assert_eq!(
+            turns.take_pending(),
+            vec![
+                ("blocked".to_string(), prompt.clone()),
+                ("done".to_string(), prompt)
+            ],
+            "once answered, a blocked agent carries on with the same prompt"
+        );
+        turns.note_transition(Done, Working);
+        turns.note_transition(Working, Done);
+        assert_eq!(
+            turns.take_pending(),
+            vec![("done".to_string(), None)],
+            "a turn no prompt started has none"
+        );
+    }
+
+    #[test]
+    fn a_recorded_checkpoint_keeps_its_prompt() {
+        let mut turns = Turns::default();
+        turns.record(None, "c1", "start", None, 1, &[]).unwrap();
+        let fix = Some("fix the sidebar");
+        turns.record(Some("c1".into()), "c2", "done", fix, 2, &[stat(1, 0)]);
+        assert_eq!(turns.get(1).unwrap().prompt, None);
+        assert_eq!(turns.get(2).unwrap().prompt.as_deref(), fix);
+    }
+
+    #[test]
     fn record_numbers_monotonically_and_chains_from_the_head() {
         let mut turns = Turns::default();
-        assert_eq!(turns.record(None, "c1", "start", 10, &[]), Some(1));
+        assert_eq!(turns.record(None, "c1", "start", None, 10, &[]), Some(1));
         assert_eq!(
             turns.record(
                 Some("c1".into()),
                 "c2",
                 "done",
+                None,
                 20,
                 &[stat(3, 1), stat(1, 0)]
             ),
@@ -175,14 +247,14 @@ mod tests {
     #[test]
     fn record_dedupes_an_unmoved_head_and_refuses_a_stale_from() {
         let mut turns = Turns::default();
-        turns.record(None, "c1", "start", 1, &[]).unwrap();
+        turns.record(None, "c1", "start", None, 1, &[]).unwrap();
         assert_eq!(
-            turns.record(Some("c1".into()), "c1", "done", 2, &[]),
+            turns.record(Some("c1".into()), "c1", "done", None, 2, &[]),
             None,
             "a turn that changed nothing gets no checkpoint"
         );
         assert_eq!(
-            turns.record(Some("c0".into()), "c2", "done", 2, &[stat(1, 0)]),
+            turns.record(Some("c0".into()), "c2", "done", None, 2, &[stat(1, 0)]),
             None,
             "a diff taken against a superseded head is dropped"
         );
@@ -195,24 +267,34 @@ mod tests {
         let mut head = None;
         for i in 0..KEEP + 5 {
             let commit = format!("c{i}");
-            turns.record(head.clone(), &commit, "done", i as u64, &[stat(1, 0)]);
+            turns.record(head.clone(), &commit, "done", None, i as u64, &[stat(1, 0)]);
             head = Some(commit);
         }
         assert_eq!(turns.entries().len(), KEEP);
         assert_eq!(turns.entries()[0].n, 6, "the five oldest dropped");
         assert!(turns.get(5).is_none());
-        let next = turns.record(head, "fresh", "done", 99, &[stat(1, 0)]);
+        let next = turns.record(head, "fresh", "done", None, 99, &[stat(1, 0)]);
         assert_eq!(next, Some(KEEP as u64 + 6));
     }
 
     #[test]
     fn a_restore_head_is_the_next_turns_from() {
         let mut turns = Turns::default();
-        turns.record(None, "c1", "start", 1, &[]).unwrap();
+        turns.record(None, "c1", "start", None, 1, &[]).unwrap();
         turns.set_head("restored".into());
-        assert_eq!(turns.record(Some("c1".into()), "c2", "done", 2, &[]), None);
         assert_eq!(
-            turns.record(Some("restored".into()), "c2", "done", 2, &[stat(1, 0)]),
+            turns.record(Some("c1".into()), "c2", "done", None, 2, &[]),
+            None
+        );
+        assert_eq!(
+            turns.record(
+                Some("restored".into()),
+                "c2",
+                "done",
+                None,
+                2,
+                &[stat(1, 0)]
+            ),
             Some(2)
         );
     }

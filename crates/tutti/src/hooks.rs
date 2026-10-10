@@ -1,8 +1,9 @@
 //! Agent hook integrations: map a Claude Code hook-event JSON object, or an
 //! opencode bus event forwarded by tutti's opencode plugin (each delivered on
-//! `tutti agent-event`'s stdin), to a tutti `AgentHookEvent`; print the
-//! settings.json snippet that wires Claude Code's events to `tutti agent-event
-//! claude`, and the opencode plugin that pipes to `tutti agent-event opencode`.
+//! `tutti agent-event`'s stdin), to a tutti `AgentHookEvent` and the agent's
+//! own conversation id; print the settings.json snippet that wires Claude
+//! Code's events to `tutti agent-event claude`, and the opencode plugin that
+//! pipes to `tutti agent-event opencode`.
 //!
 //! The mappings read only the fields tutti reacts to and ignore everything else,
 //! so they tolerate each tool's evolving schema. They never fail: an
@@ -22,19 +23,24 @@ pub const OPENCODE_PLUGIN: &str = include_str!("opencode_plugin.js");
 pub const OPENCODE_PLUGIN_MARKER: &str = "// tutti opencode plugin";
 
 /// Map one opencode bus event, as the plugin forwards it (`{type,
-/// properties}`), to a tutti `AgentHookEvent`, or `None` when irrelevant.
-/// Verified against opencode 1.18.5's event schemas: `session.status` carries
-/// `properties.status.type` (`busy` | `retry` | `idle`); `session.idle` and
-/// `session.error` end the turn; `permission.asked` names its `permission`,
-/// `question.asked` its `questions[].question`; a `*.replied` or
-/// `question.rejected` means you answered and the agent goes on.
-pub fn map_opencode_event(v: &Value) -> Option<AgentHookEvent> {
+/// properties}`), to a tutti `AgentHookEvent` and the root session's id, or
+/// `None` when irrelevant. Verified against opencode 1.18.5's event schemas:
+/// `session.status` carries `properties.status.type` (`busy` | `retry` |
+/// `idle`); `session.idle` and `session.error` end the turn; `permission.asked`
+/// names its `permission`, `question.asked` its `questions[].question`; a
+/// `*.replied` or `question.rejected` means you answered and the agent goes on.
+/// Every one names its `sessionID` (optional only on `session.error`), but
+/// only the `session.*` events are surely the root session's: the plugin drops
+/// a child (subagent) session's, while a child's prompts pass — so only those
+/// name the conversation.
+pub fn map_opencode_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
     let text = |pointer: &str| {
         v.pointer(pointer)
             .and_then(Value::as_str)
             .map(str::to_string)
     };
-    match v.get("type")?.as_str()? {
+    let kind = v.get("type")?.as_str()?;
+    let event = match kind {
         "session.status" => match v.pointer("/properties/status/type")?.as_str()? {
             "busy" | "retry" => Some(AgentHookEvent::Activity { detail: None }),
             "idle" => Some(AgentHookEvent::Done),
@@ -51,16 +57,21 @@ pub fn map_opencode_event(v: &Value) -> Option<AgentHookEvent> {
             Some(AgentHookEvent::Activity { detail: None })
         }
         _ => None,
-    }
+    }?;
+    let root = matches!(kind, "session.status" | "session.idle" | "session.error");
+    Some((event, text("/properties/sessionID").filter(|_| root)))
 }
 
-/// Map one Claude Code hook event to a tutti `AgentHookEvent`, or `None` when the
-/// event is irrelevant (nothing is sent). Verified against the hooks reference:
-/// events carry `hook_event_name`; tool events carry `tool_name`/`tool_input`
-/// (the `Task` tool's input has `description`/`title`); `Notification` carries
-/// `message`; subagent events carry `agent_id`/`agent_type`.
-pub fn map_claude_event(v: &Value) -> Option<AgentHookEvent> {
-    match v.get("hook_event_name")?.as_str()? {
+/// Map one Claude Code hook event to a tutti `AgentHookEvent` and the
+/// conversation's `session_id`, or `None` when the event is irrelevant (nothing
+/// is sent). Verified against the hooks reference: every event carries
+/// `hook_event_name` and `session_id` (a subagent's events carry its parent
+/// session's); tool events carry `tool_name`/`tool_input` (the `Task` tool's
+/// input has `description`/`title`); `Notification` carries `message` and
+/// `notification_type`; `UserPromptSubmit` carries the `prompt`; subagent
+/// events carry `agent_id`/`agent_type`.
+pub fn map_claude_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
+    let event = match v.get("hook_event_name")?.as_str()? {
         "PreToolUse" if tool_name(v) == Some("Task") => {
             let desc = subagent_desc(v);
             Some(AgentHookEvent::SubagentStarted {
@@ -72,12 +83,43 @@ pub fn map_claude_event(v: &Value) -> Option<AgentHookEvent> {
             detail: tool_name(v).map(str::to_string),
         }),
         "SubagentStop" => Some(AgentHookEvent::SubagentStopped { id: subagent_id(v) }),
-        "Notification" => Some(AgentHookEvent::Blocked {
-            message: v.get("message").and_then(Value::as_str).map(str::to_string),
-        }),
+        "Notification" => match v.get("notification_type").and_then(Value::as_str) {
+            // Reports, not requests. The idle reminder lands a minute after
+            // Stop marked the pane done: re-raising it would queue a pane you
+            // have already seen.
+            Some(
+                "idle_prompt"
+                | "auth_success"
+                | "elicitation_complete"
+                | "elicitation_response"
+                | "agent_completed"
+                | "quota_auto_resume_fired"
+                | "quota_auto_resume_disabled",
+            ) => None,
+            // Claude waits on you — a permission or MCP dialog, a question, an
+            // Enter after a usage limit (`quota_auto_resume_stale`). An older
+            // Claude names no type, and a type tutti does not know yet keeps
+            // the safe reading: blocked.
+            _ => Some(AgentHookEvent::Blocked {
+                message: v.get("message").and_then(Value::as_str).map(str::to_string),
+            }),
+        },
         "Stop" => Some(AgentHookEvent::Done),
+        "UserPromptSubmit" => Some(AgentHookEvent::Prompt {
+            text: v
+                .get("prompt")
+                .and_then(Value::as_str)
+                .and_then(tutti_agents::first_prompt_line),
+        }),
+        "SessionStart" => Some(AgentHookEvent::SessionStarted),
         _ => None,
-    }
+    }?;
+    let conversation = v
+        .get("session_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Some((event, conversation))
 }
 
 fn tool_name(v: &Value) -> Option<&str> {
@@ -113,8 +155,8 @@ fn subagent_id(v: &Value) -> String {
 /// `tutti agent-event claude`. Built as JSON so it is always valid.
 pub fn claude_hooks_json() -> Value {
     // Tool + subagent events filter on the tool/agent (matcher "*" = all); the
-    // per-event mapping decides what each one means. Notification/Stop take no
-    // matcher.
+    // per-event mapping decides what each one means. The rest take no matcher:
+    // every notification type, every session source, every prompt and stop.
     let cmd = json!({ "type": "command", "command": HOOK_COMMAND });
     let with_matcher = json!([{ "matcher": "*", "hooks": [cmd] }]);
     let no_matcher = json!([{ "hooks": [cmd] }]);
@@ -125,6 +167,8 @@ pub fn claude_hooks_json() -> Value {
             "SubagentStop": with_matcher,
             "Notification": no_matcher,
             "Stop": no_matcher,
+            "UserPromptSubmit": no_matcher,
+            "SessionStart": no_matcher,
         }
     })
 }
@@ -194,7 +238,13 @@ mod tests {
     use super::*;
 
     fn ev(json: &str) -> Option<AgentHookEvent> {
-        map_claude_event(&serde_json::from_str(json).unwrap())
+        map_claude_event(&serde_json::from_str(json).unwrap()).map(|(event, _)| event)
+    }
+
+    /// The conversation id a Claude event names, `None` when it maps to
+    /// nothing at all.
+    fn conversation(json: &str) -> Option<String> {
+        map_claude_event(&serde_json::from_str(json).unwrap()).and_then(|(_, id)| id)
     }
 
     #[test]
@@ -269,13 +319,54 @@ mod tests {
     }
 
     #[test]
-    fn notification_becomes_blocked_with_message() {
+    fn an_untyped_notification_from_an_older_claude_still_blocks() {
         assert_eq!(
             ev(r#"{ "hook_event_name": "Notification", "message": "allow edit?" }"#),
             Some(AgentHookEvent::Blocked {
                 message: Some("allow edit?".into())
             })
         );
+    }
+
+    fn notification(kind: &str) -> Option<AgentHookEvent> {
+        ev(&format!(
+            r#"{{ "hook_event_name": "Notification", "message": "m", "notification_type": "{kind}" }}"#
+        ))
+    }
+
+    #[test]
+    fn notifications_that_wait_on_you_block() {
+        for kind in [
+            "permission_prompt",
+            "elicitation_dialog",
+            "elicitation_url_dialog",
+            "agent_needs_input",
+            "quota_auto_resume_stale",
+            "some_future_type",
+        ] {
+            assert_eq!(
+                notification(kind),
+                Some(AgentHookEvent::Blocked {
+                    message: Some("m".into())
+                }),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn notifications_that_only_report_send_nothing() {
+        for kind in [
+            "idle_prompt",
+            "auth_success",
+            "elicitation_complete",
+            "elicitation_response",
+            "agent_completed",
+            "quota_auto_resume_fired",
+            "quota_auto_resume_disabled",
+        ] {
+            assert_eq!(notification(kind), None, "{kind}");
+        }
     }
 
     #[test]
@@ -287,8 +378,68 @@ mod tests {
     }
 
     #[test]
+    fn a_submitted_prompt_starts_a_turn_labelled_by_its_first_line() {
+        let prompt = |text: &str| {
+            ev(&json!({ "hook_event_name": "UserPromptSubmit", "prompt": text }).to_string())
+        };
+        assert_eq!(
+            prompt("  fix the failing test  \nit is in tests/server.rs"),
+            Some(AgentHookEvent::Prompt {
+                text: Some("fix the failing test".into())
+            })
+        );
+        let long = "x".repeat(200);
+        assert_eq!(
+            prompt(&long),
+            Some(AgentHookEvent::Prompt {
+                text: Some("x".repeat(80))
+            }),
+            "a wall of text is capped to a label"
+        );
+        for injected in [
+            "<pasted_content id=\"1\">\nlog\n</pasted_content id=\"1\">\nfix this",
+            "<task-notification>done</task-notification>",
+            "",
+        ] {
+            assert_eq!(
+                prompt(injected),
+                Some(AgentHookEvent::Prompt { text: None }),
+                "still a turn, but nothing to label it by: {injected:?}"
+            );
+        }
+        assert_eq!(
+            ev(r#"{ "hook_event_name": "UserPromptSubmit" }"#),
+            Some(AgentHookEvent::Prompt { text: None })
+        );
+    }
+
+    #[test]
+    fn every_event_names_its_session_and_a_session_start_maps() {
+        assert_eq!(
+            map_claude_event(&json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "abc123",
+                "source": "clear",
+            })),
+            Some((AgentHookEvent::SessionStarted, Some("abc123".into())))
+        );
+        assert_eq!(
+            conversation(
+                r#"{ "hook_event_name": "PostToolUse", "tool_name": "Edit", "session_id": "abc123", "agent_id": "a1" }"#
+            ),
+            Some("abc123".into()),
+            "a subagent's event names its parent session"
+        );
+        assert_eq!(
+            conversation(r#"{ "hook_event_name": "Stop", "session_id": "" }"#),
+            None
+        );
+        assert_eq!(conversation(r#"{ "hook_event_name": "Stop" }"#), None);
+    }
+
+    #[test]
     fn irrelevant_or_malformed_events_map_to_nothing() {
-        assert_eq!(ev(r#"{ "hook_event_name": "SessionStart" }"#), None);
+        assert_eq!(ev(r#"{ "hook_event_name": "SessionEnd" }"#), None);
         assert_eq!(ev(r#"{ "hook_event_name": "PreCompact" }"#), None);
         // Missing the event name entirely.
         assert_eq!(ev(r#"{ "tool_name": "Bash" }"#), None);
@@ -317,17 +468,58 @@ mod tests {
             "SubagentStop",
             "Notification",
             "Stop",
+            "UserPromptSubmit",
+            "SessionStart",
         ] {
             assert!(hooks.get(event).is_some(), "missing {event}");
         }
+        assert_eq!(hooks.as_object().unwrap().len(), 7);
         assert!(claude_hooks_snippet().contains(HOOK_COMMAND));
     }
 
     #[test]
     fn merge_installs_into_empty_settings() {
         let (merged, added) = merge_claude_hooks(&json!({})).unwrap().unwrap();
-        assert_eq!(added.len(), 5);
+        assert_eq!(added.len(), 7);
         assert!(merged["hooks"]["Stop"][0]["hooks"][0]["command"] == HOOK_COMMAND);
+        assert!(
+            merged["hooks"]["UserPromptSubmit"][0]
+                .get("matcher")
+                .is_none()
+        );
+    }
+
+    /// Re-running `--install` over what the five-event release installed adds
+    /// exactly the two new events and leaves every existing entry alone.
+    #[test]
+    fn merge_upgrades_an_old_install_with_just_the_new_events() {
+        let cmd = json!({ "type": "command", "command": HOOK_COMMAND });
+        let with_matcher = json!([{ "matcher": "*", "hooks": [cmd] }]);
+        let no_matcher = json!([{ "hooks": [cmd] }]);
+        let old = json!({
+            "model": "opus",
+            "hooks": {
+                "PreToolUse": with_matcher,
+                "PostToolUse": with_matcher,
+                "SubagentStop": with_matcher,
+                "Notification": no_matcher,
+                "Stop": no_matcher,
+            }
+        });
+        let (merged, mut added) = merge_claude_hooks(&old).unwrap().unwrap();
+        added.sort();
+        assert_eq!(added, ["SessionStart", "UserPromptSubmit"]);
+        for event in [
+            "PreToolUse",
+            "PostToolUse",
+            "SubagentStop",
+            "Notification",
+            "Stop",
+        ] {
+            assert_eq!(merged["hooks"][event], old["hooks"][event], "{event}");
+        }
+        assert_eq!(merged["model"], "opus");
+        assert!(merge_claude_hooks(&merged).unwrap().is_none());
     }
 
     #[test]
@@ -366,7 +558,40 @@ mod tests {
     }
 
     fn oc(json: &str) -> Option<AgentHookEvent> {
-        map_opencode_event(&serde_json::from_str(json).unwrap())
+        map_opencode_event(&serde_json::from_str(json).unwrap()).map(|(event, _)| event)
+    }
+
+    /// The root session id an opencode event names, `None` when it names none
+    /// or maps to nothing at all.
+    fn oc_conversation(json: &str) -> Option<String> {
+        map_opencode_event(&serde_json::from_str(json).unwrap()).and_then(|(_, id)| id)
+    }
+
+    #[test]
+    fn opencode_names_the_conversation_from_root_session_events_only() {
+        for root in [
+            r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":{"type":"busy"}}}"#,
+            r#"{"type":"session.idle","properties":{"sessionID":"ses_1"}}"#,
+            r#"{"type":"session.error","properties":{"sessionID":"ses_1","error":{"name":"UnknownError"}}}"#,
+        ] {
+            assert_eq!(oc_conversation(root), Some("ses_1".into()), "{root}");
+        }
+        assert_eq!(
+            oc_conversation(
+                r#"{"type":"session.error","properties":{"error":{"name":"UnknownError"}}}"#
+            ),
+            None,
+            "session.error may name no session"
+        );
+        // A subagent's prompts reach the pane too, under the child's id.
+        for maybe_child in [
+            r#"{"type":"permission.asked","properties":{"id":"per_1","sessionID":"ses_child","permission":"bash"}}"#,
+            r#"{"type":"question.asked","properties":{"id":"que_1","sessionID":"ses_child","questions":[]}}"#,
+            r#"{"type":"permission.replied","properties":{"sessionID":"ses_child","requestID":"per_1","reply":"once"}}"#,
+        ] {
+            assert!(oc(maybe_child).is_some());
+            assert_eq!(oc_conversation(maybe_child), None, "{maybe_child}");
+        }
     }
 
     #[test]

@@ -10,7 +10,7 @@ use crate::state::{AgentState, StateSource};
 /// Response / Event shapes (including additive fields): the daemon reports it
 /// on attach and mismatched clients tell the user to restart the daemon —
 /// binaries upgrade on install, running daemons do not.
-pub const WIRE_REV: u32 = 5;
+pub const WIRE_REV: u32 = 6;
 
 /// The revset every workspace-delta surface diffs against: the fork point of
 /// the trunk bookmark (local `main`, else `master`, else `trunk`; `root()` when
@@ -169,6 +169,12 @@ pub enum Request {
     AgentEvent {
         pane: PaneId,
         event: AgentHookEvent,
+        /// The agent's own id for its conversation when the payload carried
+        /// one — Claude's `session_id`, opencode's root `sessionID` — which
+        /// the pane remembers (`PaneInfo::conversation`). `None` from older
+        /// clients and payloads without one.
+        #[serde(default)]
+        conversation: Option<String>,
     },
     /// List `pane`'s per-turn checkpoints, oldest first. Answered with
     /// `Response::Checkpoints` (empty for a pane outside a jj workspace).
@@ -224,6 +230,19 @@ pub enum AgentHookEvent {
     },
     /// The agent finished responding.
     Done,
+    /// The agent opened a conversation or switched to another (launch,
+    /// resume, `/clear`). No state change: it names the conversation before
+    /// the first tool use does, and follows the switch.
+    SessionStarted,
+    /// A prompt was submitted — typed, or one the agent started on its own (a
+    /// scheduled task, a background subagent reporting back) — so a turn
+    /// begins (`Working`). `text` is its first line, trimmed and capped, which
+    /// the checkpoint closing the turn lists as; `None` when that line is empty
+    /// or tool-injected content (a paste marker, a task notification).
+    Prompt {
+        #[serde(default)]
+        text: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,6 +290,12 @@ pub struct PaneInfo {
     /// local pane and from older servers.
     #[serde(default)]
     pub sandbox: Option<String>,
+    /// The conversation the pane's agent holds, by the agent's own id for it
+    /// (Claude's `session_id`, opencode's root `sessionID`) from the latest
+    /// hook event naming one — what resuming it takes. Dropped when the agent
+    /// leaves the pane. `None` without hooks and from older servers.
+    #[serde(default)]
+    pub conversation: Option<String>,
 }
 
 /// One agent turn's checkpoint: the commit id of the workspace's `@` right
@@ -290,6 +315,11 @@ pub struct Checkpoint {
     /// What closed the turn: the state it ended in (`done`, `blocked`), `start`
     /// for where the agent began, or `before restore`.
     pub label: String,
+    /// The first line of the prompt that started the turn, when a hook
+    /// reported one — what the turn lists as, over `label`. `None` for
+    /// `start` and `before restore`, without hooks, and from older servers.
+    #[serde(default)]
+    pub prompt: Option<String>,
     /// The turn's stat over `from..commit`, computed once at record time.
     pub files: usize,
     pub insertions: u64,
@@ -569,26 +599,48 @@ mod tests {
                 id: "s1".into(),
                 desc: "write the tests".into(),
             },
+            conversation: None,
         });
         roundtrip(&Request::AgentEvent {
             pane: PaneId(3),
             event: AgentHookEvent::SubagentStopped { id: "s1".into() },
+            conversation: None,
         });
         roundtrip(&Request::AgentEvent {
             pane: PaneId(3),
             event: AgentHookEvent::Activity {
                 detail: Some("Bash".into()),
             },
+            conversation: Some("0b9e6c1e-3d2a-4f5b-9c8d-7e6f5a4b3c2d".into()),
         });
         roundtrip(&Request::AgentEvent {
             pane: PaneId(3),
             event: AgentHookEvent::Blocked {
                 message: Some("allow edit?".into()),
             },
+            conversation: None,
         });
         roundtrip(&Request::AgentEvent {
             pane: PaneId(3),
             event: AgentHookEvent::Done,
+            conversation: None,
+        });
+        roundtrip(&Request::AgentEvent {
+            pane: PaneId(3),
+            event: AgentHookEvent::SessionStarted,
+            conversation: Some("ses_1".into()),
+        });
+        roundtrip(&Request::AgentEvent {
+            pane: PaneId(3),
+            event: AgentHookEvent::Prompt {
+                text: Some("fix the failing test".into()),
+            },
+            conversation: Some("ses_1".into()),
+        });
+        roundtrip(&Request::AgentEvent {
+            pane: PaneId(3),
+            event: AgentHookEvent::Prompt { text: None },
+            conversation: None,
         });
         roundtrip(&Request::PaneCheckpoints { pane: PaneId(3) });
         roundtrip(&Request::PaneCheckpointDiff {
@@ -611,6 +663,7 @@ mod tests {
             from: Some("da7330dd4aa56869ad23109aba788bb16deb53af".into()),
             time: 1_760_000_000,
             label: "done".into(),
+            prompt: Some("fix the failing test".into()),
             files: 1,
             insertions: 2,
             deletions: 1,
@@ -627,9 +680,22 @@ mod tests {
             serde_json::to_string(&AgentHookEvent::SubagentStopped { id: "a".into() }).unwrap(),
             r#"{"kind":"subagent_stopped","id":"a"}"#
         );
+        assert_eq!(
+            serde_json::to_string(&AgentHookEvent::SessionStarted).unwrap(),
+            r#"{"kind":"session_started"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentHookEvent::Prompt {
+                text: Some("fix it".into())
+            })
+            .unwrap(),
+            r#"{"kind":"prompt","text":"fix it"}"#
+        );
         // A hook event serialized without the optional field still parses.
         let activity: AgentHookEvent = serde_json::from_str(r#"{"kind":"activity"}"#).unwrap();
         assert_eq!(activity, AgentHookEvent::Activity { detail: None });
+        let prompt: AgentHookEvent = serde_json::from_str(r#"{"kind":"prompt"}"#).unwrap();
+        assert_eq!(prompt, AgentHookEvent::Prompt { text: None });
     }
 
     fn sample_view() -> Vec<WorkspaceView> {
@@ -667,6 +733,7 @@ mod tests {
                     checkpoints: vec![sample_checkpoint()],
                     source: None,
                     sandbox: None,
+                    conversation: None,
                 }],
             }],
         }]
@@ -694,6 +761,7 @@ mod tests {
                 checkpoints: Vec::new(),
                 source: Some(StateSource::Hook),
                 sandbox: Some("gke".into()),
+                conversation: Some("0b9e6c1e-3d2a-4f5b-9c8d-7e6f5a4b3c2d".into()),
             }],
         });
         roundtrip(&Response::Panes {
@@ -707,6 +775,7 @@ mod tests {
                 checkpoints: Vec::new(),
                 source: Some(StateSource::Program),
                 sandbox: None,
+                conversation: None,
             }],
         });
         roundtrip(&Response::Checkpoints {
@@ -715,6 +784,7 @@ mod tests {
                     n: 1,
                     from: None,
                     label: "start".into(),
+                    prompt: None,
                     files: 0,
                     insertions: 0,
                     deletions: 0,
@@ -848,8 +918,28 @@ mod tests {
         assert!(pane.subagents.is_empty());
         assert_eq!(pane.source, None);
         assert_eq!(pane.sandbox, None, "and before `sandbox`, a local pane");
+        assert_eq!(pane.conversation, None, "and before `conversation`, none");
         // ...and before `checkpoints` existed, to no checkpoints.
         assert!(pane.checkpoints.is_empty());
+        // A checkpoint from before `prompt` existed lists as its label.
+        let checkpoint: Checkpoint = serde_json::from_str(
+            r#"{"n":2,"commit":"c2","from":"c1","time":1,"label":"done","files":1,"insertions":2,"deletions":1}"#,
+        )
+        .unwrap();
+        assert_eq!(checkpoint.prompt, None);
+        // `agent_event` from before `conversation` existed names none, which
+        // keeps whatever the pane holds.
+        let event: Request =
+            serde_json::from_str(r#"{"type":"agent_event","pane":3,"event":{"kind":"done"}}"#)
+                .unwrap();
+        assert_eq!(
+            event,
+            Request::AgentEvent {
+                pane: PaneId(3),
+                event: AgentHookEvent::Done,
+                conversation: None,
+            }
+        );
         // `pane_checkpoint_diff` without `n`/`stat` is the newest turn's full
         // diff; `pane_restore` without `force` respects the state guard.
         let diff: Request =

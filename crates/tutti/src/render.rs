@@ -46,8 +46,9 @@ pub fn panes(items: &[PaneInfo]) -> String {
     table(&["ID", "TITLE", "AGENT", "STATE", "EXIT"], &rows)
 }
 
-/// A pane's checkpoints, newest first: number, age, what closed the turn, the
-/// turn's stat, and the short commit id (usable anywhere jj takes a revision).
+/// A pane's checkpoints, newest first: number, age, the turn's stat, the short
+/// commit id (usable anywhere jj takes a revision), and last — it runs up to
+/// 80 characters — the prompt that started the turn, else what closed it.
 pub fn checkpoints(items: &[Checkpoint], now: u64) -> String {
     let rows: Vec<Vec<String>> = items
         .iter()
@@ -56,13 +57,13 @@ pub fn checkpoints(items: &[Checkpoint], now: u64) -> String {
             vec![
                 format!("#{}", c.n),
                 age(c.time, now),
-                c.label.clone(),
                 turn_stat(c),
                 c.commit.chars().take(12).collect(),
+                c.prompt.clone().unwrap_or_else(|| c.label.clone()),
             ]
         })
         .collect();
-    table(&["N", "AGE", "LABEL", "STAT", "COMMIT"], &rows)
+    table(&["N", "AGE", "STAT", "COMMIT", "LABEL"], &rows)
 }
 
 /// A checkpoint's turn stat (`2 files +14 −3`), or `-` for the first state
@@ -177,6 +178,7 @@ mod tests {
             checkpoints: Vec::new(),
             source: None,
             sandbox: None,
+            conversation: None,
         }]);
         assert_eq!(
             rendered,
@@ -193,6 +195,7 @@ mod tests {
             from: None,
             time: 1_000,
             label: "start".into(),
+            prompt: None,
             files: 0,
             insertions: 0,
             deletions: 0,
@@ -203,15 +206,36 @@ mod tests {
             from: Some(start.commit.clone()),
             time: 1_000 + 3 * 3600,
             label: "done".into(),
+            prompt: None,
             files: 1,
             insertions: 2,
             deletions: 1,
         };
         assert_eq!(
             checkpoints(&[start, turn], 1_000 + 3 * 3600 + 30),
-            "N   AGE  LABEL  STAT          COMMIT\n\
-             #2  now  done   1 file +2 −1  0fe66d0872aa\n\
-             #1  3h   start  -             da7330dd4aa5\n"
+            "N   AGE  STAT          COMMIT        LABEL\n\
+             #2  now  1 file +2 −1  0fe66d0872aa  done\n\
+             #1  3h   -             da7330dd4aa5  start\n"
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_lists_as_the_prompt_that_started_its_turn() {
+        let turn = Checkpoint {
+            n: 3,
+            commit: "0fe66d0872aa60dad12f02a7c49e1d220a67229d".into(),
+            from: Some("da7330dd4aa56869ad23109aba788bb16deb53af".into()),
+            time: 1_000,
+            label: "done".into(),
+            prompt: Some("fix the failing sidebar test".into()),
+            files: 2,
+            insertions: 14,
+            deletions: 3,
+        };
+        assert_eq!(
+            checkpoints(&[turn], 1_000),
+            "N   AGE  STAT            COMMIT        LABEL\n\
+             #3  now  2 files +14 −3  0fe66d0872aa  fix the failing sidebar test\n"
         );
     }
 

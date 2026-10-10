@@ -15,7 +15,7 @@ use tutti_core::{
     WorkspaceInfo, WorkspaceView, prompt_fingerprint,
 };
 
-use crate::checkpoints::Turns;
+use crate::checkpoints::{Noted, Turns};
 use crate::pty::{PaneSize, PtyPane, PtySpec, StatusReport};
 
 /// The most subagent rows kept per pane before the oldest is dropped, bounding
@@ -570,20 +570,30 @@ impl Session {
     }
 
     /// Apply an agent hook event to `pane`, which claims it for good (hooks
-    /// outrank every other source). Returns what moved so the caller broadcasts
-    /// the right event(s): a state transition (via the shared
-    /// `AgentState::apply`) drives `StateChanged`; a subagent-list change drives
+    /// outrank every other source) — all but `SessionStarted`, which changes no
+    /// state and so leaves the screen classifier on until the agent's first
+    /// turn. A `conversation` replaces the pane's (the agent switched to
+    /// another); `None` keeps it. A prompt is noted for the checkpoint closing
+    /// the turn it starts. Returns what moved so the caller broadcasts the right
+    /// event(s): a state transition (via the shared `AgentState::apply`) drives
+    /// `StateChanged`; a subagent-list or conversation change drives
     /// `LayoutChanged`. `None` for an unknown pane (a hook must never fail
     /// because its pane has gone away).
     pub fn apply_agent_event(
         &mut self,
         pane: PaneId,
         event: AgentHookEvent,
+        conversation: Option<String>,
     ) -> Option<AgentEventOutcome> {
         let slot = self.panes.get_mut(&pane)?;
-        slot.meta.source = Some(StateSource::Hook);
+        if event != AgentHookEvent::SessionStarted {
+            slot.meta.source = Some(StateSource::Hook);
+        }
+        let mut relisted = conversation.is_some() && slot.meta.conversation != conversation;
+        if relisted {
+            slot.meta.conversation = conversation;
+        }
         let subs = &mut slot.meta.subagents;
-        let mut subagents_changed = false;
         let mut classified = None;
         match event {
             AgentHookEvent::SubagentStarted { id, desc } => {
@@ -595,12 +605,16 @@ impl Session {
                 if subs.len() > SUBAGENT_CAP {
                     subs.remove(0);
                 }
-                subagents_changed = true;
+                relisted = true;
             }
             AgentHookEvent::SubagentStopped { id } => {
-                subagents_changed = stop_subagent(subs, &id);
+                relisted |= stop_subagent(subs, &id);
             }
             AgentHookEvent::Activity { .. } => {
+                classified = Some(Observation::Working);
+            }
+            AgentHookEvent::Prompt { text } => {
+                slot.turns.set_prompt(text);
                 classified = Some(Observation::Working);
             }
             AgentHookEvent::Blocked { .. } => {
@@ -612,8 +626,9 @@ impl Session {
                 // around only to show their completion.
                 let before = subs.len();
                 subs.retain(|s| s.running);
-                subagents_changed = subs.len() != before;
+                relisted |= subs.len() != before;
             }
+            AgentHookEvent::SessionStarted => {}
         }
         let transition = classified.and_then(|obs| {
             let from = slot.meta.state;
@@ -623,20 +638,27 @@ impl Session {
         });
         Some(AgentEventOutcome {
             transition,
-            subagents_changed,
+            relisted,
         })
     }
 
     /// Record the agent kind detected for a pane. Returns whether it changed. A
     /// change ends any program/progress claim and the self-reported label —
     /// they spoke for whatever ran there before; a hook claim stays (sticky).
-    /// An agent appearing notes its start as a checkpoint for the caller's next
-    /// change probe — detection lands well before the agent's first edit.
+    /// An agent leaving takes its conversation and its turn's prompt along;
+    /// one appearing keeps what its hooks reported before detection caught up
+    /// with it. An agent appearing notes its start as a checkpoint for the
+    /// caller's next change probe — detection lands well before the agent's
+    /// first edit.
     pub fn set_agent(&mut self, pane: PaneId, agent: Option<AgentKind>) -> bool {
         match self.panes.get_mut(&pane) {
             Some(slot) if slot.meta.agent != agent => {
                 if agent.is_some() && slot.meta.sandbox.is_none() {
                     slot.turns.note_start();
+                }
+                if slot.meta.agent.is_some() {
+                    slot.meta.conversation = None;
+                    slot.turns.set_prompt(None);
                 }
                 slot.meta.agent = agent;
                 slot.label = None;
@@ -662,8 +684,9 @@ impl Session {
     }
 
     /// Drain what every pane of `workspace` noted since the last probe: the
-    /// checkpoint labels the probe about to snapshot must record, per pane.
-    pub fn take_turns(&mut self, workspace: WorkspaceId) -> Vec<(PaneId, Vec<String>)> {
+    /// checkpoints (label and prompt) the probe about to snapshot must record,
+    /// per pane.
+    pub fn take_turns(&mut self, workspace: WorkspaceId) -> Vec<(PaneId, Vec<Noted>)> {
         let tabs: Vec<TabId> = self
             .workspaces
             .iter()
@@ -973,6 +996,7 @@ impl Session {
                     checkpoints: Vec::new(),
                     source: None,
                     sandbox: None,
+                    conversation: None,
                 },
                 pty,
                 tab,
@@ -992,8 +1016,9 @@ impl Session {
 pub struct AgentEventOutcome {
     /// The pane's `(from, to)` state transition, when the event moved it.
     pub transition: Option<(AgentState, AgentState)>,
-    /// Whether the subagent list changed (so a fresh view must be broadcast).
-    pub subagents_changed: bool,
+    /// Whether the subagent list or the conversation changed (so a fresh view
+    /// must be broadcast).
+    pub relisted: bool,
 }
 
 /// What `apply_report` changed, so the server broadcasts the right events.
@@ -1201,7 +1226,7 @@ mod tests {
     fn a_hook_claim_is_absolute_and_sticky() {
         let (mut s, pane, _tmp) = session_with_pane();
         let t0 = Instant::now();
-        s.apply_agent_event(pane, AgentHookEvent::Blocked { message: None });
+        s.apply_agent_event(pane, AgentHookEvent::Blocked { message: None }, None);
         assert_eq!(state_of(&s, pane), (Blocked, Some(Hook)));
         s.apply_report(pane, report(Program, Some(Done)), t0);
         s.apply_report(pane, report(Progress, Some(Working)), t0);
@@ -1284,9 +1309,108 @@ mod tests {
     fn a_hook_working_pane_never_stalls() {
         let (mut s, pane, _tmp) = session_with_pane();
         let t0 = Instant::now();
-        s.apply_agent_event(pane, AgentHookEvent::Activity { detail: None });
+        s.apply_agent_event(pane, AgentHookEvent::Activity { detail: None }, None);
         assert_eq!(s.observe(pane, false, None, t0 + STALL_AFTER * 10), None);
         assert_eq!(state_of(&s, pane), (Working, Some(Hook)));
+    }
+
+    /// Apply a hook event naming no conversation and note its transition, as
+    /// the server's `publish_transition` does.
+    fn hook(s: &mut Session, pane: PaneId, event: AgentHookEvent) {
+        let outcome = s.apply_agent_event(pane, event, None).unwrap();
+        if let Some((from, to)) = outcome.transition {
+            s.note_transition(pane, from, to);
+        }
+    }
+
+    #[test]
+    fn hooks_name_the_conversation_and_a_later_one_replaces_it() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let conversation = |s: &Session| info(s, pane).conversation;
+        let started = s
+            .apply_agent_event(pane, AgentHookEvent::SessionStarted, Some("c1".into()))
+            .unwrap();
+        assert!(started.relisted, "a new conversation rebroadcasts the view");
+        assert_eq!(started.transition, None);
+        assert_eq!(conversation(&s).as_deref(), Some("c1"));
+        assert_eq!(
+            state_of(&s, pane),
+            (Unknown, None),
+            "a session start claims nothing: the screen speaks until the first turn"
+        );
+
+        let working = AgentHookEvent::Activity { detail: None };
+        let again = s.apply_agent_event(pane, working, Some("c1".into()));
+        assert!(!again.unwrap().relisted, "the same conversation is no news");
+        s.apply_agent_event(pane, AgentHookEvent::Done, None);
+        assert_eq!(
+            conversation(&s).as_deref(),
+            Some("c1"),
+            "an event naming none keeps it"
+        );
+        s.apply_agent_event(pane, AgentHookEvent::SessionStarted, Some("c2".into()));
+        assert_eq!(
+            conversation(&s).as_deref(),
+            Some("c2"),
+            "a `/clear` moves it on"
+        );
+    }
+
+    #[test]
+    fn the_conversation_leaves_with_its_agent() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let conversation = |s: &Session| info(s, pane).conversation;
+        s.apply_agent_event(pane, AgentHookEvent::SessionStarted, Some("c1".into()));
+        assert!(s.set_agent(pane, Some("claude".into())));
+        assert_eq!(
+            conversation(&s).as_deref(),
+            Some("c1"),
+            "the hook beat detection to its own agent"
+        );
+        s.set_agent(pane, Some("codex".into()));
+        assert_eq!(conversation(&s), None, "it was the previous agent's");
+        s.apply_agent_event(pane, AgentHookEvent::SessionStarted, Some("c2".into()));
+        s.set_agent(pane, None);
+        assert_eq!(
+            conversation(&s),
+            None,
+            "nor does it outlive its agent quitting"
+        );
+    }
+
+    #[test]
+    fn a_prompt_starts_a_turn_and_labels_the_checkpoint_closing_it() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let workspace = s.workspace_of_pane(pane).unwrap();
+        let fix = Some("fix the sidebar".to_string());
+        hook(&mut s, pane, AgentHookEvent::Prompt { text: fix.clone() });
+        assert_eq!(state_of(&s, pane), (Working, Some(Hook)));
+        hook(&mut s, pane, AgentHookEvent::Done);
+        assert_eq!(
+            s.take_turns(workspace),
+            vec![(
+                pane,
+                vec![("start".to_string(), None), ("done".to_string(), fix)]
+            )],
+            "the baseline predates the prompt; the turn's end carries it"
+        );
+    }
+
+    #[test]
+    fn an_agent_quitting_mid_turn_takes_its_prompt_along() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let workspace = s.workspace_of_pane(pane).unwrap();
+        s.set_agent(pane, Some("claude".into()));
+        let fix = Some("fix the sidebar".to_string());
+        hook(&mut s, pane, AgentHookEvent::Prompt { text: fix });
+        s.set_agent(pane, None);
+        hook(&mut s, pane, AgentHookEvent::Done);
+        let noted = s.take_turns(workspace).remove(0).1;
+        assert_eq!(
+            noted.last(),
+            Some(&("done".to_string(), None)),
+            "whatever ended the turn later did not answer that prompt"
+        );
     }
 
     #[test]

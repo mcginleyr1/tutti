@@ -38,6 +38,7 @@ pub(crate) fn pane(id: u64, title: &str, agent: Option<&str>, state: AgentState)
         checkpoints: Vec::new(),
         source: None,
         sandbox: None,
+        conversation: None,
     }
 }
 

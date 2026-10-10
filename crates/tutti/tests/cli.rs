@@ -115,6 +115,40 @@ fn agent_event_opencode_forwards_a_recorded_permission_prompt() {
                     event: AgentHookEvent::Blocked {
                         message: Some("bash".into()),
                     },
+                    // A prompt may be a subagent's: it names no conversation.
+                    conversation: None,
+                }
+            );
+        },
+        Response::Ok,
+    );
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty() && output.stderr.is_empty());
+}
+
+/// A recorded Claude Code `UserPromptSubmit`, piped to `agent-event claude`
+/// inside a tutti pane, reaches the daemon as a labelled prompt naming its
+/// conversation — and prints nothing, as Claude hands this hook's stdout to
+/// the model.
+#[test]
+fn agent_event_claude_forwards_a_prompt_with_its_conversation() {
+    let payload = r#"{"session_id":"abc123","transcript_path":"/tmp/t.jsonl","cwd":"/tmp",
+        "permission_mode":"default","hook_event_name":"UserPromptSubmit",
+        "prompt":"fix the failing test\nit is in tests/server.rs"}"#;
+    let output = run_scenario_with(
+        "ccprompt",
+        &["agent-event", "claude"],
+        &[("TUTTI_PANE", "7"), ("TUTTI_SESSION", "tutti")],
+        payload,
+        |req| {
+            assert_eq!(
+                *req,
+                Request::AgentEvent {
+                    pane: PaneId(7),
+                    event: AgentHookEvent::Prompt {
+                        text: Some("fix the failing test".into()),
+                    },
+                    conversation: Some("abc123".into()),
                 }
             );
         },

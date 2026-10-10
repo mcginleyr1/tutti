@@ -214,6 +214,47 @@ async fn workspace_new_rejects_a_missing_dir() {
     server.stop().await;
 }
 
+/// The conversation a hook event names is remembered on its pane and listed
+/// with it — what resuming the conversation takes — until an event naming
+/// another replaces it; an event naming none keeps it.
+#[tokio::test]
+async fn an_agent_events_conversation_shows_in_pane_list() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let pane = run_sleeper(&mut conn).await;
+    let event = |event: AgentHookEvent, conversation: Option<&str>| Request::AgentEvent {
+        pane,
+        event,
+        conversation: conversation.map(Into::into),
+    };
+    let listed = |response: Response| match response {
+        Response::Panes { panes } => panes.into_iter().find(|p| p.id == pane).unwrap(),
+        other => panic!("expected Panes, got {other:?}"),
+    };
+
+    let started = event(AgentHookEvent::SessionStarted, Some("c1"));
+    assert_eq!(conn.request(started).await, Response::Ok);
+    let info = listed(conn.request(Request::PaneList).await);
+    assert_eq!(info.conversation.as_deref(), Some("c1"));
+    assert_eq!(info.source, None, "a session start claims nothing");
+
+    let unnamed = event(AgentHookEvent::Activity { detail: None }, None);
+    assert_eq!(conn.request(unnamed).await, Response::Ok);
+    let info = listed(conn.request(Request::PaneList).await);
+    assert_eq!(info.conversation.as_deref(), Some("c1"), "none named, kept");
+
+    let cleared = event(AgentHookEvent::SessionStarted, Some("c2"));
+    assert_eq!(conn.request(cleared).await, Response::Ok);
+    let info = listed(conn.request(Request::PaneList).await);
+    assert_eq!(
+        info.conversation.as_deref(),
+        Some("c2"),
+        "a `/clear` moves on"
+    );
+
+    server.stop().await;
+}
+
 /// Bytes sent with `pane send` reach the child and echo back onto its grid.
 #[tokio::test]
 async fn pane_send_echoes_into_grid() {
@@ -711,6 +752,7 @@ async fn agent_event_blocks_and_broadcasts() {
                 event: AgentHookEvent::Blocked {
                     message: Some("allow edit?".into()),
                 },
+                conversation: None,
             })
             .await,
         Response::Ok
@@ -740,6 +782,7 @@ async fn agent_event_maintains_subagent_list_with_cap() {
                     id: format!("s{i}"),
                     desc: format!("task {i}"),
                 },
+                conversation: None,
             })
             .await,
             Response::Ok
@@ -759,6 +802,7 @@ async fn agent_event_maintains_subagent_list_with_cap() {
         conn.request(Request::AgentEvent {
             pane,
             event: AgentHookEvent::SubagentStopped { id: "s4".into() },
+            conversation: None,
         })
         .await,
         Response::Ok
@@ -775,6 +819,7 @@ async fn agent_event_maintains_subagent_list_with_cap() {
         conn.request(Request::AgentEvent {
             pane,
             event: AgentHookEvent::Done,
+            conversation: None,
         })
         .await,
         Response::Ok
@@ -816,6 +861,7 @@ async fn hook_driven_pane_ignores_screen_classification() {
         conn.request(Request::AgentEvent {
             pane,
             event: AgentHookEvent::Blocked { message: None },
+            conversation: None,
         })
         .await,
         Response::Ok
@@ -1159,6 +1205,7 @@ async fn blocked_prompt(conn: &mut Conn) -> (PaneId, String) {
         conn.request(Request::AgentEvent {
             pane,
             event: AgentHookEvent::Blocked { message: None },
+            conversation: None,
         })
         .await,
         Response::Ok
@@ -2434,15 +2481,18 @@ async fn wait_checkpoints(conn: &mut Conn, pane: PaneId, want: usize) -> Vec<Che
 
 /// Drive `pane` with one hook event, the way `tutti agent-event` does.
 async fn hook(conn: &mut Conn, pane: PaneId, event: AgentHookEvent) {
-    assert_eq!(
-        conn.request(Request::AgentEvent { pane, event }).await,
-        Response::Ok
-    );
+    let request = Request::AgentEvent {
+        pane,
+        event,
+        conversation: None,
+    };
+    assert_eq!(conn.request(request).await, Response::Ok);
 }
 
-/// One agent turn, driven by hook events against a real jj repo: entering
-/// `Working` checkpoints where the agent started, leaving it checkpoints the
-/// turn with its stat; the turn's diff is served from the two commits; and a
+/// One agent turn, driven by hook events against a real jj repo: a prompt
+/// entering `Working` checkpoints where the agent started, leaving it
+/// checkpoints the turn with its stat and that prompt; the turn's diff is
+/// served from the two commits; and a
 /// restore rewinds the files on disk — refused mid-turn unless forced, first
 /// saving the state it replaces as a checkpoint so the restore itself undoes.
 /// Skips cleanly without `jj`.
@@ -2470,16 +2520,20 @@ async fn a_turn_checkpoints_its_diff_and_restores_round_trip() {
         .await,
     );
 
-    hook(&mut conn, pane, AgentHookEvent::Activity { detail: None }).await;
+    let prompt = Some("edit a and add b".to_string());
+    let text = prompt.clone();
+    hook(&mut conn, pane, AgentHookEvent::Prompt { text }).await;
     let start = wait_checkpoints(&mut conn, pane, 1).await.remove(0);
     assert_eq!((start.n, start.label.as_str()), (1, "start"));
     assert_eq!(start.from, None, "nothing was recorded before the start");
+    assert_eq!(start.prompt, None, "the baseline predates the prompt");
 
     std::fs::write(dir.join("a.txt"), "one\nTWO\nthree\n").unwrap();
     std::fs::write(dir.join("b.txt"), "bee\n").unwrap();
     hook(&mut conn, pane, AgentHookEvent::Done).await;
     let turn = wait_checkpoints(&mut conn, pane, 2).await.remove(1);
     assert_eq!((turn.n, turn.label.as_str()), (2, "done"));
+    assert_eq!(turn.prompt, prompt, "the turn lists as its prompt");
     assert_eq!(
         turn.from.as_ref(),
         Some(&start.commit),

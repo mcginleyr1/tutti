@@ -3477,6 +3477,7 @@ fn placeholder_info(pane: PaneId) -> PaneInfo {
         checkpoints: Vec::new(),
         source: None,
         sandbox: None,
+        conversation: None,
     }
 }
 
@@ -5038,6 +5039,7 @@ mod tests {
             from: from.map(Into::into),
             time: 0,
             label: label.into(),
+            prompt: None,
             files: 1,
             insertions: n,
             deletions: 0,

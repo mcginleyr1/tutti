@@ -575,7 +575,9 @@ fn to_request(command: Command) -> Result<Request> {
 /// never break an agent session: outside a tutti-spawned pane (`TUTTI_PANE`
 /// unset) it exits 0 silently; a malformed or irrelevant event sends nothing; a
 /// connect/send failure is a stderr note, never a failure exit. This is the one
-/// deliberately never-fail path in the CLI.
+/// deliberately never-fail path in the CLI. It never writes stdout either: on
+/// `UserPromptSubmit` and `SessionStart` Claude Code hands a hook's stdout to
+/// the model as context.
 fn run_agent_event(session: &str, agent: HookAgent) -> Result<i32> {
     let Some(pane) = std::env::var("TUTTI_PANE")
         .ok()
@@ -592,14 +594,14 @@ fn run_agent_event(session: &str, agent: HookAgent) -> Result<i32> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&input) else {
         return Ok(0);
     };
-    let event = match agent {
+    let mapped = match agent {
         HookAgent::Claude => hooks::map_claude_event(&value),
         HookAgent::Opencode => hooks::map_opencode_event(&value),
     };
-    let Some(event) = event else {
+    let Some((event, conversation)) = mapped else {
         return Ok(0);
     };
-    if let Err(err) = send_agent_event(&session, PaneId(pane), event) {
+    if let Err(err) = send_agent_event(&session, PaneId(pane), event, conversation) {
         eprintln!("tutti agent-event: {err:#}");
     }
     Ok(0)
@@ -607,9 +609,18 @@ fn run_agent_event(session: &str, agent: HookAgent) -> Result<i32> {
 
 /// Send an `AgentEvent` to the session's daemon. Never auto-starts a server — a
 /// hook firing with no daemon listening has nothing to report to.
-fn send_agent_event(session: &str, pane: PaneId, event: AgentHookEvent) -> Result<()> {
+fn send_agent_event(
+    session: &str,
+    pane: PaneId,
+    event: AgentHookEvent,
+    conversation: Option<String>,
+) -> Result<()> {
     let mut client = Client::connect(session).context("connecting to tutti-server")?;
-    client.request(&Request::AgentEvent { pane, event })?;
+    client.request(&Request::AgentEvent {
+        pane,
+        event,
+        conversation,
+    })?;
     Ok(())
 }
 

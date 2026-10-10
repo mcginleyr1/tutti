@@ -615,16 +615,18 @@ fn turns_header(count: usize, width: u16, focused: bool) -> Line<'static> {
 }
 
 /// One turn row's inner spans: `#N` at full intensity (the turn's identity, an
-/// accent chip when selected), its age and what closed it dim, and the turn's
-/// `+A −B` right-aligned in the diff colours — none for the first state
-/// recorded for a pane, which has nothing earlier to diff against.
+/// accent chip when selected), its age and the prompt that started it — else
+/// what closed it — dim and clipped to fit, and the turn's `+A −B`
+/// right-aligned in the diff colours — none for the first state recorded for a
+/// pane, which has nothing earlier to diff against.
 fn turn_inner(turn: &Checkpoint, now: u64, sel: bool, content_w: usize) -> Vec<Span<'static>> {
     let n = format!("#{}", turn.n);
     let stat = turn.from.as_ref().map_or_else(String::new, |_| {
         format!("+{} −{}", turn.insertions, turn.deletions)
     });
     let (n_w, stat_w) = (n.chars().count(), stat.chars().count());
-    let meta: String = format!(" {} {}", age(turn.time, now), turn.label)
+    let what = turn.prompt.as_deref().unwrap_or(&turn.label);
+    let meta: String = format!(" {} {what}", age(turn.time, now))
         .chars()
         .take(content_w.saturating_sub(n_w + stat_w + 1))
         .collect();
@@ -1764,6 +1766,7 @@ fn placeholder_title(pane: PaneId) -> PaneInfo {
         checkpoints: Vec::new(),
         source: None,
         sandbox: None,
+        conversation: None,
     }
 }
 
@@ -2333,6 +2336,7 @@ mod tests {
             checkpoints: Vec::new(),
             source: None,
             sandbox: None,
+            conversation: None,
         };
         assert_eq!(title_text(&info), "claude · blocked");
     }
@@ -2349,6 +2353,7 @@ mod tests {
             checkpoints: Vec::new(),
             source: None,
             sandbox: None,
+            conversation: None,
         };
         assert_eq!(title_text(&info), "claude · ⠋ working");
     }
@@ -2380,6 +2385,7 @@ mod tests {
             checkpoints: Vec::new(),
             source: None,
             sandbox: None,
+            conversation: None,
         };
         assert_eq!(title_text(&info), "zsh", "no `· unknown` suffix");
     }
@@ -2396,6 +2402,7 @@ mod tests {
             checkpoints: Vec::new(),
             source: None,
             sandbox: None,
+            conversation: None,
         };
         assert_eq!(
             title_text(&info),
@@ -3155,6 +3162,7 @@ mod tests {
             from: from.map(Into::into),
             time: unix_now(),
             label: label.into(),
+            prompt: None,
             files: 1,
             insertions: 3,
             deletions: 1,
@@ -3194,6 +3202,39 @@ mod tests {
         assert!(
             buffer_text(buf).contains("r restore turn"),
             "the footer hint offers the restore key"
+        );
+    }
+
+    #[test]
+    fn a_turn_row_reads_as_the_prompt_that_started_it() {
+        let now = unix_now();
+        let turn = Checkpoint {
+            n: 4,
+            commit: "c4".into(),
+            from: Some("c3".into()),
+            time: now,
+            label: "done".into(),
+            prompt: Some("fix the failing sidebar test in the resume rows".into()),
+            files: 2,
+            insertions: 14,
+            deletions: 3,
+        };
+        let row = |w: usize| -> String {
+            turn_inner(&turn, now, false, w)
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        let wide = row(70);
+        assert!(
+            wide.starts_with("#4 now fix the failing sidebar test in the resume rows")
+                && !wide.contains("done"),
+            "the prompt stands in for the label: {wide:?}"
+        );
+        let narrow = row(30);
+        assert!(
+            narrow.starts_with("#4 now fix the") && narrow.trim_end().ends_with("+14 −3"),
+            "a long prompt clips, the stat stays: {narrow:?}"
         );
     }
 
@@ -3349,6 +3390,7 @@ mod tests {
             checkpoints: Vec::new(),
             source: None,
             sandbox: None,
+            conversation: None,
         };
         let focused = pane_title_line(&info, true, ' ');
         assert_eq!(

@@ -60,6 +60,21 @@ impl Stores {
     }
 }
 
+/// The argv that resumes `agent`'s conversation `id` in a fresh pane — each
+/// tool's own recipe — or `None` for an agent without one tutti knows.
+/// opencode's is from its `--help` (1.18.5: `-s, --session  session id to
+/// continue`); it is not harvested, but its plugin reports the id.
+pub fn resume_cmd(agent: &str, id: &str) -> Option<Vec<String>> {
+    let cmd = match agent {
+        "claude" => ["claude", "--resume", id],
+        "muse" => ["muse", "resume", id],
+        "vibe" => ["vibe", "--resume", id],
+        "opencode" => ["opencode", "--session", id],
+        _ => return None,
+    };
+    Some(cmd.map(String::from).into())
+}
+
 /// The resumable conversations for the project at `dir` across every harvested
 /// store, newest first, capped at `cap` per agent.
 pub fn resume_sessions(dir: &Path, stores: &Stores, cap: usize) -> Vec<ResumeSession> {
@@ -100,7 +115,7 @@ fn claude_sessions(dir: &Path, home: &Path, cap: usize) -> Vec<ResumeSession> {
             id: id.into(),
             title,
             last_active: modified,
-            cmd: vec!["claude".into(), "--resume".into(), id.into()],
+            cmd: resume_cmd("claude", id).expect("claude has a resume recipe"),
         });
     }
     sessions.sort_by_key(|s| Reverse(s.last_active));
@@ -141,7 +156,7 @@ fn muse_sessions(dir: &Path, data_home: &Path, cap: usize) -> Vec<ResumeSession>
             id: id.into(),
             title,
             last_active: modified,
-            cmd: vec!["muse".into(), "resume".into(), id.into()],
+            cmd: resume_cmd("muse", id).expect("muse has a resume recipe"),
         });
     }
     sessions.sort_by_key(|s| Reverse(s.last_active));
@@ -246,7 +261,7 @@ fn vibe_sessions(dir: &Path, vibe_home: &Path, cap: usize) -> Vec<ResumeSession>
             id: id.into(),
             title: value["title"].as_str().and_then(first_prompt_line),
             last_active: modified,
-            cmd: vec!["vibe".into(), "--resume".into(), id.into()],
+            cmd: resume_cmd("vibe", id).expect("vibe has a resume recipe"),
         });
     }
     sessions.sort_by_key(|s| Reverse(s.last_active));
@@ -312,8 +327,9 @@ fn scan_session(path: &Path, dir: &Path) -> Option<Option<String>> {
 
 /// The label-worthy first line of a prompt: trimmed, skipping tool-injected
 /// content (`<command-name>…`, `<system-reminder>`, the resume `Caveat:`
-/// preamble), capped so a pasted wall of text stays a label.
-fn first_prompt_line(content: &str) -> Option<String> {
+/// preamble), capped so a pasted wall of text stays a label. Also what a hook
+/// reports of a live prompt, so a turn and a resume row label alike.
+pub fn first_prompt_line(content: &str) -> Option<String> {
     let line = content.lines().next()?.trim();
     if line.is_empty() || line.starts_with('<') || line.starts_with("Caveat:") {
         return None;
@@ -629,6 +645,16 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn resume_cmd_is_each_tools_own_recipe() {
+        let cmd = |agent| resume_cmd(agent, "s1").unwrap();
+        assert_eq!(cmd("claude"), ["claude", "--resume", "s1"]);
+        assert_eq!(cmd("muse"), ["muse", "resume", "s1"]);
+        assert_eq!(cmd("vibe"), ["vibe", "--resume", "s1"]);
+        assert_eq!(cmd("opencode"), ["opencode", "--session", "s1"]);
+        assert_eq!(resume_cmd("codex", "s1"), None, "no recipe known");
     }
 
     #[test]

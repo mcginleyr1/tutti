@@ -528,7 +528,11 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             direction,
             delta,
         } => resize_split(hub, pane, direction, delta),
-        Request::AgentEvent { pane, event } => agent_event(hub, pane, event),
+        Request::AgentEvent {
+            pane,
+            event,
+            conversation,
+        } => agent_event(hub, pane, event, conversation),
         Request::PaneCheckpoints { pane } => {
             let checkpoints = hub.session().turns(pane).map(|t| t.entries().to_vec());
             match checkpoints {
@@ -640,20 +644,25 @@ fn program_status(hub: &Arc<Hub>, pane: PaneId, report: StatusReport) {
     }
 }
 
-/// Ingest a Claude Code hook event for `pane`: fold it onto the pane's exact
-/// state and subagent list, then broadcast what moved. A subagent-list change
-/// broadcasts the fresh view (`LayoutChanged`); a state move broadcasts
-/// `StateChanged` so a Blocked/Done still rings the client bell. Both can fire.
-/// A state move also refreshes the workspace's changes, which records the
-/// turn's checkpoint. An unknown pane is a silent `Ok` — the hook must never
-/// fail on tutti's side. The session guard is dropped before any broadcast
-/// (which re-locks `clients`).
-fn agent_event(hub: &Arc<Hub>, pane: PaneId, event: AgentHookEvent) -> Response {
+/// Ingest an agent hook event for `pane`: fold it onto the pane's exact state,
+/// subagent list and conversation, then broadcast what moved. A subagent-list
+/// or conversation change broadcasts the fresh view (`LayoutChanged`); a state
+/// move broadcasts `StateChanged` so a Blocked/Done still rings the client
+/// bell. Both can fire. A state move also refreshes the workspace's changes,
+/// which records the turn's checkpoint. An unknown pane is a silent `Ok` — the
+/// hook must never fail on tutti's side. The session guard is dropped before
+/// any broadcast (which re-locks `clients`).
+fn agent_event(
+    hub: &Arc<Hub>,
+    pane: PaneId,
+    event: AgentHookEvent,
+    conversation: Option<String>,
+) -> Response {
     let mut session = hub.session();
-    let Some(outcome) = session.apply_agent_event(pane, event) else {
+    let Some(outcome) = session.apply_agent_event(pane, event, conversation) else {
         return Response::Ok;
     };
-    let view = outcome.subagents_changed.then(|| session.view());
+    let view = outcome.relisted.then(|| session.view());
     drop(session);
     if let Some(view) = view {
         broadcast_event(hub, Event::LayoutChanged { workspaces: view });
@@ -1168,7 +1177,7 @@ async fn restore_to(hub: &Hub, dir: &Path, pane: PaneId, n: u64, commit: &str) -
             message: "jj could not snapshot the working copy".into(),
         };
     };
-    let saved = record_checkpoint(hub, dir, pane, &before, "before restore").await;
+    let saved = record_checkpoint(hub, dir, pane, &before, "before restore", None).await;
     match jj::restore(dir, commit).await {
         Ok(after) => {
             let mut session = hub.session();
@@ -1241,11 +1250,12 @@ fn refresh_changes(hub: &Arc<Hub>, workspace: WorkspaceId) {
         let probe = jj::probe(&dir).await;
         let mut recorded = false;
         if let Some(head) = &probe.head {
-            for (pane, labels) in turns {
-                for label in labels {
-                    recorded |= record_checkpoint(&hub, &dir, pane, head, &label)
-                        .await
-                        .is_some();
+            for (pane, noted) in turns {
+                for (label, prompt) in noted {
+                    recorded |=
+                        record_checkpoint(&hub, &dir, pane, head, &label, prompt.as_deref())
+                            .await
+                            .is_some();
                 }
             }
         }
@@ -1277,17 +1287,19 @@ fn refresh_pane_workspace(hub: &Arc<Hub>, pane: PaneId) {
 }
 
 /// Record `commit` — an `@` the caller just snapshotted in `dir` — as `pane`'s
-/// next checkpoint, its stat taken over the turn (`head..commit`) once, here.
-/// `None` when nothing was recorded: the pane is gone, `@` has not moved since
-/// its head, the turn's diff is empty (a `jj new` moves `@` without changing a
-/// file), or jj failed. The session lock is never held across the jj call;
-/// `Turns::record` re-checks the head it diffed from instead.
+/// next checkpoint (with the prompt that started the turn, when known), its
+/// stat taken over the turn (`head..commit`) once, here. `None` when nothing
+/// was recorded: the pane is gone, `@` has not moved since its head, the
+/// turn's diff is empty (a `jj new` moves `@` without changing a file), or jj
+/// failed. The session lock is never held across the jj call; `Turns::record`
+/// re-checks the head it diffed from instead.
 async fn record_checkpoint(
     hub: &Hub,
     dir: &Path,
     pane: PaneId,
     commit: &str,
     label: &str,
+    prompt: Option<&str>,
 ) -> Option<u64> {
     let from = hub.session().turns(pane)?.head();
     if from.as_deref() == Some(commit) {
@@ -1305,7 +1317,7 @@ async fn record_checkpoint(
         .map_or(0, |d| d.as_secs());
     hub.session()
         .turns(pane)?
-        .record(from, commit, label, time, &files)
+        .record(from, commit, label, prompt, time, &files)
 }
 
 /// One pass of the VCS watch: a workspace whose jj repo recorded an operation
