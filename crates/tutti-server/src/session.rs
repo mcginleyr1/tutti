@@ -534,6 +534,30 @@ impl Session {
         }
     }
 
+    /// Set the ratio of the split separating `a` from `b` in their tab — a
+    /// split-border drag. Returns whether the layout actually changed (a drag
+    /// held against the clamp does not).
+    pub fn pane_split_ratio(&mut self, a: PaneId, b: PaneId, ratio: f32) -> Result<bool> {
+        let tab_of = |pane: PaneId| {
+            self.panes
+                .get(&pane)
+                .map(|slot| slot.tab)
+                .with_context(|| format!("no pane {pane}"))
+        };
+        let tab_id = tab_of(a)?;
+        if tab_of(b)? != tab_id {
+            bail!("panes {a} and {b} are in different tabs");
+        }
+        let tab = self.tab_mut(tab_id).context("pane's tab vanished")?;
+        let layout = tab.layout.as_ref().context("pane's tab has no layout")?;
+        let new = layout
+            .set_split_ratio(a, b, ratio)
+            .with_context(|| format!("no split has pane {a} before pane {b}"))?;
+        let changed = *layout != new;
+        tab.layout = Some(new);
+        Ok(changed)
+    }
+
     pub fn pane_rename(&mut self, pane: PaneId, title: String) -> Result<()> {
         let slot = self
             .panes

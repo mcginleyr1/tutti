@@ -593,6 +593,7 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             direction,
             delta,
         } => resize_split(hub, pane, direction, delta),
+        Request::PaneSplitRatio { a, b, ratio } => split_ratio(hub, a, b, ratio),
         Request::AgentEvent {
             pane,
             event,
@@ -628,6 +629,22 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
 fn resize_split(hub: &Arc<Hub>, pane: PaneId, axis: Direction, delta: f32) -> Response {
     let mut session = hub.session();
     match session.pane_resize_split(pane, axis, delta) {
+        Ok(true) => {
+            let view = session.view();
+            drop(session);
+            broadcast_event(hub, Event::LayoutChanged { workspaces: view });
+            Response::Ok
+        }
+        Ok(false) => Response::Ok,
+        Err(err) => error(err),
+    }
+}
+
+/// Set the ratio of the split separating `a` from `b` — a border drag — and
+/// broadcast the fresh view when it moved, as `resize_split` does.
+fn split_ratio(hub: &Arc<Hub>, a: PaneId, b: PaneId, ratio: f32) -> Response {
+    let mut session = hub.session();
+    match session.pane_split_ratio(a, b, ratio) {
         Ok(true) => {
             let view = session.view();
             drop(session);

@@ -1087,6 +1087,69 @@ async fn resize_split_adjusts_ratio_and_broadcasts() {
     server.stop().await;
 }
 
+/// A `PaneSplitRatio` — a split-border drag — sets the split separating its
+/// two panes, clamped like a keyboard resize, and broadcasts the fresh view;
+/// panes named in the wrong order, or from different tabs, are refused.
+#[tokio::test]
+async fn split_ratio_sets_the_separating_split_and_broadcasts() {
+    let server = TestServer::start();
+
+    let mut control = server.connect().await;
+    new_workspace(&mut control).await;
+    let cat = |tab| Request::PaneRun {
+        tab,
+        cmd: vec!["/bin/cat".into()],
+        ephemeral: false,
+        sandbox: None,
+    };
+    let left = pane_id(control.request(cat(None)).await);
+    let right = pane_id(
+        control
+            .request(Request::PaneSplit {
+                pane: left,
+                direction: Direction::Horizontal,
+            })
+            .await,
+    );
+
+    // Attach after the split so the only LayoutChanged the viewer sees is ours.
+    let mut viewer = server.connect().await;
+    viewer.send(&Request::Attach).await;
+    assert!(matches!(viewer.response().await, Response::Attached { .. }));
+
+    let drag = |a, b, ratio| Request::PaneSplitRatio { a, b, ratio };
+    assert_eq!(control.request(drag(left, right, 0.3)).await, Response::Ok);
+    let ratio = next_split_ratio(&mut viewer).await;
+    assert!((ratio - 0.3).abs() < 1e-3, "expected ~0.3, got {ratio}");
+
+    assert_eq!(control.request(drag(left, right, 0.99)).await, Response::Ok);
+    let ratio = next_split_ratio(&mut viewer).await;
+    assert!(
+        (ratio - Layout::MAX_RATIO).abs() < 1e-3,
+        "a drag past the bound clamps to it, got {ratio}"
+    );
+
+    let reversed = error_message(control.request(drag(right, left, 0.5)).await);
+    assert!(
+        reversed.contains("before"),
+        "the second pane must sit right of the first: {reversed}"
+    );
+
+    let Response::TabCreated { id: tab } =
+        control.request(Request::TabNew { workspace: None }).await
+    else {
+        panic!("expected TabCreated");
+    };
+    let elsewhere = pane_id(control.request(cat(Some(tab))).await);
+    let apart = error_message(control.request(drag(left, elsewhere, 0.5)).await);
+    assert!(
+        apart.contains("different tabs"),
+        "panes in different tabs share no split: {apart}"
+    );
+
+    server.stop().await;
+}
+
 /// Read events until a `LayoutChanged` carrying a split arrives, returning its
 /// ratio.
 async fn next_split_ratio(viewer: &mut Conn) -> f32 {

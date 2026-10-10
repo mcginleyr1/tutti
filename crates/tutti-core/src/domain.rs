@@ -39,6 +39,12 @@ pub enum Layout {
 }
 
 impl Layout {
+    /// The ratio bounds a split is clamped to when resized — by key or by a
+    /// border drag — so neither child can be shrunk to nothing. Public so a
+    /// client predicting where a drag lands clamps exactly as the server does.
+    pub const MIN_RATIO: f32 = 0.10;
+    pub const MAX_RATIO: f32 = 0.90;
+
     /// Replace `target`'s leaf with a split holding `target` and `new_pane`.
     /// A pane that isn't present leaves the layout unchanged.
     pub fn split(&self, target: PaneId, new_pane: PaneId, direction: Direction) -> Layout {
@@ -142,19 +148,57 @@ impl Layout {
         if *direction == axis {
             return Some(Layout::Split {
                 direction: *direction,
-                ratio: (ratio + delta).clamp(MIN_RATIO, MAX_RATIO),
+                ratio: (ratio + delta).clamp(Self::MIN_RATIO, Self::MAX_RATIO),
                 first: first.clone(),
                 second: second.clone(),
             });
         }
         None
     }
-}
 
-/// The ratio bounds a split is clamped to when resized, so neither child can be
-/// shrunk to nothing.
-const MIN_RATIO: f32 = 0.10;
-const MAX_RATIO: f32 = 0.90;
+    /// Set the ratio of the split that separates `a` from `b` — their lowest
+    /// common ancestor, with `a` in its first subtree and `b` in its second —
+    /// clamped to `[MIN_RATIO, MAX_RATIO]`. Returns the rebuilt layout, or
+    /// `None` when either pane is absent or the order is reversed, so a stale
+    /// drag can never move some other split.
+    pub fn set_split_ratio(&self, a: PaneId, b: PaneId, ratio: f32) -> Option<Layout> {
+        let Layout::Split {
+            direction,
+            ratio: current,
+            first,
+            second,
+        } = self
+        else {
+            return None;
+        };
+        if first.contains(a) && second.contains(b) {
+            return Some(Layout::Split {
+                direction: *direction,
+                ratio: ratio.clamp(Self::MIN_RATIO, Self::MAX_RATIO),
+                first: first.clone(),
+                second: second.clone(),
+            });
+        }
+        // Not separated here: the split lies deeper, on `b`'s side.
+        let (first, second) = if first.contains(b) {
+            (
+                Box::new(first.set_split_ratio(a, b, ratio)?),
+                second.clone(),
+            )
+        } else {
+            (
+                first.clone(),
+                Box::new(second.set_split_ratio(a, b, ratio)?),
+            )
+        };
+        Some(Layout::Split {
+            direction: *direction,
+            ratio: *current,
+            first,
+            second,
+        })
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -288,5 +332,82 @@ mod tests {
         } else {
             panic!("expected a split");
         }
+    }
+
+    /// The ratios of a two-level layout: the root's, then each child split's
+    /// (a leaf child reads as `None`).
+    fn ratios(layout: &Layout) -> (f32, Option<f32>, Option<f32>) {
+        let Layout::Split {
+            ratio,
+            first,
+            second,
+            ..
+        } = layout
+        else {
+            panic!("expected a split");
+        };
+        let inner = |child: &Layout| matches!(child, Layout::Split { .. }).then(|| ratio_of(child));
+        (*ratio, inner(first), inner(second))
+    }
+
+    #[test]
+    fn set_split_ratio_sets_the_split_separating_the_two_panes() {
+        // Two columns, each stacked: 1 over 2 on the left, 3 over 4 on the right.
+        let layout = split(
+            Direction::Horizontal,
+            0.5,
+            split(Direction::Vertical, 0.5, leaf(1), leaf(2)),
+            split(Direction::Vertical, 0.5, leaf(3), leaf(4)),
+        );
+        let set = |a, b| layout.set_split_ratio(PaneId(a), PaneId(b), 0.3).unwrap();
+        assert_eq!(ratios(&set(1, 2)), (0.5, Some(0.3), Some(0.5)));
+        assert_eq!(ratios(&set(3, 4)), (0.5, Some(0.5), Some(0.3)));
+        // Panes from different columns meet only at the root, whichever leaf
+        // of each side names it.
+        assert_eq!(ratios(&set(2, 3)), (0.3, Some(0.5), Some(0.5)));
+        assert_eq!(ratios(&set(1, 4)), (0.3, Some(0.5), Some(0.5)));
+    }
+
+    #[test]
+    fn set_split_ratio_reaches_a_split_nested_beside_a_leaf() {
+        let layout = split(
+            Direction::Horizontal,
+            0.5,
+            leaf(1),
+            split(Direction::Vertical, 0.5, leaf(2), leaf(3)),
+        );
+        let inner = layout.set_split_ratio(PaneId(2), PaneId(3), 0.7).unwrap();
+        assert_eq!(ratios(&inner), (0.5, None, Some(0.7)));
+        let outer = layout.set_split_ratio(PaneId(1), PaneId(3), 0.7).unwrap();
+        assert_eq!(ratios(&outer), (0.7, None, Some(0.5)));
+    }
+
+    #[test]
+    fn set_split_ratio_clamps_to_the_resize_bounds() {
+        let layout = split(Direction::Vertical, 0.5, leaf(1), leaf(2));
+        let high = layout.set_split_ratio(PaneId(1), PaneId(2), 0.99).unwrap();
+        assert!((ratio_of(&high) - Layout::MAX_RATIO).abs() < 1e-6);
+        let low = layout.set_split_ratio(PaneId(1), PaneId(2), 0.0).unwrap();
+        assert!((ratio_of(&low) - Layout::MIN_RATIO).abs() < 1e-6);
+    }
+
+    #[test]
+    fn set_split_ratio_refuses_reversed_absent_or_identical_panes() {
+        let layout = split(
+            Direction::Horizontal,
+            0.5,
+            leaf(1),
+            split(Direction::Vertical, 0.5, leaf(2), leaf(3)),
+        );
+        let refuses = |a, b| layout.set_split_ratio(PaneId(a), PaneId(b), 0.3).is_none();
+        assert!(
+            refuses(2, 1),
+            "b must sit in the separating split's second subtree"
+        );
+        assert!(refuses(3, 2), "the order matters at a nested split too");
+        assert!(refuses(1, 9), "an absent pane names no split");
+        assert!(refuses(9, 1));
+        assert!(refuses(2, 2), "one pane is never separated from itself");
+        assert!(leaf(1).set_split_ratio(PaneId(1), PaneId(2), 0.3).is_none());
     }
 }

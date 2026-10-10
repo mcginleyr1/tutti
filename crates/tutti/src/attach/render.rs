@@ -242,7 +242,7 @@ fn draw_app_bar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
     ];
     spans.extend(census_spans(app, spinner));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
-    draw_tab_bar(frame, app, app.tab_bar_rect(area));
+    draw_tab_bar(frame, app, app.tab_bar_rect(area), spinner);
 }
 
 /// The agent-state census after the app-bar title: one `dot N label` chip per
@@ -281,19 +281,33 @@ fn draw_rule(frame: &mut Frame, area: Rect) {
 
 /// The app-bar tab segments: one padded ` <n> <name> ` per tab (active = bold
 /// black on the accent block, inactive dim, the trailing ` + ` dim), joined by
-/// a one-column separator. Segment widths match `App::tab_chips` so clicks
-/// land true.
-fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
+/// a one-column separator. A badged tab trails its state dot and a pad — the
+/// sidebar's glyph and colour, never dimmed, with the active block's ground
+/// running under it. Each segment draws exactly `TabChip::width` columns so
+/// clicks land true.
+fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
     if area.width == 0 || area.height == 0 {
         return;
     }
+    let glyphs = glyphs(app.config().icons);
     let mut spans: Vec<Span> = Vec::new();
-    for (i, (target, label)) in app.tab_chips().into_iter().enumerate() {
+    for (i, chip) in app.tab_chips().into_iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw(" "));
         }
-        let active = matches!(target, Some(id) if app.active_tab == Some(id));
-        spans.push(Span::styled(label, tab_chip_style(active)));
+        let active = matches!(chip.target, Some(id) if app.active_tab == Some(id));
+        let style = tab_chip_style(active);
+        spans.push(Span::styled(chip.label, style));
+        if let Some(state) = chip.badge {
+            let (dot, dot_style) = agent_dot(state, spinner, glyphs);
+            let dot_style = if active {
+                dot_style.bg(accent())
+            } else {
+                dot_style
+            };
+            spans.push(Span::styled(dot.to_string(), dot_style));
+            spans.push(Span::styled(" ", style));
+        }
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -2571,6 +2585,124 @@ mod tests {
         assert!(tab_chip_style(true).add_modifier.contains(Modifier::BOLD));
         assert!(tab_chip_style(false).add_modifier.contains(Modifier::DIM));
         assert_eq!(tab_chip_style(false).bg, None);
+    }
+
+    #[test]
+    fn tab_segments_trail_their_most_urgent_agents_dot_and_click_true() {
+        use crate::attach::app::control;
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+        use tutti_core::{Request, WorkspaceId};
+        let claude = |id, state| pane(id, "agent", Some("claude"), state);
+        let mut exited = pane(2, "zsh", None, AgentState::Done);
+        exited.exited = Some(0);
+        let mut app = App::new();
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Response::Attached {
+                wire_rev: tutti_core::WIRE_REV,
+                session: "demo".into(),
+                workspaces: vec![workspace(
+                    1,
+                    "w",
+                    None,
+                    vec![
+                        tab(
+                            1,
+                            "sh",
+                            false,
+                            leaf(1),
+                            vec![pane(1, "zsh", None, AgentState::Idle), exited],
+                        ),
+                        tab(2, "w", false, leaf(3), vec![claude(3, AgentState::Working)]),
+                        tab(
+                            3,
+                            "d",
+                            false,
+                            leaf(4),
+                            vec![claude(4, AgentState::Working), claude(5, AgentState::Done)],
+                        ),
+                        tab(
+                            4,
+                            "b",
+                            true,
+                            leaf(6),
+                            vec![
+                                claude(6, AgentState::Done),
+                                claude(7, AgentState::Blocked),
+                                claude(8, AgentState::Working),
+                            ],
+                        ),
+                    ],
+                )],
+            })
+            .unwrap(),
+        ));
+        let area = Rect::new(0, 0, 120, 12);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let cell = |x: u16| buf.cell((x, 0)).unwrap();
+        // Walk the segments by `TabChip::width`: each draws its label, a badged
+        // one then its dot and a pad, and the next starts past one separator.
+        let mut x = app.tab_bar_rect(Rect::new(0, 0, area.width, 1)).x;
+        let mut after_label = Vec::new();
+        let mut segments = Vec::new();
+        for chip in app.tab_chips() {
+            let label_end = x + chip.label.chars().count() as u16;
+            let drawn: String = (x..label_end).map(|c| cell(c).symbol()).collect();
+            assert_eq!(drawn, chip.label);
+            if chip.target.is_some() {
+                let next = cell(label_end);
+                after_label.push((next.symbol().to_string(), next.fg, next.bg));
+            }
+            if chip.badge.is_some() {
+                assert_eq!(cell(label_end + 1).symbol(), " ", "a pad closes {chip:?}");
+            }
+            segments.push((chip.target, x + chip.width() - 1));
+            x += chip.width() + 1;
+        }
+        assert_eq!(
+            x - 1,
+            area.width,
+            "the segments fill the bar to its right edge"
+        );
+        let spinner = &after_label[1].0;
+        assert!(
+            spinner
+                .chars()
+                .all(|c| ('\u{2800}'..='\u{28ff}').contains(&c)),
+            "a working tab spins the shared braille spinner: {spinner:?}"
+        );
+        assert_eq!(after_label[0].0, " ", "a tab of shells carries no dot");
+        assert_eq!(
+            after_label[1..4]
+                .iter()
+                .map(|(_, fg, _)| *fg)
+                .collect::<Vec<_>>(),
+            vec![Color::Yellow, Color::Green, Color::Red],
+            "working alone spins; done beats working; blocked beats both"
+        );
+        assert_eq!(
+            (after_label[3].0.as_str(), after_label[3].2),
+            ("●", accent()),
+            "the active block's ground runs under its dot"
+        );
+        assert_eq!(
+            after_label[2].2,
+            Color::Reset,
+            "an inactive dot has no ground"
+        );
+        // A click on a segment's last column — a badged one's pad — selects it.
+        app.sync_sizes(area);
+        for (target, last) in segments {
+            let out = app.on_mouse(MouseEventKind::Down(MouseButton::Left), last, 0);
+            let want = match target {
+                Some(id) => Request::TabSelect { id },
+                None => Request::TabNew {
+                    workspace: Some(WorkspaceId(1)),
+                },
+            };
+            assert_eq!(out, vec![control(&want)], "column {last}");
+        }
     }
 
     #[test]

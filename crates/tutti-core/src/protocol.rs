@@ -202,6 +202,16 @@ pub enum Request {
         direction: Direction,
         delta: f32,
     },
+    /// Set the ratio of the split separating `a` from `b` — their lowest
+    /// common ancestor in one tab's layout, `a` in its first (left/top)
+    /// subtree and `b` in its second — clamped as `PaneResizeSplit` is. A
+    /// split-border drag: the client names the split by a leaf from each side.
+    /// Error when the panes share no tab or sit in the other order.
+    PaneSplitRatio {
+        a: PaneId,
+        b: PaneId,
+        ratio: f32,
+    },
     /// A ground-truth agent-lifecycle signal for `pane`, forwarded from a Claude
     /// Code hook by `tutti agent-event`. Drives exact state + the subagent list,
     /// replacing screen-heuristic guessing for that pane.
@@ -710,6 +720,11 @@ mod tests {
             pane: PaneId(2),
             direction: Direction::Horizontal,
             delta: 0.05,
+        });
+        roundtrip(&Request::PaneSplitRatio {
+            a: PaneId(2),
+            b: PaneId(3),
+            ratio: 0.35,
         });
         roundtrip(&Request::AgentEvent {
             pane: PaneId(3),

@@ -19,7 +19,7 @@ use tutti_agents::Registry;
 
 use super::input;
 use super::launcher::{self, LaunchKind, LauncherRow};
-use super::layout::pane_rects;
+use super::layout::{Boundary, boundaries, pane_rects};
 use super::navigate;
 use super::sidebar::{self, Sidebar, SidebarEntry};
 use crate::config::{self, Action, Config, PrefixAction, RESIZE_DELTA, SidebarVisibility};
@@ -100,6 +100,19 @@ struct Selection {
     dragged: bool,
 }
 
+/// A split-border drag, from a left press on a boundary to the release.
+/// `boundary.at` follows where the last `PaneSplitRatio` put the border, and
+/// `grab` is the pressed cell's offset from it (1 on the first child's border
+/// cell, 0 on the second's), so the grabbed cell stays under the pointer.
+/// `moved` stays false for a press that never moved the border: its release is
+/// a plain click.
+#[derive(Clone, Copy)]
+struct BorderDrag {
+    boundary: Boundary,
+    grab: u16,
+    moved: bool,
+}
+
 /// The input mode the client is in. Terminal mode forwards keys to the focused
 /// pane; the others intercept keys for multiplexer control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +176,11 @@ pub struct App {
     /// Pane rectangles from the last size sync, in content-area coordinates —
     /// used for mouse hit-testing and directional focus.
     pub rects: Vec<(PaneId, Rect)>,
+    /// The active tab's split boundaries from the last size sync, in the same
+    /// coordinates — what a press grabs to drag a border. Empty while zoomed.
+    boundaries: Vec<Boundary>,
+    /// The border drag in progress; `None` while no border is held.
+    border_drag: Option<BorderDrag>,
     status: Option<(String, Instant)>,
     requested_sizes: HashMap<PaneId, (u16, u16)>,
     /// The focus last reported to the server via `PaneFocus`; lets the event
@@ -309,6 +327,8 @@ impl App {
             zoom: false,
             should_quit: false,
             rects: Vec::new(),
+            boundaries: Vec::new(),
+            border_drag: None,
             status: None,
             requested_sizes: HashMap::new(),
             focus_sent: None,
@@ -1229,13 +1249,12 @@ impl App {
         Rect::new(app_bar.x + app_bar.width.saturating_sub(w), app_bar.y, w, 1)
     }
 
-    /// The rendered width of the tab segments: the chip labels plus one-column
+    /// The rendered width of the tab segments: the chips plus one-column
     /// separators between them.
     fn tab_bar_width(&self) -> u16 {
         let chips = self.tab_chips();
-        let labels: usize = chips.iter().map(|(_, l)| l.chars().count()).sum();
-        let seps = chips.len().saturating_sub(1);
-        (labels + seps) as u16
+        let segments: u16 = chips.iter().map(TabChip::width).sum();
+        segments + chips.len().saturating_sub(1) as u16
     }
 
     /// Focus the sidebar, revealing it if hidden. Refuses when the terminal is
@@ -2522,9 +2541,20 @@ impl App {
                 Vec::new()
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                // Any press drops a prior selection's highlight before starting
-                // fresh, wherever it lands.
+                // Any press drops a prior selection's highlight (and a border
+                // whose release went astray) before starting fresh, wherever
+                // it lands.
                 self.selection = None;
+                self.border_drag = self.boundary_at(col, row).map(|boundary| BorderDrag {
+                    boundary,
+                    grab: boundary.at - boundary.along(col, row),
+                    moved: false,
+                });
+                // A press on the cells where two panes meet grabs their split's
+                // border instead of focusing or selecting.
+                if self.border_drag.is_some() {
+                    return Vec::new();
+                }
                 if let Some(pane) = self.pane_at(col, row) {
                     let frames = self.mouse_focus(pane);
                     if let Some((pane, r, c)) = self.pane_cell_at(col, row) {
@@ -2548,9 +2578,21 @@ impl App {
                 }
                 Vec::new()
             }
+            MouseEventKind::Drag(MouseButton::Left) if self.border_drag.is_some() => {
+                self.drag_border(col, row)
+            }
             MouseEventKind::Drag(MouseButton::Left) => {
                 self.extend_selection(col, row);
                 Vec::new()
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.border_drag.is_some() => {
+                let still = self.border_drag.take().is_some_and(|drag| !drag.moved);
+                // A press that never moved the border was a click: it focuses
+                // the pane beneath, as a press anywhere else in it does.
+                match self.pane_at(col, row) {
+                    Some(pane) if still => self.mouse_focus(pane),
+                    _ => Vec::new(),
+                }
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.finish_selection();
@@ -2560,6 +2602,41 @@ impl App {
             MouseEventKind::ScrollDown => self.mouse_scroll(col, row, false),
             _ => Vec::new(),
         }
+    }
+
+    /// The split boundary whose border cells hold `(col, row)`. Panes tile
+    /// with no gap, each drawing its own frame, so those are the two cells that
+    /// meet there: the frame column on either side of side-by-side panes, the
+    /// upper pane's bottom frame row and the lower pane's title row of stacked
+    /// ones. Where two boundaries cross, the outer split's wins.
+    fn boundary_at(&self, col: u16, row: u16) -> Option<Boundary> {
+        self.boundaries.iter().copied().find(|b| {
+            let along = b.along(col, row);
+            contains(b.area, col, row) && (along == b.at || along + 1 == b.at)
+        })
+    }
+
+    /// Follow a border drag to `(col, row)`: the ratio that brings the grabbed
+    /// cell under the pointer, sent only when it moves the border by a cell or
+    /// more. The drag predicts exactly where the server will put the border, so
+    /// a pointer wandering within one cell, or pinned past the clamp, sends
+    /// nothing.
+    fn drag_border(&mut self, col: u16, row: u16) -> Vec<WireFrame> {
+        let Some(drag) = self.border_drag.as_mut() else {
+            return Vec::new();
+        };
+        let b = drag.boundary;
+        let (ratio, at) = b.drag_to(b.along(col, row).saturating_add(drag.grab));
+        if at == b.at {
+            return Vec::new();
+        }
+        drag.boundary.at = at;
+        drag.moved = true;
+        vec![control(&Request::PaneSplitRatio {
+            a: b.first,
+            b: b.second,
+            ratio,
+        })]
     }
 
     /// Extend the live selection's head to the cell under `(col, row)`, clamped
@@ -2672,18 +2749,34 @@ impl App {
     }
 
     /// The app-bar tab segments, left to right: one ` <n> <name> ` per tab
-    /// (carrying its id) then a trailing ` + ` (a `None` target = new tab) —
-    /// space-padded so the active segment's background reads as a filled block.
-    /// Shared by the renderer and the click hit-test so a click lands on exactly
-    /// what is drawn; the renderer joins them with a one-column separator.
-    pub fn tab_chips(&self) -> Vec<(Option<TabId>, String)> {
-        let mut chips: Vec<(Option<TabId>, String)> = self
+    /// (carrying its id, and a badge for the most urgent state among its
+    /// agents — blocked, then done, then working; none for a tab of shells)
+    /// then a trailing ` + ` (a `None` target = new tab) — space-padded so the
+    /// active segment's background reads as a filled block. Shared by the
+    /// renderer and the click hit-test so a click lands on exactly what is
+    /// drawn; the renderer joins them with a one-column separator.
+    pub fn tab_chips(&self) -> Vec<TabChip> {
+        let mut chips: Vec<TabChip> = self
             .all_tabs()
             .iter()
             .enumerate()
-            .map(|(i, t)| (Some(t.id), format!(" {} {} ", i + 1, t.name)))
+            .map(|(i, t)| TabChip {
+                target: Some(t.id),
+                label: format!(" {} {} ", i + 1, t.name),
+                badge: [AgentState::Blocked, AgentState::Done, AgentState::Working]
+                    .into_iter()
+                    .find(|&state| {
+                        t.panes
+                            .iter()
+                            .any(|p| p.agent.is_some() && p.state == state)
+                    }),
+            })
             .collect();
-        chips.push((None, " + ".into()));
+        chips.push(TabChip {
+            target: None,
+            label: " + ".into(),
+            badge: None,
+        });
         chips
     }
 
@@ -2696,10 +2789,10 @@ impl App {
             return Vec::new();
         };
         let mut x = rect.x;
-        for (target, label) in self.tab_chips() {
-            let w = label.chars().count() as u16;
+        for chip in self.tab_chips() {
+            let w = chip.width();
             if col >= x && col < x + w {
-                return match target {
+                return match chip.target {
                     Some(id) => {
                         self.active_tab = Some(id);
                         self.zoom = false;
@@ -2912,18 +3005,24 @@ impl App {
 
     /// Recompute pane rectangles for the terminal `area` and emit resize requests
     /// for any pane whose rendered size changed, so the server's ptys track the
-    /// client. Records the sidebar and tab-bar rects for mouse hit-testing.
+    /// client. Records the sidebar and tab-bar rects and the split boundaries
+    /// for mouse hit-testing.
     pub fn sync_sizes(&mut self, area: Rect) -> Vec<WireFrame> {
         let (content, _footer) = App::content_rect(area);
         let (app_bar, _rule) = App::header_rects(area);
         self.last_content_width = content.width;
-        let (sidebar_rect, _panes, diff_panel_rect) = self.regions(content);
+        let (sidebar_rect, panes, diff_panel_rect) = self.regions(content);
         self.sidebar_rect = sidebar_rect;
         self.diff_panel_rect = diff_panel_rect;
         self.tab_bar_rect = Some(self.tab_bar_rect(app_bar));
         self.peek_rect = self.peek_popup(area).map(|(_, rect, _)| rect);
         self.navigate_rect = (self.mode == Mode::Navigate).then_some(content);
         self.rects = self.compute_rects(content);
+        let zoom = if self.zoom { self.focused } else { None };
+        self.boundaries = self
+            .active_tab_view()
+            .and_then(|t| t.layout.as_ref())
+            .map_or_else(Vec::new, |layout| boundaries(layout, panes, zoom));
         let mut out = Vec::new();
         for (pane, rect) in &self.rects {
             let (rows, cols) = inner_size(*rect);
@@ -3221,6 +3320,25 @@ impl App {
             .find(|(p, _)| *p == pane)
             .map(|(_, r)| inner_size(*r).0)
             .unwrap_or(0)
+    }
+}
+
+/// One app-bar tab segment, as `App::tab_chips` lays it out.
+#[derive(Debug)]
+pub struct TabChip {
+    /// The tab the segment selects; `None` for the trailing ` + ` (new tab).
+    pub target: Option<TabId>,
+    pub label: String,
+    /// The state the segment's dot shows, drawn after the label with a pad.
+    pub badge: Option<AgentState>,
+}
+
+impl TabChip {
+    /// The columns the segment covers — the one measure the renderer draws to
+    /// and the click hit-test steps by. Every dot glyph is one column wide.
+    pub fn width(&self) -> u16 {
+        let dot = if self.badge.is_some() { 2 } else { 0 };
+        self.label.chars().count() as u16 + dot
     }
 }
 
@@ -6457,6 +6575,99 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_tab_chip_badges_its_most_urgent_agent() {
+        use tutti_core::AgentState::{Blocked, Done, Idle, Working};
+        // An exited plain shell is `Done` too, but only agents earn a dot.
+        let mut exited = shell(9);
+        exited.state = Done;
+        exited.exited = Some(0);
+        let tabs = vec![
+            tab(1, "1", true, leaf(1), vec![shell(1)]),
+            tab(
+                2,
+                "2",
+                false,
+                leaf(2),
+                vec![agent(2, "claude", Working), agent(3, "codex", Done)],
+            ),
+            tab(3, "3", false, leaf(4), vec![agent(4, "claude", Working)]),
+            tab(
+                4,
+                "4",
+                false,
+                leaf(5),
+                vec![
+                    agent(5, "claude", Done),
+                    agent(6, "claude", Blocked),
+                    agent(7, "codex", Working),
+                ],
+            ),
+            tab(
+                5,
+                "5",
+                false,
+                leaf(8),
+                vec![agent(8, "claude", Idle), exited],
+            ),
+        ];
+        let mut app = App::new();
+        attach_with(&mut app, vec![workspace(1, "w", None, tabs)]);
+        let badges: Vec<Option<AgentState>> = app.tab_chips().iter().map(|c| c.badge).collect();
+        assert_eq!(
+            badges,
+            vec![None, Some(Done), Some(Working), Some(Blocked), None, None],
+            "blocked beats done beats working; shells, idle agents, and the + earn none"
+        );
+    }
+
+    #[test]
+    fn a_badged_tab_chip_still_clicks_true() {
+        let mut app = App::new();
+        attach_with(
+            &mut app,
+            vec![workspace(
+                1,
+                "w",
+                None,
+                vec![
+                    tab(1, "1", true, leaf(1), vec![shell(1)]),
+                    tab(
+                        2,
+                        "2",
+                        false,
+                        leaf(2),
+                        vec![agent(2, "claude", AgentState::Blocked)],
+                    ),
+                ],
+            )],
+        );
+        app.sync_sizes(Rect::new(0, 0, 100, 24));
+        // " 1 1 " (5), " 2 2 " plus its dot and pad (7), and " + " (3), with
+        // two separators: 17 columns from col 83, so tab 2 covers 89-95 — its
+        // dot on 94, the pad on 95 — and the + starts at 97.
+        let widths: Vec<u16> = app.tab_chips().iter().map(TabChip::width).collect();
+        assert_eq!(widths, vec![5, 7, 3]);
+        for col in [89, 94, 95] {
+            assert_eq!(
+                app.on_mouse(MouseEventKind::Down(MouseButton::Left), col, 0),
+                vec![control(&Request::TabSelect { id: TabId(2) })],
+                "col {col} is tab 2's segment"
+            );
+        }
+        assert!(
+            app.on_mouse(MouseEventKind::Down(MouseButton::Left), 96, 0)
+                .is_empty(),
+            "the separator selects nothing"
+        );
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Down(MouseButton::Left), 97, 0),
+            vec![control(&Request::TabNew {
+                workspace: Some(WorkspaceId(1)),
+            })]
+        );
+    }
+
     // ---- mouse wheel ----------------------------------------------------
 
     /// Seed pane 1's parser with `bytes` so its declared modes (alt screen,
@@ -6683,6 +6894,165 @@ mod tests {
             vec![osc52("hello world")],
             "the drag clamps to the pane and takes the whole line"
         );
+    }
+
+    // ---- split-border drag ----------------------------------------------
+
+    /// Shells 1 and 2 split along `direction` as the one tab, synced to a
+    /// 100x24 terminal with the sidebar off, so the pane area is the full
+    /// width under the two header rows: (0, 2, 100, 21).
+    fn border_fixture(direction: Direction) -> App {
+        let mut app = App::with_config(Config::parse("sidebar = \"off\"\n").unwrap());
+        attach_with(
+            &mut app,
+            vec![workspace(
+                1,
+                "w",
+                None,
+                vec![tab(
+                    1,
+                    "1",
+                    true,
+                    split(direction, leaf(1), leaf(2)),
+                    vec![shell(1), shell(2)],
+                )],
+            )],
+        );
+        app.sync_sizes(Rect::new(0, 0, 100, 24));
+        app
+    }
+
+    fn split_ratio(ratio: f32) -> WireFrame {
+        control(&Request::PaneSplitRatio {
+            a: PaneId(1),
+            b: PaneId(2),
+            ratio,
+        })
+    }
+
+    #[test]
+    fn dragging_a_side_by_side_border_sends_split_ratios_not_a_selection() {
+        use MouseEventKind::{Down, Drag, Up};
+        let mut app = border_fixture(Direction::Horizontal);
+        // Panes 1 | 2 meet at column 50: pane 1's right frame is column 49,
+        // pane 2's left frame column 50. Grab pane 2's side.
+        assert!(app.on_mouse(Down(MouseButton::Left), 50, 10).is_empty());
+        assert_eq!(
+            app.on_mouse(Drag(MouseButton::Left), 69, 10),
+            vec![split_ratio(0.69)]
+        );
+        assert!(
+            app.on_mouse(Drag(MouseButton::Left), 69, 15).is_empty(),
+            "moving along the border moves it no cell"
+        );
+        assert_eq!(
+            app.on_mouse(Drag(MouseButton::Left), 70, 15),
+            vec![split_ratio(0.7)]
+        );
+        assert!(app.on_mouse(Up(MouseButton::Left), 70, 15).is_empty());
+        assert_eq!(
+            app.focused,
+            Some(PaneId(1)),
+            "a border drag leaves focus where it was"
+        );
+        assert!(app.selection_span(PaneId(1)).is_none());
+        assert!(app.selection_span(PaneId(2)).is_none());
+        assert!(app.take_terminal_out().is_empty(), "and copies nothing");
+        // Grabbed on pane 1's side, that column stays under the pointer:
+        // dragged to 59, pane 1 ends there and pane 2 starts at 60.
+        app.on_mouse(Down(MouseButton::Left), 49, 3);
+        assert_eq!(
+            app.on_mouse(Drag(MouseButton::Left), 59, 3),
+            vec![split_ratio(0.6)]
+        );
+    }
+
+    #[test]
+    fn dragging_a_stacked_border_sends_split_ratios_not_a_selection() {
+        use MouseEventKind::{Down, Drag, Up};
+        let mut app = border_fixture(Direction::Vertical);
+        // The 21 content rows split 11 / 10: pane 1 holds rows 2-12, its bottom
+        // frame on 12; pane 2 rows 13-22, its title on 13.
+        assert!(app.on_mouse(Down(MouseButton::Left), 30, 13).is_empty());
+        assert_eq!(
+            app.on_mouse(Drag(MouseButton::Left), 30, 8),
+            vec![split_ratio(6.0 / 21.0)]
+        );
+        assert!(app.on_mouse(Up(MouseButton::Left), 30, 8).is_empty());
+        // Grabbed on pane 1's bottom frame, the border lands one row below the
+        // pointer.
+        app.on_mouse(Down(MouseButton::Left), 30, 12);
+        assert_eq!(
+            app.on_mouse(Drag(MouseButton::Left), 30, 16),
+            vec![split_ratio(15.0 / 21.0)]
+        );
+        assert_eq!(app.focused, Some(PaneId(1)));
+        assert!(app.selection_span(PaneId(2)).is_none());
+    }
+
+    #[test]
+    fn a_border_dragged_past_the_clamp_sends_once() {
+        use MouseEventKind::{Down, Drag};
+        let mut app = border_fixture(Direction::Horizontal);
+        app.on_mouse(Down(MouseButton::Left), 50, 10);
+        assert_eq!(
+            app.on_mouse(Drag(MouseButton::Left), 99, 10),
+            vec![split_ratio(Layout::MAX_RATIO)]
+        );
+        assert!(
+            app.on_mouse(Drag(MouseButton::Left), 98, 10).is_empty(),
+            "held past the bound, the border is already where it can go"
+        );
+    }
+
+    #[test]
+    fn a_still_click_on_a_border_focuses_like_any_click() {
+        use MouseEventKind::{Down, Up};
+        let mut app = border_fixture(Direction::Vertical);
+        // Pane 2's title row is its side of the border: the press grabs it, and
+        // a release that never moved it focuses the pane.
+        app.on_mouse(Down(MouseButton::Left), 30, 13);
+        assert_eq!(app.focused, Some(PaneId(1)), "the press alone only grabs");
+        app.on_mouse(Up(MouseButton::Left), 30, 13);
+        assert_eq!(app.focused, Some(PaneId(2)));
+    }
+
+    #[test]
+    fn a_drag_inside_a_split_pane_still_selects_and_copies() {
+        use MouseEventKind::{Down, Drag, Up};
+        let mut app = border_fixture(Direction::Horizontal);
+        app.handle_frame(WireFrame::PaneSnapshot(PaneData {
+            pane: PaneId(1),
+            rows: 18,
+            cols: 48,
+            seq: 0,
+            bytes: b"hello world".to_vec(),
+        }));
+        // Pane 1's interior starts at (1, 4); the drag runs on past the border
+        // at column 50 and clamps to the pane, as it always has.
+        app.on_mouse(Down(MouseButton::Left), 1, 4);
+        assert!(app.on_mouse(Drag(MouseButton::Left), 60, 4).is_empty());
+        app.on_mouse(Up(MouseButton::Left), 60, 4);
+        assert_eq!(app.take_terminal_out(), vec![osc52("hello world")]);
+        assert_eq!(app.transient(), Some("copied 11 chars"));
+    }
+
+    #[test]
+    fn zoom_leaves_no_border_to_grab() {
+        use MouseEventKind::{Down, Drag};
+        let mut app = border_fixture(Direction::Horizontal);
+        app.on_key(ctrl('b'));
+        app.on_key(plain('z'));
+        assert!(app.zoom);
+        app.sync_sizes(Rect::new(0, 0, 100, 24));
+        assert!(app.boundaries.is_empty());
+        // Column 50 is now deep inside the zoomed pane: the press selects.
+        app.on_mouse(Down(MouseButton::Left), 50, 10);
+        assert!(
+            app.on_mouse(Drag(MouseButton::Left), 70, 10).is_empty(),
+            "no split ratio while zoomed"
+        );
+        assert!(app.selection_span(PaneId(1)).is_some());
     }
 
     #[test]
