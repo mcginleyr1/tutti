@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use tutti_core::{
-    AgentHookEvent, ApprovalDecision, Direction, Event, PaneId, Request, Response, TabId,
-    WaitFor, WorkspaceId,
+    AgentHookEvent, ApprovalDecision, Direction, Event, PaneId, Request, Response, TabId, WaitFor,
+    WorkspaceId,
 };
 
 use tutti::client::{self, Client, StopOutcome};
@@ -427,6 +427,10 @@ impl From<Until> for WaitFor {
 /// A wait's exit code when it timed out: coreutils `timeout`'s.
 const TIMED_OUT: i32 = 124;
 
+/// How long `agent-event` waits on the daemon before giving up: a hook must
+/// never stall its agent (Claude Code gives `UserPromptSubmit` 30 s).
+const AGENT_EVENT_DEADLINE: Duration = Duration::from_secs(2);
+
 fn main() {
     match run(Cli::parse()) {
         Ok(code) => std::process::exit(code),
@@ -671,11 +675,18 @@ fn run_server(action: ServerAction, session: &str, json: bool) -> Result<i32> {
             Ok(1)
         }
         ServerAction::Start { foreground: false } => {
+            let log = tutti_core::log_path(session);
             match Client::connect(session) {
-                Ok(_) => println!("tutti-server already running for session '{session}'"),
+                Ok(_) => println!(
+                    "tutti-server already running for session '{session}' (log: {})",
+                    log.display()
+                ),
                 Err(e) if client::not_running(&e) => {
                     Client::connect_or_start(session)?;
-                    println!("tutti-server started for session '{session}'");
+                    println!(
+                        "tutti-server started for session '{session}' (log: {})",
+                        log.display()
+                    );
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -914,9 +925,10 @@ fn run_wait(
 /// Forward one agent hook event (read as JSON on stdin) to the daemon. Built to
 /// never break an agent session: outside a tutti-spawned pane (`TUTTI_PANE`
 /// unset) it exits 0 silently; a malformed or irrelevant event sends nothing; a
-/// connect/send failure is a stderr note, never a failure exit. This is the one
-/// deliberately never-fail path in the CLI. It writes stdout only to answer a
-/// held permission request (`approvals = "hold"`): on `UserPromptSubmit` and
+/// connect/send failure, or a daemon that has not answered within
+/// `AGENT_EVENT_DEADLINE`, is a stderr note, never a failure exit. This is the
+/// one deliberately never-fail path in the CLI. It writes stdout only to answer
+/// a held permission request (`approvals = "hold"`): on `UserPromptSubmit` and
 /// `SessionStart` Claude Code hands a hook's stdout to the model as context.
 fn run_agent_event(session: &str, agent: HookAgent) -> Result<i32> {
     let Some(pane) = std::env::var("TUTTI_PANE")
@@ -952,8 +964,25 @@ fn run_agent_event(session: &str, agent: HookAgent) -> Result<i32> {
         }
         return Ok(0);
     }
-    if let Err(err) = send_agent_event(&session, PaneId(pane), event, conversation) {
-        eprintln!("tutti agent-event: {err:#}");
+    // A wedged daemon must not stall the hook: the whole round trip — connect,
+    // write, read — runs against one deadline, and past it the process exits
+    // regardless, the stuck thread with it.
+    let (done, outcome) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(send_agent_event(
+            &session,
+            PaneId(pane),
+            event,
+            conversation,
+        ));
+    });
+    match outcome.recv_timeout(AGENT_EVENT_DEADLINE) {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => eprintln!("tutti agent-event: {err:#}"),
+        Err(_) => eprintln!(
+            "tutti agent-event: tutti-server did not answer within {}s",
+            AGENT_EVENT_DEADLINE.as_secs()
+        ),
     }
     Ok(0)
 }

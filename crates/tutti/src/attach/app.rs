@@ -2,8 +2,10 @@
 //! decision it makes, driven purely by inbound wire frames and user input. It
 //! owns no socket and no terminal, so it can be exercised headlessly in tests.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -11,8 +13,8 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, Mo
 use ratatui::layout::Rect;
 use tutti_core::{
     AgentKind, AgentState, ApprovalDecision, Checkpoint, DIFF_RANGE, Direction, Event, FileStat,
-    Frame as WireFrame, Layout, PaneId, PaneInfo, Request, Response, RestoreSummary, TabId,
-    TabView, WorkspaceId, WorkspaceView, prompt_fingerprint, prompt_rows,
+    Frame as WireFrame, Layout, PaneDims, PaneId, PaneInfo, Request, Response, RestoreSummary,
+    TabId, TabView, Tagged, WorkspaceId, WorkspaceView, prompt_fingerprint, prompt_rows,
 };
 
 use tutti_agents::Registry;
@@ -96,6 +98,19 @@ impl PaneState {
             scroll: None,
         }
     }
+}
+
+/// What the reply to a tagged request completes (`App::follow`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowUp {
+    /// A `WorkspaceNew` from add-project, whose refusal disarms the jump to
+    /// the new workspace's tab.
+    Mount,
+    /// A `WorkspaceFork`: `WorkspaceCreated` jumps to the new workspace and
+    /// opens its launcher.
+    Fork,
+    /// A `WorkspaceMerge` of this workspace: `Merged` offers its cleanup.
+    Merge(WorkspaceId),
 }
 
 /// An in-progress or just-finished mouse text selection within one pane. `anchor`
@@ -205,7 +220,9 @@ pub struct App {
     /// The border drag in progress; `None` while no border is held.
     border_drag: Option<BorderDrag>,
     status: Option<(String, Instant)>,
-    requested_sizes: HashMap<PaneId, (u16, u16)>,
+    /// The visible set last sent as `ViewSizes` — each shown pane at its
+    /// rendered size — so a draw that moved nothing sends nothing.
+    view_sent: Vec<PaneDims>,
     /// The focus last reported to the server via `PaneFocus`; lets the event
     /// loop notice a focus change from any source (input, layout, attach).
     focus_sent: Option<PaneId>,
@@ -318,17 +335,23 @@ pub struct App {
     /// The workspace name captured in step 1, carried while the `where:` step is
     /// edited so submit can send both name and destination.
     new_workspace_name: String,
-    /// Set while a `WorkspaceFork` is in flight so the `WorkspaceCreated` reply
-    /// (shared with add-project) knows to jump to the new workspace and open its
-    /// launcher.
-    fork_pending: bool,
-    /// The child workspace a `WorkspaceMerge` is in flight for, so the `Merged`
-    /// reply knows which workspace the follow-up cleanup confirm targets.
-    merge_pending: Option<WorkspaceId>,
     /// The saved layout the attach offered back (`Mode::RestoreOffer`), with
     /// the mode it opened over — the first-run prompt, when armed — for `esc`
     /// to return to.
     restore_offer: Option<(RestoreSummary, Mode)>,
+    /// What the reply to each tagged request in flight completes, keyed by the
+    /// `req` it rode out with: a guided create's jump and launcher, a merge's
+    /// cleanup offer. Only that request's own reply — a refusal included —
+    /// completes or cancels one.
+    pending: HashMap<u64, FollowUp>,
+    /// The `req` of the last tagged request; the attach rides out as 0.
+    last_req: u64,
+    /// Whether the daemon predates request tags (wire rev 8): it answered the
+    /// attach without its `req`. Such a daemon echoes none and knows only
+    /// per-pane `PaneResize`, so the client speaks the old way to it: a reply
+    /// completes the oldest follow-up of its kind, and any `Error` cancels
+    /// them all.
+    old_daemon: bool,
     /// Panes that raised a notification while unfocused; their sidebar entry
     /// shows a bell mark until the pane is focused.
     notified: HashSet<PaneId>,
@@ -377,7 +400,7 @@ impl App {
             boundaries: Vec::new(),
             border_drag: None,
             status: None,
-            requested_sizes: HashMap::new(),
+            view_sent: Vec::new(),
             focus_sent: None,
             bell: false,
             prefix_since: None,
@@ -416,9 +439,10 @@ impl App {
             adopt_active_view: false,
             fork_target: None,
             new_workspace_name: String::new(),
-            fork_pending: false,
-            merge_pending: None,
             restore_offer: None,
+            pending: HashMap::new(),
+            last_req: 0,
+            old_daemon: false,
             notified: HashSet::new(),
             terminal_out: Vec::new(),
             collapsed_projects: false,
@@ -529,8 +553,10 @@ impl App {
 
     // ---- inbound frames -------------------------------------------------
 
-    /// Apply one frame received from the server, mutating client state.
-    pub fn handle_frame(&mut self, frame: WireFrame) {
+    /// Apply one frame received from the server, mutating client state, and
+    /// return what it calls for: a fresh snapshot of a pane whose frame broke
+    /// its parser.
+    pub fn handle_frame(&mut self, frame: WireFrame) -> Vec<WireFrame> {
         match frame {
             WireFrame::Control(json) => self.handle_control(&json),
             WireFrame::PaneSnapshot(data) => {
@@ -539,28 +565,44 @@ impl App {
                     .get(&data.pane)
                     .map(|s| s.info.clone())
                     .unwrap_or_else(|| placeholder_info(data.pane));
-                self.panes.insert(
-                    data.pane,
-                    PaneState::seeded(data.rows, data.cols, &data.bytes, info),
-                );
+                match fed(|| PaneState::seeded(data.rows, data.cols, &data.bytes, info.clone())) {
+                    Some(state) => {
+                        self.panes.insert(data.pane, state);
+                    }
+                    None => return self.reseed(data.pane, data.rows, data.cols, info),
+                }
             }
             WireFrame::PaneDelta(data) => {
                 if let Some(state) = self.panes.get_mut(&data.pane)
                     && state.scroll.is_none()
                 {
-                    state.parser.process(&data.bytes);
+                    if fed(|| state.parser.process(&data.bytes)).is_none() {
+                        let info = state.info.clone();
+                        return self.reseed(data.pane, data.rows, data.cols, info);
+                    }
                     state.damaged = true;
                 }
             }
             WireFrame::Input { .. } => {}
         }
+        Vec::new()
+    }
+
+    /// Recover a pane whose frame panicked its parser: start it over blank and
+    /// have the server reseed it — a `PaneScroll` back to the live view does —
+    /// instead of letting vt100 take the TUI down.
+    fn reseed(&mut self, pane: PaneId, rows: u16, cols: u16, info: PaneInfo) -> Vec<WireFrame> {
+        self.panes
+            .insert(pane, PaneState::seeded(rows, cols, b"", info));
+        self.set_status(format!("pane {pane}'s output broke its parser; reseeding"));
+        vec![control(&Request::PaneScroll { pane, offset: 0 })]
     }
 
     fn handle_control(&mut self, json: &[u8]) {
         if let Ok(event) = serde_json::from_slice::<Event>(json) {
             self.handle_event(event);
-        } else if let Ok(response) = serde_json::from_slice::<Response>(json) {
-            self.handle_response(response);
+        } else if let Ok(Tagged { req, body }) = serde_json::from_slice::<Tagged<Response>>(json) {
+            self.handle_response(req, body);
         }
         // A peek only ever answers a blocked agent: once the agent moves on —
         // answered from here or from anywhere else — or vanishes, the overlay
@@ -679,7 +721,8 @@ impl App {
         }
     }
 
-    fn handle_response(&mut self, response: Response) {
+    /// Apply a reply; `req` is the one its request rode out with, echoed.
+    fn handle_response(&mut self, req: Option<u64>, response: Response) {
         match response {
             Response::Attached {
                 session,
@@ -687,6 +730,7 @@ impl App {
                 wire_rev,
                 restorable,
             } => {
+                self.old_daemon = req.is_none();
                 self.session = session;
                 self.set_view(workspaces);
                 if wire_rev != tutti_core::WIRE_REV {
@@ -714,7 +758,8 @@ impl App {
                 // Add-project ignores this (it armed its jump + launcher up
                 // front); guided create waited for it: jump to the new workspace,
                 // open the launcher over it, and flash what it made and where.
-                if std::mem::take(&mut self.fork_pending) {
+                let creates = |f| matches!(f, FollowUp::Mount | FollowUp::Fork);
+                if self.take_follow_up(req, creates) == Some(FollowUp::Fork) {
                     let created = self
                         .workspaces
                         .iter()
@@ -737,7 +782,8 @@ impl App {
             Response::Merged { pushed, bookmark } => {
                 // The merge landed: report where, then offer to clean up (discard)
                 // the now-merged workspace.
-                if let Some(id) = self.merge_pending.take() {
+                let merges = |f| matches!(f, FollowUp::Merge(_));
+                if let Some(FollowUp::Merge(id)) = self.take_follow_up(req, merges) {
                     let mut msg = format!("merged into {bookmark}");
                     if pushed {
                         msg.push_str(" and pushed");
@@ -768,14 +814,53 @@ impl App {
             }
             Response::Error { message } => {
                 // A failed new-workspace, guided-create, or merge request must not
-                // later hijack the tab, the launcher, or the cleanup confirm.
-                self.adopt_active_view = false;
-                self.fork_pending = false;
-                self.merge_pending = None;
+                // later hijack the tab, the launcher, or the cleanup confirm —
+                // and cancels only its own: a refused answer leaves a merge's
+                // cleanup offer standing. An old daemon names no request, so
+                // its refusal cancels them all.
+                let mounted = match req {
+                    Some(req) => self.pending.remove(&req) == Some(FollowUp::Mount),
+                    None if self.old_daemon => {
+                        self.pending.clear();
+                        true
+                    }
+                    None => false,
+                };
+                if mounted {
+                    self.adopt_active_view = false;
+                }
                 self.set_status(format!("error: {message}"));
             }
             _ => {}
         }
+    }
+
+    /// Tag `request` with a fresh `req` and note what its reply completes, so
+    /// that reply alone — a refusal included — completes or cancels it.
+    fn follow(&mut self, request: &Request, follow_up: FollowUp) -> WireFrame {
+        self.last_req += 1;
+        self.pending.insert(self.last_req, follow_up);
+        tagged(request, self.last_req)
+    }
+
+    /// The follow-up a reply completes: the one its `req` keys — or, from an
+    /// old daemon that echoes none, the oldest pending one that `fits`.
+    fn take_follow_up(
+        &mut self,
+        req: Option<u64>,
+        fits: impl Fn(FollowUp) -> bool,
+    ) -> Option<FollowUp> {
+        let req = match req {
+            Some(req) => req,
+            None if self.old_daemon => *self
+                .pending
+                .iter()
+                .filter(|(_, f)| fits(**f))
+                .map(|(req, _)| req)
+                .min()?,
+            None => return None,
+        };
+        self.pending.remove(&req)
     }
 
     /// Reconcile the pane/tab tree with a fresh view: update pane metadata, drop
@@ -793,7 +878,6 @@ impl App {
             }
         }
         self.panes.retain(|id, _| present.contains(id));
-        self.requested_sizes.retain(|id, _| present.contains(id));
 
         // After a new-workspace prompt, follow the server's freshly-current tab.
         if std::mem::take(&mut self.adopt_active_view) {
@@ -882,10 +966,10 @@ impl App {
                 (KeyCode::Char('p'), Some(sandbox)) => {
                     // The reply lands as guided create's does: a jump to the
                     // new workspace and the launcher over it.
-                    self.fork_pending = true;
                     let branch = tutti_core::sandbox_branch(&sandbox);
                     self.set_status(format!("pulling {branch}…"));
-                    return vec![control(&Request::SandboxPull { pane, name: None })];
+                    let pull = Request::SandboxPull { pane, name: None };
+                    return vec![self.follow(&pull, FollowUp::Fork)];
                 }
                 (KeyCode::Char('x'), _) => return vec![control(&Request::PaneKill { pane })],
                 _ => {}
@@ -2245,7 +2329,7 @@ impl App {
         // Harvest against the directory being added: an existing project often
         // has conversations from before it was mounted in tutti.
         self.open_launcher(true, name, Some(dir.as_path()));
-        vec![control(&Request::WorkspaceNew { dir })]
+        vec![self.follow(&Request::WorkspaceNew { dir }, FollowUp::Mount)]
     }
 
     /// Guided create, step 1 (`workspace name:`): type the name, `esc` cancels
@@ -2365,13 +2449,13 @@ impl App {
         self.clear_prompt();
         self.mode = Mode::Sidebar;
         self.status = None;
-        self.fork_pending = true;
-        vec![control(&Request::WorkspaceFork {
+        let fork = Request::WorkspaceFork {
             id,
             name,
             revision: None,
             dest,
-        })]
+        };
+        vec![self.follow(&fork, FollowUp::Fork)]
     }
 
     /// Resolve the merge confirm: `y` dispatches the `WorkspaceMerge` (letting the
@@ -2380,11 +2464,11 @@ impl App {
     fn on_key_confirm_merge(&mut self, key: KeyEvent, id: WorkspaceId) -> Vec<WireFrame> {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                self.merge_pending = Some(id);
                 self.mode = Mode::Sidebar;
                 let name = self.workspace_name(id).unwrap_or_default();
                 self.set_status(format!("merging {name}…"));
-                vec![control(&Request::WorkspaceMerge { id, push: true })]
+                let merge = Request::WorkspaceMerge { id, push: true };
+                vec![self.follow(&merge, FollowUp::Merge(id))]
             }
             _ => {
                 self.mode = Mode::Sidebar;
@@ -3114,7 +3198,8 @@ impl App {
 
     /// Map an absolute terminal point to the pane and 0-based grid cell beneath
     /// it, or `None` when the point is over a pane's border/title rather than its
-    /// interior. Used to seed a selection on the exact cell clicked.
+    /// interior. Used to seed a selection on the exact cell clicked; a point
+    /// past a grid smaller than the pane takes the grid's nearest edge cell.
     fn pane_cell_at(&self, col: u16, row: u16) -> Option<(PaneId, u16, u16)> {
         let (pane, rect) = self.rects.iter().find(|(_, r)| contains(*r, col, row))?;
         let (rows, cols) = inner_size(*rect);
@@ -3123,7 +3208,8 @@ impl App {
             return None;
         }
         let (c, r) = (col - x0, row - y0);
-        (c < cols && r < rows).then_some((*pane, r, c))
+        let (grid_rows, grid_cols) = self.cell_bounds(*pane, *rect);
+        (c < cols && r < rows).then_some((*pane, r.min(grid_rows - 1), c.min(grid_cols - 1)))
     }
 
     /// Clamp an absolute point to `pane`'s interior, returning the 0-based cell —
@@ -3134,10 +3220,22 @@ impl App {
             .iter()
             .find(|(p, _)| *p == pane)
             .map(|(_, r)| *r)?;
-        let (rows, cols) = inner_size(rect);
+        let (rows, cols) = self.cell_bounds(pane, rect);
         let c = col.saturating_sub(rect.x + 1).min(cols - 1);
         let r = row.saturating_sub(rect.y + 2).min(rows - 1);
         Some((r, c))
+    }
+
+    /// The cells a pointer can pick in `pane`, `(rows, cols)`: its rect's
+    /// interior, cut to its grid where that is smaller — the grid is sized by
+    /// the smallest client viewing the pane, which may be another one.
+    fn cell_bounds(&self, pane: PaneId, rect: Rect) -> (u16, u16) {
+        let (rows, cols) = inner_size(rect);
+        let (grid_rows, grid_cols) = self
+            .panes
+            .get(&pane)
+            .map_or((rows, cols), |s| s.parser.screen().size());
+        (rows.min(grid_rows).max(1), cols.min(grid_cols).max(1))
     }
 
     fn in_sidebar(&self, col: u16, row: u16) -> bool {
@@ -3399,10 +3497,12 @@ impl App {
 
     // ---- layout / sizing ------------------------------------------------
 
-    /// Recompute pane rectangles for the terminal `area` and emit resize requests
-    /// for any pane whose rendered size changed, so the server's ptys track the
-    /// client. Records the sidebar and tab-bar rects and the split boundaries
-    /// for mouse hit-testing.
+    /// Recompute pane rectangles for the terminal `area` and, when the visible
+    /// set moved, send it whole as `ViewSizes` — each shown pane at its
+    /// rendered size — so the server sizes every pane by its smallest viewer
+    /// (an old daemon gets a `PaneResize` per pane whose size moved instead).
+    /// Records the sidebar and tab-bar rects and the split boundaries for
+    /// mouse hit-testing.
     pub fn sync_sizes(&mut self, area: Rect) -> Vec<WireFrame> {
         let (content, _footer) = App::content_rect(area);
         let (app_bar, _rule) = App::header_rects(area);
@@ -3422,18 +3522,34 @@ impl App {
             .active_tab_view()
             .and_then(|t| t.layout.as_ref())
             .map_or_else(Vec::new, |layout| boundaries(layout, panes, zoom));
-        let mut out = Vec::new();
-        for (pane, rect) in &self.rects {
-            let (rows, cols) = inner_size(*rect);
-            if self.requested_sizes.get(pane) != Some(&(rows, cols)) {
-                self.requested_sizes.insert(*pane, (rows, cols));
-                out.push(control(&Request::PaneResize {
+        let view: Vec<PaneDims> = self
+            .rects
+            .iter()
+            .map(|(pane, rect)| {
+                let (rows, cols) = inner_size(*rect);
+                PaneDims {
                     pane: *pane,
                     rows,
                     cols,
-                }));
-            }
+                }
+            })
+            .collect();
+        if view == self.view_sent {
+            return Vec::new();
         }
+        let out = if self.old_daemon {
+            view.iter()
+                .filter(|dims| !self.view_sent.contains(dims))
+                .map(|&PaneDims { pane, rows, cols }| {
+                    control(&Request::PaneResize { pane, rows, cols })
+                })
+                .collect()
+        } else {
+            vec![control(&Request::ViewSizes {
+                panes: view.clone(),
+            })]
+        };
+        self.view_sent = view;
         out
     }
 
@@ -3783,6 +3899,36 @@ fn inner_size(rect: Rect) -> (u16, u16) {
 
 pub(crate) fn control(request: &Request) -> WireFrame {
     WireFrame::Control(serde_json::to_vec(request).expect("serialize request"))
+}
+
+/// `control`, tagged with `req` for the server to echo on the answer.
+pub(crate) fn tagged(request: &Request, req: u64) -> WireFrame {
+    let tagged = Tagged {
+        req: Some(req),
+        body: request,
+    };
+    WireFrame::Control(serde_json::to_vec(&tagged).expect("serialize request"))
+}
+
+thread_local! {
+    /// Set while `fed` feeds a pane frame to its parser, so the panic hook
+    /// leaves the terminal be for a panic that is about to be caught.
+    static FEEDING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether this thread is feeding a pane frame to its parser — for the panic
+/// hook: that panic is caught and the pane reseeded, so the TUI runs on.
+pub(crate) fn feeding() -> bool {
+    FEEDING.get()
+}
+
+/// Feed a pane frame to its parser, catching a vt100 panic — a wide character
+/// in a one-column pane is one — as `None`: the parser it left is suspect.
+fn fed<T>(feed: impl FnOnce() -> T) -> Option<T> {
+    FEEDING.set(true);
+    let fed = catch_unwind(AssertUnwindSafe(feed)).ok();
+    FEEDING.set(false);
+    fed
 }
 
 /// The workspace name a directory mounts under — its final path component — for
@@ -4185,15 +4331,24 @@ mod tests {
         )]
     }
 
+    /// A reply as a current daemon sends it: tagged with its request's `req`.
+    fn reply(req: u64, response: Response) -> WireFrame {
+        let tagged = Tagged {
+            req: Some(req),
+            body: response,
+        };
+        WireFrame::Control(serde_json::to_vec(&tagged).unwrap())
+    }
+
     fn attached(app: &mut App) {
-        app.handle_frame(WireFrame::Control(
-            serde_json::to_vec(&Response::Attached {
+        app.handle_frame(reply(
+            0,
+            Response::Attached {
                 wire_rev: tutti_core::WIRE_REV,
                 session: "tutti".into(),
                 workspaces: view_one_pane(),
                 restorable: None,
-            })
-            .unwrap(),
+            },
         ));
     }
 
@@ -4255,6 +4410,68 @@ mod tests {
             bytes: b"\x1b[2Jlive".to_vec(),
         }));
         assert!(app.pane_text(PaneId(1)).unwrap().contains("frozen"));
+    }
+
+    /// A frame that panics vt100 — a wide character in a one-column pane, which
+    /// the client's one-column clamp makes reachable — resets that pane blank
+    /// and asks the server to reseed it, instead of taking the TUI down.
+    #[test]
+    fn a_frame_that_panics_the_parser_reseeds_its_pane() {
+        let mut app = App::new();
+        attached(&mut app);
+        let frame = |rows, cols, bytes: &str| PaneData {
+            pane: PaneId(1),
+            rows,
+            cols,
+            seq: 0,
+            bytes: bytes.as_bytes().to_vec(),
+        };
+        let reseed = vec![control(&Request::PaneScroll {
+            pane: PaneId(1),
+            offset: 0,
+        })];
+        assert_eq!(
+            app.handle_frame(WireFrame::PaneSnapshot(frame(2, 1, "日本"))),
+            reseed
+        );
+        assert_eq!(app.panes[&PaneId(1)].parser.screen().size(), (2, 1));
+        assert_eq!(app.pane_text(PaneId(1)).unwrap(), "", "reset blank");
+        assert!(app.transient().is_some_and(|t| t.contains("reseeding")));
+        // A delta can break a seeded pane the same way.
+        assert!(
+            app.handle_frame(WireFrame::PaneSnapshot(frame(2, 1, "x")))
+                .is_empty()
+        );
+        assert_eq!(
+            app.handle_frame(WireFrame::PaneDelta(frame(2, 1, "日"))),
+            reseed
+        );
+        assert!(!feeding(), "the panic hook is armed again");
+        // The reseed lands like any snapshot.
+        assert!(
+            app.handle_frame(WireFrame::PaneSnapshot(frame(2, 4, "ok")))
+                .is_empty()
+        );
+        assert!(app.pane_text(PaneId(1)).unwrap().contains("ok"));
+    }
+
+    /// Another client viewing a pane smaller leaves its grid smaller than its
+    /// rect here: a click past the grid lands on the grid's nearest cell.
+    #[test]
+    fn a_click_past_a_smaller_grid_clamps_to_its_edge() {
+        let mut app = App::with_config(Config::parse("sidebar = \"off\"\n").unwrap());
+        attached(&mut app);
+        app.sync_sizes(Rect::new(0, 0, 80, 24)); // an 18x78 interior from (1, 4)
+        app.handle_frame(WireFrame::PaneSnapshot(PaneData {
+            pane: PaneId(1),
+            rows: 5,
+            cols: 10,
+            seq: 0,
+            bytes: b"0123456789".to_vec(),
+        }));
+        app.on_mouse(MouseEventKind::Down(MouseButton::Left), 60, 15);
+        app.on_mouse(MouseEventKind::Drag(MouseButton::Left), 1, 4);
+        assert_eq!(app.selection_span(PaneId(1)), Some(((0, 0), (4, 9))));
     }
 
     #[test]
@@ -4346,24 +4563,85 @@ mod tests {
     }
 
     #[test]
-    fn sync_sizes_requests_resize_once_per_size() {
+    fn sync_sizes_sends_the_visible_set_once_per_change() {
         // Sidebar off so the lone pane keeps the full width. The chrome costs
         // four rows of the pane's height: the two-row app-bar header, the footer,
         // and the pane's own title line above its frame (plus the two borders).
         let mut app = App::with_config(Config::parse("sidebar = \"off\"\n").unwrap());
         attached(&mut app);
         let area = Rect::new(0, 0, 80, 24);
-        let first = app.sync_sizes(area);
+        let dims = |pane, rows, cols| PaneDims {
+            pane: PaneId(pane),
+            rows,
+            cols,
+        };
         assert_eq!(
-            first,
+            app.sync_sizes(area),
+            vec![control(&Request::ViewSizes {
+                panes: vec![dims(1, 18, 78)],
+            })]
+        );
+        // Same size again produces nothing.
+        assert!(app.sync_sizes(area).is_empty());
+        // A split changes the set: it goes out whole, both panes in it.
+        let mut view = view_one_pane();
+        view[0].tabs[0].layout = Some(split(Direction::Horizontal, leaf(1), leaf(2)));
+        view[0].tabs[0].panes.push(shell(2));
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Event::LayoutChanged { workspaces: view }).unwrap(),
+        ));
+        assert_eq!(
+            app.sync_sizes(area),
+            vec![control(&Request::ViewSizes {
+                panes: vec![dims(1, 18, 38), dims(2, 18, 38)],
+            })]
+        );
+        // A tab with nothing in it shows no pane: the empty set retracts the
+        // client's votes.
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Event::LayoutChanged {
+                workspaces: Vec::new(),
+            })
+            .unwrap(),
+        ));
+        assert_eq!(
+            app.sync_sizes(area),
+            vec![control(&Request::ViewSizes { panes: Vec::new() })]
+        );
+    }
+
+    /// A daemon that answered the attach untagged predates `ViewSizes`: the
+    /// client sends it a `PaneResize` per pane whose size moved, as before.
+    #[test]
+    fn an_old_daemon_gets_a_resize_per_moved_pane() {
+        let mut app = App::with_config(Config::parse("sidebar = \"off\"\n").unwrap());
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Response::Attached {
+                wire_rev: 7,
+                session: "t".into(),
+                workspaces: view_one_pane(),
+                restorable: None,
+            })
+            .unwrap(),
+        ));
+        let area = Rect::new(0, 0, 80, 24);
+        assert_eq!(
+            app.sync_sizes(area),
             vec![control(&Request::PaneResize {
                 pane: PaneId(1),
                 rows: 18,
                 cols: 78,
             })]
         );
-        // Same size again produces nothing.
         assert!(app.sync_sizes(area).is_empty());
+        assert_eq!(
+            app.sync_sizes(Rect::new(0, 0, 80, 30)),
+            vec![control(&Request::PaneResize {
+                pane: PaneId(1),
+                rows: 24,
+                cols: 78,
+            })]
+        );
     }
 
     #[test]
@@ -4538,14 +4816,14 @@ mod tests {
     }
 
     fn attach_with(app: &mut App, workspaces: Vec<WorkspaceView>) {
-        app.handle_frame(WireFrame::Control(
-            serde_json::to_vec(&Response::Attached {
+        app.handle_frame(reply(
+            0,
+            Response::Attached {
                 wire_rev: tutti_core::WIRE_REV,
                 session: "t".into(),
                 workspaces,
                 restorable: None,
-            })
-            .unwrap(),
+            },
         ));
     }
 
@@ -6455,7 +6733,8 @@ mod tests {
         // The old tab is untouched until the reply lands.
         assert_eq!(app.active_tab, Some(TabId(1)));
 
-        app.handle_response(Response::WorkspaceCreated { id: WorkspaceId(3) });
+        // The fork was the first tagged request: req 1.
+        app.handle_response(Some(1), Response::WorkspaceCreated { id: WorkspaceId(3) });
         assert_eq!(
             app.active_tab,
             Some(TabId(3)),
@@ -6499,22 +6778,29 @@ mod tests {
             "the confirm names the workspace"
         );
 
-        // `y` dispatches the merge (push requested; the server owns the bookmark).
+        // `y` dispatches the merge (push requested; the server owns the bookmark),
+        // tagged so its reply alone completes the follow-up.
         let out = app.on_key(plain('y'));
         assert_eq!(
             out,
-            vec![control(&Request::WorkspaceMerge {
-                id: WorkspaceId(2),
-                push: true,
-            })],
+            vec![tagged(
+                &Request::WorkspaceMerge {
+                    id: WorkspaceId(2),
+                    push: true,
+                },
+                1
+            )],
             "y sends the merge request"
         );
 
         // The Merged reply flashes the outcome and raises the cleanup confirm.
-        app.handle_response(Response::Merged {
-            pushed: false,
-            bookmark: "main".into(),
-        });
+        app.handle_response(
+            Some(1),
+            Response::Merged {
+                pushed: false,
+                bookmark: "main".into(),
+            },
+        );
         assert_eq!(app.mode, Mode::ConfirmCleanup(WorkspaceId(2)));
         assert!(
             app.transient()
@@ -6545,10 +6831,13 @@ mod tests {
         app.on_key(plain('j'));
         app.on_key(plain('m'));
         app.on_key(plain('y'));
-        app.handle_response(Response::Merged {
-            pushed: true,
-            bookmark: "main".into(),
-        });
+        app.handle_response(
+            Some(1),
+            Response::Merged {
+                pushed: true,
+                bookmark: "main".into(),
+            },
+        );
         assert!(
             app.transient().is_some_and(|t| t.contains("and pushed")),
             "a pushed merge says so"
@@ -6565,14 +6854,143 @@ mod tests {
         app.on_key(plain('j'));
         app.on_key(plain('m'));
         app.on_key(plain('y'));
-        app.handle_response(Response::Merged {
-            pushed: false,
-            bookmark: "main".into(),
-        });
+        app.handle_response(
+            Some(1),
+            Response::Merged {
+                pushed: false,
+                bookmark: "main".into(),
+            },
+        );
         // `n` at the cleanup confirm keeps the workspace on disk.
         let out = app.on_key(plain('n'));
         assert!(out.is_empty(), "declining cleanup sends nothing");
         assert_eq!(app.mode, Mode::Sidebar);
+    }
+
+    /// What request correlation fixes: a guarded answer refused while a merge
+    /// runs used to cancel the merge's cleanup offer along with it. Now only
+    /// the merge's own refusal cancels it.
+    #[test]
+    fn a_refused_answer_leaves_a_running_merge_its_cleanup_offer() {
+        let mut app = App::new();
+        let mut view = view_two_workspaces();
+        view[1].parent = Some(WorkspaceId(1)); // web, nested under api
+        attach_with(&mut app, view);
+        focus_sidebar(&mut app);
+        app.on_key(plain('j'));
+        app.on_key(plain('m'));
+        app.on_key(plain('y')); // the merge rides out as req 1
+
+        // While it runs, pane 3's prompt is answered from the peek, and the
+        // daemon refuses the answer, naming no request of ours.
+        let waiting = app
+            .sidebar()
+            .index_of(sidebar::EntryIdent::Waiting(PaneId(3)))
+            .unwrap();
+        for _ in app.sidebar_selected()..waiting {
+            app.on_key(plain('j'));
+        }
+        app.on_key(plain('p'));
+        assert_eq!(
+            app.on_key(plain('1')).len(),
+            1,
+            "the guarded answer goes out"
+        );
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Response::Error {
+                message: "the prompt changed since you looked".into(),
+            })
+            .unwrap(),
+        ));
+        assert!(
+            app.transient()
+                .is_some_and(|t| t.contains("prompt changed"))
+        );
+
+        let merged = || Response::Merged {
+            pushed: false,
+            bookmark: "main".into(),
+        };
+        app.handle_frame(reply(1, merged()));
+        assert_eq!(app.mode, Mode::ConfirmCleanup(WorkspaceId(2)));
+
+        // A merge refused itself loses its offer: a stray `Merged` for it then
+        // raises nothing.
+        app.on_key(plain('n'));
+        app.on_key(plain('m'));
+        app.on_key(plain('y')); // req 2
+        app.handle_frame(reply(
+            2,
+            Response::Error {
+                message: "the merge would conflict".into(),
+            },
+        ));
+        app.handle_frame(reply(2, merged()));
+        assert_eq!(app.mode, Mode::Sidebar);
+    }
+
+    /// Only add-project's own refusal disarms its jump to the new tab.
+    #[test]
+    fn only_its_own_refusal_disarms_add_projects_jump() {
+        let root = temp_tree(&[]);
+        let mut app = App::new();
+        app.start_first_run_prompt(root.display().to_string());
+        attach_with(&mut app, vec![]);
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // req 1
+        let _ = std::fs::remove_dir_all(&root);
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Response::Error {
+                message: "no pane 9".into(),
+            })
+            .unwrap(),
+        ));
+        assert!(app.adopt_active_view, "another request's refusal");
+        app.handle_frame(reply(
+            1,
+            Response::Error {
+                message: "directory does not exist".into(),
+            },
+        ));
+        assert!(!app.adopt_active_view, "its own");
+    }
+
+    /// An old daemon echoes no `req`: a reply completes the oldest follow-up
+    /// of its kind, and any refusal cancels them all — the rule before tags.
+    #[test]
+    fn an_old_daemons_refusal_cancels_every_follow_up() {
+        let mut app = App::new();
+        let mut view = view_two_workspaces();
+        view[1].parent = Some(WorkspaceId(1));
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Response::Attached {
+                wire_rev: 7,
+                session: "t".into(),
+                workspaces: view,
+                restorable: None,
+            })
+            .unwrap(),
+        ));
+        let untagged =
+            |response: &Response| WireFrame::Control(serde_json::to_vec(response).unwrap());
+        let merged = Response::Merged {
+            pushed: false,
+            bookmark: "main".into(),
+        };
+        focus_sidebar(&mut app);
+        app.on_key(plain('j'));
+        app.on_key(plain('m'));
+        app.on_key(plain('y'));
+        app.handle_frame(untagged(&merged));
+        assert_eq!(app.mode, Mode::ConfirmCleanup(WorkspaceId(2)));
+
+        app.on_key(plain('n'));
+        app.on_key(plain('m'));
+        app.on_key(plain('y'));
+        app.handle_frame(untagged(&Response::Error {
+            message: "the prompt changed since you looked".into(),
+        }));
+        app.handle_frame(untagged(&merged));
+        assert_eq!(app.mode, Mode::Sidebar, "the refusal cancelled the offer");
     }
 
     #[test]
@@ -6922,7 +7340,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         assert_eq!(
             out,
-            vec![control(&Request::WorkspaceNew { dir })],
+            vec![tagged(&Request::WorkspaceNew { dir }, 1)],
             "submit mounts the typed directory, then the launcher picks its first pane"
         );
         assert_eq!(app.mode, Mode::Launcher);
@@ -6966,12 +7384,15 @@ mod tests {
     #[test]
     fn attached_with_old_wire_rev_warns_to_restart_the_daemon() {
         let mut app = App::new();
-        app.handle_response(Response::Attached {
-            session: "t".into(),
-            workspaces: Vec::new(),
-            wire_rev: 0,
-            restorable: None,
-        });
+        app.handle_response(
+            None,
+            Response::Attached {
+                session: "t".into(),
+                workspaces: Vec::new(),
+                wire_rev: 0,
+                restorable: None,
+            },
+        );
         let warning = app.transient().unwrap_or_default().to_string();
         assert!(
             warning.contains("older build"),
@@ -7020,7 +7441,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(
             out,
-            vec![control(&Request::WorkspaceNew { dir })],
+            vec![tagged(&Request::WorkspaceNew { dir }, 1)],
             "the first-run prompt mounts the workspace, then the launcher picks its pane"
         );
         assert_eq!(app.mode, Mode::Launcher);
@@ -7171,12 +7592,15 @@ mod tests {
             .unwrap(),
         ));
         assert_eq!(app.active_tab, Some(TabId(1)), "a view alone keeps the tab");
-        app.handle_response(Response::SessionRestored {
-            workspaces: 2,
-            panes: 3,
-            revived: 2,
-            skipped: vec!["/srv/gone: the directory is gone".into()],
-        });
+        app.handle_response(
+            None,
+            Response::SessionRestored {
+                workspaces: 2,
+                panes: 3,
+                revived: 2,
+                skipped: vec!["/srv/gone: the directory is gone".into()],
+            },
+        );
         assert_eq!(app.active_tab, Some(TabId(2)));
         assert_eq!(app.focused, Some(PaneId(2)));
         assert_eq!(
@@ -7184,12 +7608,15 @@ mod tests {
             Some("restored 2 projects · revived 2 agents · skipped 1")
         );
 
-        app.handle_response(Response::SessionRestored {
-            workspaces: 0,
-            panes: 0,
-            revived: 0,
-            skipped: Vec::new(),
-        });
+        app.handle_response(
+            None,
+            Response::SessionRestored {
+                workspaces: 0,
+                panes: 0,
+                revived: 0,
+                skipped: Vec::new(),
+            },
+        );
         assert_eq!(app.transient(), Some("discarded the saved layout"));
         assert_eq!(app.active_tab, Some(TabId(2)), "a discard moves nothing");
     }
@@ -7907,13 +8334,11 @@ mod tests {
         view[0].tabs[0].panes[0].sandbox_name = Some("tutti-p1-ab".into());
         attach_with(&mut app, view.clone());
         let out = app.on_key(plain('p'));
-        assert_eq!(
-            out,
-            vec![control(&Request::SandboxPull {
-                pane: PaneId(1),
-                name: None,
-            })]
-        );
+        let pull = Request::SandboxPull {
+            pane: PaneId(1),
+            name: None,
+        };
+        assert_eq!(out, vec![tagged(&pull, 1)]);
         assert_eq!(app.transient(), Some("pulling tutti/tutti-p1-ab…"));
 
         // The view carrying the pulled workspace lands before the reply.
@@ -7926,7 +8351,7 @@ mod tests {
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Event::LayoutChanged { workspaces: view }).unwrap(),
         ));
-        app.handle_response(Response::WorkspaceCreated { id: WorkspaceId(2) });
+        app.handle_response(Some(1), Response::WorkspaceCreated { id: WorkspaceId(2) });
         assert_eq!(
             app.active_tab,
             Some(TabId(2)),
@@ -8190,7 +8615,7 @@ mod tests {
         let dir = std::fs::canonicalize(&typed).unwrap();
         assert_eq!(
             out,
-            vec![control(&Request::WorkspaceNew { dir })],
+            vec![tagged(&Request::WorkspaceNew { dir }, 1)],
             "submit mounts the typed directory, then opens the launcher"
         );
         assert_eq!(app.mode, Mode::Launcher);
@@ -8211,7 +8636,7 @@ mod tests {
         let dir = std::fs::canonicalize(root.join("the-librarian")).unwrap();
         assert_eq!(
             out,
-            vec![control(&Request::WorkspaceNew { dir })],
+            vec![tagged(&Request::WorkspaceNew { dir }, 1)],
             "enter completes to the highlighted directory and mounts it"
         );
         assert_eq!(app.mode, Mode::Launcher);

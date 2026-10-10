@@ -120,15 +120,24 @@ impl Mirror {
     /// into a fresh parser — off the lock. vt100 can hold a state it cannot
     /// replay (a wide character a shrink left in a one-column pane panics
     /// `process`), and the render tick must outlive that: such a mirror falls
-    /// back to a blank screen.
+    /// back to a blank screen, snapshot included — a client's parser, vt100
+    /// too, would panic on the original.
     fn new(size: PaneSize, snapshot: Vec<u8>) -> Self {
         let replay = |bytes: &[u8]| {
             let mut parser = vt100::Parser::new(size.rows, size.cols, 0);
             parser.process(bytes);
             parser
         };
-        let parser = catch_unwind(|| replay(&snapshot)).unwrap_or_else(|_| replay(b""));
-        Self { snapshot, parser }
+        match catch_unwind(|| replay(&snapshot)) {
+            Ok(parser) => Self { snapshot, parser },
+            Err(_) => {
+                let parser = replay(b"");
+                Self {
+                    snapshot: parser.screen().state_formatted(),
+                    parser,
+                }
+            }
+        }
     }
 }
 
@@ -482,6 +491,11 @@ impl PtyPane {
         lock(&self.term).parser.screen_mut().set_size(rows, cols);
         *lock(&self.size) = PaneSize { rows, cols };
         Ok(())
+    }
+
+    /// The size the pane was spawned at or last resized to.
+    pub fn size(&self) -> PaneSize {
+        *lock(&self.size)
     }
 
     /// Current screen contents, cursor position, and size.
@@ -1820,6 +1834,10 @@ mod tests {
         );
         let mirror = Mirror::new(PaneSize::new(2, 1), snapshot);
         assert_eq!(mirror.parser.screen().contents(), "");
+        assert!(
+            catch_unwind(|| vt100::Parser::new(2, 1, 0).process(&mirror.snapshot)).is_ok(),
+            "a client is sent the blank screen's snapshot, which replays"
+        );
     }
 
     /// Poll `done` for up to three seconds.

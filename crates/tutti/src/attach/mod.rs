@@ -16,7 +16,7 @@ mod theme;
 pub(crate) mod fixtures;
 
 pub use app::App;
-use app::control;
+use app::tagged;
 
 use std::io;
 use std::time::Duration;
@@ -49,8 +49,9 @@ pub fn run(
 ) -> Result<()> {
     let mut conn = Connection::open(session)?;
     // macOS names the GUI app a process was launched under; watchers raise it.
+    // Tagged, so the reply shows whether the daemon echoes a request's `req`.
     let terminal = std::env::var("__CFBundleIdentifier").ok();
-    conn.send(&control(&Request::Attach { terminal }))
+    conn.send(&tagged(&Request::Attach { terminal }, 0))
         .context("send attach request")?;
 
     if config.theme == crate::config::Theme::Terminal {
@@ -93,7 +94,9 @@ fn event_loop(
             Ok(frames) => {
                 if !frames.is_empty() {
                     for frame in frames {
-                        app.handle_frame(frame);
+                        for reply in app.handle_frame(frame) {
+                            let _ = conn.send(&reply);
+                        }
                     }
                     dirty = true;
                 }
@@ -187,9 +190,17 @@ fn emit_terminal(bytes: &[u8]) {
     let _ = out.flush();
 }
 
+/// Chain onto the hook `ratatui::init` installed — which leaves raw mode and
+/// the alternate screen before printing the panic — so any panic restores the
+/// terminal, mouse capture included. A pane frame that panics its parser is
+/// the exception: that panic is caught and the pane reseeded
+/// (`App::handle_frame`), so the TUI and its screen are left as they are.
 fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        if app::feeding() {
+            return;
+        }
         // Capture may have been toggled at runtime; releasing when it was never
         // grabbed is harmless.
         let _ = execute!(io::stdout(), DisableMouseCapture);

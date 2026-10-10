@@ -185,10 +185,21 @@ pub enum Request {
         since: Option<u64>,
     },
     /// Resize a pane's pty and grid to the attached client's rendered size.
+    /// What clients older than `ViewSizes` send; it still applies directly.
     PaneResize {
         pane: PaneId,
         rows: u16,
         cols: u16,
+    },
+    /// An attached client's whole visible set — every pane it shows, at the
+    /// size it renders it — replacing the set it sent before (empty: it shows
+    /// none). The server sizes each pane to the smallest rows and the smallest
+    /// cols among the clients viewing it now, as tmux's smallest client wins,
+    /// and re-arbitrates when a set changes or its client detaches; a pane
+    /// nobody views keeps its last size. Answered with `Response::Ok`, or an
+    /// Error on a connection that never attached.
+    ViewSizes {
+        panes: Vec<PaneDims>,
     },
     /// View a pane's scrollback: `offset` rows back from the live screen.
     /// `offset == 0` resumes the live view.
@@ -395,6 +406,15 @@ impl WaitFor {
             WaitFor::Idle => state == AgentState::Idle,
         }
     }
+}
+
+/// One pane in a client's visible set (`Request::ViewSizes`): the size it
+/// renders the pane at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneDims {
+    pub pane: PaneId,
+    pub rows: u16,
+    pub cols: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -755,6 +775,22 @@ pub enum Event {
     },
 }
 
+/// A control frame's JSON object: `body` — a `Request` or a `Response` — with
+/// an optional correlation number, `req`, beside its `type` tag. A request may
+/// carry one, and the server echoes it on that request's answer, async answers
+/// included, so a client can tell which request an answer — an `Error` above
+/// all — belongs to. Events carry none. The enums stay untouched: an untagged
+/// frame is byte-for-byte a bare `Request`/`Response`, and a peer that ignores
+/// `req` (any older one) parses a tagged frame as one. Not `id`: several
+/// variants own an `id` field of their own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Tagged<T> {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub req: Option<u64>,
+    #[serde(flatten)]
+    pub body: T,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -888,6 +924,21 @@ mod tests {
             rows: 40,
             cols: 120,
         });
+        roundtrip(&Request::ViewSizes {
+            panes: vec![
+                PaneDims {
+                    pane: PaneId(2),
+                    rows: 40,
+                    cols: 120,
+                },
+                PaneDims {
+                    pane: PaneId(3),
+                    rows: 12,
+                    cols: 60,
+                },
+            ],
+        });
+        roundtrip(&Request::ViewSizes { panes: Vec::new() });
         roundtrip(&Request::PaneScroll {
             pane: PaneId(2),
             offset: 120,
@@ -1373,6 +1424,51 @@ mod tests {
             .unwrap(),
             r#"{"type":"state_changed","pane":1,"from":"working","to":"idle"}"#
         );
+    }
+
+    #[test]
+    fn a_tagged_frame_carries_req_beside_type_and_reads_bare_without_it() {
+        let merge = Request::WorkspaceMerge {
+            id: WorkspaceId(6),
+            push: true,
+        };
+        let tagged = Tagged {
+            req: Some(7),
+            body: merge.clone(),
+        };
+        let json = serde_json::to_string(&tagged).unwrap();
+        assert_eq!(
+            json, r#"{"req":7,"type":"workspace_merge","id":6,"push":true}"#,
+            "`req` rides beside the variant's own `id`"
+        );
+        roundtrip(&tagged);
+        assert_eq!(
+            serde_json::from_str::<Request>(&json).unwrap(),
+            merge,
+            "a peer ignoring `req` reads the bare request"
+        );
+        // Untagged is the bare enum, byte for byte, and reads back untagged.
+        let bare = serde_json::to_string(&Request::WorkspaceList).unwrap();
+        let untagged = Tagged {
+            req: None,
+            body: Request::WorkspaceList,
+        };
+        assert_eq!(serde_json::to_string(&untagged).unwrap(), bare);
+        assert_eq!(
+            serde_json::from_str::<Tagged<Request>>(&bare).unwrap(),
+            untagged
+        );
+        // Replies too: a unit variant, and one owning an `id`.
+        roundtrip(&Tagged {
+            req: Some(1),
+            body: Response::Ok,
+        });
+        roundtrip(&Tagged {
+            req: Some(2),
+            body: Response::WorkspaceCreated { id: WorkspaceId(3) },
+        });
+        let ok: Response = serde_json::from_str(r#"{"req":1,"type":"ok"}"#).unwrap();
+        assert_eq!(ok, Response::Ok);
     }
 
     #[test]

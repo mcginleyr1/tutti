@@ -2259,6 +2259,24 @@ mod tests {
         );
     }
 
+    /// A pane's grid is sized by its smallest viewer, so here it can be smaller
+    /// than the pane: it draws from the top-left, blank beyond.
+    #[test]
+    fn a_grid_smaller_than_its_pane_draws_from_the_top_left() {
+        let app = app_with_pane(b"HELLO\r\nWORLD"); // a 6x18 grid
+        let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let row = |y: u16| {
+            (1..39)
+                .map(|x| buf.cell((x, y)).unwrap().symbol())
+                .collect::<String>()
+        };
+        assert!(row(4).starts_with("HELLO") && row(5).starts_with("WORLD"));
+        assert_eq!(row(4)[18..].trim(), "", "blank past the grid's columns");
+        assert_eq!(row(10).trim(), "", "and past its rows");
+    }
+
     fn app_two_workspaces() -> App {
         let mut app = App::new();
         app.handle_frame(WireFrame::Control(

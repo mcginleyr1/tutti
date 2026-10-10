@@ -14,8 +14,8 @@ use tokio::time::{sleep, timeout};
 
 use tutti_core::{
     AgentHookEvent, AgentState, ApprovalDecision, Checkpoint, Direction, Event, Frame, Layout,
-    PaneData, PaneId, PaneInfo, PendingApproval, Request, Response, StateSource, SubagentInfo,
-    WatchPane, WorkspaceId,
+    PaneData, PaneDims, PaneId, PaneInfo, PendingApproval, Request, Response, StateSource,
+    SubagentInfo, Tagged, WatchPane, WorkspaceId,
 };
 use tutti_server::{PaneSize, serve};
 
@@ -1461,6 +1461,352 @@ async fn wedged_client_is_dropped_but_others_keep_flowing() {
         .expect("good task panicked");
 
     server.stop().await;
+}
+
+/// The answer to the request just sent on `conn`, with the `req` it carries,
+/// skipping events and pane frames.
+async fn answer(conn: &mut Conn) -> Tagged<Response> {
+    timeout(DEADLINE, async {
+        loop {
+            if let Frame::Control(json) = conn.read_frame().await
+                && let Ok(tagged) = serde_json::from_slice(&json)
+            {
+                return tagged;
+            }
+        }
+    })
+    .await
+    .expect("an answer")
+}
+
+/// Send `conn`'s visible set: each pane at the size it renders it.
+async fn view(conn: &mut Conn, panes: &[(PaneId, u16, u16)]) {
+    let panes = panes
+        .iter()
+        .map(|&(pane, rows, cols)| PaneDims { pane, rows, cols })
+        .collect();
+    conn.send(&Request::ViewSizes { panes }).await;
+    assert_eq!(answer(conn).await.body, Response::Ok);
+}
+
+/// Skip frames until `pane`'s snapshot arrives at `rows`x`cols`.
+async fn snapshot_at(conn: &mut Conn, pane: PaneId, rows: u16, cols: u16) {
+    timeout(DEADLINE, async {
+        loop {
+            if let Frame::PaneSnapshot(data) = conn.read_frame().await
+                && data.pane == pane
+                && (data.rows, data.cols) == (rows, cols)
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("pane {pane} never came at {rows}x{cols}"));
+}
+
+/// Clients attached at different sizes share a pane at the smallest rows and
+/// the smallest cols among those viewing it — tmux's smallest client wins —
+/// and it grows back as they leave, by detaching or by just going away.
+#[tokio::test]
+async fn the_smallest_viewer_sizes_a_shared_pane_until_it_leaves() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let pane = run_marker(&mut control, "sleep 30").await;
+
+    let mut wide = server.connect().await;
+    attach(&mut wide).await;
+    view(&mut wide, &[(pane, 30, 100)]).await;
+    snapshot_at(&mut wide, pane, 30, 100).await;
+
+    let mut short = server.connect().await;
+    attach(&mut short).await;
+    view(&mut short, &[(pane, 20, 120)]).await;
+    snapshot_at(&mut wide, pane, 20, 100).await;
+    short.send(&Request::Detach).await;
+    assert_eq!(answer(&mut short).await.body, Response::Ok);
+    snapshot_at(&mut wide, pane, 30, 100).await;
+
+    let mut gone = server.connect().await;
+    attach(&mut gone).await;
+    view(&mut gone, &[(pane, 12, 50)]).await;
+    snapshot_at(&mut wide, pane, 12, 50).await;
+    drop(gone);
+    snapshot_at(&mut wide, pane, 30, 100).await;
+
+    server.stop().await;
+}
+
+/// A client votes only for the panes it shows: switching tabs, its new set
+/// replaces the old one and a pane it left takes the other viewers' size. A
+/// pane nobody shows keeps its last.
+#[tokio::test]
+async fn a_tab_switch_stops_a_client_voting_for_panes_it_left() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let first = run_marker(&mut control, "sleep 30").await;
+    let tab = match control.request(Request::TabNew { workspace: None }).await {
+        Response::TabCreated { id } => id,
+        other => panic!("expected TabCreated, got {other:?}"),
+    };
+    let second = pane_id(
+        control
+            .request(Request::PaneRun {
+                tab: Some(tab),
+                cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+                ephemeral: false,
+                sandbox: None,
+            })
+            .await,
+    );
+
+    let mut a = server.connect().await;
+    attach(&mut a).await;
+    view(&mut a, &[(first, 10, 40)]).await;
+    let mut b = server.connect().await;
+    attach(&mut b).await;
+    view(&mut b, &[(first, 20, 60)]).await;
+    snapshot_at(&mut b, first, 10, 40).await;
+
+    view(&mut a, &[(second, 10, 40)]).await;
+    snapshot_at(&mut b, first, 20, 60).await;
+    snapshot_at(&mut a, second, 10, 40).await;
+
+    view(&mut b, &[]).await;
+    let mut late = server.connect().await;
+    attach(&mut late).await;
+    snapshot_at(&mut late, first, 20, 60).await;
+
+    server.stop().await;
+}
+
+/// A request may carry a `req`, and its answer carries it back: a sync answer,
+/// one sent later from a spawned task, even the refusal of a request that does
+/// not parse. An untagged request's answer carries none, nor does an event.
+#[tokio::test]
+async fn a_requests_req_rides_back_on_its_answer() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let pane = run_marker(&mut conn, "sleep 30").await;
+    let tagged = |req, body| Frame::Control(serde_json::to_vec(&Tagged { req, body }).unwrap());
+
+    conn.write_frame(&tagged(Some(7), Request::WorkspaceList))
+        .await;
+    let listed = answer(&mut conn).await;
+    assert_eq!(listed.req, Some(7));
+    assert!(matches!(listed.body, Response::Workspaces { .. }));
+
+    let wait = wait_for(pane, &[tutti_core::WaitFor::Blocked], false, Some(20));
+    conn.write_frame(&tagged(Some(8), wait)).await;
+    let waited = answer(&mut conn).await;
+    assert_eq!(waited.req, Some(8), "an async answer");
+    assert!(matches!(
+        waited.body,
+        Response::Waited {
+            timed_out: true,
+            ..
+        }
+    ));
+
+    conn.write_frame(&Frame::Control(
+        br#"{"type":"no_such_request","req":9}"#.to_vec(),
+    ))
+    .await;
+    let refused = answer(&mut conn).await;
+    assert_eq!(
+        refused.req,
+        Some(9),
+        "a refusal of a request that does not parse"
+    );
+    assert!(matches!(refused.body, Response::Error { .. }));
+
+    conn.send(&Request::PaneList).await;
+    assert_eq!(answer(&mut conn).await.req, None);
+
+    let mut viewer = server.connect().await;
+    viewer
+        .write_frame(&tagged(Some(10), Request::Attach { terminal: None }))
+        .await;
+    assert_eq!(answer(&mut viewer).await.req, Some(10));
+    conn.send(&Request::PaneKill { pane }).await;
+    answer(&mut conn).await;
+    let event = timeout(DEADLINE, async {
+        loop {
+            if let Frame::Control(json) = viewer.read_frame().await
+                && serde_json::from_slice::<Event>(&json).is_ok()
+            {
+                return serde_json::from_slice::<serde_json::Value>(&json).unwrap();
+            }
+        }
+    })
+    .await
+    .expect("an event");
+    assert!(
+        event.get("req").is_none(),
+        "an event carries no req: {event}"
+    );
+
+    server.stop().await;
+}
+
+/// The runtime dir of a daemon this test runs from the real binary — its
+/// socket under `tutti/`, its saved layout under `state/` (pass it as
+/// `XDG_STATE_HOME`, or the daemon saves into the real home) — on a short
+/// `/tmp` path: macOS caps a socket path near 104 bytes.
+fn runtime_dir(label: &str) -> PathBuf {
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let base = PathBuf::from("/tmp").join(format!("tt-{label}-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(base.join("tutti")).unwrap();
+    base
+}
+
+/// Connect to a daemon the test started, waiting for it to come up.
+async fn connect_when_up(path: &Path) -> Conn {
+    timeout(DEADLINE, async {
+        loop {
+            if let Ok(stream) = UnixStream::connect(path).await {
+                return Conn {
+                    stream,
+                    buf: Vec::new(),
+                };
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the daemon came up")
+}
+
+/// Whether the daemon at `path` answers a `WorkspaceList`, retrying while it
+/// drops the connection unanswered: macOS destroys a queued connection that
+/// an accept dequeued and then failed on with EMFILE.
+async fn answers(path: &Path) -> bool {
+    let list = Frame::Control(serde_json::to_vec(&Request::WorkspaceList).unwrap()).encode();
+    timeout(DEADLINE, async {
+        loop {
+            if let Ok(mut stream) = UnixStream::connect(path).await
+                && stream.write_all(&list).await.is_ok()
+            {
+                let (mut buf, mut chunk) = (Vec::new(), [0u8; 8192]);
+                while let Ok(n @ 1..) = stream.read(&mut chunk).await {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Ok(Some((Frame::Control(json), _))) = Frame::decode(&buf) {
+                        let answer = serde_json::from_slice(&json);
+                        return matches!(answer, Ok(Response::Workspaces { .. }));
+                    }
+                }
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Wait until `log` contains `needle`.
+async fn log_says(log: &Path, needle: &str) -> bool {
+    timeout(DEADLINE, async {
+        while !std::fs::read_to_string(log).is_ok_and(|text| text.contains(needle)) {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// SIGTERMs the daemon serving this socket once the test ends, however it
+/// ends — a daemon run from the binary outlives a failed assertion. Only while
+/// the socket still answers: a dead daemon's stale pidfile may name a pid
+/// reused since.
+struct StopOnDrop(PathBuf);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        if std::os::unix::net::UnixStream::connect(&self.0).is_ok()
+            && let Ok(pid) = std::fs::read_to_string(self.0.with_extension("pid"))
+        {
+            let _ = std::process::Command::new("kill").arg(pid.trim()).status();
+        }
+    }
+}
+
+/// An accept error — EMFILE here: the daemon runs under a 16-descriptor cap and
+/// more clients connect than it can hold — is logged and retried. It used to
+/// end `serve`, and with it every pane.
+#[tokio::test]
+async fn an_accept_error_is_logged_and_retried() {
+    let base = runtime_dir("emfile");
+    let log = base.join("daemon.log");
+    let mut daemon = std::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            "ulimit -n 16 && exec \"$0\" --session cap --foreground",
+        ])
+        .arg(env!("CARGO_BIN_EXE_tutti-server"))
+        .env("XDG_RUNTIME_DIR", &base)
+        .env("XDG_STATE_HOME", base.join("state"))
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let path = base.join("tutti").join("cap.sock");
+    let stop = StopOnDrop(path.clone());
+
+    let mut held = Vec::new();
+    for _ in 0..24 {
+        held.push(connect_when_up(&path).await);
+    }
+    assert!(
+        log_says(&log, "accept failed").await,
+        "the daemon never ran out of descriptors"
+    );
+    drop(held);
+    assert!(
+        answers(&path).await,
+        "the daemon stopped serving after the accept error"
+    );
+
+    drop(stop);
+    let _ = daemon.wait();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Started detached, the daemon appends its stderr to `<session>.log` beside
+/// its socket, so crash notes outlive it — trimming a log grown past 4 MiB to
+/// its newest MiB, from a line start, as it starts.
+#[tokio::test]
+async fn a_detached_daemon_logs_beside_its_socket() {
+    let base = runtime_dir("log");
+    let dir = base.join("tutti");
+    let log = dir.join("logged.log");
+    let mut old = "an old line\n".repeat(400_000);
+    old.push_str("the newest old line\n");
+    std::fs::write(&log, old).unwrap();
+    let launched = std::process::Command::new(env!("CARGO_BIN_EXE_tutti-server"))
+        .args(["--session", "logged"])
+        .env("XDG_RUNTIME_DIR", &base)
+        .env("XDG_STATE_HOME", base.join("state"))
+        .status()
+        .unwrap();
+    assert!(launched.success());
+    let stop = StopOnDrop(dir.join("logged.sock"));
+    let mut conn = connect_when_up(&stop.0).await;
+
+    // An undecodable frame ends its connection with a logged error.
+    conn.stream.write_all(&[1, 0, 0, 0, 0xff]).await.unwrap();
+    assert!(
+        log_says(&log, "connection error").await,
+        "the daemon's stderr never reached its log"
+    );
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        text.len() < (1 << 20) + 4096,
+        "trimmed: {} bytes",
+        text.len()
+    );
+    assert!(text.starts_with("an old line\n") && text.contains("the newest old line\n"));
+
+    drop(stop);
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// Every spawned pane carries `TUTTI_PANE` (its id) and `TUTTI_SESSION` (the

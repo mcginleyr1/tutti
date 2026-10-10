@@ -371,6 +371,52 @@ fn agent_event_opencode_is_a_silent_no_op_when_there_is_nothing_to_send() {
     }
 }
 
+/// A wedged daemon — it takes the connection but never answers — cannot stall
+/// a Claude hook: `agent-event` gives up at its deadline, still exiting 0 and
+/// printing nothing on stdout.
+#[test]
+fn agent_event_gives_up_on_a_wedged_daemon() {
+    let base = unique_base("wedged");
+    let sock_dir = base.join("tutti");
+    std::fs::create_dir_all(&sock_dir).unwrap();
+    let listener = UnixListener::bind(sock_dir.join("tutti.sock")).unwrap();
+    let daemon = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        // Take everything until the client hangs up; answer nothing.
+        let _ = stream.read_to_end(&mut Vec::new());
+    });
+
+    let started = std::time::Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tutti"))
+        .args(["agent-event", "claude"])
+        .env("XDG_RUNTIME_DIR", &base)
+        .env("TUTTI_PANE", "7")
+        .env("TUTTI_SESSION", "tutti")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"session_id":"abc123","hook_event_name":"Stop"}"#)
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let elapsed = started.elapsed();
+
+    daemon.join().unwrap();
+    let _ = std::fs::remove_dir_all(&base);
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the hook waited {elapsed:?}"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("did not answer"));
+}
+
 /// `hooks opencode --install` writes the plugin into opencode's global plugin
 /// dir under `XDG_CONFIG_HOME`, is idempotent, replaces an older tutti plugin
 /// behind a `.bak`, and refuses to touch a foreign file of the same name.

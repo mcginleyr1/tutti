@@ -149,13 +149,15 @@ pub enum StopOutcome {
     NotRunning,
 }
 
+/// Launch the daemon. The launched process only re-execs a detached copy of
+/// itself, whose stderr it sends to the session's log (`log_path`); its own
+/// stderr stays ours, so a launch that fails says why.
 fn spawn_server(session: &str) -> Result<()> {
     Command::new(server_exe()?)
         .arg("--session")
         .arg(session)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
         .spawn()
         .context("spawning tutti-server")?;
     Ok(())

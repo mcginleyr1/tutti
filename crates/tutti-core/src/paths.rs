@@ -6,6 +6,12 @@ pub fn socket_path(session: &str) -> PathBuf {
     socket_dir().join(format!("{session}.sock"))
 }
 
+/// The detached daemon's log, beside its socket: `<session>.log`. Its stderr
+/// lands there, so panics and crash notes outlive the process.
+pub fn log_path(session: &str) -> PathBuf {
+    socket_dir().join(format!("{session}.log"))
+}
+
 pub fn socket_dir() -> PathBuf {
     match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("tutti"),

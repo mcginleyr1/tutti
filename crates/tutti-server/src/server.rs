@@ -2,17 +2,21 @@
 //! connection is a request/response loop; a connection that sends `Attach` also
 //! joins the broadcast set and receives pane snapshots, coalesced deltas, and
 //! control events until it detaches or disconnects. One that sends `Watch` is
-//! pushed a whole-session snapshot whenever it changes, outside that set.
+//! pushed a whole-session snapshot whenever it changes, outside that set. A
+//! panic is contained where it happens — one frame's ends its connection, one
+//! background pass's ends that pass — so the daemon, and every pane with it,
+//! lives on.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::os::unix::fs::DirBuilderExt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
@@ -24,8 +28,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tutti_agents::{ProcessTree, Registry};
 use tutti_core::{
     AgentHookEvent, AgentKind, AgentState, ApprovalDecision, Checkpoint, Direction, Event, Frame,
-    Observation, PaneData, PaneId, PaneInfo, Request, Response, StateEvent, WaitFor, WorkspaceId,
-    prompt_fingerprint,
+    Observation, PaneData, PaneDims, PaneId, PaneInfo, Request, Response, StateEvent, Tagged,
+    WaitFor, WorkspaceId, prompt_fingerprint,
 };
 
 use crate::herdr;
@@ -54,6 +58,10 @@ const SIGNAL_CAP: usize = 256;
 /// Cadence of the layout save. A daemon that dies without a graceful shutdown
 /// loses at most this much of its layout's history.
 const SAVE_INTERVAL: Duration = Duration::from_secs(2);
+/// How long the accept loop pauses after a failed accept — EMFILE, out of
+/// descriptors, is the likely one — before trying again: long enough not to
+/// spin on an error that persists, short enough to soon use a freed one.
+const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 
 /// One pane's news, broadcast to every `pane wait`.
 #[derive(Debug, Clone, Copy)]
@@ -81,6 +89,9 @@ struct Client {
     /// Panes this client has already been sent a snapshot for; the rest of its
     /// panes fall into the shared delta cadence.
     seen: HashSet<PaneId>,
+    /// The panes this client shows, each at the size it renders it: its vote
+    /// in every one's size (`Request::ViewSizes`).
+    view: Vec<PaneDims>,
     /// The terminal app the client runs in, from its `Attach`, for watchers.
     terminal: Option<String>,
     /// The pane the client last reported focused — what it shows, for watchers.
@@ -93,6 +104,29 @@ struct Watcher {
     writer: tokio::task::AbortHandle,
     /// The encoded snapshot last sent, so an unchanged session sends nothing.
     last: Vec<u8>,
+}
+
+/// Where a request's answer goes: the requester's own queue, tagged with the
+/// request's `req` when it carried one — answers sent later from a spawned
+/// task included.
+#[derive(Clone)]
+struct Reply {
+    tx: mpsc::Sender<Vec<u8>>,
+    req: Option<u64>,
+}
+
+impl Reply {
+    fn encode(&self, response: &Response) -> Vec<u8> {
+        encode_json(&Tagged {
+            req: self.req,
+            body: response,
+        })
+    }
+
+    /// Answer from a spawned task, waiting for room in the queue.
+    async fn send(&self, response: Response) {
+        let _ = self.tx.send(self.encode(&response)).await;
+    }
 }
 
 pub struct Hub {
@@ -133,13 +167,36 @@ struct VcsMark {
 }
 
 impl Hub {
-    fn session(&self) -> std::sync::MutexGuard<'_, Session> {
-        self.session.lock().expect("session poisoned")
+    fn session(&self) -> MutexGuard<'_, Session> {
+        lock(&self.session)
     }
 
-    fn vcs(&self) -> std::sync::MutexGuard<'_, HashMap<WorkspaceId, VcsMark>> {
-        self.vcs.lock().expect("vcs book poisoned")
+    fn clients(&self) -> MutexGuard<'_, HashMap<u64, Client>> {
+        lock(&self.clients)
     }
+
+    fn watchers(&self) -> MutexGuard<'_, HashMap<u64, Watcher>> {
+        lock(&self.watchers)
+    }
+
+    fn last(&self) -> MutexGuard<'_, HashMap<PaneId, (vt100::Parser, u32, u64)>> {
+        lock(&self.last)
+    }
+
+    fn vcs(&self) -> MutexGuard<'_, HashMap<WorkspaceId, VcsMark>> {
+        lock(&self.vcs)
+    }
+
+    fn approvals(&self) -> MutexGuard<'_, HashMap<u64, oneshot::Sender<ApprovalDecision>>> {
+        lock(&self.approvals)
+    }
+}
+
+/// Lock a hub mutex, recovering it if a panicking task poisoned it: that panic
+/// was caught and logged where it struck, and the daemon — every pane — must
+/// outlive it rather than turn each later lock into another.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Bootstrap the socket, install a SIGTERM/SIGINT shutdown, and serve until it
@@ -203,8 +260,8 @@ pub async fn serve(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            broadcast_tick(&tick_hub);
-            snapshot_watchers(&tick_hub);
+            guarded("render tick", || broadcast_tick(&tick_hub));
+            guarded("watch snapshot", || snapshot_watchers(&tick_hub));
         }
     });
 
@@ -214,7 +271,13 @@ pub async fn serve(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            detect_pass(&detect_hub).await;
+            // An async pass, so a task of its own: the task boundary catches
+            // its panic as `guarded` does a sync pass's.
+            if let Err(err) = tokio::spawn(detect_pass(Arc::clone(&detect_hub))).await
+                && err.is_panic()
+            {
+                eprintln!("tutti: the agent-detection pass panicked; carrying on");
+            }
         }
     });
 
@@ -224,7 +287,7 @@ pub async fn serve(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            vcs_pass(&vcs_hub);
+            guarded("VCS watch", || vcs_pass(&vcs_hub));
         }
     });
 
@@ -235,7 +298,7 @@ pub async fn serve(
         let mut last_gen: HashMap<PaneId, u64> = HashMap::new();
         loop {
             interval.tick().await;
-            classify_pass(&classify_hub, &mut last_gen);
+            guarded("classify", || classify_pass(&classify_hub, &mut last_gen));
         }
     });
 
@@ -256,14 +319,15 @@ pub async fn serve(
 
     // herdr's reporting socket, beside ours: agents that report to herdr
     // natively (Crush, …) find it through every pane's HERDR_* and report
-    // here. Without it the daemon runs on and panes carry no HERDR_*.
+    // here. Without it the daemon runs on and panes carry no HERDR_*. A
+    // request that panics answers as one for an unknown pane.
     let herdr_path = herdr::socket_path(&socket_path);
     let herdr_listener = match herdr::bind(&herdr_path) {
         Ok(listener) => {
             hub.session().set_herdr_socket(herdr_path.clone());
             let herdr_hub = Arc::clone(&hub);
             Some(tokio::spawn(herdr::serve(listener, move |request| {
-                herdr_request(&herdr_hub, request)
+                guarded("herdr request", || herdr_request(&herdr_hub, request)).unwrap_or(false)
             })))
         }
         Err(err) => {
@@ -276,14 +340,21 @@ pub async fn serve(
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
-            accepted = listener.accept() => {
-                let (stream, _) = accepted.context("accept failed")?;
-                let hub = Arc::clone(&hub);
-                tokio::spawn(async move {
-                    if let Err(err) = handle_conn(hub, stream).await {
-                        eprintln!("connection error: {err:#}");
-                    }
-                });
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    let hub = Arc::clone(&hub);
+                    tokio::spawn(async move {
+                        if let Err(err) = handle_conn(hub, stream).await {
+                            eprintln!("connection error: {err:#}");
+                        }
+                    });
+                }
+                // Out of descriptors (EMFILE) and its kin pass: ending `serve`
+                // here would kill every pane.
+                Err(err) => {
+                    eprintln!("tutti: accept failed: {err}; retrying");
+                    tokio::time::sleep(ACCEPT_PAUSE).await;
+                }
             }
         }
     }
@@ -312,6 +383,18 @@ pub async fn serve(
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(&pid_path);
     Ok(())
+}
+
+/// Run one pass of a background loop, catching its panic (`None`) so the loop
+/// lives on: a dead render tick would freeze every pane on every client, a
+/// dead classifier every agent's badge, until the daemon restarted. The panic
+/// hook has logged the panic itself; this notes the recovery.
+fn guarded<T>(pass: &str, run: impl FnOnce() -> T) -> Option<T> {
+    let ran = catch_unwind(AssertUnwindSafe(run)).ok();
+    if ran.is_none() {
+        eprintln!("tutti: the {pass} pass panicked; carrying on");
+    }
+    ran
 }
 
 fn prepare_socket(path: &Path) -> Result<()> {
@@ -343,15 +426,23 @@ async fn handle_conn(hub: Arc<Hub>, stream: tokio::net::UnixStream) -> Result<()
 
     let mut buf = Vec::new();
     let mut wedged = false;
-    // A read error (reset socket, malformed frame) still falls through to the
-    // cleanup: a client left registered keeps its writer task alive and
-    // defeats the ticker's nobody-attached shortcut.
+    // A read error (reset socket, malformed frame) or a panic handling a frame
+    // still falls through to the cleanup: a client left registered keeps its
+    // writer task alive, defeats the ticker's nobody-attached shortcut, and
+    // holds its vote in the sizes of the panes it viewed.
     let outcome = loop {
         match read_frame(&mut read_half, &mut buf).await {
             Ok(Some(frame)) => {
-                if handle_frame(&hub, cid, &tx, &abort, frame).is_break() {
-                    wedged = true;
-                    break Ok(());
+                let handled = catch_unwind(AssertUnwindSafe(|| {
+                    handle_frame(&hub, cid, &tx, &abort, frame)
+                }));
+                match handled {
+                    Ok(ControlFlow::Continue(())) => {}
+                    Ok(ControlFlow::Break(())) => {
+                        wedged = true;
+                        break Ok(());
+                    }
+                    Err(_) => break Err(anyhow!("handling a frame panicked")),
                 }
             }
             Ok(None) => break Ok(()),
@@ -359,8 +450,8 @@ async fn handle_conn(hub: Arc<Hub>, stream: tokio::net::UnixStream) -> Result<()
         }
     };
 
-    hub.clients.lock().expect("clients poisoned").remove(&cid);
-    hub.watchers.lock().expect("watchers poisoned").remove(&cid);
+    drop_client(&hub, cid);
+    hub.watchers().remove(&cid);
     if wedged {
         // The client's own reply queue backed up: it is not draining, so abort
         // the writer to drop the socket rather than block awaiting a flush.
@@ -420,6 +511,20 @@ fn handle_frame(
     writer: &tokio::task::AbortHandle,
     frame: Frame,
 ) -> ControlFlow<()> {
+    #[cfg(test)]
+    tests::inject_panic(hub, &frame);
+    // A request's `req` rides back on its answer — even on the refusal of one
+    // that does not parse.
+    let req = match &frame {
+        Frame::Control(json) => serde_json::from_slice::<Tagged<serde_json::Value>>(json)
+            .ok()
+            .and_then(|tagged| tagged.req),
+        _ => None,
+    };
+    let reply = Reply {
+        tx: tx.clone(),
+        req,
+    };
     match frame {
         Frame::Control(json) => match serde_json::from_slice::<Request>(&json) {
             Ok(Request::Attach { terminal }) => {
@@ -430,19 +535,20 @@ fn handle_frame(
                 // until its Attached reply is queued below, so no pane frame can
                 // slip ahead of Attached. Locks stay un-nested: clients and
                 // session are never held together.
-                hub.clients.lock().expect("clients poisoned").insert(
+                hub.clients().insert(
                     cid,
                     Client {
                         tx: tx.clone(),
                         writer: writer.clone(),
                         ready: false,
                         seen: HashSet::new(),
+                        view: Vec::new(),
                         terminal,
                         focused: None,
                     },
                 );
                 let workspaces = hub.session().view();
-                let reply = encode_json(&Response::Attached {
+                let attached = reply.encode(&Response::Attached {
                     session: hub.name.clone(),
                     workspaces,
                     wire_rev: tutti_core::WIRE_REV,
@@ -451,10 +557,9 @@ fn handle_frame(
                         .as_deref()
                         .and_then(|dir| persist::summary(dir, &hub.name)),
                 });
-                let flow = send_reply(hub, cid, tx, reply);
+                let flow = send_reply(hub, cid, tx, attached);
                 if flow.is_continue()
-                    && let Some(client) =
-                        hub.clients.lock().expect("clients poisoned").get_mut(&cid)
+                    && let Some(client) = hub.clients().get_mut(&cid)
                 {
                     client.ready = true;
                 }
@@ -463,11 +568,12 @@ fn handle_frame(
                 flow
             }
             Ok(Request::Detach) => {
-                hub.clients.lock().expect("clients poisoned").remove(&cid);
-                send_reply(hub, cid, tx, encode_json(&Response::Ok))
+                drop_client(hub, cid);
+                send_reply(hub, cid, tx, reply.encode(&Response::Ok))
             }
+            Ok(Request::ViewSizes { panes }) => view_sizes(hub, cid, &reply, panes),
             Ok(Request::Watch) => {
-                hub.watchers.lock().expect("watchers poisoned").insert(
+                hub.watchers().insert(
                     cid,
                     Watcher {
                         tx: tx.clone(),
@@ -481,45 +587,57 @@ fn handle_frame(
             }
             Ok(Request::PaneFocus { pane }) => {
                 let response = focus_pane(hub, cid, pane);
-                send_reply(hub, cid, tx, encode_json(&response))
+                send_reply(hub, cid, tx, reply.encode(&response))
             }
             Ok(Request::PaneScroll { pane, offset }) => scroll(hub, cid, tx, pane, offset),
-            Ok(Request::WorkspaceDiff { id, stat }) => workspace_diff(hub, tx, id, stat),
+            Ok(Request::WorkspaceDiff { id, stat }) => workspace_diff(hub, &reply, id, stat),
             Ok(Request::ApprovalHold {
                 pane,
                 conversation,
                 tool,
                 summary,
-            }) => approval_hold(hub, cid, tx, pane, conversation, tool, summary),
+            }) => approval_hold(hub, cid, &reply, pane, conversation, tool, summary),
             Ok(Request::PaneWait {
                 pane,
                 until,
                 next,
                 timeout_ms,
-            }) => pane_wait(hub, tx, pane, until, next, timeout_ms),
-            Ok(Request::WorkspaceKill { id, discard }) => workspace_kill(hub, cid, tx, id, discard),
+            }) => pane_wait(hub, &reply, pane, until, next, timeout_ms),
+            Ok(Request::WorkspaceKill { id, discard }) => {
+                workspace_kill(hub, cid, &reply, id, discard)
+            }
             Ok(Request::WorkspaceFork {
                 id,
                 name,
                 revision,
                 dest,
-            }) => workspace_fork(hub, cid, tx, id, name, Checkout::Revision(revision), dest),
-            Ok(Request::SandboxPull { pane, name }) => sandbox_pull(hub, cid, tx, pane, name),
-            Ok(Request::WorkspaceMerge { id, push }) => workspace_merge(hub, cid, tx, id, push),
-            Ok(Request::WorkspaceUpdate { id }) => workspace_update(hub, tx, id),
+            }) => workspace_fork(
+                hub,
+                cid,
+                &reply,
+                id,
+                name,
+                Checkout::Revision(revision),
+                dest,
+            ),
+            Ok(Request::SandboxPull { pane, name }) => sandbox_pull(hub, cid, &reply, pane, name),
+            Ok(Request::WorkspaceMerge { id, push }) => workspace_merge(hub, cid, &reply, id, push),
+            Ok(Request::WorkspaceUpdate { id }) => workspace_update(hub, &reply, id),
             Ok(Request::PaneCheckpointDiff { pane, n, stat }) => {
-                checkpoint_diff(hub, tx, pane, n, stat)
+                checkpoint_diff(hub, &reply, pane, n, stat)
             }
-            Ok(Request::PaneRestore { pane, n, force }) => pane_restore(hub, tx, pane, n, force),
+            Ok(Request::PaneRestore { pane, n, force }) => {
+                pane_restore(hub, &reply, pane, n, force)
+            }
             Ok(request) => {
                 let response = dispatch(hub, request);
-                send_reply(hub, cid, tx, encode_json(&response))
+                send_reply(hub, cid, tx, reply.encode(&response))
             }
             Err(err) => send_reply(
                 hub,
                 cid,
                 tx,
-                encode_json(&Response::Error {
+                reply.encode(&Response::Error {
                     message: format!("bad request: {err}"),
                 }),
             ),
@@ -535,18 +653,71 @@ fn handle_frame(
 /// Enqueue a reply on the client's own channel. A full or closed queue means the
 /// client is not draining: drop it from the broadcast set and tell the caller to
 /// tear the connection down.
-fn send_reply(
-    hub: &Arc<Hub>,
-    cid: u64,
-    tx: &mpsc::Sender<Vec<u8>>,
-    bytes: Vec<u8>,
-) -> ControlFlow<()> {
+fn send_reply(hub: &Hub, cid: u64, tx: &mpsc::Sender<Vec<u8>>, bytes: Vec<u8>) -> ControlFlow<()> {
     match tx.try_send(bytes) {
         Ok(()) => ControlFlow::Continue(()),
         Err(_) => {
-            hub.clients.lock().expect("clients poisoned").remove(&cid);
+            drop_client(hub, cid);
             ControlFlow::Break(())
         }
+    }
+}
+
+/// Drop client `cid` from the broadcast set — detached, gone, or wedged — and
+/// let the panes it viewed re-arbitrate their size without its vote. Returns
+/// the client, for a caller that must tear it down.
+fn drop_client(hub: &Hub, cid: u64) -> Option<Client> {
+    let client = hub.clients().remove(&cid)?;
+    arbitrate(hub, client.view.iter().map(|d| d.pane));
+    Some(client)
+}
+
+/// Record an attached client's visible set in place of its last, then size
+/// every pane either set names by the viewers it has now. A connection that
+/// never attached has no set to keep.
+fn view_sizes(hub: &Hub, cid: u64, reply: &Reply, panes: Vec<PaneDims>) -> ControlFlow<()> {
+    let old = hub
+        .clients()
+        .get_mut(&cid)
+        .map(|client| std::mem::replace(&mut client.view, panes.clone()));
+    let response = match old {
+        Some(old) => {
+            arbitrate(hub, old.iter().chain(&panes).map(|d| d.pane));
+            Response::Ok
+        }
+        None => Response::Error {
+            message: "view sizes come from an attached client".into(),
+        },
+    };
+    send_reply(hub, cid, &reply.tx, reply.encode(&response))
+}
+
+/// Size each of `panes` to the smallest rows and the smallest cols among the
+/// clients viewing it now — tmux's smallest client wins. A pane nobody views
+/// keeps its size. The votes are read under the clients lock, released before
+/// `resize_pane` takes the others.
+fn arbitrate(hub: &Hub, panes: impl IntoIterator<Item = PaneId>) {
+    let panes: HashSet<PaneId> = panes.into_iter().collect();
+    let sizes: Vec<PaneDims> = {
+        let clients = hub.clients();
+        panes
+            .into_iter()
+            .filter_map(|pane| {
+                clients
+                    .values()
+                    .flat_map(|client| &client.view)
+                    .filter(|dims| dims.pane == pane)
+                    .copied()
+                    .reduce(|a, b| PaneDims {
+                        pane,
+                        rows: a.rows.min(b.rows),
+                        cols: a.cols.min(b.cols),
+                    })
+            })
+            .collect()
+    };
+    for PaneDims { pane, rows, cols } in sizes {
+        let _ = resize_pane(hub, pane, rows, cols);
     }
 }
 
@@ -623,7 +794,7 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
                 Ok(_workspace) => {
                     let view = session.view();
                     drop(session);
-                    hub.last.lock().expect("last poisoned").remove(&pane);
+                    hub.last().remove(&pane);
                     let _ = hub.signals.send(PaneSignal::Gone(pane));
                     broadcast_event(hub, Event::LayoutChanged { workspaces: view });
                     Response::Ok
@@ -729,6 +900,7 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
         // Handled in `handle_frame`; unreachable here.
         Request::Attach { .. }
         | Request::Detach
+        | Request::ViewSizes { .. }
         | Request::Watch
         | Request::PaneFocus { .. }
         | Request::PaneScroll { .. }
@@ -813,7 +985,7 @@ fn focus_pane(hub: &Arc<Hub>, cid: u64, pane: PaneId) -> Response {
         broadcast_event(hub, Event::LayoutChanged { workspaces: view });
     }
     publish_transition(hub, pane, from, to);
-    let attached = match hub.clients.lock().expect("clients poisoned").get_mut(&cid) {
+    let attached = match hub.clients().get_mut(&cid) {
         Some(client) => {
             client.focused = Some(pane);
             true
@@ -947,14 +1119,14 @@ fn agent_event(
 fn approval_hold(
     hub: &Arc<Hub>,
     cid: u64,
-    tx: &mpsc::Sender<Vec<u8>>,
+    reply: &Reply,
     pane: PaneId,
     conversation: Option<String>,
     tool: String,
     summary: String,
 ) -> ControlFlow<()> {
     let message = Some(format!("{tool} · {summary}"));
-    let attached = !hub.clients.lock().expect("clients poisoned").is_empty();
+    let attached = !hub.clients().is_empty();
     let held = if attached {
         hub.session().hold_approval(pane, tool, summary)
     } else {
@@ -962,10 +1134,7 @@ fn approval_hold(
     };
     let (answer, answered) = oneshot::channel();
     if let Some(id) = held {
-        hub.approvals
-            .lock()
-            .expect("approvals poisoned")
-            .insert(id, answer);
+        hub.approvals().insert(id, answer);
         let view = hub.session().view();
         broadcast_event(hub, Event::LayoutChanged { workspaces: view });
     }
@@ -974,19 +1143,16 @@ fn approval_hold(
         let pass = Response::Approval {
             decision: ApprovalDecision::Pass,
         };
-        return send_reply(hub, cid, tx, encode_json(&pass));
+        return send_reply(hub, cid, &reply.tx, reply.encode(&pass));
     };
     let hub = Arc::clone(hub);
-    let tx = tx.clone();
+    let reply = reply.clone();
     tokio::spawn(async move {
         let decision = tokio::select! {
-            () = tx.closed() => None,
+            () = reply.tx.closed() => None,
             decision = answered => decision.ok(),
         };
-        hub.approvals
-            .lock()
-            .expect("approvals poisoned")
-            .remove(&id);
+        hub.approvals().remove(&id);
         let view = {
             let mut session = hub.session();
             session
@@ -997,7 +1163,7 @@ fn approval_hold(
             broadcast_event(&hub, Event::LayoutChanged { workspaces: view });
         }
         if let Some(decision) = decision {
-            let _ = tx.send(encode_json(&Response::Approval { decision })).await;
+            reply.send(Response::Approval { decision }).await;
         }
     });
     ControlFlow::Continue(())
@@ -1022,11 +1188,7 @@ fn approval_answer(
     };
     let view = session.view();
     drop(session);
-    let answer = hub
-        .approvals
-        .lock()
-        .expect("approvals poisoned")
-        .remove(&held);
+    let answer = hub.approvals().remove(&held);
     if let Some(answer) = answer {
         let _ = answer.send(decision);
     }
@@ -1149,10 +1311,11 @@ fn session_restore(hub: &Arc<Hub>, discard: bool) -> Response {
     }
 }
 
-/// Resize a pane's pty and grid, then force a fresh baseline-paired snapshot for
-/// every client (clear the last broadcast screen and each client's seen set) so
-/// the next tick reseeds their parsers at the new size.
-fn resize_pane(hub: &Arc<Hub>, pane: PaneId, rows: u16, cols: u16) -> Response {
+/// Resize a pane's pty and grid — a no-op at the size it has — then force a
+/// fresh baseline-paired snapshot for every client (clear the last broadcast
+/// screen and each client's seen set) so the next tick reseeds their parsers
+/// at the new size.
+fn resize_pane(hub: &Hub, pane: PaneId, rows: u16, cols: u16) -> Response {
     let pty = match hub.session().pty(pane) {
         Some(pty) => pty,
         None => {
@@ -1161,10 +1324,13 @@ fn resize_pane(hub: &Arc<Hub>, pane: PaneId, rows: u16, cols: u16) -> Response {
             };
         }
     };
+    if pty.size() == PaneSize::new(rows, cols) {
+        return Response::Ok;
+    }
     match pty.resize(rows, cols) {
         Ok(()) => {
-            hub.last.lock().expect("last poisoned").remove(&pane);
-            for client in hub.clients.lock().expect("clients poisoned").values_mut() {
+            hub.last().remove(&pane);
+            for client in hub.clients().values_mut() {
                 client.seen.remove(&pane);
             }
             Response::Ok
@@ -1184,7 +1350,7 @@ fn scroll(
     offset: usize,
 ) -> ControlFlow<()> {
     if offset == 0 {
-        if let Some(client) = hub.clients.lock().expect("clients poisoned").get_mut(&cid) {
+        if let Some(client) = hub.clients().get_mut(&cid) {
             client.seen.remove(&pane);
         }
         return ControlFlow::Continue(());
@@ -1207,14 +1373,9 @@ fn scroll(
 /// large) diff never stalls this connection's frame loop; the reply lands on the
 /// requester's own outbound channel when it is ready. A vanished workspace
 /// answers Error without touching jj.
-fn workspace_diff(
-    hub: &Arc<Hub>,
-    tx: &mpsc::Sender<Vec<u8>>,
-    id: WorkspaceId,
-    stat: bool,
-) -> ControlFlow<()> {
+fn workspace_diff(hub: &Arc<Hub>, reply: &Reply, id: WorkspaceId, stat: bool) -> ControlFlow<()> {
     let dir = hub.session().workspace_dir(id);
-    let tx = tx.clone();
+    let reply = reply.clone();
     tokio::spawn(async move {
         let response = match dir {
             Some(dir) => jj::diff(&dir, stat).await,
@@ -1222,7 +1383,7 @@ fn workspace_diff(
                 message: format!("no workspace {id}"),
             },
         };
-        let _ = tx.send(encode_json(&response)).await;
+        reply.send(response).await;
     });
     ControlFlow::Continue(())
 }
@@ -1240,7 +1401,7 @@ fn workspace_diff(
 /// its client hangs up.
 fn pane_wait(
     hub: &Arc<Hub>,
-    tx: &mpsc::Sender<Vec<u8>>,
+    reply: &Reply,
     pane: PaneId,
     until: Vec<WaitFor>,
     next: bool,
@@ -1249,7 +1410,7 @@ fn pane_wait(
     let mut signals = hub.signals.subscribe();
     let start = hub.session().pane(pane);
     let hub = Arc::clone(hub);
-    let tx = tx.clone();
+    let reply = reply.clone();
     tokio::spawn(async move {
         let gone = || Response::Error {
             message: format!("pane {pane} is gone"),
@@ -1314,7 +1475,7 @@ fn pane_wait(
             }
         };
         let response = tokio::select! {
-            () = tx.closed() => return,
+            () = reply.tx.closed() => return,
             outcome = bounded => match outcome {
                 Some(response) => response,
                 None => {
@@ -1326,7 +1487,7 @@ fn pane_wait(
                 }
             },
         };
-        let _ = tx.send(encode_json(&response)).await;
+        reply.send(response).await;
     });
     ControlFlow::Continue(())
 }
@@ -1362,7 +1523,7 @@ fn wait_verdict(info: PaneInfo, until: &[WaitFor], level: bool) -> Option<Respon
 fn workspace_kill(
     hub: &Arc<Hub>,
     cid: u64,
-    tx: &mpsc::Sender<Vec<u8>>,
+    reply: &Reply,
     id: WorkspaceId,
     discard: bool,
 ) -> ControlFlow<()> {
@@ -1375,8 +1536,8 @@ fn workspace_kill(
         return send_reply(
             hub,
             cid,
-            tx,
-            encode_json(&Response::Error {
+            &reply.tx,
+            reply.encode(&Response::Error {
                 message: "refusing to discard a workspace tutti did not create".into(),
             }),
         );
@@ -1385,7 +1546,7 @@ fn workspace_kill(
         Ok(panes) => {
             let view = session.view();
             drop(session);
-            let mut last = hub.last.lock().expect("last poisoned");
+            let mut last = hub.last();
             for pane in &panes {
                 last.remove(pane);
                 let _ = hub.signals.send(PaneSignal::Gone(*pane));
@@ -1393,14 +1554,14 @@ fn workspace_kill(
             drop(last);
             broadcast_event(hub, Event::LayoutChanged { workspaces: view });
             if !discard {
-                return send_reply(hub, cid, tx, encode_json(&Response::Ok));
+                return send_reply(hub, cid, &reply.tx, reply.encode(&Response::Ok));
             }
             // Fork discard: forget at the origin, then remove the checkout. Each
             // failure is surfaced but neither aborts the other, so a half-cleaned
             // fork has still left tutti (the LayoutChanged above already dropped
             // it). The reply follows the cleanup on the requester's channel.
             let fork = fork.expect("discard on a non-fork was rejected above");
-            let tx = tx.clone();
+            let reply = reply.clone();
             tokio::spawn(async move {
                 let mut errors = Vec::new();
                 if let Err(e) = jj::forget(&fork.origin_root, &fork.jj_name).await {
@@ -1418,13 +1579,13 @@ fn workspace_kill(
                         message: errors.join("; "),
                     }
                 };
-                let _ = tx.send(encode_json(&response)).await;
+                reply.send(response).await;
             });
             ControlFlow::Continue(())
         }
         Err(err) => {
             drop(session);
-            send_reply(hub, cid, tx, encode_json(&error(err)))
+            send_reply(hub, cid, &reply.tx, reply.encode(&error(err)))
         }
     }
 }
@@ -1449,7 +1610,7 @@ enum Checkout {
 fn workspace_fork(
     hub: &Arc<Hub>,
     cid: u64,
-    tx: &mpsc::Sender<Vec<u8>>,
+    reply: &Reply,
     id: WorkspaceId,
     name: String,
     checkout: Checkout,
@@ -1459,8 +1620,8 @@ fn workspace_fork(
         return send_reply(
             hub,
             cid,
-            tx,
-            encode_json(&Response::Error {
+            &reply.tx,
+            reply.encode(&Response::Error {
                 message: format!(
                     "invalid workspace name {name:?}: use letters, digits, '-' or '_'"
                 ),
@@ -1474,8 +1635,8 @@ fn workspace_fork(
         return send_reply(
             hub,
             cid,
-            tx,
-            encode_json(&Response::Error {
+            &reply.tx,
+            reply.encode(&Response::Error {
                 message: format!("no workspace {id}"),
             }),
         );
@@ -1484,8 +1645,8 @@ fn workspace_fork(
         return send_reply(
             hub,
             cid,
-            tx,
-            encode_json(&Response::Error {
+            &reply.tx,
+            reply.encode(&Response::Error {
                 message: format!("not a jj workspace: {}", source.display()),
             }),
         );
@@ -1497,8 +1658,8 @@ fn workspace_fork(
             return send_reply(
                 hub,
                 cid,
-                tx,
-                encode_json(&Response::Error {
+                &reply.tx,
+                reply.encode(&Response::Error {
                     message: format!("workspace destination must be absolute: {}", dest.display()),
                 }),
             );
@@ -1509,8 +1670,8 @@ fn workspace_fork(
                 return send_reply(
                     hub,
                     cid,
-                    tx,
-                    encode_json(&Response::Error {
+                    &reply.tx,
+                    reply.encode(&Response::Error {
                         message: format!("cannot place a workspace beside {}", repo_root.display()),
                     }),
                 );
@@ -1522,15 +1683,15 @@ fn workspace_fork(
         return send_reply(
             hub,
             cid,
-            tx,
-            encode_json(&Response::Error {
+            &reply.tx,
+            reply.encode(&Response::Error {
                 message: format!("workspace destination already exists: {}", dest.display()),
             }),
         );
     }
 
     let hub = Arc::clone(hub);
-    let tx = tx.clone();
+    let reply = reply.clone();
     tokio::spawn(async move {
         let forked = async {
             let revision = match &checkout {
@@ -1540,7 +1701,7 @@ fn workspace_fork(
             jj::fork(&repo_root, &dest, &name, revision.as_deref()).await
         };
         if let Err(message) = forked.await {
-            let _ = tx.send(encode_json(&Response::Error { message })).await;
+            reply.send(Response::Error { message }).await;
             return;
         }
         let meta = crate::session::ForkMeta {
@@ -1557,9 +1718,7 @@ fn workspace_fork(
         spawn_pane(&hub, |s| s.pane_run(Some(tab_id), vec![shell], false, None));
         // Seed the fork's change stat / stale flag now that it exists.
         refresh_changes(&hub, ws_id);
-        let _ = tx
-            .send(encode_json(&Response::WorkspaceCreated { id: ws_id }))
-            .await;
+        reply.send(Response::WorkspaceCreated { id: ws_id }).await;
     });
     ControlFlow::Continue(())
 }
@@ -1571,7 +1730,7 @@ fn workspace_fork(
 fn sandbox_pull(
     hub: &Arc<Hub>,
     cid: u64,
-    tx: &mpsc::Sender<Vec<u8>>,
+    reply: &Reply,
     pane: PaneId,
     name: Option<String>,
 ) -> ControlFlow<()> {
@@ -1585,12 +1744,17 @@ fn sandbox_pull(
         Some((Some(sandbox), Some(id))) => {
             let branch = tutti_core::sandbox_branch(&sandbox);
             let name = name.unwrap_or(sandbox);
-            return workspace_fork(hub, cid, tx, id, name, Checkout::Fetched(branch), None);
+            return workspace_fork(hub, cid, reply, id, name, Checkout::Fetched(branch), None);
         }
         Some((None, _)) => format!("pane {pane} is not a sandbox pane"),
         _ => format!("no pane {pane}"),
     };
-    send_reply(hub, cid, tx, encode_json(&Response::Error { message }))
+    send_reply(
+        hub,
+        cid,
+        &reply.tx,
+        reply.encode(&Response::Error { message }),
+    )
 }
 
 /// Merge a child workspace's work into its origin's trunk bookmark. Only a
@@ -1603,7 +1767,7 @@ fn sandbox_pull(
 fn workspace_merge(
     hub: &Arc<Hub>,
     cid: u64,
-    tx: &mpsc::Sender<Vec<u8>>,
+    reply: &Reply,
     id: WorkspaceId,
     push: bool,
 ) -> ControlFlow<()> {
@@ -1616,14 +1780,14 @@ fn workspace_merge(
         return send_reply(
             hub,
             cid,
-            tx,
-            encode_json(&Response::Error {
+            &reply.tx,
+            reply.encode(&Response::Error {
                 message: "only a workspace can merge (this is a top-level project)".into(),
             }),
         );
     };
     let hub = Arc::clone(hub);
-    let tx = tx.clone();
+    let reply = reply.clone();
     tokio::spawn(async move {
         let response = match jj::merge(&fork.origin_root, &dir, &fork.jj_name, push).await {
             Ok(outcome) => {
@@ -1645,7 +1809,7 @@ fn workspace_merge(
             }
             Err(message) => Response::Error { message },
         };
-        let _ = tx.send(encode_json(&response)).await;
+        reply.send(response).await;
     });
     ControlFlow::Continue(())
 }
@@ -1653,14 +1817,10 @@ fn workspace_merge(
 /// Clear a stale working copy with `jj workspace update-stale`, then refresh the
 /// workspace's stale flag. Runs on a spawned task (it touches the working copy)
 /// and replies when done.
-fn workspace_update(
-    hub: &Arc<Hub>,
-    tx: &mpsc::Sender<Vec<u8>>,
-    id: WorkspaceId,
-) -> ControlFlow<()> {
+fn workspace_update(hub: &Arc<Hub>, reply: &Reply, id: WorkspaceId) -> ControlFlow<()> {
     let dir = hub.session().workspace_dir(id);
     let hub = Arc::clone(hub);
-    let tx = tx.clone();
+    let reply = reply.clone();
     tokio::spawn(async move {
         let response = match dir {
             Some(dir) => {
@@ -1674,7 +1834,7 @@ fn workspace_update(
                 message: format!("no workspace {id}"),
             },
         };
-        let _ = tx.send(encode_json(&response)).await;
+        reply.send(response).await;
     });
     ControlFlow::Continue(())
 }
@@ -1709,13 +1869,13 @@ fn find_checkpoint(
 /// diff against and answers Error saying so.
 fn checkpoint_diff(
     hub: &Arc<Hub>,
-    tx: &mpsc::Sender<Vec<u8>>,
+    reply: &Reply,
     pane: PaneId,
     n: Option<u64>,
     stat: bool,
 ) -> ControlFlow<()> {
     let target = find_checkpoint(hub, pane, n);
-    let tx = tx.clone();
+    let reply = reply.clone();
     tokio::spawn(async move {
         let response = match target {
             Ok((
@@ -1736,7 +1896,7 @@ fn checkpoint_diff(
             },
             Err(message) => Response::Error { message },
         };
-        let _ = tx.send(encode_json(&response)).await;
+        reply.send(response).await;
     });
     ControlFlow::Continue(())
 }
@@ -1749,7 +1909,7 @@ fn checkpoint_diff(
 /// the repo behind them and rebroadcasts the stat.
 fn pane_restore(
     hub: &Arc<Hub>,
-    tx: &mpsc::Sender<Vec<u8>>,
+    reply: &Reply,
     pane: PaneId,
     n: u64,
     force: bool,
@@ -1767,7 +1927,7 @@ fn pane_restore(
         hub.vcs().entry(*workspace).or_default().in_flight += 1;
     }
     let hub = Arc::clone(hub);
-    let tx = tx.clone();
+    let reply = reply.clone();
     tokio::spawn(async move {
         let response = match target {
             Ok((workspace, dir, commit)) => {
@@ -1782,7 +1942,7 @@ fn pane_restore(
             }
             Err(message) => Response::Error { message },
         };
-        let _ = tx.send(encode_json(&response)).await;
+        reply.send(response).await;
     });
     ControlFlow::Continue(())
 }
@@ -1833,7 +1993,7 @@ fn spawn_reaper(hub: &Arc<Hub>, pane: PaneId, pty: Arc<PtyPane>) {
             let workspace = session.pane_kill(pane).ok();
             let view = session.view();
             drop(session);
-            hub.last.lock().expect("last poisoned").remove(&pane);
+            hub.last().remove(&pane);
             let _ = hub.signals.send(PaneSignal::Gone(pane));
             broadcast_event(&hub, Event::LayoutChanged { workspaces: view });
             if let Some(workspace) = workspace {
@@ -2024,7 +2184,7 @@ fn broadcast_tick(hub: &Arc<Hub>) {
         }
     }
 
-    if hub.clients.lock().expect("clients poisoned").is_empty() {
+    if hub.clients().is_empty() {
         return;
     }
     // Clients whose bounded queue filled this tick, disconnected once the loop
@@ -2038,17 +2198,10 @@ fn broadcast_tick(hub: &Arc<Hub>) {
         // this tick. A fresh client, missing it from `seen`, still gets its
         // snapshot below, so only skip when every client has already seen it.
         let unchanged = matches!(
-            hub.last.lock().expect("last poisoned").get(&pane),
+            hub.last().get(&pane),
             Some((_, _, stored)) if *stored == generation
         );
-        if unchanged
-            && hub
-                .clients
-                .lock()
-                .expect("clients poisoned")
-                .values()
-                .all(|c| c.seen.contains(&pane))
-        {
+        if unchanged && hub.clients().values().all(|c| c.seen.contains(&pane)) {
             continue;
         }
 
@@ -2058,7 +2211,7 @@ fn broadcast_tick(hub: &Arc<Hub>) {
         let (rows, cols) = cur.parser.screen().size();
 
         let (seq, delta) = {
-            let mut last = hub.last.lock().expect("last poisoned");
+            let mut last = hub.last();
             let outcome = match last.get(&pane) {
                 None => (0, None),
                 Some((prev, seq, _)) => {
@@ -2080,7 +2233,7 @@ fn broadcast_tick(hub: &Arc<Hub>) {
             outcome
         };
 
-        let mut clients = hub.clients.lock().expect("clients poisoned");
+        let mut clients = hub.clients();
         for (cid, client) in clients.iter_mut() {
             if !client.ready || doomed.contains(cid) {
                 continue;
@@ -2120,13 +2273,11 @@ fn broadcast_tick(hub: &Arc<Hub>) {
 /// attached client is the newest. A watcher whose queue is full is dropped,
 /// as a wedged client is.
 fn snapshot_watchers(hub: &Hub) {
-    if hub.watchers.lock().expect("watchers poisoned").is_empty() {
+    if hub.watchers().is_empty() {
         return;
     }
     let (attached_terminal, focused) = hub
-        .clients
-        .lock()
-        .expect("clients poisoned")
+        .clients()
         .iter()
         .max_by_key(|(cid, _)| **cid)
         .map_or((None, None), |(_, client)| {
@@ -2139,20 +2290,17 @@ fn snapshot_watchers(hub: &Hub) {
         attached_terminal,
         panes,
     });
-    hub.watchers
-        .lock()
-        .expect("watchers poisoned")
-        .retain(|_, watcher| {
-            if watcher.last == snapshot {
-                return true;
-            }
-            if watcher.tx.try_send(snapshot.clone()).is_err() {
-                watcher.writer.abort();
-                return false;
-            }
-            watcher.last.clone_from(&snapshot);
-            true
-        });
+    hub.watchers().retain(|_, watcher| {
+        if watcher.last == snapshot {
+            return true;
+        }
+        if watcher.tx.try_send(snapshot.clone()).is_err() {
+            watcher.writer.abort();
+            return false;
+        }
+        watcher.last.clone_from(&snapshot);
+        true
+    });
 }
 
 /// One agent-detection pass: snapshot the process tree, walk each live local
@@ -2160,7 +2308,7 @@ fn snapshot_watchers(hub: &Hub) {
 /// pane's agent broadcasts the fresh view so clients relabel their badges, and
 /// an agent appearing refreshes its workspace so where it started is
 /// checkpointed.
-async fn detect_pass(hub: &Arc<Hub>) {
+async fn detect_pass(hub: Arc<Hub>) {
     let panes = hub.session().detectable_panes();
     if panes.is_empty() {
         return;
@@ -2193,10 +2341,10 @@ async fn detect_pass(hub: &Arc<Hub>) {
     let view = changed.then(|| session.view());
     drop(session);
     if let Some(view) = view {
-        broadcast_event(hub, Event::LayoutChanged { workspaces: view });
+        broadcast_event(&hub, Event::LayoutChanged { workspaces: view });
     }
     for workspace in started {
-        refresh_changes(hub, workspace);
+        refresh_changes(&hub, workspace);
     }
 }
 
@@ -2282,7 +2430,7 @@ fn broadcast_event(hub: &Hub, event: Event) {
     let bytes = encode_json(&event);
     let mut doomed = Vec::new();
     {
-        let clients = hub.clients.lock().expect("clients poisoned");
+        let clients = hub.clients();
         for (cid, client) in clients.iter() {
             if client.tx.try_send(bytes.clone()).is_err() {
                 doomed.push(*cid);
@@ -2296,13 +2444,8 @@ fn broadcast_event(hub: &Hub, event: Event) {
 /// so the socket closes. Callers collect the ids while iterating, release the
 /// clients lock, then call this — the clients lock must not be held here.
 fn disconnect(hub: &Hub, cids: impl IntoIterator<Item = u64>) {
-    let mut cids = cids.into_iter().peekable();
-    if cids.peek().is_none() {
-        return;
-    }
-    let mut clients = hub.clients.lock().expect("clients poisoned");
     for cid in cids {
-        if let Some(client) = clients.remove(&cid) {
+        if let Some(client) = drop_client(hub, cid) {
             client.writer.abort();
             eprintln!("tutti: client {cid} send queue full; disconnecting");
         }
@@ -2322,6 +2465,163 @@ fn error(err: anyhow::Error) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A control frame of exactly `"panic"` panics its handling — holding
+    /// every hub lock, so each is poisoned after.
+    pub(super) fn inject_panic(hub: &Hub, frame: &Frame) {
+        if matches!(frame, Frame::Control(json) if json.as_slice() == b"\"panic\"") {
+            let _held = (
+                hub.session(),
+                hub.clients(),
+                hub.watchers(),
+                hub.last(),
+                hub.vcs(),
+                hub.approvals(),
+            );
+            panic!("injected: a frame panics holding every hub lock");
+        }
+    }
+
+    /// A client of the daemon a test serves in-process.
+    struct Peer {
+        stream: tokio::net::UnixStream,
+        buf: Vec<u8>,
+    }
+
+    impl Peer {
+        async fn connect(path: &Path) -> Peer {
+            let stream = tokio::net::UnixStream::connect(path).await.unwrap();
+            Peer {
+                stream,
+                buf: Vec::new(),
+            }
+        }
+
+        async fn send(&mut self, json: Vec<u8>) {
+            let frame = Frame::Control(json).encode();
+            self.stream.write_all(&frame).await.unwrap();
+        }
+
+        /// Send `request` and await its answer, skipping events and pane frames.
+        async fn request(&mut self, request: &Request) -> Response {
+            self.send(serde_json::to_vec(request).unwrap()).await;
+            self.until(|frame| match frame {
+                Frame::Control(json) => serde_json::from_slice(&json).ok(),
+                _ => None,
+            })
+            .await
+        }
+
+        /// Read frames until `pick` takes one; a hangup first fails the test.
+        async fn until<T>(&mut self, mut pick: impl FnMut(Frame) -> Option<T>) -> T {
+            let read = async {
+                loop {
+                    if let Some((frame, used)) = Frame::decode(&self.buf).unwrap() {
+                        self.buf.drain(..used);
+                        if let Some(picked) = pick(frame) {
+                            return picked;
+                        }
+                        continue;
+                    }
+                    let mut chunk = [0u8; 8192];
+                    match self.stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => panic!("the daemon hung up"),
+                        Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(5), read)
+                .await
+                .expect("the awaited frame never came")
+        }
+
+        async fn snapshot_at(&mut self, pane: PaneId, rows: u16, cols: u16) {
+            self.until(|frame| match frame {
+                Frame::PaneSnapshot(data) => {
+                    (data.pane == pane && (data.rows, data.cols) == (rows, cols)).then_some(())
+                }
+                _ => None,
+            })
+            .await
+        }
+    }
+
+    /// A panic handling one frame — injected while it holds every hub lock —
+    /// ends that connection alone: its client is dropped, its vote in a shared
+    /// pane's size with it, and the daemon serves on through the poisoned locks.
+    #[tokio::test]
+    async fn a_panicking_frame_drops_only_its_connection() {
+        let dir = std::env::temp_dir().join(format!("tutti-unit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("panic.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (stop, stopped) = oneshot::channel::<()>();
+        let server = tokio::spawn(serve(
+            listener,
+            path.clone(),
+            PaneSize::new(24, 80),
+            None,
+            async {
+                let _ = stopped.await;
+            },
+        ));
+
+        let mut viewer = Peer::connect(&path).await;
+        let workspace = Request::WorkspaceNew {
+            dir: std::env::temp_dir(),
+        };
+        viewer.request(&workspace).await;
+        let run = Request::PaneRun {
+            tab: None,
+            cmd: vec!["/bin/cat".into()],
+            ephemeral: false,
+            sandbox: None,
+        };
+        let Response::PaneCreated { id: pane } = viewer.request(&run).await else {
+            panic!("expected the cat pane");
+        };
+        let vote = |rows, cols| Request::ViewSizes {
+            panes: vec![PaneDims { pane, rows, cols }],
+        };
+        let attach = Request::Attach { terminal: None };
+        viewer.request(&attach).await;
+        assert_eq!(viewer.request(&vote(20, 60)).await, Response::Ok);
+        let mut doomed = Peer::connect(&path).await;
+        doomed.request(&attach).await;
+        assert_eq!(doomed.request(&vote(10, 40)).await, Response::Ok);
+        viewer.snapshot_at(pane, 10, 40).await;
+
+        doomed.send(b"\"panic\"".to_vec()).await;
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), doomed.stream.read_to_end(&mut rest))
+            .await
+            .expect("the panicking connection is dropped")
+            .unwrap();
+        // Dropping it re-arbitrated the pane through the poisoned locks...
+        viewer.snapshot_at(pane, 20, 60).await;
+        // ...and the session and the VCS book serve on.
+        assert!(matches!(
+            viewer.request(&workspace).await,
+            Response::WorkspaceCreated { .. }
+        ));
+
+        let _ = stop.send(());
+        server.await.unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A background pass that panics is caught, and its loop runs the next.
+    #[test]
+    fn a_guarded_pass_survives_its_panic() {
+        let mut passes = 0;
+        for _ in 0..3 {
+            guarded("test", || {
+                passes += 1;
+                panic!("injected pass panic");
+            });
+        }
+        assert_eq!(passes, 3);
+    }
 
     /// A peer hanging up closes the reply queue once what was queued drains,
     /// so a task still holding a sender — a pane wait — sees `closed()`
