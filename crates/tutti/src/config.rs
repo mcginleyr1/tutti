@@ -70,6 +70,9 @@ pub enum PrefixAction {
     Navigate,
     /// Focus the changed-files panel (the per-file diff stats on the right).
     DiffFiles,
+    /// Open the notifications panel: the daemon's history of bells, desktop
+    /// notifications and agents wanting attention.
+    Notes,
     /// Open the agent launcher to run a choice in a new pane here.
     Run,
     /// Open the setup panel: install the Claude Code hooks, the opencode
@@ -160,6 +163,7 @@ const DEFAULT_PREFIX_TABLE: &[PrefixBinding] = &[
     b(KeyCode::Char('w'), PrefixAction::Sidebar, "workspaces"),
     b(KeyCode::Char('g'), PrefixAction::Navigate, "go to"),
     b(KeyCode::Char('f'), PrefixAction::DiffFiles, "changed files"),
+    b(KeyCode::Char('N'), PrefixAction::Notes, "notifications"),
     b(KeyCode::Char('r'), PrefixAction::Run, "run here"),
     b(KeyCode::Char('i'), PrefixAction::Integrations, "setup"),
     b(
@@ -193,6 +197,7 @@ const VIM_PREFIX_TABLE: &[PrefixBinding] = &[
     b(KeyCode::Char('w'), PrefixAction::Sidebar, "workspaces"),
     b(KeyCode::Char('g'), PrefixAction::Navigate, "go to"),
     b(KeyCode::Char('f'), PrefixAction::DiffFiles, "changed files"),
+    b(KeyCode::Char('N'), PrefixAction::Notes, "notifications"),
     b(KeyCode::Char('r'), PrefixAction::Run, "run here"),
     b(KeyCode::Char('i'), PrefixAction::Integrations, "setup"),
     b(KeyCode::Char('z'), PrefixAction::Zoom, "zoom pane"),
@@ -1332,6 +1337,25 @@ ttl_minutes = 15
                 cfg.prefix_action(KeyCode::Char('g')),
                 Some(PrefixAction::Navigate),
                 "g should open the go-to overlay in every preset"
+            );
+        }
+    }
+
+    #[test]
+    fn both_presets_bind_the_notifications_key() {
+        for cfg in [
+            Config::default(),
+            Config::parse("preset = \"vim\"\n").unwrap(),
+        ] {
+            assert_eq!(
+                cfg.prefix_action(KeyCode::Char('N')),
+                Some(PrefixAction::Notes),
+                "N should open the notifications panel in every preset"
+            );
+            assert_eq!(
+                cfg.prefix_action(KeyCode::Char('n')),
+                Some(PrefixAction::TabNext),
+                "shift-n leaves n itself alone"
             );
         }
     }

@@ -9,7 +9,7 @@ use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
-use tutti_core::{AgentState, Checkpoint, PaneId, PaneInfo, SubagentInfo};
+use tutti_core::{AgentState, Checkpoint, Note, NoteKind, PaneId, PaneInfo, SubagentInfo};
 
 use super::app::{App, Mode};
 use super::launcher::LauncherRow;
@@ -18,7 +18,7 @@ use super::sidebar::{AgentRow, SidebarEntry, WorkspaceRow};
 use super::theme;
 use crate::config::{self, Config, Icons, PanelBinding, PrefixAction};
 use crate::integrations::Status;
-use crate::render::{age, count, state_label, unix_now};
+use crate::render::{age, count, note_kind_label, state_label, unix_now};
 
 /// The accent colour of the active theme — the one thing that marks the
 /// focused or active thing. Everything else renders muted so it is
@@ -105,6 +105,14 @@ const APPROVAL_HINT: &[(&str, &str)] = &[("y", "allow"), ("n", "deny"), ("esc", 
 /// The go-to overlay's key hint, two-tone at its input row's right edge —
 /// typing filters, so the movement keys are the ones worth saying.
 const NAVIGATE_HINT: &[(&str, &str)] = &[("↑↓", "move"), ("enter", "jump"), ("esc", "back")];
+
+/// The notifications panel's hint row, two-tone under its notes.
+const NOTES_HINT: &[(&str, &str)] = &[
+    ("enter", "jump"),
+    ("r", "read all"),
+    ("X", "clear"),
+    ("esc", "close"),
+];
 
 /// The metadata style of the active theme — DIM on the terminal theme, an
 /// explicit muted colour on the truecolor ones — applied to nearly everything
@@ -211,53 +219,54 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if app.mode == Mode::Navigate {
         draw_navigate(frame, app, content, spinner);
     }
+    draw_notes(frame, app, area);
 }
 
 /// The top app bar (full width): the accent bar and bold `tutti — <session>`
-/// wordmark on the left, the tab segments right-aligned. Draws over the
-/// terminal's own background so it tracks the terminal's light/dark scheme.
+/// wordmark on the left, then the census, the tab segments right-aligned.
+/// Draws over the terminal's own background so it tracks the terminal's
+/// light/dark scheme.
 fn draw_app_bar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    // A session named after the binary would read as a stutter ("tutti — tutti"),
-    // so the suffix only appears when it says something the wordmark doesn't.
-    let title = if app.session.is_empty() || app.session == "tutti" {
-        "tutti".to_string()
-    } else {
-        format!("tutti — {}", app.session)
-    };
     let mut spans = vec![
         Span::styled("▍", Style::default().fg(accent())),
-        Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            app.app_title(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
     ];
     spans.extend(census_spans(app, spinner));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    // The unread-notes chip draws where its click lands, dim until a note
+    // goes unread.
+    let (chip, rect) = app.notes_chip(area);
+    let style = if app.unread_notes() == 0 {
+        dim()
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    };
+    frame.render_widget(Paragraph::new(Span::styled(chip, style)), rect);
     draw_tab_bar(frame, app, app.tab_bar_rect(area), spinner);
 }
 
 /// The agent-state census after the app-bar title: one `dot N label` chip per
 /// non-empty state, blocked first — the at-a-glance answer to "does anything
-/// need me" without opening the sidebar. Empty (no chips) when no agents run.
+/// need me" without opening the sidebar — then the separator before the
+/// unread-notes chip that closes it (`App::notes_chip`).
 fn census_spans(app: &App, spinner: char) -> Vec<Span<'static>> {
     let glyphs = glyphs(app.config().icons);
-    let counts = app.agent_census();
-    let chips: [(usize, AgentState, &str); 3] = [
-        (counts.blocked, AgentState::Blocked, "blocked"),
-        (counts.working, AgentState::Working, "working"),
-        (counts.done, AgentState::Done, "done"),
-    ];
     let mut spans = Vec::new();
-    for (count, state, label) in chips {
-        if count == 0 {
-            continue;
-        }
+    for (state, text) in app.census_chips() {
         let (dot, style) = agent_dot(state, spinner, glyphs);
         let sep = if spans.is_empty() { "   " } else { " · " };
-        spans.push(Span::styled(sep.to_string(), dim()));
+        spans.push(Span::styled(sep, dim()));
         spans.push(Span::styled(dot.to_string(), style));
-        spans.push(Span::styled(format!(" {count} {label}"), dim()));
+        spans.push(Span::styled(text, dim()));
     }
+    let sep = if spans.is_empty() { "   " } else { " · " };
+    spans.push(Span::styled(sep, dim()));
     spans
 }
 
@@ -1364,6 +1373,8 @@ fn mode_label(mode: Mode) -> Option<&'static str> {
         Mode::Peek(_) => Some("ANSWER"),
         Mode::Navigate => Some("GO TO"),
         Mode::Approval(_) => Some("APPROVE"),
+        Mode::Notes => Some("NOTES"),
+        Mode::ConfirmClearNotes => Some("CONFIRM"),
     }
 }
 
@@ -1890,6 +1901,96 @@ fn navigate_inner(
     pad_inner(spans, sel, content_w)
 }
 
+/// The notifications panel: a centred rounded panel titled ` notifications `
+/// (and its unread count) listing the history newest first, one note a row,
+/// over its two-tone hint row — or a dim `no notifications`. Rows draw like
+/// the sidebar's, so the highlight is the one accent. The window follows the
+/// highlight through `App::notes_popup`, which the mouse hit-test shares.
+fn draw_notes(frame: &mut Frame, app: &App, area: Rect) {
+    let Some((popup, list, first)) = app.notes_popup(area) else {
+        return;
+    };
+    let title = match app.unread_notes() {
+        0 => " notifications ".to_string(),
+        unread => format!(" notifications · {unread} unread "),
+    };
+    clear(frame, popup, theme::current().pane_bg);
+    frame.render_widget(popup_block(&title), popup);
+    if list.height == 0 {
+        return;
+    }
+    let content_w = list.width.saturating_sub(2) as usize;
+    let selected = app.notes_selected();
+    let (now, glyphs) = (unix_now(), glyphs(app.config().icons));
+    let lines: Vec<Line> = if app.notes().is_empty() {
+        vec![Line::from(Span::styled(" no notifications", dim()))]
+    } else {
+        app.notes()
+            .iter()
+            .rev()
+            .enumerate()
+            .skip(first)
+            .take(list.height as usize)
+            .map(|(i, note)| {
+                let gone = !app.panes.contains_key(&note.pane);
+                let sel = i == selected;
+                bare_row(note_inner(note, now, gone, sel, content_w, glyphs), sel)
+            })
+            .collect()
+    };
+    frame.render_widget(Paragraph::new(lines), list);
+    let hint = Rect::new(list.x, list.y + list.height, list.width, 1);
+    let mut spans = vec![Span::raw(" ")];
+    spans.extend(two_tone(NOTES_HINT).0);
+    frame.render_widget(Paragraph::new(Line::from(spans)), hint);
+}
+
+/// One note row's inner spans: its unread dot — the state dot for a blocked or
+/// done note, a bold dot for a bell or notification, none once read — its age,
+/// the pane title at full intensity (the accent chip when selected), the dim
+/// `workspace · kind`, and the note's own text, clipped to fit. A note whose
+/// pane is gone draws dim throughout.
+fn note_inner(
+    note: &Note,
+    now: u64,
+    gone: bool,
+    sel: bool,
+    content_w: usize,
+    glyphs: &Glyphs,
+) -> Vec<Span<'static>> {
+    let (dot, dot_style) = match (note.read, note.kind) {
+        (true, _) => (' ', Style::default()),
+        (false, NoteKind::Blocked) => agent_dot(AgentState::Blocked, ' ', glyphs),
+        (false, NoteKind::Done) => agent_dot(AgentState::Done, ' ', glyphs),
+        (false, NoteKind::Bell | NoteKind::Notify) => {
+            ('●', Style::default().add_modifier(Modifier::BOLD))
+        }
+    };
+    let mut spans = vec![
+        Span::styled(dot.to_string(), dot_style),
+        Span::styled(format!(" {:>3}  ", age(note.time, now)), dim()),
+        name_span(&note.pane_title, sel, Modifier::empty()),
+        Span::styled(
+            format!("  {} · {}", note.workspace, note_kind_label(note.kind)),
+            dim(),
+        ),
+    ];
+    let text = note.text();
+    if !text.is_empty() {
+        let used: usize = spans.iter().map(Span::width).sum();
+        let room = content_w.saturating_sub(used);
+        spans.push(Span::raw(
+            format!("  {text}").chars().take(room).collect::<String>(),
+        ));
+    }
+    if gone {
+        for span in &mut spans {
+            span.style = dim();
+        }
+    }
+    pad_inner(spans, sel, content_w as u16)
+}
+
 /// Render `lines` in a rounded panel titled `title`, centred over `area`. Shared
 /// by the launcher picker with the help/which-key panel look.
 fn draw_centered_popup(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line>) {
@@ -2198,6 +2299,7 @@ mod tests {
                     )],
                 )],
                 restorable: None,
+                notes: Vec::new(),
             })
             .unwrap(),
         ));
@@ -2310,6 +2412,7 @@ mod tests {
                     ),
                 ],
                 restorable: None,
+                notes: Vec::new(),
             })
             .unwrap(),
         ));
@@ -2371,6 +2474,7 @@ mod tests {
                 session: "demo".into(),
                 workspaces: view,
                 restorable: None,
+                notes: Vec::new(),
             })
             .unwrap(),
         ));
@@ -2442,6 +2546,7 @@ mod tests {
                 session: "demo".into(),
                 workspaces: view,
                 restorable: None,
+                notes: Vec::new(),
             })
             .unwrap(),
         ));
@@ -2480,6 +2585,7 @@ mod tests {
                 session: "demo".into(),
                 workspaces: view,
                 restorable: None,
+                notes: Vec::new(),
             })
             .unwrap(),
         ));
@@ -2522,6 +2628,7 @@ mod tests {
                     )],
                 )],
                 restorable: None,
+                notes: Vec::new(),
             })
             .unwrap(),
         ));
@@ -2555,6 +2662,7 @@ mod tests {
                     vec![tab(1, "1", true, leaf(1), vec![agent_pane])],
                 )],
                 restorable: None,
+                notes: Vec::new(),
             })
             .unwrap(),
         ));
@@ -2658,10 +2766,138 @@ mod tests {
         ));
         // 16 rows: the notified agent is another project's, so its bell rides
         // the waiting-section row below the (empty) filtered agents section.
+        // Scoped to the sidebar column: the app bar's notes chip is a bell too.
         let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let sidebar: String = (2..16)
+            .map(|row| row_text(buf, row).chars().take(30).collect::<String>())
+            .collect();
+        assert!(sidebar.contains("🔔"), "bell mark missing: {sidebar:?}");
+    }
+
+    fn note(id: u64, pane: u64, title: &str, kind: NoteKind) -> Note {
+        Note {
+            id,
+            time: unix_now(),
+            pane: PaneId(pane),
+            pane_title: title.into(),
+            workspace: "web".into(),
+            kind,
+            title: None,
+            body: None,
+            read: false,
+        }
+    }
+
+    fn with_notes(app: &mut App, notes: Vec<Note>) {
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&tutti_core::Event::NotesChanged { notes }).unwrap(),
+        ));
+    }
+
+    #[test]
+    fn the_notifications_panel_lists_notes_newest_first_over_its_hint() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = app_two_workspaces();
+        let prefix = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        let open = KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT);
+        app.on_key(prefix);
+        app.on_key(open);
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
-        assert!(text.contains("🔔"), "bell mark missing: {text:?}");
+        assert!(text.contains(" notifications "), "the title: {text:?}");
+        assert!(
+            text.contains("no notifications"),
+            "the empty history: {text:?}"
+        );
+
+        let built = Note {
+            title: Some("build".into()),
+            body: Some("Built".into()),
+            read: true,
+            ..note(2, 1, "zsh", NoteKind::Notify)
+        };
+        with_notes(
+            &mut app,
+            vec![
+                note(1, 2, "agent", NoteKind::Blocked),
+                built,
+                note(3, 9, "old", NoteKind::Done),
+            ],
+        );
+        // Off the newest note, so the gone pane's row draws unselected.
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let w = buf.area.width as usize;
+        let text = buffer_text(buf);
+        assert!(text.contains(" notifications · 2 unread "), "{text:?}");
+        let (old, zsh, agent) = (
+            row_containing(buf, "old"),
+            row_containing(buf, "build: Built"),
+            row_containing(buf, "agent  web · blocked"),
+        );
+        assert!(old < zsh && zsh < agent, "newest first: {text:?}");
+        assert!(
+            row_text(buf, zsh).contains("now  zsh  web · notify  build: Built"),
+            "age, pane, where and what, then the text: {:?}",
+            row_text(buf, zsh)
+        );
+        let dot_col = col_of(buf, agent, "agent") - 7;
+        let dot = &buf.content()[agent * w + dot_col];
+        assert_eq!(
+            (dot.symbol(), dot.fg),
+            ("●", Color::Red),
+            "an unread blocked note leads with the blocked dot"
+        );
+        assert_eq!(
+            buf.content()[zsh * w + dot_col].symbol(),
+            " ",
+            "a read note has no unread dot"
+        );
+        let name = &buf.content()[zsh * w + col_of(buf, zsh, "zsh")];
+        assert_eq!(name.bg, accent(), "the highlighted note's pane is the chip");
+        let gone = &buf.content()[old * w + col_of(buf, old, "old")];
+        assert!(
+            gone.modifier.contains(Modifier::DIM),
+            "a gone pane's note draws dim"
+        );
+        assert!(
+            row_text(buf, agent + 1).contains("enter jump"),
+            "the hint row"
+        );
+        assert!(row_text(buf, 19).contains("NOTES"), "the footer mode chip");
+    }
+
+    #[test]
+    fn the_app_bar_census_closes_with_the_unread_count() {
+        let mut app = app_two_workspaces();
+        let area = Rect::new(0, 0, 100, 12);
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let (_, chip) = app.notes_chip(App::header_rects(area).0);
+        let buf = terminal.backend().buffer();
+        let bar = row_text(buf, 0);
+        assert!(bar.contains("1 blocked · 🔔"), "after the states: {bar:?}");
+        assert_eq!(
+            col_of(buf, 0, "🔔"),
+            chip.x as usize,
+            "drawn where it clicks"
+        );
+        let count = &buf.content()[chip.x as usize + 3];
+        assert_eq!(count.symbol(), "0");
+        assert!(count.modifier.contains(Modifier::DIM), "dim at zero");
+
+        with_notes(&mut app, vec![note(1, 2, "agent", NoteKind::Blocked)]);
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let count = &terminal.backend().buffer().content()[chip.x as usize + 3];
+        assert_eq!(count.symbol(), "1");
+        assert!(
+            !count.modifier.contains(Modifier::DIM),
+            "an unread note brings it to full intensity"
+        );
     }
 
     #[test]
@@ -2865,6 +3101,7 @@ mod tests {
             serde_json::to_vec(&Response::Attached {
                 wire_rev: tutti_core::WIRE_REV,
                 restorable: None,
+                notes: Vec::new(),
                 session: "demo".into(),
                 workspaces: vec![workspace(
                     1,
@@ -3088,6 +3325,7 @@ mod tests {
                     agents: 2,
                     saved_at: unix_now() - 2 * 3600,
                 }),
+                notes: Vec::new(),
             })
             .unwrap(),
         ));
@@ -3172,6 +3410,7 @@ mod tests {
                 session: "demo".into(),
                 workspaces: view,
                 restorable: None,
+                notes: Vec::new(),
             })
             .unwrap(),
         ));
@@ -3391,6 +3630,7 @@ mod tests {
                     vec![tab(1, "1", true, leaf(1), vec![agent_pane])],
                 )],
                 restorable: None,
+                notes: Vec::new(),
             })
             .unwrap(),
         ));
@@ -3920,6 +4160,7 @@ mod tests {
                 session: "demo".into(),
                 workspaces: view,
                 restorable: None,
+                notes: Vec::new(),
             })
             .unwrap(),
         ));

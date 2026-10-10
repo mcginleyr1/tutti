@@ -10,8 +10,8 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 
 use tutti_core::{
-    AgentHookEvent, AgentState, ApprovalDecision, Event, Frame, PaneId, Request, Response,
-    WatchPane, WorkspaceId, WorkspaceInfo,
+    AgentHookEvent, AgentState, ApprovalDecision, Event, Frame, Note, NoteKind, PaneId, Request,
+    Response, WatchPane, WorkspaceId, WorkspaceInfo,
 };
 
 fn unique_base(label: &str) -> PathBuf {
@@ -670,6 +670,67 @@ fn run_from_a_pane_names_its_caller_in_its_own_session_only() {
         );
         assert!(output.status.success());
     }
+}
+
+/// `notes --unread` asks for the unread history and prints it newest first —
+/// what an agent reads to learn what blocked while it was busy — and `notes
+/// read --pane` marks one pane's notes read.
+#[test]
+fn notes_lists_the_unread_history_newest_first() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let blocked = Note {
+        id: 4,
+        time: now,
+        pane: PaneId(7),
+        pane_title: "fix-tests".into(),
+        workspace: "api".into(),
+        kind: NoteKind::Blocked,
+        title: None,
+        body: None,
+        read: false,
+    };
+    let done = Note {
+        id: 9,
+        pane: PaneId(8),
+        pane_title: "docs".into(),
+        kind: NoteKind::Done,
+        ..blocked.clone()
+    };
+    let output = run_scenario(
+        "notes",
+        &["notes", "--unread"],
+        |req| assert_eq!(*req, Request::NotesList { unread: true }),
+        Response::Notes {
+            notes: vec![blocked, done],
+        },
+    );
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "ID  AGE  PANE  TITLE      WORKSPACE  KIND     UNREAD  TEXT\n\
+         9   now  8     docs       api        done     *\n\
+         4   now  7     fix-tests  api        blocked  *\n"
+    );
+
+    let output = run_scenario(
+        "notesread",
+        &["notes", "read", "--pane", "7"],
+        |req| {
+            assert_eq!(
+                *req,
+                Request::NotesRead {
+                    up_to: None,
+                    pane: Some(PaneId(7)),
+                }
+            );
+        },
+        Response::Ok,
+    );
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "ok\n");
 }
 
 /// `server restore` prints what came back on one line and names each skipped

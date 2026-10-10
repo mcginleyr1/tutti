@@ -10,7 +10,11 @@ use crate::state::{AgentState, StateSource};
 /// Response / Event shapes (including additive fields): the daemon reports it
 /// on attach and mismatched clients tell the user to restart the daemon —
 /// binaries upgrade on install, running daemons do not.
-pub const WIRE_REV: u32 = 8;
+pub const WIRE_REV: u32 = 9;
+
+/// The most notes the daemon's notification history keeps, the oldest going
+/// first. A client caps its copy the same, so the two agree.
+pub const NOTES_CAP: usize = 200;
 
 /// The revset every workspace-delta surface diffs against: the fork point of
 /// the trunk bookmark (local `main`, else `master`, else `trunk`; `root()` when
@@ -212,6 +216,24 @@ pub enum Request {
     PaneFocus {
         pane: PaneId,
     },
+    /// The notification history, oldest first — only its unread notes with
+    /// `unread` — answered with `Response::Notes`.
+    NotesList {
+        #[serde(default)]
+        unread: bool,
+    },
+    /// Mark notes read: every one, or only those up to id `up_to`, or only
+    /// `pane`'s — the two narrow together. Answered `Ok`, and broadcast as
+    /// `Event::NotesChanged` so every client agrees.
+    NotesRead {
+        #[serde(default)]
+        up_to: Option<u64>,
+        #[serde(default)]
+        pane: Option<PaneId>,
+    },
+    /// Empty the notification history, answered `Ok` and broadcast like
+    /// `NotesRead`. Ids go on counting from where they were.
+    NotesClear,
     /// Serve a workspace's jj diff, answered with `Response::Content`. `stat`
     /// requests the `--stat` summary instead of the full diff. jj is the required
     /// VCS: a workspace whose directory is not under a `.jj` repo answers Error.
@@ -681,6 +703,10 @@ pub enum Response {
     Checkpoints {
         checkpoints: Vec<Checkpoint>,
     },
+    /// The notification history, oldest first.
+    Notes {
+        notes: Vec<Note>,
+    },
     /// A `PaneRestore` landed: the working copy now matches checkpoint `n`.
     /// `saved` is the `before restore` checkpoint holding the state it replaced
     /// — `None` when nothing had changed since the pane's last checkpoint or
@@ -705,6 +731,8 @@ pub enum Response {
     /// old daemon defaults to 0, which correctly reads as outdated).
     /// `restorable` summarises the layout a previous daemon left to offer back
     /// (`Request::SessionRestore`); `None` when there is none, and from older
+    /// servers. `notes` is the notification history, oldest first, so a
+    /// reattaching client catches up on what it missed; empty from older
     /// servers.
     Attached {
         session: String,
@@ -713,6 +741,8 @@ pub enum Response {
         wire_rev: u32,
         #[serde(default)]
         restorable: Option<RestoreSummary>,
+        #[serde(default)]
+        notes: Vec<Note>,
     },
 }
 
@@ -725,6 +755,52 @@ pub struct RestoreSummary {
     pub panes: usize,
     pub agents: usize,
     pub saved_at: u64,
+}
+
+/// One entry in the daemon's notification history. `pane_title` and
+/// `workspace` are the pane's title and its workspace's name as they were when
+/// the note landed, so it reads the same once the pane is gone. Ids count up
+/// for the daemon's life and are never reused, across a clear too.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Note {
+    pub id: u64,
+    /// Unix seconds when it landed.
+    pub time: u64,
+    pub pane: PaneId,
+    pub pane_title: String,
+    pub workspace: String,
+    pub kind: NoteKind,
+    /// A notification's own title and body, as `Event::PaneNotification`
+    /// carries them; both `None` for a bell and a transition.
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub read: bool,
+}
+
+impl Note {
+    /// The notification's text on one line: `title: body`, whichever of the
+    /// two it has, or empty.
+    pub fn text(&self) -> String {
+        [self.title.as_deref(), self.body.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(": ")
+    }
+}
+
+/// What a note records: a pane's bell or desktop notification, or its agent
+/// needing attention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteKind {
+    Bell,
+    /// OSC 9 / 777, or an OSC 7501 report's `msg`.
+    Notify,
+    /// The pane moved into `Blocked`.
+    Blocked,
+    /// The pane moved from `Working` to `Done`.
+    Done,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -756,6 +832,16 @@ pub enum Event {
         pane: PaneId,
         title: Option<String>,
         body: Option<String>,
+    },
+    /// A note landed in the notification history.
+    Noted {
+        note: Note,
+    },
+    /// The notification history changed other than by a note landing — notes
+    /// marked read, the history cleared: the whole of it, oldest first,
+    /// replacing the client's copy.
+    NotesChanged {
+        notes: Vec<Note>,
     },
     /// Someone other than an attached client focused `pane` — a script's
     /// `pane focus`, a notch app's click: the attached client shows it,
@@ -944,6 +1030,16 @@ mod tests {
             offset: 120,
         });
         roundtrip(&Request::PaneFocus { pane: PaneId(2) });
+        roundtrip(&Request::NotesList { unread: true });
+        roundtrip(&Request::NotesRead {
+            up_to: Some(7),
+            pane: Some(PaneId(2)),
+        });
+        roundtrip(&Request::NotesRead {
+            up_to: None,
+            pane: None,
+        });
+        roundtrip(&Request::NotesClear);
         roundtrip(&Request::PaneResizeSplit {
             pane: PaneId(2),
             direction: Direction::Horizontal,
@@ -1064,6 +1160,54 @@ mod tests {
             insertions: 2,
             deletions: 1,
         }
+    }
+
+    fn sample_note() -> Note {
+        Note {
+            id: 12,
+            time: 1_760_000_000,
+            pane: PaneId(3),
+            pane_title: "claude".into(),
+            workspace: "api".into(),
+            kind: NoteKind::Notify,
+            title: Some("build".into()),
+            body: Some("Built".into()),
+            read: false,
+        }
+    }
+
+    /// `tutti --json notes` prints notes as they ride the wire: the kind a
+    /// snake_case word, an absent title or body a `null`.
+    #[test]
+    fn a_note_rides_the_wire_flat_with_a_snake_case_kind() {
+        let bell = Note {
+            kind: NoteKind::Bell,
+            title: None,
+            body: None,
+            read: true,
+            ..sample_note()
+        };
+        assert_eq!(
+            serde_json::to_string(&bell).unwrap(),
+            concat!(
+                r#"{"id":12,"time":1760000000,"pane":3,"pane_title":"claude","workspace":"api","#,
+                r#""kind":"bell","title":null,"body":null,"read":true}"#
+            )
+        );
+        for (kind, word) in [
+            (NoteKind::Notify, r#""notify""#),
+            (NoteKind::Blocked, r#""blocked""#),
+            (NoteKind::Done, r#""done""#),
+        ] {
+            assert_eq!(serde_json::to_string(&kind).unwrap(), word);
+        }
+        assert_eq!(sample_note().text(), "build: Built");
+        assert_eq!(bell.text(), "", "a bell has no text");
+        let body_only = Note {
+            title: None,
+            ..sample_note()
+        };
+        assert_eq!(body_only.text(), "Built");
     }
 
     #[test]
@@ -1253,6 +1397,9 @@ mod tests {
                 sandbox_name: None,
             }],
         });
+        roundtrip(&Response::Notes {
+            notes: vec![sample_note()],
+        });
         roundtrip(&Response::Checkpoints {
             checkpoints: vec![
                 Checkpoint {
@@ -1318,6 +1465,7 @@ mod tests {
             session: "tutti".into(),
             workspaces: sample_view(),
             restorable: None,
+            notes: vec![sample_note()],
         });
         roundtrip(&Response::Attached {
             wire_rev: WIRE_REV,
@@ -1329,6 +1477,7 @@ mod tests {
                 agents: 2,
                 saved_at: 1_760_000_000,
             }),
+            notes: Vec::new(),
         });
     }
 
@@ -1357,6 +1506,24 @@ mod tests {
             title: Some("agent".into()),
             body: Some("ready to merge".into()),
         });
+        roundtrip(&Event::Noted {
+            note: sample_note(),
+        });
+        roundtrip(&Event::NotesChanged {
+            notes: vec![
+                Note {
+                    kind: NoteKind::Blocked,
+                    read: true,
+                    ..sample_note()
+                },
+                Note {
+                    id: 13,
+                    kind: NoteKind::Done,
+                    ..sample_note()
+                },
+            ],
+        });
+        roundtrip(&Event::NotesChanged { notes: Vec::new() });
         roundtrip(&Event::PaneFocused { pane: PaneId(3) });
         roundtrip(&sample_snapshot());
         roundtrip(&Event::Snapshot {
@@ -1699,7 +1866,8 @@ mod tests {
         // A bare `session_restore` restores rather than discards.
         let restore: Request = serde_json::from_str(r#"{"type":"session_restore"}"#).unwrap();
         assert_eq!(restore, Request::SessionRestore { discard: false });
-        // An `attached` from before `restorable` existed offers nothing.
+        // An `attached` from before `restorable` and `notes` existed offers
+        // nothing and has no history.
         let attached: Response = serde_json::from_str(
             r#"{"type":"attached","session":"tutti","workspaces":[],"wire_rev":6}"#,
         )
@@ -1711,6 +1879,19 @@ mod tests {
                 workspaces: Vec::new(),
                 wire_rev: 6,
                 restorable: None,
+                notes: Vec::new(),
+            }
+        );
+        // A bare `notes_list` lists every note; a bare `notes_read` marks
+        // every note read.
+        let list: Request = serde_json::from_str(r#"{"type":"notes_list"}"#).unwrap();
+        assert_eq!(list, Request::NotesList { unread: false });
+        let read: Request = serde_json::from_str(r#"{"type":"notes_read"}"#).unwrap();
+        assert_eq!(
+            read,
+            Request::NotesRead {
+                up_to: None,
+                pane: None,
             }
         );
     }

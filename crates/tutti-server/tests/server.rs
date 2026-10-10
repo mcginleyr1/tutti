@@ -14,8 +14,8 @@ use tokio::time::{sleep, timeout};
 
 use tutti_core::{
     AgentHookEvent, AgentState, ApprovalDecision, Checkpoint, Direction, Event, Frame, Layout,
-    PaneData, PaneDims, PaneId, PaneInfo, PendingApproval, Request, Response, StateSource,
-    SubagentInfo, Tagged, WatchPane, WorkspaceId,
+    Note, NoteKind, PaneData, PaneDims, PaneId, PaneInfo, PendingApproval, Request, Response,
+    StateSource, SubagentInfo, Tagged, WatchPane, WorkspaceId,
 };
 use tutti_server::{PaneSize, serve};
 
@@ -2288,6 +2288,348 @@ async fn agent_event_maintains_subagent_list_with_cap() {
     let subs = pane_subagents(&mut conn, pane).await;
     assert_eq!(subs.len(), 15, "Done sweeps the finished subagent");
     assert!(subs.iter().all(|s| s.running), "only running rows remain");
+
+    server.stop().await;
+}
+
+/// The next note an attached `conn` is told of, skipping every other frame.
+async fn noted(conn: &mut Conn) -> Note {
+    timeout(DEADLINE, async {
+        loop {
+            if let Frame::Control(json) = conn.read_frame().await
+                && let Ok(Event::Noted { note }) = serde_json::from_slice(&json)
+            {
+                return note;
+            }
+        }
+    })
+    .await
+    .expect("no note landed within the deadline")
+}
+
+/// The next whole history an attached `conn` is sent, skipping every other
+/// frame.
+async fn notes_changed(conn: &mut Conn) -> Vec<Note> {
+    timeout(DEADLINE, async {
+        loop {
+            if let Frame::Control(json) = conn.read_frame().await
+                && let Ok(Event::NotesChanged { notes }) = serde_json::from_slice(&json)
+            {
+                return notes;
+            }
+        }
+    })
+    .await
+    .expect("the history was not rebroadcast within the deadline")
+}
+
+/// The history as `notes` lists it: only the unread notes with `unread`.
+async fn list_notes(conn: &mut Conn, unread: bool) -> Vec<Note> {
+    match conn.request(Request::NotesList { unread }).await {
+        Response::Notes { notes } => notes,
+        other => panic!("expected Notes, got {other:?}"),
+    }
+}
+
+/// An interactive shell in a fresh workspace, for `printf_osc` to drive.
+async fn run_shell(conn: &mut Conn) -> PaneId {
+    new_workspace(conn).await;
+    pane_id(
+        conn.request(Request::PaneRun {
+            tab: None,
+            cmd: vec!["/bin/sh".into()],
+            ephemeral: false,
+            sandbox: None,
+        })
+        .await,
+    )
+}
+
+/// A pane's desktop notification and its agent's attention transitions — into
+/// blocked, working to done — land in the history as they happen, each
+/// broadcast as `Noted` and keeping the pane's title and workspace name; a
+/// turn starting wants no attention. A later attach is handed the history.
+#[tokio::test]
+async fn notifications_and_attention_transitions_land_in_the_history() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let pane = run_shell(&mut control).await;
+    let mut viewer = server.connect().await;
+    attach(&mut viewer).await;
+
+    printf_osc(&mut control, pane, "9;tests pass").await;
+    let note = noted(&mut viewer).await;
+    let workspace = std::env::temp_dir();
+    let workspace = workspace.file_name().unwrap().to_string_lossy();
+    assert_eq!(
+        note,
+        Note {
+            id: note.id,
+            time: note.time,
+            pane,
+            pane_title: "sh".into(),
+            workspace: workspace.into_owned(),
+            kind: NoteKind::Notify,
+            title: None,
+            body: Some("tests pass".into()),
+            read: false,
+        }
+    );
+
+    for event in [
+        AgentHookEvent::Activity { detail: None },
+        AgentHookEvent::Blocked { message: None },
+        AgentHookEvent::Activity { detail: None },
+        AgentHookEvent::Done,
+    ] {
+        hook(&mut control, pane, event).await;
+    }
+    assert_eq!(noted(&mut viewer).await.kind, NoteKind::Blocked);
+    assert_eq!(noted(&mut viewer).await.kind, NoteKind::Done);
+
+    let history = list_notes(&mut control, false).await;
+    let kinds: Vec<NoteKind> = history.iter().map(|n| n.kind).collect();
+    assert_eq!(kinds, [NoteKind::Notify, NoteKind::Blocked, NoteKind::Done]);
+    assert!(
+        history.windows(2).all(|w| w[0].id < w[1].id),
+        "ids count up"
+    );
+
+    let mut late = server.connect().await;
+    late.send(&Request::Attach { terminal: None }).await;
+    let caught_up = timeout(DEADLINE, async {
+        loop {
+            if let Frame::Control(json) = late.read_frame().await
+                && let Ok(Response::Attached { notes, .. }) = serde_json::from_slice(&json)
+            {
+                return notes;
+            }
+        }
+    })
+    .await
+    .expect("no Attached reply");
+    assert_eq!(caught_up, history, "an attach carries the whole history");
+
+    server.stop().await;
+}
+
+/// The history keeps the newest 200 notes, the oldest leaving first, and ids
+/// are never reused: not past the cap, and not after a clear.
+#[tokio::test]
+async fn the_history_caps_and_never_reuses_an_id() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let pane = run_shell(&mut conn).await;
+    let burst = Request::PaneSend {
+        pane,
+        text: Some(
+            "i=0; while [ $i -lt 205 ]; do i=$((i+1)); printf '\\033]9;n%d\\007' $i; done\n".into(),
+        ),
+        keys: None,
+        expect: None,
+    };
+    assert_eq!(conn.request(burst).await, Response::Ok);
+    let history = timeout(DEADLINE, async {
+        loop {
+            let notes = list_notes(&mut conn, false).await;
+            if notes
+                .last()
+                .is_some_and(|n| n.body.as_deref() == Some("n205"))
+            {
+                return notes;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the burst never fully landed");
+    assert_eq!(history.len(), 200, "the history caps at 200");
+    assert_eq!(
+        (history[0].id, history[0].body.as_deref()),
+        (6, Some("n6")),
+        "the five oldest left first"
+    );
+    assert_eq!(history[199].id, 205);
+
+    assert_eq!(conn.request(Request::NotesClear).await, Response::Ok);
+    assert!(list_notes(&mut conn, false).await.is_empty());
+    printf_osc(&mut conn, pane, "9;after").await;
+    let after = timeout(DEADLINE, async {
+        loop {
+            if let [note] = list_notes(&mut conn, false).await.as_slice() {
+                return note.clone();
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("no note after the clear");
+    assert_eq!(
+        (after.id, after.body.as_deref()),
+        (206, Some("after")),
+        "ids go on counting past a clear"
+    );
+
+    server.stop().await;
+}
+
+/// Focusing a pane marks its notes read — and only its own — broadcasting the
+/// history so every client agrees.
+#[tokio::test]
+async fn focusing_a_pane_marks_its_notes_read() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let first = run_shell(&mut control).await;
+    let second = run_shell(&mut control).await;
+    let mut viewer = server.connect().await;
+    attach(&mut viewer).await;
+    printf_osc(&mut control, first, "9;one").await;
+    noted(&mut viewer).await;
+    printf_osc(&mut control, second, "9;two").await;
+    noted(&mut viewer).await;
+
+    assert_eq!(
+        control.request(Request::PaneFocus { pane: first }).await,
+        Response::Ok
+    );
+    let read: Vec<(PaneId, bool)> = notes_changed(&mut viewer)
+        .await
+        .iter()
+        .map(|n| (n.pane, n.read))
+        .collect();
+    assert_eq!(read, [(first, true), (second, false)]);
+    let unread = list_notes(&mut control, true).await;
+    assert_eq!(unread.len(), 1);
+    assert_eq!(unread[0].pane, second);
+
+    server.stop().await;
+}
+
+/// `notes read` marks every note, or those up to an id, or one pane's — the
+/// two narrowing together — and `notes clear` empties the history; each is
+/// broadcast whole.
+#[tokio::test]
+async fn reading_and_clearing_the_history_broadcast_it() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let first = run_shell(&mut control).await;
+    let second = run_shell(&mut control).await;
+    let mut viewer = server.connect().await;
+    attach(&mut viewer).await;
+    let mut ids = Vec::new();
+    for (pane, body) in [(first, "one"), (second, "two"), (first, "three")] {
+        printf_osc(&mut control, pane, &format!("9;{body}")).await;
+        ids.push(noted(&mut viewer).await.id);
+    }
+    let read = |up_to, pane| Request::NotesRead { up_to, pane };
+    let flags = |notes: Vec<Note>| notes.iter().map(|n| n.read).collect::<Vec<_>>();
+
+    assert_eq!(
+        control.request(read(Some(ids[0]), None)).await,
+        Response::Ok
+    );
+    assert_eq!(
+        flags(notes_changed(&mut viewer).await),
+        [true, false, false]
+    );
+    // Both narrow: the first pane's notes up to the second id are just the
+    // one already read, so nothing moves and nothing is broadcast — the next
+    // broadcast is the first pane's own read, reaching its third note.
+    let narrowed = read(Some(ids[1]), Some(first));
+    assert_eq!(control.request(narrowed).await, Response::Ok);
+    assert_eq!(control.request(read(None, Some(first))).await, Response::Ok);
+    assert_eq!(flags(notes_changed(&mut viewer).await), [true, false, true]);
+    assert_eq!(control.request(read(None, None)).await, Response::Ok);
+    assert_eq!(flags(notes_changed(&mut viewer).await), [true, true, true]);
+
+    assert_eq!(control.request(Request::NotesClear).await, Response::Ok);
+    assert!(notes_changed(&mut viewer).await.is_empty());
+    assert!(list_notes(&mut control, false).await.is_empty());
+
+    server.stop().await;
+}
+
+/// A bell says nothing but "look": a storm of them from one pane lands one
+/// unread note, and a bell from the pane an attached client is looking at
+/// lands none — while a notification there still lands, already read.
+#[tokio::test]
+async fn bells_land_once_and_never_from_the_pane_in_view() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let pane = run_shell(&mut control).await;
+    let mut viewer = server.connect().await;
+    attach(&mut viewer).await;
+
+    let bells = Request::PaneSend {
+        pane,
+        text: Some("printf '\\a\\a\\a'; printf '\\033]9;storm\\007'\n".into()),
+        keys: None,
+        expect: None,
+    };
+    assert_eq!(control.request(bells).await, Response::Ok);
+    let bell = noted(&mut viewer).await;
+    assert_eq!((bell.kind, bell.read), (NoteKind::Bell, false));
+    assert_eq!(
+        noted(&mut viewer).await.body.as_deref(),
+        Some("storm"),
+        "the two repeat bells landed nothing"
+    );
+
+    // The focus's reply follows its broadcasts and the server noting what
+    // the viewer looks at.
+    viewer.send(&Request::PaneFocus { pane }).await;
+    timeout(DEADLINE, async {
+        loop {
+            if let Frame::Control(json) = viewer.read_frame().await
+                && serde_json::from_slice::<Response>(&json).is_ok_and(|r| r == Response::Ok)
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the focus was never answered");
+    let watched = Request::PaneSend {
+        pane,
+        text: Some("printf '\\a'; printf '\\033]9;watched\\007'\n".into()),
+        keys: None,
+        expect: None,
+    };
+    assert_eq!(control.request(watched).await, Response::Ok);
+    let note = noted(&mut viewer).await;
+    assert_eq!(
+        (note.kind, note.body.as_deref(), note.read),
+        (NoteKind::Notify, Some("watched"), true),
+        "the bell in view landed nothing; the notification landed read"
+    );
+    assert_eq!(list_notes(&mut control, false).await.len(), 3);
+
+    server.stop().await;
+}
+
+/// A herdr reporter's `notification.show` is a notification like any other:
+/// it lands in the history, answered once it has.
+#[tokio::test]
+async fn a_herdr_notification_lands_in_the_history() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let pane = run_sleeper(&mut conn).await;
+    let socket = server.path.with_extension("herdr.sock");
+    let show = serde_json::json!({
+        "id": "n1",
+        "method": "notification.show",
+        "params": {"pane_id": format!("w1:p{pane}"), "title": "crush", "body": "ready"},
+    });
+    assert_eq!(herdr(&socket, show).await["result"]["type"], "ok");
+    let notes = list_notes(&mut conn, false).await;
+    let landed: Vec<_> = notes
+        .iter()
+        .map(|n| (n.pane, n.kind, n.title.as_deref(), n.body.as_deref()))
+        .collect();
+    assert_eq!(
+        landed,
+        [(pane, NoteKind::Notify, Some("crush"), Some("ready"))]
+    );
 
     server.stop().await;
 }

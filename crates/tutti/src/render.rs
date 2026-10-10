@@ -1,4 +1,4 @@
-use tutti_core::{AgentState, Checkpoint, PaneInfo, TabInfo, WorkspaceInfo};
+use tutti_core::{AgentState, Checkpoint, Note, NoteKind, PaneInfo, TabInfo, WorkspaceInfo};
 
 /// Every entry, projects and the workspaces nested under them, each with the
 /// id of the entry it is nested under (`-` for a top-level project).
@@ -83,6 +83,51 @@ pub fn checkpoints(items: &[Checkpoint], now: u64) -> String {
         })
         .collect();
     table(&["N", "AGE", "STAT", "COMMIT", "LABEL"], &rows)
+}
+
+/// The notification history, newest first: id, age, the pane's id and title
+/// and its workspace when the note landed, what it records, `*` while unread,
+/// and last — it runs as long as the notification — its text.
+pub fn notes(items: &[Note], now: u64) -> String {
+    let rows: Vec<Vec<String>> = items
+        .iter()
+        .rev()
+        .map(|n| {
+            vec![
+                n.id.to_string(),
+                age(n.time, now),
+                n.pane.to_string(),
+                n.pane_title.clone(),
+                n.workspace.clone(),
+                note_kind_label(n.kind).to_string(),
+                if n.read { "" } else { "*" }.to_string(),
+                n.text(),
+            ]
+        })
+        .collect();
+    table(
+        &[
+            "ID",
+            "AGE",
+            "PANE",
+            "TITLE",
+            "WORKSPACE",
+            "KIND",
+            "UNREAD",
+            "TEXT",
+        ],
+        &rows,
+    )
+}
+
+/// What a note records, in the words the CLI and the notifications panel use.
+pub(crate) fn note_kind_label(kind: NoteKind) -> &'static str {
+    match kind {
+        NoteKind::Bell => "bell",
+        NoteKind::Notify => "notify",
+        NoteKind::Blocked => "blocked",
+        NoteKind::Done => "done",
+    }
 }
 
 /// A checkpoint's turn stat (`2 files +14 −3`), or `-` for the first state
@@ -299,6 +344,42 @@ mod tests {
             checkpoints(&[turn], 1_000),
             "N   AGE  STAT            COMMIT        LABEL\n\
              #3  now  2 files +14 −3  0fe66d0872aa  fix the failing sidebar test\n"
+        );
+    }
+
+    #[test]
+    fn notes_table_lists_newest_first_marking_the_unread() {
+        let bell = Note {
+            id: 7,
+            time: 1_000,
+            pane: PaneId(3),
+            pane_title: "claude".into(),
+            workspace: "api".into(),
+            kind: NoteKind::Bell,
+            title: None,
+            body: None,
+            read: true,
+        };
+        let built = Note {
+            id: 8,
+            time: 1_000 + 120,
+            pane: PaneId(12),
+            pane_title: "build".into(),
+            workspace: "web".into(),
+            kind: NoteKind::Notify,
+            title: Some("make".into()),
+            body: Some("Built".into()),
+            read: false,
+        };
+        assert_eq!(
+            notes(&[bell, built], 1_000 + 150),
+            "ID  AGE  PANE  TITLE   WORKSPACE  KIND    UNREAD  TEXT\n\
+             8   now  12    build   web        notify  *       make: Built\n\
+             7   2m   3     claude  api        bell\n"
+        );
+        assert_eq!(
+            notes(&[], 0),
+            "ID  AGE  PANE  TITLE  WORKSPACE  KIND  UNREAD  TEXT\n"
         );
     }
 

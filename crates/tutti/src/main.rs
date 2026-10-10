@@ -90,6 +90,17 @@ enum Command {
     /// now and on each change, until the daemon exits. Read-only, beside any
     /// attached TUI; never starts a daemon.
     Watch,
+    /// List the notification history, newest first: bells, desktop
+    /// notifications, and agents that blocked or finished a turn — what
+    /// happened while nobody was looking.
+    #[command(args_conflicts_with_subcommands = true)]
+    Notes {
+        /// List only the notes nobody has read.
+        #[arg(long)]
+        unread: bool,
+        #[command(subcommand)]
+        action: Option<NotesAction>,
+    },
     /// Forward an agent's hook event to tutti (reads its JSON on stdin): a
     /// Claude Code hook payload, or an opencode event from tutti's plugin.
     /// Wired up by `tutti hooks <agent>`; a silent no-op outside a tutti pane.
@@ -170,6 +181,22 @@ enum SandboxAction {
         #[arg(long)]
         name: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum NotesAction {
+    /// Mark notes read: all of them, or only those up to an id, or only one
+    /// pane's — the two narrow together.
+    Read {
+        /// Only the notes up to this id.
+        #[arg(long)]
+        up_to: Option<u64>,
+        /// Only this pane's notes.
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// Empty the history.
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -755,6 +782,14 @@ fn to_request(command: Command) -> Result<Request> {
                 stat,
             },
         }),
+        Command::Notes { unread, action } => Ok(match action {
+            None => Request::NotesList { unread },
+            Some(NotesAction::Read { up_to, pane }) => Request::NotesRead {
+                up_to,
+                pane: pane.map(PaneId),
+            },
+            Some(NotesAction::Clear) => Request::NotesClear,
+        }),
         Command::Tab { action } => Ok(match action {
             TabAction::New { workspace } => Request::TabNew {
                 workspace: workspace.map(WorkspaceId),
@@ -1313,6 +1348,10 @@ fn emit(response: Response, json: bool) -> i32 {
             print!("{}", render::checkpoints(&checkpoints, render::unix_now()));
             0
         }
+        Response::Notes { notes } => {
+            print!("{}", render::notes(&notes, render::unix_now()));
+            0
+        }
         Response::Restored { n, saved } => {
             match saved {
                 Some(saved) => println!("restored to #{n} (the state it replaced is #{saved})"),
@@ -1422,6 +1461,40 @@ mod tests {
             "a project's directory is the user's: there is nothing to discard"
         );
         assert!(Cli::try_parse_from(["tutti", "project", "add"]).is_err());
+    }
+
+    #[test]
+    fn notes_verbs_parse() {
+        assert_eq!(
+            request_of(&["tutti", "notes"]),
+            Request::NotesList { unread: false }
+        );
+        assert_eq!(
+            request_of(&["tutti", "notes", "--unread"]),
+            Request::NotesList { unread: true }
+        );
+        assert_eq!(
+            request_of(&["tutti", "notes", "read", "--up-to", "12", "--pane", "3"]),
+            Request::NotesRead {
+                up_to: Some(12),
+                pane: Some(PaneId(3)),
+            }
+        );
+        assert_eq!(
+            request_of(&["tutti", "notes", "read"]),
+            Request::NotesRead {
+                up_to: None,
+                pane: None,
+            }
+        );
+        assert_eq!(
+            request_of(&["tutti", "notes", "clear"]),
+            Request::NotesClear
+        );
+        assert!(
+            Cli::try_parse_from(["tutti", "notes", "--unread", "clear"]).is_err(),
+            "--unread narrows the listing, not a verb"
+        );
     }
 
     #[test]

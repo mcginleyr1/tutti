@@ -11,10 +11,12 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
+use ratatui::text::Span;
 use tutti_core::{
     AgentKind, AgentState, ApprovalDecision, Checkpoint, DIFF_RANGE, Direction, Event, FileStat,
-    Frame as WireFrame, Layout, PaneDims, PaneId, PaneInfo, Request, Response, RestoreSummary,
-    TabId, TabView, Tagged, WorkspaceId, WorkspaceView, prompt_fingerprint, prompt_rows,
+    Frame as WireFrame, Layout, NOTES_CAP, Note, NoteKind, PaneDims, PaneId, PaneInfo, Request,
+    Response, RestoreSummary, TabId, TabView, Tagged, WorkspaceId, WorkspaceView,
+    prompt_fingerprint, prompt_rows,
 };
 
 use tutti_agents::Registry;
@@ -61,6 +63,10 @@ const MAX_COMPLETIONS: usize = 8;
 /// The peek overlay's narrowest width, so its hint row (answer keys, esc, how
 /// to jump in: 62 columns padded) fits between the borders over a narrow pane.
 const PEEK_MIN_WIDTH: u16 = 64;
+
+/// The notifications panel's widest width — a comfortable reading line; a
+/// narrower terminal takes all but a margin.
+const NOTES_WIDTH: u16 = 100;
 
 /// The setup panel's rows, top to bottom: each integration tutti installs and
 /// the name it goes by there.
@@ -200,6 +206,13 @@ pub enum Mode {
     /// peek; `y` allows, `n` denies, `esc` passes it on to Claude's own
     /// dialog.
     Approval(PaneId),
+    /// The notifications panel: the daemon's history of bells, desktop
+    /// notifications and agents wanting attention, newest first; enter jumps
+    /// to the highlighted note's pane.
+    Notes,
+    /// Confirming a clear of the notification history, raised from its panel
+    /// (`y` clears, anything else cancels).
+    ConfirmClearNotes,
 }
 
 pub struct App {
@@ -353,8 +366,21 @@ pub struct App {
     /// them all.
     old_daemon: bool,
     /// Panes that raised a notification while unfocused; their sidebar entry
-    /// shows a bell mark until the pane is focused.
+    /// shows a bell mark until the pane is focused, or the history says its
+    /// notifications were read.
     notified: HashSet<PaneId>,
+    /// The client's copy of the daemon's notification history, oldest first.
+    notes: Vec<Note>,
+    /// The highlighted note's id while the notifications panel is open, so a
+    /// note landing never slides the highlight onto another; `None` — an
+    /// empty history — highlights the newest.
+    notes_anchor: Option<u64>,
+    /// The terminal area from the last size sync while the notifications
+    /// panel is open, for mouse hit-testing.
+    notes_area: Option<Rect>,
+    /// The app bar's unread-notes chip from the last size sync, for mouse
+    /// hit-testing.
+    notes_chip_rect: Option<Rect>,
     /// Whether the projects / agents / waiting sidebar sections are collapsed to
     /// their header. Toggled by clicking a section header.
     collapsed_projects: bool,
@@ -444,6 +470,10 @@ impl App {
             last_req: 0,
             old_daemon: false,
             notified: HashSet::new(),
+            notes: Vec::new(),
+            notes_anchor: None,
+            notes_area: None,
+            notes_chip_rect: None,
             terminal_out: Vec::new(),
             collapsed_projects: false,
             collapsed_waiting: false,
@@ -543,6 +573,16 @@ impl App {
     /// Whether `pane` has an unseen notification (drives the sidebar bell mark).
     pub fn is_notified(&self, pane: PaneId) -> bool {
         self.notified.contains(&pane)
+    }
+
+    /// The client's copy of the notification history, oldest first.
+    pub fn notes(&self) -> &[Note] {
+        &self.notes
+    }
+
+    /// How many notes nobody has read — the app bar's notes chip.
+    pub fn unread_notes(&self) -> usize {
+        self.notes.iter().filter(|n| !n.read).count()
     }
 
     /// Drain the escape sequences queued for the real terminal — bell and OSC 9
@@ -654,6 +694,24 @@ impl App {
             Event::PaneNotification { pane, title, body } => {
                 self.on_notification(pane, title, body)
             }
+            // Notes land in id order, but one can cross a `NotesChanged` in
+            // flight: a repeat is dropped, a late one slots in by id.
+            Event::Noted { note } => {
+                let at = self.notes.partition_point(|n| n.id < note.id);
+                if self.notes.get(at).is_none_or(|n| n.id != note.id) {
+                    self.notes.insert(at, note);
+                    if self.notes.len() > NOTES_CAP {
+                        self.notes.remove(0);
+                    }
+                }
+            }
+            // A pane whose notifications have all been read, by anyone,
+            // loses its bell mark.
+            Event::NotesChanged { notes } => {
+                let pending = notified_panes(&notes);
+                self.notified.retain(|pane| pending.contains(pane));
+                self.notes = notes;
+            }
             // A script focused `pane` (a notch app's click): show it as an
             // agent-row jump does — its tab, wherever that lives, focused.
             Event::PaneFocused { pane } => {
@@ -729,10 +787,15 @@ impl App {
                 workspaces,
                 wire_rev,
                 restorable,
+                notes,
             } => {
                 self.old_daemon = req.is_none();
                 self.session = session;
                 self.set_view(workspaces);
+                // A reattach catches up on the history — and on the bell
+                // marks of the panes whose notifications nobody has read.
+                self.notified = notified_panes(&notes);
+                self.notes = notes;
                 if wire_rev != tutti_core::WIRE_REV {
                     self.note(format!(
                         "daemon is running an older build (wire rev {wire_rev}, client {}) — `tutti server stop`, reinstall, and reattach",
@@ -942,6 +1005,8 @@ impl App {
                 Vec::new()
             }
             Mode::Approval(pane) => self.on_key_approval(key, pane),
+            Mode::Notes => self.on_key_notes(key),
+            Mode::ConfirmClearNotes => self.on_key_confirm_clear_notes(key),
         }
     }
 
@@ -1098,6 +1163,10 @@ impl App {
             }
             PrefixAction::DiffFiles => {
                 self.focus_diff_panel();
+                Vec::new()
+            }
+            PrefixAction::Notes => {
+                self.open_notes();
                 Vec::new()
             }
             PrefixAction::Run => {
@@ -1465,6 +1534,51 @@ impl App {
         let chips = self.tab_chips();
         let segments: u16 = chips.iter().map(TabChip::width).sum();
         segments + chips.len().saturating_sub(1) as u16
+    }
+
+    /// The app bar's title: `tutti`, plus ` — <session>` when the session is
+    /// named anything else — one named after the binary would read as a
+    /// stutter ("tutti — tutti").
+    pub fn app_title(&self) -> String {
+        if self.session.is_empty() || self.session == "tutti" {
+            "tutti".to_string()
+        } else {
+            format!("tutti — {}", self.session)
+        }
+    }
+
+    /// The agent-state census after the app-bar title: one `(state, text)`
+    /// chip per state with agents in it, blocked first — each drawn after a
+    /// three-column separator and its one-column state dot.
+    pub fn census_chips(&self) -> Vec<(AgentState, String)> {
+        let counts = self.agent_census();
+        [
+            (counts.blocked, AgentState::Blocked, "blocked"),
+            (counts.working, AgentState::Working, "working"),
+            (counts.done, AgentState::Done, "done"),
+        ]
+        .into_iter()
+        .filter(|(count, ..)| *count > 0)
+        .map(|(count, state, label)| (state, format!(" {count} {label}")))
+        .collect()
+    }
+
+    /// The unread-notes chip closing the app-bar census — the bell and the
+    /// unread count — and the cells it covers on the `app_bar` row: past the
+    /// accent bar, the title, each census chip and its own separator. The
+    /// renderer draws it there and a click there opens the notifications
+    /// panel.
+    pub fn notes_chip(&self, app_bar: Rect) -> (String, Rect) {
+        let text = format!("🔔 {}", self.unread_notes());
+        let census: usize = self
+            .census_chips()
+            .iter()
+            .map(|(_, chip)| 4 + Span::raw(chip.as_str()).width())
+            .sum();
+        let offset = 1 + Span::raw(self.app_title()).width() + census + 3;
+        let x = app_bar.x.saturating_add(offset as u16).min(app_bar.right());
+        let width = (Span::raw(text.as_str()).width() as u16).min(app_bar.right() - x);
+        (text, Rect::new(x, app_bar.y, width, 1))
     }
 
     /// Focus the sidebar, revealing it if hidden. Refuses when the terminal is
@@ -2980,6 +3094,153 @@ impl App {
         &self.navigate_query
     }
 
+    // ---- notifications panel --------------------------------------------
+
+    /// Open the notifications panel on the newest note.
+    fn open_notes(&mut self) {
+        self.mode = Mode::Notes;
+        self.notes_anchor = self.notes.last().map(|n| n.id);
+        self.prefix_since = None;
+        self.status = None;
+    }
+
+    /// Keys in the notifications panel: `j`/`k`/`↑`/`↓` walk the highlight,
+    /// enter jumps to the note's pane, `r` marks every note listed read, `X`
+    /// asks to clear the history, esc closes. The prefix chord still reaches
+    /// across, closing the panel into prefix mode.
+    fn on_key_notes(&mut self, key: KeyEvent) -> Vec<WireFrame> {
+        if self.enter_prefix(key) {
+            return Vec::new();
+        }
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.notes_step(true),
+            KeyCode::Char('k') | KeyCode::Up => self.notes_step(false),
+            KeyCode::Enter => return self.jump_to_note(self.notes_selected()),
+            // Up to the newest note shown, never one still on its way.
+            KeyCode::Char('r') => {
+                if let Some(newest) = self.notes.last() {
+                    return vec![control(&Request::NotesRead {
+                        up_to: Some(newest.id),
+                        pane: None,
+                    })];
+                }
+            }
+            KeyCode::Char('X') if !self.notes.is_empty() => {
+                self.mode = Mode::ConfirmClearNotes;
+                self.set_status("clear all notifications? y/N".into());
+            }
+            KeyCode::Esc => {
+                self.mode = Mode::Terminal;
+                self.status = None;
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    /// Resolve the clear confirm: `y` empties the history, anything else
+    /// keeps it. Either way the panel stays open.
+    fn on_key_confirm_clear_notes(&mut self, key: KeyEvent) -> Vec<WireFrame> {
+        self.mode = Mode::Notes;
+        self.status = None;
+        match key.code {
+            KeyCode::Char('y' | 'Y') => vec![control(&Request::NotesClear)],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Walk the panel's highlight one note older (down) or newer (up); it
+    /// stays put at either end.
+    fn notes_step(&mut self, older: bool) {
+        let at = self.notes_selected();
+        let next = if older { at + 1 } else { at.saturating_sub(1) };
+        if let Some(note) = self.notes.iter().rev().nth(next) {
+            self.notes_anchor = Some(note.id);
+        }
+    }
+
+    /// The highlighted panel row, newest first: the anchored note's while it
+    /// is listed, else the newest's.
+    pub fn notes_selected(&self) -> usize {
+        self.notes_anchor
+            .and_then(|id| self.notes.iter().rev().position(|n| n.id == id))
+            .unwrap_or(0)
+    }
+
+    /// Jump to the pane of the note on panel row `row` (newest first) — the
+    /// go-to jump, so focus follows — and mark that pane's notes read. A note
+    /// whose pane is gone flashes so instead, the panel staying open.
+    fn jump_to_note(&mut self, row: usize) -> Vec<WireFrame> {
+        let Some(pane) = self.notes.iter().rev().nth(row).map(|n| n.pane) else {
+            return Vec::new();
+        };
+        let Some(tab) = self.tab_of_pane(pane) else {
+            self.set_status("that pane is gone".into());
+            return Vec::new();
+        };
+        let mut frames = self.jump_to(tab, Some(pane));
+        frames.push(control(&Request::NotesRead {
+            up_to: None,
+            pane: Some(pane),
+        }));
+        frames
+    }
+
+    /// A left-click while the notifications panel is open: on a note, jump
+    /// to its pane; outside the panel, close it; on its border or hint row,
+    /// nothing.
+    fn notes_click(&mut self, col: u16, row: u16) -> Vec<WireFrame> {
+        let Some((popup, list, first)) = self.notes_area.and_then(|area| self.notes_popup(area))
+        else {
+            return Vec::new();
+        };
+        if !contains(popup, col, row) {
+            self.mode = Mode::Terminal;
+            self.status = None;
+            return Vec::new();
+        }
+        let at = first + row.saturating_sub(list.y) as usize;
+        let clicked = self.notes.iter().rev().nth(at).map(|n| n.id);
+        match clicked {
+            Some(id) if contains(list, col, row) => {
+                self.notes_anchor = Some(id);
+                self.jump_to_note(at)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The notifications panel while it is open: the popup centred in the
+    /// terminal `area` — a reading width, as tall as its notes need between
+    /// the app bar and the notification band — the rect its rows draw in
+    /// (inside the border, above the hint row), and the first row shown,
+    /// newest first: 0 until the highlight would leave the window, then
+    /// following it. The one geometry the renderer and the mouse hit-test
+    /// share.
+    pub fn notes_popup(&self, area: Rect) -> Option<(Rect, Rect, usize)> {
+        if !matches!(self.mode, Mode::Notes | Mode::ConfirmClearNotes) {
+            return None;
+        }
+        let width = area.width.saturating_sub(4).min(NOTES_WIDTH);
+        let height = (self.notes.len().max(1) as u16 + 3).min(area.height.saturating_sub(4));
+        let popup = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
+        let list = Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            width.saturating_sub(2),
+            height.saturating_sub(3),
+        );
+        let first = self
+            .notes_selected()
+            .saturating_sub((list.height as usize).saturating_sub(1));
+        Some((popup, list, first))
+    }
+
     // ---- mouse ----------------------------------------------------------
 
     /// Handle a mouse event, returning frames to send to the server.
@@ -3012,6 +3273,20 @@ impl App {
                     Mode::Approval(_) => self.approval_back,
                     _ => Mode::Sidebar,
                 };
+            }
+            return Vec::new();
+        }
+        // The notifications panel is modal too: a click on a note jumps to
+        // its pane and the wheel walks the highlight — its clear confirm is
+        // answered from the keyboard — and nothing reaches what lies beneath.
+        if matches!(self.mode, Mode::Notes | Mode::ConfirmClearNotes) {
+            match kind {
+                MouseEventKind::Down(MouseButton::Left) if self.mode == Mode::Notes => {
+                    return self.notes_click(col, row);
+                }
+                MouseEventKind::ScrollDown => self.notes_step(true),
+                MouseEventKind::ScrollUp => self.notes_step(false),
+                _ => {}
             }
             return Vec::new();
         }
@@ -3055,6 +3330,9 @@ impl App {
                 }
                 if self.tab_bar_rect.is_some_and(|r| contains(r, col, row)) {
                     return self.tab_bar_click(col);
+                }
+                if self.notes_chip_rect.is_some_and(|r| contains(r, col, row)) {
+                    self.open_notes();
                 }
                 Vec::new()
             }
@@ -3511,11 +3789,13 @@ impl App {
         self.sidebar_rect = sidebar_rect;
         self.diff_panel_rect = diff_panel_rect;
         self.tab_bar_rect = Some(self.tab_bar_rect(app_bar));
+        self.notes_chip_rect = Some(self.notes_chip(app_bar).1);
         self.peek_rect = self
             .peek_popup(area)
             .map(|(_, rect, _)| rect)
             .or_else(|| self.approval_popup(area).map(|(_, rect, _)| rect));
         self.navigate_rect = (self.mode == Mode::Navigate).then_some(content);
+        self.notes_area = self.notes_popup(area).map(|_| area);
         self.rects = self.compute_rects(content);
         let zoom = if self.zoom { self.focused } else { None };
         self.boundaries = self
@@ -4029,6 +4309,16 @@ fn notification_text(title: Option<String>, body: Option<String>) -> Option<Stri
     }
 }
 
+/// The panes holding an unread bell or desktop notification in `notes` — the
+/// ones the sidebar's bell marks catch up to.
+fn notified_panes(notes: &[Note]) -> HashSet<PaneId> {
+    notes
+        .iter()
+        .filter(|n| !n.read && matches!(n.kind, NoteKind::Bell | NoteKind::Notify))
+        .map(|n| n.pane)
+        .collect()
+}
+
 /// An OSC 9 desktop-notification escape carrying `text`, BEL-terminated.
 fn osc9(text: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(text.len() + 4);
@@ -4348,6 +4638,7 @@ mod tests {
                 session: "tutti".into(),
                 workspaces: view_one_pane(),
                 restorable: None,
+                notes: Vec::new(),
             },
         ));
     }
@@ -4621,6 +4912,7 @@ mod tests {
                 session: "t".into(),
                 workspaces: view_one_pane(),
                 restorable: None,
+                notes: Vec::new(),
             })
             .unwrap(),
         ));
@@ -4748,6 +5040,7 @@ mod tests {
                 session: "t".into(),
                 workspaces: view_two_panes(),
                 restorable: None,
+                notes: Vec::new(),
             })
             .unwrap(),
         ));
@@ -4823,6 +5116,7 @@ mod tests {
                 session: "t".into(),
                 workspaces,
                 restorable: None,
+                notes: Vec::new(),
             },
         ));
     }
@@ -6967,6 +7261,7 @@ mod tests {
                 session: "t".into(),
                 workspaces: view,
                 restorable: None,
+                notes: Vec::new(),
             })
             .unwrap(),
         ));
@@ -7391,6 +7686,7 @@ mod tests {
                 workspaces: Vec::new(),
                 wire_rev: 0,
                 restorable: None,
+                notes: Vec::new(),
             },
         );
         let warning = app.transient().unwrap_or_default().to_string();
@@ -7489,6 +7785,7 @@ mod tests {
                     agents: 2,
                     saved_at: 0,
                 }),
+                notes: Vec::new(),
             })
             .unwrap(),
         ));
@@ -8496,6 +8793,276 @@ mod tests {
     #[test]
     fn osc9_wraps_text_in_the_escape() {
         assert_eq!(osc9("hi"), b"\x1b]9;hi\x07".to_vec());
+    }
+
+    // ---- notifications panel ----------------------------------------------
+
+    fn note(id: u64, pane: u64, kind: NoteKind) -> Note {
+        Note {
+            id,
+            time: 0,
+            pane: PaneId(pane),
+            pane_title: format!("pane-{pane}"),
+            workspace: "web".into(),
+            kind,
+            title: None,
+            body: None,
+            read: false,
+        }
+    }
+
+    /// Attach to `view_two_workspaces` — the shell pane 1 focused, web's
+    /// agents 2 and 3 in tab 2 — with `notes` in the history.
+    fn attach_noting(app: &mut App, notes: Vec<Note>) {
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Response::Attached {
+                wire_rev: tutti_core::WIRE_REV,
+                session: "t".into(),
+                workspaces: view_two_workspaces(),
+                restorable: None,
+                notes,
+            })
+            .unwrap(),
+        ));
+    }
+
+    fn event(app: &mut App, event: Event) {
+        app.handle_frame(WireFrame::Control(serde_json::to_vec(&event).unwrap()));
+    }
+
+    fn shift(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT)
+    }
+
+    fn open_notes(app: &mut App) {
+        app.on_key(ctrl('b'));
+        assert!(app.on_key(shift('N')).is_empty());
+        assert_eq!(app.mode, Mode::Notes);
+    }
+
+    #[test]
+    fn prefix_shift_n_opens_the_notifications_panel_in_both_presets() {
+        for config in [Config::default(), vim_config()] {
+            let mut app = App::with_config(config);
+            attach_noting(&mut app, vec![note(1, 2, NoteKind::Done)]);
+            open_notes(&mut app);
+            app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert_eq!(app.mode, Mode::Terminal, "esc closes it");
+        }
+    }
+
+    #[test]
+    fn the_panel_lists_newest_first_and_enter_jumps_to_the_notes_pane() {
+        let mut app = App::new();
+        attach_noting(
+            &mut app,
+            vec![
+                note(1, 2, NoteKind::Done),
+                note(2, 3, NoteKind::Blocked),
+                note(3, 1, NoteKind::Bell),
+            ],
+        );
+        open_notes(&mut app);
+        assert_eq!(app.notes_selected(), 0, "the newest note is highlighted");
+        app.on_key(plain('j'));
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.on_key(plain('j'));
+        assert_eq!(app.notes_selected(), 2, "the highlight stops at the oldest");
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            out,
+            vec![
+                control(&Request::TabSelect { id: TabId(2) }),
+                control(&Request::NotesRead {
+                    up_to: None,
+                    pane: Some(PaneId(3)),
+                }),
+            ],
+            "the jump goes to the blocked agent, marking its pane's notes read"
+        );
+        assert_eq!(app.mode, Mode::Terminal);
+        assert_eq!(app.focused, Some(PaneId(3)));
+    }
+
+    #[test]
+    fn r_reads_up_to_the_newest_note_and_x_clears_after_asking() {
+        let mut app = App::new();
+        attach_noting(
+            &mut app,
+            vec![note(4, 2, NoteKind::Done), note(9, 3, NoteKind::Notify)],
+        );
+        open_notes(&mut app);
+        assert_eq!(
+            app.on_key(plain('r')),
+            vec![control(&Request::NotesRead {
+                up_to: Some(9),
+                pane: None,
+            })]
+        );
+        assert_eq!(app.mode, Mode::Notes, "the panel stays open");
+
+        app.on_key(shift('X'));
+        assert_eq!(app.mode, Mode::ConfirmClearNotes);
+        assert_eq!(app.transient(), Some("clear all notifications? y/N"));
+        assert!(app.on_key(plain('n')).is_empty(), "anything else keeps it");
+        assert_eq!(app.mode, Mode::Notes);
+        app.on_key(shift('X'));
+        assert_eq!(app.on_key(plain('y')), vec![control(&Request::NotesClear)]);
+        assert_eq!(app.mode, Mode::Notes);
+    }
+
+    #[test]
+    fn a_note_whose_pane_is_gone_stays_listed_and_enter_says_so() {
+        let mut app = App::new();
+        attach_noting(&mut app, vec![note(1, 99, NoteKind::Done)]);
+        open_notes(&mut app);
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(out.is_empty());
+        assert_eq!(app.transient(), Some("that pane is gone"));
+        assert_eq!(app.mode, Mode::Notes, "the panel stays open on it");
+        assert_eq!(app.notes().len(), 1);
+    }
+
+    #[test]
+    fn the_highlight_keeps_its_note_as_new_ones_land() {
+        let mut app = App::new();
+        attach_noting(
+            &mut app,
+            vec![note(1, 2, NoteKind::Done), note(2, 3, NoteKind::Blocked)],
+        );
+        open_notes(&mut app);
+        app.on_key(plain('j'));
+        event(
+            &mut app,
+            Event::Noted {
+                note: note(3, 1, NoteKind::Bell),
+            },
+        );
+        assert_eq!(app.notes_selected(), 2, "pushed down with its note");
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            out[1],
+            control(&Request::NotesRead {
+                up_to: None,
+                pane: Some(PaneId(2)),
+            })
+        );
+    }
+
+    #[test]
+    fn the_census_chip_opens_the_panel_whose_notes_click_through() {
+        let mut app = App::new();
+        attach_noting(
+            &mut app,
+            vec![note(1, 2, NoteKind::Done), note(2, 3, NoteKind::Blocked)],
+        );
+        let area = Rect::new(0, 0, 100, 24);
+        app.sync_sizes(area);
+        let (_, chip) = app.notes_chip(App::header_rects(area).0);
+        let down = MouseEventKind::Down(MouseButton::Left);
+        assert!(app.on_mouse(down, chip.x + 1, chip.y).is_empty());
+        assert_eq!(app.mode, Mode::Notes);
+
+        app.sync_sizes(area);
+        let (popup, list, _) = app.notes_popup(area).unwrap();
+        app.on_mouse(MouseEventKind::ScrollDown, list.x, list.y);
+        assert_eq!(app.notes_selected(), 1, "the wheel walks the highlight");
+        let out = app.on_mouse(down, list.x + 4, list.y + 1);
+        assert_eq!(
+            out.first(),
+            Some(&control(&Request::TabSelect { id: TabId(2) })),
+            "a click on the older note jumps to pane 2"
+        );
+        assert_eq!(app.focused, Some(PaneId(2)));
+
+        app.on_mouse(down, chip.x, chip.y);
+        app.sync_sizes(area);
+        assert!(app.on_mouse(down, popup.x - 1, popup.y).is_empty());
+        assert_eq!(
+            app.mode,
+            Mode::Terminal,
+            "a press outside closes it, reaching nothing beneath"
+        );
+    }
+
+    #[test]
+    fn a_note_lands_once_in_id_order_and_the_copy_caps_like_the_daemons() {
+        let mut app = App::new();
+        attach_noting(&mut app, Vec::new());
+        for id in [1, 3, 2, 3] {
+            event(
+                &mut app,
+                Event::Noted {
+                    note: note(id, 2, NoteKind::Notify),
+                },
+            );
+        }
+        let ids: Vec<u64> = app.notes().iter().map(|n| n.id).collect();
+        assert_eq!(ids, [1, 2, 3], "a late note slots in, a repeat is dropped");
+        for id in 4..=NOTES_CAP as u64 + 2 {
+            event(
+                &mut app,
+                Event::Noted {
+                    note: note(id, 2, NoteKind::Notify),
+                },
+            );
+        }
+        assert_eq!(app.notes().len(), NOTES_CAP);
+        assert_eq!(app.notes()[0].id, 3, "the oldest left first");
+        assert_eq!(app.unread_notes(), NOTES_CAP);
+    }
+
+    #[test]
+    fn a_rebroadcast_history_clears_the_marks_of_panes_read_elsewhere() {
+        let mut app = App::new();
+        attach_noting(&mut app, Vec::new());
+        notify(&mut app, PaneId(2), None, Some("built"));
+        notify(&mut app, PaneId(3), None, None);
+        let built = Note {
+            body: Some("built".into()),
+            ..note(1, 2, NoteKind::Notify)
+        };
+        let mut notes = vec![built, note(2, 3, NoteKind::Bell)];
+        for note in &notes {
+            event(&mut app, Event::Noted { note: note.clone() });
+        }
+        assert!(app.is_notified(PaneId(2)) && app.is_notified(PaneId(3)));
+
+        // Pane 2's notes were read — by another client, or a script.
+        notes[0].read = true;
+        event(&mut app, Event::NotesChanged { notes });
+        assert!(!app.is_notified(PaneId(2)), "its mark follows the history");
+        assert!(app.is_notified(PaneId(3)), "pane 3's bell is still unread");
+        assert_eq!(app.unread_notes(), 1);
+
+        event(&mut app, Event::NotesChanged { notes: Vec::new() });
+        assert!(
+            !app.is_notified(PaneId(3)),
+            "a clear leaves nothing pending"
+        );
+        assert!(app.notes().is_empty());
+    }
+
+    #[test]
+    fn an_attach_catches_up_on_the_history_and_its_unread_marks() {
+        let mut app = App::new();
+        let read = Note {
+            read: true,
+            ..note(1, 2, NoteKind::Notify)
+        };
+        attach_noting(
+            &mut app,
+            vec![read, note(2, 3, NoteKind::Bell), note(3, 2, NoteKind::Done)],
+        );
+        assert_eq!(app.notes().len(), 3);
+        assert_eq!(app.unread_notes(), 2);
+        assert!(app.is_notified(PaneId(3)), "an unread bell marks its pane");
+        assert!(
+            !app.is_notified(PaneId(2)),
+            "a read notification marks nothing, and a done is no notification"
+        );
     }
 
     // ---- add-project prompt: prefill and completion -----------------------

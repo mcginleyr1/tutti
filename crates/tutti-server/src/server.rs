@@ -28,8 +28,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tutti_agents::{ProcessTree, Registry};
 use tutti_core::{
     AgentHookEvent, AgentKind, AgentState, ApprovalDecision, Checkpoint, Direction, Event, Frame,
-    Observation, PaneData, PaneDims, PaneId, PaneInfo, Request, Response, StateEvent, Tagged,
-    WaitFor, WorkspaceId, prompt_fingerprint,
+    NOTES_CAP, Note, NoteKind, Observation, PaneData, PaneDims, PaneId, PaneInfo, Request,
+    Response, StateEvent, Tagged, WaitFor, WorkspaceId, prompt_fingerprint,
 };
 
 use crate::herdr;
@@ -153,6 +153,16 @@ pub struct Hub {
     /// Each held approval's way back to the hook holding it, by approval id:
     /// an answer sends its decision down the channel.
     approvals: Mutex<HashMap<u64, oneshot::Sender<ApprovalDecision>>>,
+    /// The notification history, for clients that missed a note to catch up.
+    notes: Mutex<Notes>,
+}
+
+/// The notification history: the newest `NOTES_CAP` notes, oldest first, and
+/// the last id handed out — ids only grow, across a clear too.
+#[derive(Default)]
+struct Notes {
+    ring: Vec<Note>,
+    last: u64,
 }
 
 /// One workspace's VCS-watch state: `mark` is the op-heads mtime as of the last
@@ -189,6 +199,10 @@ impl Hub {
 
     fn approvals(&self) -> MutexGuard<'_, HashMap<u64, oneshot::Sender<ApprovalDecision>>> {
         lock(&self.approvals)
+    }
+
+    fn notes(&self) -> MutexGuard<'_, Notes> {
+        lock(&self.notes)
     }
 }
 
@@ -251,6 +265,7 @@ pub async fn serve(
         vcs: Mutex::new(HashMap::new()),
         signals: broadcast::channel(SIGNAL_CAP).0,
         state,
+        notes: Mutex::new(Notes::default()),
         approvals: Mutex::new(HashMap::new()),
     });
 
@@ -548,6 +563,7 @@ fn handle_frame(
                     },
                 );
                 let workspaces = hub.session().view();
+                let notes = hub.notes().ring.clone();
                 let attached = reply.encode(&Response::Attached {
                     session: hub.name.clone(),
                     workspaces,
@@ -556,6 +572,7 @@ fn handle_frame(
                         .state
                         .as_deref()
                         .and_then(|dir| persist::summary(dir, &hub.name)),
+                    notes,
                 });
                 let flow = send_reply(hub, cid, tx, attached);
                 if flow.is_continue()
@@ -897,6 +914,26 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
                 },
             }
         }
+        Request::NotesList { unread } => Response::Notes {
+            notes: hub
+                .notes()
+                .ring
+                .iter()
+                .filter(|n| !(unread && n.read))
+                .cloned()
+                .collect(),
+        },
+        Request::NotesRead { up_to, pane } => {
+            mark_read(hub, |n| {
+                up_to.is_none_or(|id| n.id <= id) && pane.is_none_or(|p| n.pane == p)
+            });
+            Response::Ok
+        }
+        Request::NotesClear => {
+            hub.notes().ring.clear();
+            broadcast_event(hub, Event::NotesChanged { notes: Vec::new() });
+            Response::Ok
+        }
         // Handled in `handle_frame`; unreachable here.
         Request::Attach { .. }
         | Request::Detach
@@ -964,11 +1001,11 @@ fn split_ratio(hub: &Arc<Hub>, a: PaneId, b: PaneId, ratio: f32) -> Response {
 }
 
 /// Focus a pane: record it active and apply a `Focused` state event, flipping a
-/// `Done` pane to `Idle` (marked seen). Broadcasts the transition if it changed
-/// — and the view, when that settles a self-reported pane out of the agent
-/// surfaces. An attached client's focus is recorded as what it shows; anyone
-/// else's (a script, a notch app's click) is relayed as `PaneFocused`, so the
-/// attached client jumps there.
+/// `Done` pane to `Idle` (marked seen), and mark its notes read. Broadcasts the
+/// transition if it changed — and the view, when that settles a self-reported
+/// pane out of the agent surfaces. An attached client's focus is recorded as
+/// what it shows; anyone else's (a script, a notch app's click) is relayed as
+/// `PaneFocused`, so the attached client jumps there.
 fn focus_pane(hub: &Arc<Hub>, cid: u64, pane: PaneId) -> Response {
     let mut session = hub.session();
     if session.set_active_pane(pane).is_err() {
@@ -985,6 +1022,7 @@ fn focus_pane(hub: &Arc<Hub>, cid: u64, pane: PaneId) -> Response {
         broadcast_event(hub, Event::LayoutChanged { workspaces: view });
     }
     publish_transition(hub, pane, from, to);
+    mark_read(hub, |n| n.pane == pane);
     let attached = match hub.clients().get_mut(&cid) {
         Some(client) => {
             client.focused = Some(pane);
@@ -999,12 +1037,14 @@ fn focus_pane(hub: &Arc<Hub>, cid: u64, pane: PaneId) -> Response {
 }
 
 /// Publish one pane's state transition — the single funnel every transition
-/// source goes through, so each one gets checkpoints and waiters for free:
-/// broadcast `StateChanged`, signal the `pane wait`s, and note the turn edge on
-/// the pane (leaving `Working` ends a turn; entering it with nothing recorded
-/// takes the baseline). The caller then refreshes the pane's workspace
-/// (batched per pass where it can): that probe's snapshot of `@` is what gets
-/// recorded. A no-op when `from == to`.
+/// source goes through, so each one gets checkpoints, waiters and the
+/// notification history for free: broadcast `StateChanged`, signal the `pane
+/// wait`s, note the turn edge on the pane (leaving `Working` ends a turn;
+/// entering it with nothing recorded takes the baseline), and note one that
+/// wants attention — into `Blocked`, or `Working` → `Done` — in the history.
+/// The caller then refreshes the pane's workspace (batched per pass where it
+/// can): that probe's snapshot of `@` is what gets recorded. A no-op when
+/// `from == to`.
 fn publish_transition(hub: &Hub, pane: PaneId, from: AgentState, to: AgentState) {
     if from == to {
         return;
@@ -1012,6 +1052,97 @@ fn publish_transition(hub: &Hub, pane: PaneId, from: AgentState, to: AgentState)
     hub.session().note_transition(pane, from, to);
     broadcast_event(hub, Event::StateChanged { pane, from, to });
     let _ = hub.signals.send(PaneSignal::Moved { pane, from, to });
+    let kind = match (from, to) {
+        (_, AgentState::Blocked) => NoteKind::Blocked,
+        (AgentState::Working, AgentState::Done) => NoteKind::Done,
+        _ => return,
+    };
+    add_note(hub, pane, kind, None, None);
+}
+
+/// Note a pane's bell or desktop notification in the history, then broadcast
+/// it — in that order, so a client attaching in between finds the note in the
+/// history it is handed.
+fn pane_notification(hub: &Hub, pane: PaneId, title: Option<String>, body: Option<String>) {
+    let kind = if title.is_none() && body.is_none() {
+        NoteKind::Bell
+    } else {
+        NoteKind::Notify
+    };
+    add_note(hub, pane, kind, title.clone(), body.clone());
+    broadcast_event(hub, Event::PaneNotification { pane, title, body });
+}
+
+/// Record a note about `pane` in the history and broadcast it as `Noted`. It
+/// keeps the pane's title and workspace name as they are now, so it outlives
+/// the pane. A note about a pane an attached client is looking at lands read —
+/// and a bell there, which says nothing more, lands not at all; nor does a
+/// bell repeating its pane's newest note, an unread bell, so a bell storm
+/// cannot flush the history. Each lock is taken and released on its own.
+fn add_note(hub: &Hub, pane: PaneId, kind: NoteKind, title: Option<String>, body: Option<String>) {
+    // Read straight off the model, as a watcher's snapshot is.
+    let names = hub
+        .session()
+        .watch_panes(None)
+        .into_iter()
+        .find(|p| p.id == pane);
+    let Some(names) = names else {
+        return;
+    };
+    let seen = hub.clients().values().any(|c| c.focused == Some(pane));
+    let bell = kind == NoteKind::Bell;
+    if bell && seen {
+        return;
+    }
+    let note = {
+        let mut notes = hub.notes();
+        let repeat = notes
+            .ring
+            .iter()
+            .rev()
+            .find(|n| n.pane == pane)
+            .is_some_and(|n| n.kind == NoteKind::Bell && !n.read);
+        if bell && repeat {
+            return;
+        }
+        notes.last += 1;
+        let note = Note {
+            id: notes.last,
+            time: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+            pane,
+            pane_title: names.title,
+            workspace: names.workspace,
+            kind,
+            title,
+            body,
+            read: seen,
+        };
+        notes.ring.push(note.clone());
+        if notes.ring.len() > NOTES_CAP {
+            notes.ring.remove(0);
+        }
+        note
+    };
+    broadcast_event(hub, Event::Noted { note });
+}
+
+/// Mark the notes `which` picks read and, when any of them was unread,
+/// broadcast the history so every client agrees.
+fn mark_read(hub: &Hub, which: impl Fn(&Note) -> bool) {
+    let notes = {
+        let mut notes = hub.notes();
+        let mut moved = false;
+        for note in notes.ring.iter_mut().filter(|n| !n.read && which(n)) {
+            note.read = true;
+            moved = true;
+        }
+        moved.then(|| notes.ring.clone())
+    };
+    if let Some(notes) = notes {
+        broadcast_event(hub, Event::NotesChanged { notes });
+    }
 }
 
 /// Fold a program's own status report (OSC 9;4 / 7501, pulled from `pane`'s
@@ -1038,8 +1169,7 @@ fn herdr_request(hub: &Arc<Hub>, request: herdr::Request) -> bool {
         herdr::Request::Notify { pane, title, body } => {
             let known = hub.session().pane_state(pane).is_some();
             if known {
-                let title = Some(title);
-                broadcast_event(hub, Event::PaneNotification { pane, title, body });
+                pane_notification(hub, pane, Some(title), body);
             }
             known
         }
@@ -1067,14 +1197,7 @@ fn publish_report(hub: &Arc<Hub>, pane: PaneId, outcome: ReportOutcome) {
         refresh_pane_workspace(hub, pane);
     }
     if let Some((title, body)) = outcome.notify {
-        broadcast_event(
-            hub,
-            Event::PaneNotification {
-                pane,
-                title,
-                body: Some(body),
-            },
-        );
+        pane_notification(hub, pane, title, Some(body));
     }
 }
 
@@ -2165,20 +2288,14 @@ fn broadcast_tick(hub: &Arc<Hub>) {
     let panes = hub.session().live_panes();
 
     // Drain each pane's bells/notifications every tick so the queues stay
-    // bounded even with nobody attached; `broadcast_event` is a no-op then.
-    // Status reports ride the same queue, so a program's word lands within a
-    // tick, in stream order with the notifications around it.
+    // bounded even with nobody attached; `broadcast_event` is a no-op then,
+    // but the history still records them. Status reports ride the same
+    // queue, so a program's word lands within a tick, in stream order with
+    // the notifications around it.
     for (pane, pty) in &panes {
         for signal in pty.take_notifications() {
             match signal {
-                Signal::Notify(note) => broadcast_event(
-                    hub,
-                    Event::PaneNotification {
-                        pane: *pane,
-                        title: note.title,
-                        body: note.body,
-                    },
-                ),
+                Signal::Notify(note) => pane_notification(hub, *pane, note.title, note.body),
                 Signal::Status(report) => program_status(hub, *pane, report),
             }
         }
