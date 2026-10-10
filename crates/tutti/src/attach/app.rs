@@ -842,18 +842,25 @@ impl App {
         if let Some(action) = self.config.keys.action_for(key) {
             return self.direct_action(action);
         }
-        // An exited pane has no child to type at; the two keys its title
-        // advertises act on the corpse instead: relaunch or close.
+        // An exited pane has no child to type at; the keys its title
+        // advertises act on the corpse instead: relaunch, pull a sandbox's
+        // pushed work, or close.
         if let Some(pane) = self.focused
             && key.modifiers.is_empty()
-            && self
-                .panes
-                .get(&pane)
-                .is_some_and(|s| s.info.exited.is_some())
+            && let Some(state) = self.panes.get(&pane)
+            && state.info.exited.is_some()
         {
-            match key.code {
-                KeyCode::Char('r') => return self.relaunch_exited(pane),
-                KeyCode::Char('x') => return vec![control(&Request::PaneKill { pane })],
+            match (key.code, state.info.sandbox_name.clone()) {
+                (KeyCode::Char('r'), _) => return self.relaunch_exited(pane),
+                (KeyCode::Char('p'), Some(sandbox)) => {
+                    // The reply lands as guided create's does: a jump to the
+                    // new workspace and the launcher over it.
+                    self.fork_pending = true;
+                    let branch = tutti_core::sandbox_branch(&sandbox);
+                    self.set_status(format!("pulling {branch}…"));
+                    return vec![control(&Request::SandboxPull { pane, name: None })];
+                }
+                (KeyCode::Char('x'), _) => return vec![control(&Request::PaneKill { pane })],
                 _ => {}
             }
         }
@@ -4020,6 +4027,7 @@ fn placeholder_info(pane: PaneId) -> PaneInfo {
         source: None,
         sandbox: None,
         conversation: None,
+        sandbox_name: None,
     }
 }
 
@@ -7581,6 +7589,52 @@ mod tests {
             out,
             vec![control(&Request::PaneKill { pane: PaneId(1) })],
             "a corpse needs no kill confirm"
+        );
+    }
+
+    #[test]
+    fn p_on_an_exited_sandbox_pane_pulls_its_work_and_jumps_to_it() {
+        let mut app = App::new();
+        let mut view = view_one_exited_agent();
+        view[0].tabs[0].panes[0].sandbox = Some("gke".into());
+        view[0].tabs[0].panes[0].sandbox_name = Some("tutti-p1-ab".into());
+        attach_with(&mut app, view.clone());
+        let out = app.on_key(plain('p'));
+        assert_eq!(
+            out,
+            vec![control(&Request::SandboxPull {
+                pane: PaneId(1),
+                name: None,
+            })]
+        );
+        assert_eq!(app.transient(), Some("pulling tutti/tutti-p1-ab…"));
+
+        // The view carrying the pulled workspace lands before the reply.
+        view.push(workspace(
+            2,
+            "w-tutti-p1-ab",
+            None,
+            vec![tab(2, "2", true, leaf(5), vec![shell(5)])],
+        ));
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Event::LayoutChanged { workspaces: view }).unwrap(),
+        ));
+        app.handle_response(Response::WorkspaceCreated { id: WorkspaceId(2) });
+        assert_eq!(
+            app.active_tab,
+            Some(TabId(2)),
+            "the reply jumps to the pulled workspace, as guided create's does"
+        );
+
+        let mut local = App::new();
+        attach_with(&mut local, view_one_exited_agent());
+        assert_eq!(
+            local.on_key(plain('p')),
+            vec![WireFrame::Input {
+                pane: PaneId(1),
+                bytes: b"p".to_vec(),
+            }],
+            "a local corpse has no pushed work to pull"
         );
     }
 

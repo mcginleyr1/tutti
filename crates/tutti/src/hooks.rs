@@ -2,8 +2,9 @@
 //! opencode bus event forwarded by tutti's opencode plugin (each delivered on
 //! `tutti agent-event`'s stdin), to a tutti `AgentHookEvent` and the agent's
 //! own conversation id; print the settings.json snippet that wires Claude
-//! Code's events to `tutti agent-event claude`, and the opencode plugin that
-//! pipes to `tutti agent-event opencode`.
+//! Code's events to `tutti agent-event claude` (or, for a sandbox image,
+//! straight to the terminal as OSC 7501), and the opencode plugin that pipes
+//! to `tutti agent-event opencode`.
 //!
 //! The mappings read only the fields tutti reacts to and ignore everything else,
 //! so they tolerate each tool's evolving schema. They never fail: an
@@ -176,6 +177,42 @@ pub fn claude_hooks_json() -> Value {
 /// The pretty-printed snippet, ready to paste into settings.json.
 pub fn claude_hooks_snippet() -> String {
     serde_json::to_string_pretty(&claude_hooks_json()).expect("hooks snippet serializes")
+}
+
+/// The Notification types that wait on you, as the `--tty` hooks' matcher. A
+/// matcher can only name types, so an unknown one cannot read as blocked the
+/// way it does through `tutti agent-event`.
+const WAITING: &str =
+    "permission_prompt|elicitation_dialog|elicitation_url_dialog|agent_needs_input";
+
+/// The settings.json `hooks` snippet for an agent with no route to the daemon
+/// — one in a k8s sandbox. Each hook writes an OSC 7501 report straight to its
+/// terminal, which `kubectl exec -it` carries back to the pane like any other
+/// output, so the image needs only `printf`: a prompt or tool use reports
+/// `working`, a waiting Notification `blocked`, Stop `done`, and SessionEnd
+/// `clear`. Every command is silent and never fails, and writes nothing to
+/// stdout (Claude hands a UserPromptSubmit hook's stdout to the model).
+pub fn claude_tty_hooks_json() -> Value {
+    let report = |state: &str, matcher: Option<&str>| {
+        let command = format!(
+            r"{{ printf '\033]7501;state={state}:app=claude\007' >/dev/tty; }} 2>/dev/null || true"
+        );
+        let mut group = json!({ "hooks": [{ "type": "command", "command": command }] });
+        if let Some(matcher) = matcher {
+            group["matcher"] = json!(matcher);
+        }
+        json!([group])
+    };
+    json!({
+        "hooks": {
+            "UserPromptSubmit": report("working", None),
+            "PreToolUse": report("working", Some("*")),
+            "PostToolUse": report("working", Some("*")),
+            "Notification": report("blocked", Some(WAITING)),
+            "Stop": report("done", None),
+            "SessionEnd": report("clear", None),
+        }
+    })
 }
 
 /// Merge the tutti hook entries into an existing settings.json value. Returns
@@ -475,6 +512,48 @@ mod tests {
         }
         assert_eq!(hooks.as_object().unwrap().len(), 7);
         assert!(claude_hooks_snippet().contains(HOOK_COMMAND));
+    }
+
+    /// The `--tty` hooks report each event's state over OSC 7501 with plain
+    /// `printf` — no tutti binary — silently, never failing, never on stdout.
+    #[test]
+    fn tty_hooks_report_each_event_over_osc_7501() {
+        let value = claude_tty_hooks_json();
+        let hooks = value["hooks"].as_object().unwrap();
+        for (event, matcher, state) in [
+            ("UserPromptSubmit", None, "working"),
+            ("PreToolUse", Some("*"), "working"),
+            ("PostToolUse", Some("*"), "working"),
+            ("Notification", Some(WAITING), "blocked"),
+            ("Stop", None, "done"),
+            ("SessionEnd", None, "clear"),
+        ] {
+            let group = &hooks[event][0];
+            assert_eq!(group["matcher"].as_str(), matcher, "{event}");
+            assert_eq!(
+                group["hooks"][0]["command"],
+                format!(
+                    r"{{ printf '\033]7501;state={state}:app=claude\007' >/dev/tty; }} 2>/dev/null || true"
+                ),
+                "{event}"
+            );
+        }
+        assert_eq!(hooks.len(), 6);
+        assert_eq!(
+            WAITING.split('|').collect::<Vec<_>>(),
+            [
+                "permission_prompt",
+                "elicitation_dialog",
+                "elicitation_url_dialog",
+                "agent_needs_input"
+            ]
+        );
+        for kind in WAITING.split('|') {
+            assert!(
+                matches!(notification(kind), Some(AgentHookEvent::Blocked { .. })),
+                "{kind} blocks through agent-event too"
+            );
+        }
     }
 
     #[test]

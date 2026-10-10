@@ -5,8 +5,10 @@
 //! `kubectl`, waits for it to be Ready, then `kubectl exec -it`s `cmd` in its
 //! pod — so the pane's pty, and with it the screen classifier, the badges and
 //! answering from the queue, stays local. The sandbox owns the code: its image
-//! or template clones the repo (an image sandbox is told the workspace's git
-//! remote as `TUTTI_GIT_REMOTE`). However the wrapper ends — exit, failure,
+//! or template clones the repo and pushes the agent's work (an image sandbox,
+//! or a claim with `inject_env`, is told the workspace's git remote as
+//! `TUTTI_GIT_REMOTE` and the branch to push to as `TUTTI_BRANCH`, which
+//! `SandboxPull` fetches back). However the wrapper ends — exit, failure,
 //! ctrl-c, or the SIGKILL a killed pane's process group gets — a watchdog
 //! deletes what it made, and a `shutdownTime` the wrapper keeps pushing ahead
 //! reaps the sandbox should even that fail.
@@ -35,6 +37,12 @@ pub struct Profile {
     pub source: Source,
     /// The container `cmd` runs in; `None` lets kubectl pick the pod's default.
     pub container: Option<String>,
+    /// Whether a warm-pool claim carries the env an image sandbox gets. The
+    /// pool's template must allow it (`envVarsInjectionPolicy: Allowed`); its
+    /// default rejects the claim. It costs the pool's head start: a running
+    /// pod cannot take env, so the claim gets a fresh one. Never set on an
+    /// image profile.
+    pub inject_env: bool,
     /// How long a sandbox outlives its last renewal. The wrapper renews every
     /// third of it, so this bounds how long an orphan lingers after a crash.
     pub ttl: Duration,
@@ -61,18 +69,14 @@ impl Source {
     }
 }
 
-/// What a sandbox pane runs: provision, exec `cmd`, clean up. Returns the exit
-/// code to leave with — the remote command's own.
-pub fn run(profile: &Profile, cmd: &[String]) -> Result<i32> {
-    let pane = std::env::var("TUTTI_PANE").unwrap_or_else(|_| "x".into());
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64);
-    let name = sandbox_name(&pane, nanos);
-    let remote = matches!(profile.source, Source::Image(_))
+/// What a sandbox pane runs: provision sandbox `name` (the daemon names it per
+/// pane), exec `cmd`, clean up. Returns the exit code to leave with — the
+/// remote command's own.
+pub fn run(profile: &Profile, name: &str, cmd: &[String]) -> Result<i32> {
+    let remote = (matches!(profile.source, Source::Image(_)) || profile.inject_env)
         .then(git_remote)
         .flatten();
-    let object = manifest(profile, &name, &expiry(profile.ttl), remote.as_deref());
+    let object = manifest(profile, name, &expiry(profile.ttl), remote.as_deref());
     say(&format!(
         "creating {} {name} on {}{}",
         object["kind"].as_str().unwrap_or_default(),
@@ -82,15 +86,15 @@ pub fn run(profile: &Profile, cmd: &[String]) -> Result<i32> {
             .as_deref()
             .map_or(String::new(), |ns| format!("/{ns}")),
     ));
-    let _reaper = reap_on_exit(profile, &name)?;
+    let _reaper = reap_on_exit(profile, name)?;
     capture(
         kubectl(profile).args(["create", "-f", "-"]),
         Some(object.to_string().as_bytes()),
     )?;
     say("waiting for it to be ready (ctrl-c cancels)");
-    let pod = await_ready(profile, &name)?;
+    let pod = await_ready(profile, name)?;
     say(&format!("ready — exec {} in pod {pod}", cmd.join(" ")));
-    keep_renewing(profile.clone(), name);
+    keep_renewing(profile.clone(), name.into());
     let mut exec = kubectl(profile);
     exec.args(["exec", "-it", &pod]);
     if let Some(container) = &profile.container {
@@ -152,7 +156,7 @@ impl Drop for Reaper {
 }
 
 /// Poll until Ready, echoing each new status message, and answer the pod to
-/// exec into.
+/// exec into. A claim whose env its template refuses fails at once.
 fn await_ready(profile: &Profile, name: &str) -> Result<String> {
     let deadline = Instant::now() + READY_TIMEOUT;
     let mut last = String::new();
@@ -164,6 +168,9 @@ fn await_ready(profile: &Profile, name: &str) -> Result<String> {
         let object: Value = serde_json::from_str(&json).context("parsing kubectl get")?;
         match readiness(&object) {
             Readiness::Ready(pod) => return Ok(pod),
+            Readiness::Rejected(message) => bail!(
+                "{message} — set `envVarsInjectionPolicy: Allowed` on the pool's template, or drop `inject_env`"
+            ),
             Readiness::Waiting(message) if message != last => {
                 say(&format!("  {message}"));
                 last = message;
@@ -202,43 +209,57 @@ fn keep_renewing(profile: Profile, name: String) {
 }
 
 /// The object `run` creates: a `Sandbox` running the image as container
-/// `agent` (told the workspace's git remote when it has one), or a
-/// `SandboxClaim` on the warm pool — no env there, since a template's default
-/// policy rejects injected env. Either is labelled tutti's, expires at
-/// `shutdown`, and is deleted outright when it does.
+/// `agent`, or a `SandboxClaim` on the warm pool. Either is labelled tutti's,
+/// expires at `shutdown`, and is deleted outright when it does. The sandbox is
+/// told the branch to push its work to (`TUTTI_BRANCH`) and, when there is
+/// one, the workspace's git remote (`TUTTI_GIT_REMOTE`) — a claim only with
+/// `inject_env`, since a template's default policy rejects injected env.
 fn manifest(profile: &Profile, name: &str, shutdown: &str, remote: Option<&str>) -> Value {
     let metadata = json!({
         "name": name,
         "labels": {"app.kubernetes.io/managed-by": "tutti"},
     });
+    let branch = tutti_core::sandbox_branch(name);
+    let env = remote
+        .map(|url| ("TUTTI_GIT_REMOTE", url))
+        .into_iter()
+        .chain([("TUTTI_BRANCH", branch.as_str())])
+        .map(|(key, value)| json!({"name": key, "value": value}));
     match &profile.source {
-        Source::Image(image) => {
-            let env: Vec<Value> = remote
-                .map(|url| json!({"name": "TUTTI_GIT_REMOTE", "value": url}))
-                .into_iter()
-                .collect();
-            json!({
-                "apiVersion": "agents.x-k8s.io/v1beta1",
-                "kind": "Sandbox",
-                "metadata": metadata,
-                "spec": {
-                    "shutdownTime": shutdown,
-                    "shutdownPolicy": "Delete",
-                    "podTemplate": {"spec": {"containers": [
-                        {"name": "agent", "image": image, "env": env},
-                    ]}},
-                },
-            })
-        }
-        Source::WarmPool(pool) => json!({
-            "apiVersion": "extensions.agents.x-k8s.io/v1beta1",
-            "kind": "SandboxClaim",
+        Source::Image(image) => json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1",
+            "kind": "Sandbox",
             "metadata": metadata,
             "spec": {
-                "warmPoolRef": {"name": pool},
-                "lifecycle": {"shutdownTime": shutdown, "shutdownPolicy": "Delete"},
+                "shutdownTime": shutdown,
+                "shutdownPolicy": "Delete",
+                "podTemplate": {"spec": {"containers": [
+                    {"name": "agent", "image": image, "env": env.collect::<Value>()},
+                ]}},
             },
         }),
+        Source::WarmPool(pool) => {
+            let mut spec = json!({
+                "warmPoolRef": {"name": pool},
+                "lifecycle": {"shutdownTime": shutdown, "shutdownPolicy": "Delete"},
+            });
+            if profile.inject_env {
+                spec["env"] = env
+                    .map(|mut var| {
+                        if let Some(container) = &profile.container {
+                            var["containerName"] = json!(container);
+                        }
+                        var
+                    })
+                    .collect();
+            }
+            json!({
+                "apiVersion": "extensions.agents.x-k8s.io/v1beta1",
+                "kind": "SandboxClaim",
+                "metadata": metadata,
+                "spec": spec,
+            })
+        }
     }
 }
 
@@ -256,6 +277,8 @@ enum Readiness {
     Ready(String),
     /// Not yet, with the Ready condition's message.
     Waiting(String),
+    /// Never: the claim's template refuses the env it carries.
+    Rejected(String),
 }
 
 /// Read a `kubectl get -o json` object's Ready condition. A Sandbox's pod
@@ -270,22 +293,18 @@ fn readiness(object: &Value) -> Readiness {
         Some("SandboxClaim") => object["status"]["sandbox"]["name"].as_str(),
         _ => object["metadata"]["name"].as_str(),
     };
+    let message = ready
+        .and_then(|c| c["message"].as_str())
+        .filter(|m| !m.is_empty())
+        .unwrap_or("waiting for the controller")
+        .into();
     match (ready.is_some_and(|c| c["status"] == "True"), pod) {
         (true, Some(pod)) => Readiness::Ready(pod.into()),
-        _ => Readiness::Waiting(
-            ready
-                .and_then(|c| c["message"].as_str())
-                .filter(|m| !m.is_empty())
-                .unwrap_or("waiting for the controller")
-                .into(),
-        ),
+        _ if ready.is_some_and(|c| c["reason"] == "EnvVarsInjectionRejected") => {
+            Readiness::Rejected(message)
+        }
+        _ => Readiness::Waiting(message),
     }
-}
-
-/// A DNS-1123 name unique to this launch: `tutti-p<pane>-<nanos hex>`.
-fn sandbox_name(pane: &str, nanos: u64) -> String {
-    let pane: String = pane.chars().filter(char::is_ascii_digit).collect();
-    format!("tutti-p{pane}-{nanos:x}")
 }
 
 /// A TTL from now, as the RFC 3339 a k8s `metav1.Time` takes.
@@ -316,30 +335,16 @@ fn rfc3339(secs: u64) -> String {
     )
 }
 
-/// The workspace's git remote for an image sandbox to clone: `origin`, else
-/// the first. Read without snapshotting the working copy, so asking records
-/// no jj operation for tutti's VCS watch to chase.
+/// The workspace's git remote URL for the sandbox to clone: `origin`, else the
+/// first. Read without snapshotting the working copy, so asking records no jj
+/// operation for tutti's VCS watch to chase.
 fn git_remote() -> Option<String> {
     let out = Command::new("jj")
         .args(["--ignore-working-copy", "git", "remote", "list"])
         .stderr(Stdio::null())
         .output()
         .ok()?;
-    pick_remote(&String::from_utf8(out.stdout).ok()?)
-}
-
-/// `origin`'s URL from `jj git remote list` output (`<name> <url>` lines),
-/// else the first remote's.
-fn pick_remote(listing: &str) -> Option<String> {
-    let remotes: Vec<(&str, &str)> = listing
-        .lines()
-        .filter_map(|line| line.split_once(' '))
-        .collect();
-    remotes
-        .iter()
-        .find(|(name, _)| *name == "origin")
-        .or(remotes.first())
-        .map(|(_, url)| url.trim().to_string())
+    tutti_core::pick_remote(&String::from_utf8(out.stdout).ok()?).map(|(_, url)| url.to_string())
 }
 
 /// `TERM` (and `COLORTERM` when set) for the remote command — `kubectl exec`
@@ -409,12 +414,13 @@ mod tests {
             namespace: None,
             source,
             container: None,
+            inject_env: false,
             ttl: Duration::from_secs(3_600),
         }
     }
 
     #[test]
-    fn an_image_profile_makes_a_sandbox_told_the_git_remote() {
+    fn an_image_profile_makes_a_sandbox_told_the_git_remote_and_branch() {
         let object = manifest(
             &profile(Source::Image("ghcr.io/acme/agent:1".into())),
             "tutti-p3-ab",
@@ -438,13 +444,16 @@ mod tests {
         assert_eq!(container["image"], "ghcr.io/acme/agent:1");
         assert_eq!(
             container["env"],
-            json!([{"name": "TUTTI_GIT_REMOTE", "value": "git@github.com:acme/app.git"}])
+            json!([
+                {"name": "TUTTI_GIT_REMOTE", "value": "git@github.com:acme/app.git"},
+                {"name": "TUTTI_BRANCH", "value": "tutti/tutti-p3-ab"},
+            ])
         );
         let bare = manifest(&profile(Source::Image("img".into())), "n", "t", None);
         assert_eq!(
             bare["spec"]["podTemplate"]["spec"]["containers"][0]["env"],
-            json!([]),
-            "no remote, no env"
+            json!([{"name": "TUTTI_BRANCH", "value": "tutti/n"}]),
+            "no remote, just the branch to push to"
         );
     }
 
@@ -466,6 +475,34 @@ mod tests {
         assert!(
             object["spec"].get("env").is_none(),
             "a template's default policy rejects a claim carrying env"
+        );
+    }
+
+    #[test]
+    fn a_claim_with_inject_env_carries_it_into_the_profiles_container() {
+        let mut injecting = Profile {
+            inject_env: true,
+            container: Some("agent".into()),
+            ..profile(Source::WarmPool("claude-pool".into()))
+        };
+        let object = manifest(
+            &injecting,
+            "tutti-p3-ab",
+            "T",
+            Some("https://g.example/a.git"),
+        );
+        assert_eq!(
+            object["spec"]["env"],
+            json!([
+                {"name": "TUTTI_GIT_REMOTE", "value": "https://g.example/a.git", "containerName": "agent"},
+                {"name": "TUTTI_BRANCH", "value": "tutti/tutti-p3-ab", "containerName": "agent"},
+            ])
+        );
+        injecting.container = None;
+        assert_eq!(
+            manifest(&injecting, "n", "T", None)["spec"]["env"],
+            json!([{"name": "TUTTI_BRANCH", "value": "tutti/n"}]),
+            "without a container the controller picks the pod's"
         );
     }
 
@@ -507,14 +544,30 @@ mod tests {
             "a claim execs into the sandbox it bound"
         );
 
+        // As agent-sandbox v1.0.2 refuses a claim's env under a Disallowed
+        // (or default) template policy: final, so no use waiting it out.
         let rejected = json!({
             "kind": "SandboxClaim",
             "metadata": {"name": "c"},
-            "status": {"conditions": [{"type": "Ready", "status": "False", "message": "environment variable injection rejected"}]},
+            "status": {"conditions": [{
+                "type": "Ready",
+                "status": "False",
+                "reason": "EnvVarsInjectionRejected",
+                "message": "environment variable injection rejected: environment variable injection is not allowed by the template policy",
+            }]},
         });
         assert_eq!(
             readiness(&rejected),
-            Readiness::Waiting("environment variable injection rejected".into())
+            Readiness::Rejected("environment variable injection rejected: environment variable injection is not allowed by the template policy".into())
+        );
+        let pending = json!({
+            "kind": "SandboxClaim",
+            "metadata": {"name": "c"},
+            "status": {"conditions": [{"type": "Ready", "status": "False", "message": "Pod exists with phase: Pending"}]},
+        });
+        assert_eq!(
+            readiness(&pending),
+            Readiness::Waiting("Pod exists with phase: Pending".into())
         );
         let fresh = json!({"kind": "Sandbox", "metadata": {"name": "s"}});
         assert_eq!(
@@ -524,34 +577,10 @@ mod tests {
     }
 
     #[test]
-    fn names_are_dns_labels_unique_per_launch() {
-        assert_eq!(sandbox_name("12", 0xabc), "tutti-p12-abc");
-        assert_eq!(
-            sandbox_name("x", 255),
-            "tutti-p-ff",
-            "outside a pane there is no pane id to carry"
-        );
-    }
-
-    #[test]
     fn rfc3339_formats_utc_including_leap_days() {
         assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
         assert_eq!(rfc3339(1_760_000_000), "2025-10-09T08:53:20Z");
         assert_eq!(rfc3339(951_782_400), "2000-02-29T00:00:00Z");
         assert_eq!(rfc3339(951_782_399), "2000-02-28T23:59:59Z");
-    }
-
-    #[test]
-    fn pick_remote_prefers_origin() {
-        assert_eq!(
-            pick_remote("upstream https://u.example/r.git\norigin git@github.com:me/r.git\n")
-                .as_deref(),
-            Some("git@github.com:me/r.git")
-        );
-        assert_eq!(
-            pick_remote("upstream https://u.example/r.git\n").as_deref(),
-            Some("https://u.example/r.git")
-        );
-        assert_eq!(pick_remote(""), None);
     }
 }

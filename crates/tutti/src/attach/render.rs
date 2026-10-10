@@ -1983,9 +1983,10 @@ fn identity(info: &PaneInfo) -> String {
 /// The border badge. The name is dim-bold, followed by a dim `on <profile>`
 /// for a pane running in a sandbox; a detected agent adds a dim `·` then the
 /// state in its colour (a spinner precedes `working`); a plain shell shows
-/// just its name. An exited pane appends a dim `exited <code>` plus the two
-/// keys that act on the corpse, `r` in the accent so the way back to a dead
-/// agent's conversation is visible right where it died.
+/// just its name. An exited pane appends a dim `exited <code>` plus the keys
+/// that act on the corpse — `p` pulls a sandbox's pushed work — each in the
+/// accent, so the way back to a dead agent's conversation is visible right
+/// where it died.
 fn border_title(info: &PaneInfo, spinner: char) -> Line<'static> {
     let mut spans = vec![Span::styled(
         identity(info),
@@ -2007,6 +2008,10 @@ fn border_title(info: &PaneInfo, spinner: char) -> Line<'static> {
         spans.push(Span::styled(format!(" exited {code} · "), dim()));
         spans.push(Span::styled("r", Style::default().fg(accent())));
         spans.push(Span::styled(" resume · ", dim()));
+        if info.sandbox_name.is_some() {
+            spans.push(Span::styled("p", Style::default().fg(accent())));
+            spans.push(Span::styled(" pull · ", dim()));
+        }
         spans.push(Span::styled("x", Style::default().fg(accent())));
         spans.push(Span::styled(" close", dim()));
     }
@@ -2050,6 +2055,7 @@ fn placeholder_title(pane: PaneId) -> PaneInfo {
         source: None,
         sandbox: None,
         conversation: None,
+        sandbox_name: None,
     }
 }
 
@@ -2627,6 +2633,7 @@ mod tests {
             source: None,
             sandbox: None,
             conversation: None,
+            sandbox_name: None,
         };
         assert_eq!(title_text(&info), "claude · blocked");
     }
@@ -2644,6 +2651,7 @@ mod tests {
             source: None,
             sandbox: None,
             conversation: None,
+            sandbox_name: None,
         };
         assert_eq!(title_text(&info), "claude · ⠋ working");
     }
@@ -2676,6 +2684,7 @@ mod tests {
             source: None,
             sandbox: None,
             conversation: None,
+            sandbox_name: None,
         };
         assert_eq!(title_text(&info), "zsh", "no `· unknown` suffix");
     }
@@ -2693,11 +2702,26 @@ mod tests {
             source: None,
             sandbox: None,
             conversation: None,
+            sandbox_name: None,
         };
         assert_eq!(
             title_text(&info),
             "zsh exited 0 · r resume · x close",
             "the corpse advertises its two keys next to the exit code"
+        );
+    }
+
+    #[test]
+    fn border_title_offers_a_pull_on_an_exited_sandbox_pane() {
+        let info = PaneInfo {
+            sandbox: Some("gke".into()),
+            sandbox_name: Some("tutti-p1-ab".into()),
+            exited: Some(0),
+            ..crate::attach::fixtures::agent(1, "claude", AgentState::Done)
+        };
+        assert_eq!(
+            title_text(&info),
+            "claude on gke · done exited 0 · r resume · p pull · x close"
         );
     }
 
@@ -4106,6 +4130,7 @@ mod tests {
             source: None,
             sandbox: None,
             conversation: None,
+            sandbox_name: None,
         };
         let focused = pane_title_line(&info, true, ' ');
         assert_eq!(

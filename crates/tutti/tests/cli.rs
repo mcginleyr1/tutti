@@ -256,6 +256,30 @@ fn hooks_opencode_install_writes_backs_up_and_refuses_foreign_files() {
     let _ = std::fs::remove_dir_all(&config);
 }
 
+/// `hooks claude --tty` prints the OSC 7501 hooks for a sandbox image —
+/// `--raw` puts the JSON alone on stdout — and opencode has no such form.
+#[test]
+fn hooks_claude_tty_prints_the_osc_hooks() {
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_tutti"))
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let raw = run(&["hooks", "claude", "--tty", "--raw"]);
+    assert!(raw.status.success() && raw.stderr.is_empty());
+    let printed: serde_json::Value = serde_json::from_slice(&raw.stdout).unwrap();
+    assert_eq!(printed, tutti::hooks::claude_tty_hooks_json());
+    let noted = run(&["hooks", "claude", "--tty"]);
+    assert_eq!(noted.stdout, raw.stdout);
+    assert!(
+        String::from_utf8(noted.stderr)
+            .unwrap()
+            .contains("/dev/tty")
+    );
+    assert_eq!(run(&["hooks", "opencode", "--tty"]).status.code(), Some(1));
+}
+
 /// `pane run --sandbox <profile>` sends the profile with the command; a
 /// profile the config does not name fails before anything reaches a daemon,
 /// as does `sandbox run` with one.
@@ -295,7 +319,15 @@ fn pane_run_sandbox_sends_a_configured_profile_and_refuses_an_unknown_one() {
 
     for args in [
         &["pane", "run", "--sandbox", "gke", "--", "claude"][..],
-        &["sandbox", "run", "gke", "--", "claude"][..],
+        &[
+            "sandbox",
+            "run",
+            "gke",
+            "--name",
+            "tutti-p1-a",
+            "--",
+            "claude",
+        ][..],
     ] {
         let refused = Command::new(env!("CARGO_BIN_EXE_tutti"))
             .args(args)

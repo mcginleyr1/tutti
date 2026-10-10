@@ -14,7 +14,7 @@ use tokio::net::UnixListener;
 use tokio::sync::oneshot;
 
 use tutti::attach::App;
-use tutti_core::{Frame, PaneId, Request, Response};
+use tutti_core::{AgentState, Frame, PaneId, Request, Response, StateSource};
 use tutti_server::{PaneSize, serve};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -260,6 +260,74 @@ fn a_scripted_pane_focus_jumps_the_attached_client() {
         )),
         "the client reports the jumped-to pane as its focus"
     );
+}
+
+/// The `--tty` hooks' commands report over OSC 7501 through the pane's own
+/// pty — as from a sandbox, whose pty `kubectl exec -it` joins to the pane —
+/// each moving the pane as its event should, under the `claude` label, with no
+/// tutti binary involved.
+#[test]
+fn tty_hook_commands_report_through_the_panes_pty() {
+    let daemon = Daemon::start();
+    let mut control = daemon.connect();
+    control.send(&Request::WorkspaceNew {
+        dir: std::env::temp_dir(),
+    });
+    assert!(matches!(
+        control.response(),
+        Response::WorkspaceCreated { .. }
+    ));
+    // Each hook waits for a line first, so the test moves them along in turn.
+    let hooks = tutti::hooks::claude_tty_hooks_json();
+    let steps: Vec<String> = ["UserPromptSubmit", "Notification", "Stop", "SessionEnd"]
+        .iter()
+        .map(|event| {
+            let command = hooks["hooks"][event][0]["hooks"][0]["command"].as_str();
+            format!("read _; {}", command.unwrap())
+        })
+        .collect();
+    control.send(&Request::PaneRun {
+        tab: None,
+        cmd: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("{}; sleep 30", steps.join("; ")),
+        ],
+        ephemeral: false,
+        sandbox: None,
+    });
+    let pane = match control.response() {
+        Response::PaneCreated { id } => id,
+        other => panic!("expected PaneCreated, got {other:?}"),
+    };
+    for expected in [
+        (AgentState::Working, Some(StateSource::Program)),
+        (AgentState::Blocked, Some(StateSource::Program)),
+        (AgentState::Done, Some(StateSource::Program)),
+        (AgentState::Done, None),
+    ] {
+        control.send(&Request::PaneSend {
+            pane,
+            text: Some("\n".into()),
+            keys: None,
+            expect: None,
+        });
+        assert_eq!(control.response(), Response::Ok);
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            control.send(&Request::PaneList);
+            let Response::Panes { panes } = control.response() else {
+                panic!("expected Panes");
+            };
+            let info = panes.into_iter().find(|p| p.id == pane).unwrap();
+            if (info.state, info.source) == expected {
+                assert_eq!(info.agent, Some("claude".into()), "the report's app");
+                break;
+            }
+            assert!(Instant::now() < deadline, "never {expected:?}: {info:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 fn seed_from_snapshot(viewer: &mut Wire, app: &mut App, pane: PaneId) {

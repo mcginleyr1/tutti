@@ -8,7 +8,7 @@ use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 
 use tokio::process::Command;
-use tutti_core::{DIFF_RANGE, FileStat, Response};
+use tutti_core::{DIFF_RANGE, FileStat, Response, pick_remote};
 
 /// How long a `jj` invocation may run before it is killed. A wedged repo or a
 /// hung external diff tool must never stall a client or a background refresh.
@@ -20,7 +20,8 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 const FORK_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Cap on each `jj` invocation in the merge sequence — rebase, conflict probe,
-/// bookmark move, optional push — each of which can touch the store or network.
+/// bookmark move, optional push — each of which can touch the store or network,
+/// and on a sandbox pull's fetch.
 const MERGE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Caps on a diff returned to a client, in lines and in raw bytes — one huge
@@ -328,6 +329,38 @@ pub async fn fork(
         Ok(output) => Err(stderr_or(&output, "jj workspace add failed")),
         Err(message) => Err(message),
     }
+}
+
+/// Fetch `branch` from the remote of the repo at `repo_root` — `origin`, else
+/// the first — and track it: an untracked remote bookmark is immutable, which
+/// would refuse the rebase a merge of the work needs. Returns the commit it
+/// names. A branch the remote lacks is an error before anything is checked
+/// out: `jj workspace add` makes its checkout before resolving a revision.
+pub async fn fetch_branch(repo_root: &Path, branch: &str) -> Result<String, String> {
+    let listed = run(jj_cmd(repo_root, &["git", "remote", "list"]), TIMEOUT).await?;
+    let listing = String::from_utf8_lossy(&listed.stdout);
+    let (remote, _) = pick_remote(&listing).ok_or("no git remote to pull from")?;
+    let args = ["git", "fetch", "--remote", remote, "--branch", branch];
+    let fetched = run(jj_cmd(repo_root, &args), MERGE_TIMEOUT).await?;
+    if !fetched.status.success() {
+        return Err(format!(
+            "could not fetch {branch} from {remote} — has the sandbox pushed it? {}",
+            stderr_or(&fetched, "jj git fetch failed")
+        ));
+    }
+    let present = format!("present(\"{branch}\"@\"{remote}\")");
+    let commit = log_template(repo_root, &present, "commit_id").await?;
+    if commit.trim().is_empty() {
+        return Err(format!(
+            "{branch} is not on {remote} — has the sandbox pushed it?"
+        ));
+    }
+    run_mutation(
+        repo_root,
+        &["bookmark", "track", &format!("{branch}@{remote}")],
+    )
+    .await?;
+    Ok(commit.trim().to_string())
 }
 
 /// Forget the workspace named `jj_name`, run at its origin repo `origin_root`

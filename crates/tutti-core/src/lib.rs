@@ -4,6 +4,7 @@ mod ids;
 mod paths;
 mod prompt;
 mod protocol;
+mod sandbox;
 mod state;
 
 pub use domain::{AgentKind, Direction, Layout};
@@ -16,4 +17,5 @@ pub use protocol::{
     RestoreSummary, SubagentInfo, TabInfo, TabView, WIRE_REV, WaitFor, WatchPane, WorkspaceInfo,
     WorkspaceView,
 };
+pub use sandbox::{pick_remote, sandbox_branch};
 pub use state::{AgentState, Observation, StateEvent, StateSource};

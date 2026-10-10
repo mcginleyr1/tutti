@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -352,7 +352,8 @@ impl Session {
     /// Spawn `cmd` in `tab` (or the current tab when `None`), placing the
     /// new pane in the tab's layout and focusing it. An `ephemeral` pane is torn
     /// down entirely when its child exits. With a `sandbox` profile the pane
-    /// runs `cmd` through `tutti sandbox run <profile> --`, titled for `cmd`.
+    /// runs `cmd` through `tutti sandbox run <profile> --name <name> --`,
+    /// titled for `cmd`, its sandbox named for the pane (`sandbox_name`).
     pub fn pane_run(
         &mut self,
         tab: Option<TabId>,
@@ -362,8 +363,14 @@ impl Session {
     ) -> Result<PaneId> {
         let tab = self.resolve_tab(tab)?;
         let title = pane_title(cmd.first().context("empty command")?);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
+        // Named for the id `spawn_into_tab` allocates next.
+        let sandbox =
+            sandbox.map(|profile| (profile, sandbox_name(PaneId(self.ids.pane + 1), nanos)));
         let argv = match &sandbox {
-            Some(profile) => sandbox_argv(&client_exe()?, profile, cmd.clone()),
+            Some((profile, name)) => sandbox_argv(&client_exe()?, profile, name, cmd.clone()),
             None => cmd.clone(),
         };
         let (program, args) = argv.split_first().context("empty command")?;
@@ -374,7 +381,7 @@ impl Session {
         spec.env = vec![("TERM".into(), "xterm-256color".into())];
         let id = self.spawn_into_tab(tab, spec, cmd, title, None, ephemeral)?;
         if let Some(slot) = self.panes.get_mut(&id) {
-            slot.meta.sandbox = sandbox;
+            (slot.meta.sandbox, slot.meta.sandbox_name) = sandbox.unzip();
         }
         Ok(id)
     }
@@ -1308,6 +1315,7 @@ impl Session {
                     source: None,
                     sandbox: None,
                     conversation: None,
+                    sandbox_name: None,
                 },
                 pty,
                 tab,
@@ -1432,14 +1440,20 @@ fn client_exe() -> Result<String> {
     })
 }
 
-/// The argv running `cmd` in sandbox `profile`: `<exe> sandbox run <profile>
-/// -- <cmd…>`.
-fn sandbox_argv(exe: &str, profile: &str, cmd: Vec<String>) -> Vec<String> {
-    [exe, "sandbox", "run", profile, "--"]
+/// The argv running `cmd` in sandbox `profile` under `name`: `<exe> sandbox
+/// run <profile> --name <name> -- <cmd…>`.
+fn sandbox_argv(exe: &str, profile: &str, name: &str, cmd: Vec<String>) -> Vec<String> {
+    [exe, "sandbox", "run", profile, "--name", name, "--"]
         .into_iter()
         .map(String::from)
         .chain(cmd)
         .collect()
+}
+
+/// A DNS-1123 name for pane `pane`'s sandbox, unique to this launch:
+/// `tutti-p<pane>-<nanos hex>`.
+fn sandbox_name(pane: PaneId, nanos: u64) -> String {
+    format!("tutti-p{pane}-{nanos:x}")
 }
 
 /// The current git branch of `dir`, read straight from `.git/HEAD` — no
@@ -1483,7 +1497,7 @@ fn parse_head(contents: &str) -> Option<String> {
 mod tests {
     use super::{
         ForkMeta, STALL_AFTER, Session, git_branch, pane_title, parse_head, rename_leaves,
-        sandbox_argv, stop_subagent,
+        sandbox_argv, sandbox_name, stop_subagent,
     };
     use crate::persist::{Saved, SavedPane};
     use crate::pty::{PaneSize, StatusReport};
@@ -1901,9 +1915,29 @@ mod tests {
     #[test]
     fn a_sandbox_pane_runs_its_command_through_the_wrapper() {
         assert_eq!(
-            sandbox_argv("/bin/tutti", "gke", vec!["claude".into(), "-c".into()]),
-            ["/bin/tutti", "sandbox", "run", "gke", "--", "claude", "-c"]
+            sandbox_argv(
+                "/bin/tutti",
+                "gke",
+                "tutti-p3-ab",
+                vec!["claude".into(), "-c".into()]
+            ),
+            [
+                "/bin/tutti",
+                "sandbox",
+                "run",
+                "gke",
+                "--name",
+                "tutti-p3-ab",
+                "--",
+                "claude",
+                "-c"
+            ]
         );
+    }
+
+    #[test]
+    fn a_sandbox_is_named_for_its_pane_and_launch() {
+        assert_eq!(sandbox_name(PaneId(12), 0xabc), "tutti-p12-abc");
     }
 
     #[test]

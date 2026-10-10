@@ -470,7 +470,8 @@ fn handle_frame(
                 name,
                 revision,
                 dest,
-            }) => workspace_fork(hub, cid, tx, id, name, revision, dest),
+            }) => workspace_fork(hub, cid, tx, id, name, Checkout::Revision(revision), dest),
+            Ok(Request::SandboxPull { pane, name }) => sandbox_pull(hub, cid, tx, pane, name),
             Ok(Request::WorkspaceMerge { id, push }) => workspace_merge(hub, cid, tx, id, push),
             Ok(Request::WorkspaceUpdate { id }) => workspace_update(hub, tx, id),
             Ok(Request::PaneCheckpointDiff { pane, n, stat }) => {
@@ -703,7 +704,8 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
         | Request::WorkspaceMerge { .. }
         | Request::WorkspaceUpdate { .. }
         | Request::PaneCheckpointDiff { .. }
-        | Request::PaneRestore { .. } => Response::Ok,
+        | Request::PaneRestore { .. }
+        | Request::SandboxPull { .. } => Response::Ok,
     }
 }
 
@@ -1249,21 +1251,30 @@ fn workspace_kill(
     }
 }
 
+/// What a new workspace checks out: a revision of the repo (`None`: jj's
+/// default), or a branch first fetched from the repo's remote — a sandbox's
+/// pushed work.
+enum Checkout {
+    Revision(Option<String>),
+    Fetched(String),
+}
+
 /// Fork a jj workspace into a named checkout and mount it. `dest`, when given, is
 /// the client-chosen absolute checkout directory (its parent already
 /// canonicalized client-side); when absent the server places a named sibling of
 /// the repo root. Validation (name shape, source is a jj repo, an absolute
-/// destination that does not yet exist) is synchronous; the `jj workspace add` —
-/// which materializes a working copy — runs on a spawned task so it never stalls
-/// the frame loop, and the `WorkspaceCreated` reply lands on the requester's
-/// channel once the checkout's shell pane is up.
+/// destination that does not yet exist) is synchronous; the fetch a `checkout`
+/// may need and the `jj workspace add` — which materializes a working copy —
+/// run on a spawned task so they never stall the frame loop, and the
+/// `WorkspaceCreated` reply lands on the requester's channel once the
+/// checkout's shell pane is up.
 fn workspace_fork(
     hub: &Arc<Hub>,
     cid: u64,
     tx: &mpsc::Sender<Vec<u8>>,
     id: WorkspaceId,
     name: String,
-    revision: Option<String>,
+    checkout: Checkout,
     dest: Option<PathBuf>,
 ) -> ControlFlow<()> {
     if !jj::valid_fork_name(&name) {
@@ -1343,7 +1354,14 @@ fn workspace_fork(
     let hub = Arc::clone(hub);
     let tx = tx.clone();
     tokio::spawn(async move {
-        if let Err(message) = jj::fork(&repo_root, &dest, &name, revision.as_deref()).await {
+        let forked = async {
+            let revision = match &checkout {
+                Checkout::Revision(revision) => revision.clone(),
+                Checkout::Fetched(branch) => Some(jj::fetch_branch(&repo_root, branch).await?),
+            };
+            jj::fork(&repo_root, &dest, &name, revision.as_deref()).await
+        };
+        if let Err(message) = forked.await {
             let _ = tx.send(encode_json(&Response::Error { message })).await;
             return;
         }
@@ -1366,6 +1384,35 @@ fn workspace_fork(
             .await;
     });
     ControlFlow::Continue(())
+}
+
+/// Pull a sandbox pane's pushed work into a workspace of its own: the branch
+/// its sandbox pushes to, fetched from the repo's remote and checked out by
+/// `workspace_fork` beside the pane's workspace — named `name`, else after the
+/// sandbox — so its diff and merge work as any workspace's do.
+fn sandbox_pull(
+    hub: &Arc<Hub>,
+    cid: u64,
+    tx: &mpsc::Sender<Vec<u8>>,
+    pane: PaneId,
+    name: Option<String>,
+) -> ControlFlow<()> {
+    let found = {
+        let session = hub.session();
+        session
+            .pane(pane)
+            .map(|info| (info.sandbox_name, session.workspace_of_pane(pane)))
+    };
+    let message = match found {
+        Some((Some(sandbox), Some(id))) => {
+            let branch = tutti_core::sandbox_branch(&sandbox);
+            let name = name.unwrap_or(sandbox);
+            return workspace_fork(hub, cid, tx, id, name, Checkout::Fetched(branch), None);
+        }
+        Some((None, _)) => format!("pane {pane} is not a sandbox pane"),
+        _ => format!("no pane {pane}"),
+    };
+    send_reply(hub, cid, tx, encode_json(&Response::Error { message }))
 }
 
 /// Merge a child workspace's work into its origin's trunk bookmark. Only a

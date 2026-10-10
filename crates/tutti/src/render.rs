@@ -240,6 +240,7 @@ mod tests {
             source: None,
             sandbox: None,
             conversation: None,
+            sandbox_name: None,
         }]);
         assert_eq!(
             rendered,

@@ -260,6 +260,18 @@ pub enum Request {
         #[serde(default)]
         force: bool,
     },
+    /// Pull a sandbox pane's work back: in its workspace's repo, `jj git
+    /// fetch` the branch its sandbox pushes to (`sandbox_branch` of the pane's
+    /// `sandbox_name`) from the remote it cloned (`pick_remote`), track it,
+    /// and check it out as a new workspace like `WorkspaceFork` does — named
+    /// `name`, else after the sandbox. Answered with `Response::WorkspaceCreated`;
+    /// Error for a pane that is not a sandbox's, a repo with no remote, or a
+    /// branch the sandbox has not pushed.
+    SandboxPull {
+        pane: PaneId,
+        #[serde(default)]
+        name: Option<String>,
+    },
     /// Join the attached-client set. `terminal` names the terminal app the
     /// client runs in — macOS's `__CFBundleIdentifier`, e.g.
     /// `com.mitchellh.ghostty` — which watchers are told so they can raise it.
@@ -397,6 +409,11 @@ pub struct PaneInfo {
     /// leaves the pane. `None` without hooks and from older servers.
     #[serde(default)]
     pub conversation: Option<String>,
+    /// The name the daemon gave the pane's sandbox: the k8s object's, and
+    /// under `tutti/` the branch the sandbox pushes its work to, which
+    /// `SandboxPull` fetches. `None` for a local pane and from older servers.
+    #[serde(default)]
+    pub sandbox_name: Option<String>,
 }
 
 /// One agent turn's checkpoint: the commit id of the workspace's `@` right
@@ -874,6 +891,14 @@ mod tests {
             n: 1,
             force: true,
         });
+        roundtrip(&Request::SandboxPull {
+            pane: PaneId(3),
+            name: Some("review".into()),
+        });
+        roundtrip(&Request::SandboxPull {
+            pane: PaneId(3),
+            name: None,
+        });
         roundtrip(&Request::Attach { terminal: None });
         roundtrip(&Request::Attach {
             terminal: Some("com.mitchellh.ghostty".into()),
@@ -975,6 +1000,7 @@ mod tests {
                     source: None,
                     sandbox: None,
                     conversation: None,
+                    sandbox_name: None,
                 }],
             }],
         }]
@@ -1017,6 +1043,7 @@ mod tests {
                 source: Some(StateSource::Hook),
                 sandbox: Some("gke".into()),
                 conversation: Some("0b9e6c1e-3d2a-4f5b-9c8d-7e6f5a4b3c2d".into()),
+                sandbox_name: Some("tutti-p1-18f2a9c0de".into()),
             }],
         });
         roundtrip(&Response::Panes {
@@ -1031,6 +1058,7 @@ mod tests {
                 source: Some(StateSource::Program),
                 sandbox: None,
                 conversation: None,
+                sandbox_name: None,
             }],
         });
         roundtrip(&Response::Checkpoints {
@@ -1272,6 +1300,7 @@ mod tests {
         assert_eq!(pane.source, None);
         assert_eq!(pane.sandbox, None, "and before `sandbox`, a local pane");
         assert_eq!(pane.conversation, None, "and before `conversation`, none");
+        assert_eq!(pane.sandbox_name, None, "and before `sandbox_name`, none");
         // ...and before `checkpoints` existed, to no checkpoints.
         assert!(pane.checkpoints.is_empty());
         // A checkpoint from before `prompt` existed lists as its label.
@@ -1393,6 +1422,15 @@ mod tests {
                 until: vec![WaitFor::Done],
                 next: false,
                 timeout_ms: None,
+            }
+        );
+        // `sandbox_pull` without a name names the workspace after the sandbox.
+        let pull: Request = serde_json::from_str(r#"{"type":"sandbox_pull","pane":3}"#).unwrap();
+        assert_eq!(
+            pull,
+            Request::SandboxPull {
+                pane: PaneId(3),
+                name: None,
             }
         );
         // `run` with only a command runs locally in the current workspace,

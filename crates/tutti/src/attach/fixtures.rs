@@ -39,6 +39,7 @@ pub(crate) fn pane(id: u64, title: &str, agent: Option<&str>, state: AgentState)
         source: None,
         sandbox: None,
         conversation: None,
+        sandbox_name: None,
     }
 }
 

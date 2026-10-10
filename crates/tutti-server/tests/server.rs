@@ -3198,6 +3198,110 @@ async fn fork_with_a_custom_dest_places_the_checkout_there() {
     server.stop().await;
 }
 
+/// `SandboxPull` fetches the branch a sandbox pane's sandbox pushed —
+/// `tutti/<its name>` — from the project's remote and checks it out as a
+/// workspace nested under the project, named after the sandbox; it refuses a
+/// pane that is not a sandbox's, a repo with no remote, and a branch not yet
+/// pushed. The sandbox pane runs a stand-in for the `tutti` wrapper — the
+/// server looks beside its own executable, here this test binary — that exits
+/// at once: no cluster involved. Skips without `jj`.
+#[tokio::test]
+async fn sandbox_pull_checks_out_the_branch_the_sandbox_pushed() {
+    if !jj_on_path() {
+        return;
+    }
+    let remote = jj_git_init("sbremote");
+    std::fs::write(remote.join("agent.txt"), "from the sandbox\n").unwrap();
+    assert!(
+        run_jj(&remote, &["commit", "-m", "sandbox work"])
+            .status
+            .success()
+    );
+    let local = jj_git_init("sblocal");
+    // Kept, never removed: without it the server would fall back to a `tutti`
+    // on PATH — the user's real install — for any sandbox pane a test spawns.
+    let wrapper = std::env::current_exe().unwrap().with_file_name("tutti");
+    match std::os::unix::fs::symlink("/usr/bin/true", &wrapper) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+            panic!("placing the wrapper stand-in at {}: {e}", wrapper.display())
+        }
+        _ => {}
+    }
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let project = workspace_id(
+        conn.request(Request::WorkspaceNew { dir: local.clone() })
+            .await,
+    );
+    let run = |cmd: &str, sandbox: Option<&str>| Request::PaneRun {
+        tab: None,
+        cmd: vec![cmd.into()],
+        ephemeral: false,
+        sandbox: sandbox.map(Into::into),
+    };
+
+    let shell = pane_id(conn.request(run("/bin/sh", None)).await);
+    let refused = Request::SandboxPull {
+        pane: shell,
+        name: None,
+    };
+    assert!(error_message(conn.request(refused).await).contains("not a sandbox pane"));
+    let pane = pane_id(conn.request(run("claude", Some("orb"))).await);
+    let name = match conn.request(Request::PaneList).await {
+        Response::Panes { panes } => panes.into_iter().find(|p| p.id == pane),
+        other => panic!("expected Panes, got {other:?}"),
+    }
+    .and_then(|p| p.sandbox_name)
+    .expect("a sandbox pane carries its sandbox's name");
+    assert!(name.starts_with(&format!("tutti-p{pane}-")), "{name}");
+    let pull = Request::SandboxPull { pane, name: None };
+    let message = error_message(conn.request(pull.clone()).await);
+    assert!(message.contains("no git remote"), "{message}");
+    let url = remote.join(".git");
+    let added = run_jj(
+        &local,
+        &["git", "remote", "add", "origin", url.to_str().unwrap()],
+    );
+    assert!(added.status.success());
+    let branch = format!("tutti/{name}");
+    let message = error_message(conn.request(pull.clone()).await);
+    assert!(
+        message.contains(&branch) && message.contains("has the sandbox pushed it?"),
+        "not pushed yet: {message}"
+    );
+    assert!(
+        !fork_sibling(&local, &name).exists(),
+        "a branch the remote lacks checks nothing out"
+    );
+
+    assert!(
+        run_jj(&remote, &["bookmark", "create", &branch, "-r", "@-"])
+            .status
+            .success()
+    );
+    let pulled = workspace_id(conn.request(pull).await);
+    let dest = fork_sibling(&local, &name);
+    assert_eq!(
+        std::fs::read_to_string(dest.join("agent.txt")).unwrap(),
+        "from the sandbox\n",
+        "the checkout holds the sandbox's work"
+    );
+    match conn.request(Request::WorkspaceList).await {
+        Response::Workspaces { workspaces } => assert!(
+            workspaces
+                .iter()
+                .any(|w| w.id == pulled && w.parent == Some(project)),
+            "nested under the project: {workspaces:?}"
+        ),
+        other => panic!("expected Workspaces, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&remote);
+    let _ = std::fs::remove_dir_all(&local);
+    let _ = std::fs::remove_dir_all(&dest);
+    server.stop().await;
+}
+
 /// Merge lands a child's non-empty working copy on trunk: the bookmark advances
 /// to the child's own commit and the origin's `main` gains the child's file. With
 /// no remote, `push: true` still reports `pushed: false`. Skips without `jj`.

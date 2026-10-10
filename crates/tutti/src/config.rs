@@ -666,12 +666,14 @@ struct RawSandbox {
     image: Option<String>,
     warm_pool: Option<String>,
     container: Option<String>,
+    inject_env: Option<bool>,
     ttl_minutes: Option<u64>,
 }
 
 impl RawSandbox {
     /// Validate into a profile: a name usable as a CLI argument, exactly one
-    /// of `image`/`warm_pool`, and a TTL of at least a minute (default 60).
+    /// of `image`/`warm_pool`, `inject_env` only on a warm pool (default off),
+    /// and a TTL of at least a minute (default 60).
     fn into_profile(self) -> Result<Profile> {
         let name = self.name;
         if name.is_empty()
@@ -686,6 +688,12 @@ impl RawSandbox {
             (None, Some(pool)) => Source::WarmPool(pool),
             _ => bail!("sandboxes.{name}: set exactly one of `image` or `warm_pool`"),
         };
+        let inject_env = self.inject_env.unwrap_or(false);
+        if inject_env && matches!(source, Source::Image(_)) {
+            bail!(
+                "sandboxes.{name}: `inject_env` is for `warm_pool` profiles (an image sandbox always gets the env)"
+            );
+        }
         let ttl_minutes = self.ttl_minutes.unwrap_or(60);
         if ttl_minutes == 0 {
             bail!("sandboxes.{name}: ttl_minutes must be at least 1");
@@ -696,6 +704,7 @@ impl RawSandbox {
             namespace: self.namespace,
             source,
             container: self.container,
+            inject_env,
             ttl: std::time::Duration::from_secs(ttl_minutes * 60),
         })
     }
@@ -1072,6 +1081,7 @@ name = "gke"
 namespace = "agents"
 warm_pool = "claude-pool"
 container = "agent"
+inject_env = true
 ttl_minutes = 15
 "#,
         )
@@ -1085,6 +1095,7 @@ ttl_minutes = 15
                     namespace: None,
                     source: Source::Image("ghcr.io/acme/agent:1".into()),
                     container: None,
+                    inject_env: false,
                     ttl: std::time::Duration::from_secs(3_600),
                 },
                 Profile {
@@ -1093,6 +1104,7 @@ ttl_minutes = 15
                     namespace: Some("agents".into()),
                     source: Source::WarmPool("claude-pool".into()),
                     container: Some("agent".into()),
+                    inject_env: true,
                     ttl: std::time::Duration::from_secs(900),
                 },
             ]
@@ -1123,6 +1135,10 @@ ttl_minutes = 15
             (
                 "[[sandboxes]]\nname = \"a\"\nimage = \"i\"\nttl_minutes = 0\n",
                 "at least 1",
+            ),
+            (
+                "[[sandboxes]]\nname = \"a\"\nimage = \"i\"\ninject_env = true\n",
+                "`inject_env` is for `warm_pool` profiles",
             ),
             (
                 "[[sandboxes]]\nname = \"a\"\nimage = \"i\"\n\n[[sandboxes]]\nname = \"a\"\nimage = \"j\"\n",

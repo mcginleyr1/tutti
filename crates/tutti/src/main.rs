@@ -104,6 +104,11 @@ enum Command {
         /// Print only the snippet (omit the install instructions on stderr).
         #[arg(long, conflicts_with = "install")]
         raw: bool,
+        /// Claude only: hooks that report over OSC 7501 to the terminal, for
+        /// baking into a k8s sandbox image — the pod has no route to the
+        /// daemon, but its pty is the pane's. Print-only.
+        #[arg(long, conflicts_with = "install")]
+        tty: bool,
         /// Install it (shows the change, asks first).
         #[arg(long)]
         install: bool,
@@ -148,8 +153,21 @@ enum SandboxAction {
     /// --sandbox` pane runs.
     Run {
         profile: String,
+        /// The sandbox's name, which the daemon picks per pane: it names the
+        /// k8s object and, as `tutti/<name>`, the branch the sandbox pushes to.
+        #[arg(long)]
+        name: String,
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
+    },
+    /// Fetch the branch a sandbox pane's agent pushed (`tutti/<sandbox
+    /// name>`) and check it out as a workspace beside the pane's, for its
+    /// diff and a merge.
+    Pull {
+        pane: u64,
+        /// The workspace's name, `[A-Za-z0-9_-]+` (default: the sandbox's).
+        #[arg(long)]
+        name: Option<String>,
     },
 }
 
@@ -425,16 +443,20 @@ fn run(cli: Cli) -> Result<i32> {
                 },
         }) => run_wait(&cli.session, cli.json, &panes, &until, next, timeout),
         Some(Command::Sandbox {
-            action: SandboxAction::Run { profile, cmd },
-        }) => tutti::sandbox::run(Config::load()?.sandbox(&profile)?, &cmd),
+            action: SandboxAction::Run { profile, name, cmd },
+        }) => tutti::sandbox::run(Config::load()?.sandbox(&profile)?, &name, &cmd),
         Some(Command::Watch) => run_watch(&cli.session),
         Some(Command::Hooks {
             agent,
             raw,
+            tty,
             install,
             project,
             yes,
         }) => match (agent, install) {
+            (HookAgent::Opencode, _) if tty => {
+                bail!("--tty is for claude: opencode reports through its plugin")
+            }
             (HookAgent::Claude, true) => {
                 install_integration(Integration::ClaudeHooks, project, yes)
             }
@@ -442,7 +464,7 @@ fn run(cli: Cli) -> Result<i32> {
                 install_integration(Integration::OpencodePlugin, project, yes)
             }
             (HookAgent::Claude, false) => {
-                emit_hooks(raw);
+                emit_hooks(raw, tty);
                 Ok(0)
             }
             (HookAgent::Opencode, false) => {
@@ -797,9 +819,17 @@ fn to_request(command: Command) -> Result<Request> {
                 force,
             },
         }),
+        Command::Sandbox {
+            action: SandboxAction::Pull { pane, name },
+        } => Ok(Request::SandboxPull {
+            pane: PaneId(pane),
+            name,
+        }),
         Command::Server { .. }
         | Command::Attach
-        | Command::Sandbox { .. }
+        | Command::Sandbox {
+            action: SandboxAction::Run { .. },
+        }
         | Command::Watch
         | Command::AgentEvent { .. }
         | Command::Hooks { .. }
@@ -928,16 +958,34 @@ fn run_watch(session: &str) -> Result<i32> {
     Ok(0)
 }
 
-/// Print the Claude Code hooks snippet: the JSON to stdout, plus — unless
-/// `--raw` — a few install lines to stderr so the JSON pipes cleanly on its own.
-fn emit_hooks(raw: bool) {
-    println!("{}", hooks::claude_hooks_snippet());
+/// Print the Claude Code hooks snippet — with `tty`, the OSC 7501 one for a
+/// sandbox image: the JSON to stdout, plus — unless `--raw` — a few lines on
+/// where it goes to stderr so the JSON pipes cleanly on its own.
+fn emit_hooks(raw: bool, tty: bool) {
+    let notes: &[&str] = if tty {
+        let snippet = serde_json::to_string_pretty(&hooks::claude_tty_hooks_json());
+        println!("{}", snippet.expect("hooks snippet serializes"));
+        &[
+            "# For a sandbox image: each hook writes OSC 7501 to /dev/tty, which",
+            "# `kubectl exec -it` carries back to the tutti pane — the image needs",
+            "# printf, not tutti. Merge the object above into the agent user's",
+            "# ~/.claude/settings.json at the TOP level as the image is built (or",
+            "# commit it as .claude/settings.json in the repo the sandbox clones).",
+        ]
+    } else {
+        println!("{}", hooks::claude_hooks_snippet());
+        &[
+            "# The object above already includes the \"hooks\" key: merge it into",
+            "# ~/.claude/settings.json at the TOP level (or .claude/settings.json in",
+            "# a project) — or let tutti do it: `tutti hooks claude --install`.",
+            "# Outside a tutti pane the hook exits silently; if you ever uninstall",
+            "# tutti, remove these entries or Claude will warn on every tool call.",
+        ]
+    };
     if !raw {
-        eprintln!("# The object above already includes the \"hooks\" key: merge it into");
-        eprintln!("# ~/.claude/settings.json at the TOP level (or .claude/settings.json in");
-        eprintln!("# a project) — or let tutti do it: `tutti hooks claude --install`.");
-        eprintln!("# Outside a tutti pane the hook exits silently; if you ever uninstall");
-        eprintln!("# tutti, remove these entries or Claude will warn on every tool call.");
+        for line in notes {
+            eprintln!("{line}");
+        }
     }
 }
 
@@ -1860,6 +1908,44 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_verbs_parse() {
+        assert_eq!(
+            request_of(&["tutti", "sandbox", "pull", "3"]),
+            Request::SandboxPull {
+                pane: PaneId(3),
+                name: None,
+            }
+        );
+        assert_eq!(
+            request_of(&["tutti", "sandbox", "pull", "3", "--name", "review"]),
+            Request::SandboxPull {
+                pane: PaneId(3),
+                name: Some("review".into()),
+            }
+        );
+        let run = Cli::try_parse_from([
+            "tutti",
+            "sandbox",
+            "run",
+            "orb",
+            "--name",
+            "tutti-p3-ab",
+            "--",
+            "claude",
+        ]);
+        assert!(matches!(
+            run.unwrap().command,
+            Some(Command::Sandbox {
+                action: SandboxAction::Run { name, cmd, .. },
+            }) if name == "tutti-p3-ab" && cmd == ["claude"]
+        ));
+        assert!(
+            Cli::try_parse_from(["tutti", "sandbox", "run", "orb", "--", "claude"]).is_err(),
+            "the daemon names every sandbox it runs"
+        );
+    }
+
+    #[test]
     fn checkpoint_verbs_parse() {
         assert_eq!(
             request_of(&["tutti", "pane", "checkpoints", "3"]),
@@ -1998,9 +2084,21 @@ mod tests {
                 ..
             })
         ));
-        // --yes/--project require --install; --raw conflicts with --install.
+        // --yes/--project require --install; --raw and --tty conflict with it.
         assert!(Cli::try_parse_from(["tutti", "hooks", "claude", "--yes"]).is_err());
         assert!(Cli::try_parse_from(["tutti", "hooks", "claude", "--raw", "--install"]).is_err());
+        assert!(Cli::try_parse_from(["tutti", "hooks", "claude", "--tty", "--install"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["tutti", "hooks", "claude", "--tty", "--raw"])
+                .unwrap()
+                .command,
+            Some(Command::Hooks {
+                agent: HookAgent::Claude,
+                tty: true,
+                raw: true,
+                ..
+            })
+        ));
         assert!(matches!(
             Cli::try_parse_from(["tutti", "hooks", "claude", "--raw"])
                 .unwrap()
