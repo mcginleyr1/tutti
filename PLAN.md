@@ -190,7 +190,16 @@ Goal: the differentiator. Tutti knows which panes are agents and what state they
    stay sticky. Any pane may report its own state (OSC 7501 root record only, no
    `?` probe; OSC 9;4 never surfaces as a notification) and then shows where
    agent state does, labelled by its `app`. A non-hook pane `Working` with no
-   output and no classifier match for 30s stalls to `Unknown`.
+   output and no classifier match for 30s stalls to `Unknown` — a behaviour
+   change for guess-pattern agents, which used to sit in `Working` forever after
+   any output. A 7501 `clear` from `Blocked` settles to `Idle` (beyond the spec,
+   so a cleared shell pane can leave the waiting queue). Open: a program claim
+   ends only on its own `clear`, and the spec's own shell example never sends
+   one — that pane then ignores 9;4 for life; end a Done/Idle program claim
+   when the pane is typed into (TUIOS drops done records on typing). And other
+   ConEmu `OSC 9;N` subcommands (`9;9;<cwd>`, which shells emit for Windows
+   Terminal) still surface as bogus notifications — only 9;4 was fixed; a
+   `9;<digits>;…` body is a subcommand, never a notification.
 3. **Surfacing**: colored state badge per pane border + tab, workspace overview in
    navigate mode grouped by state (Blocked first), optional terminal bell / OSC 9
    desktop notification on `Working → Blocked/Done`.
@@ -199,6 +208,7 @@ Goal: the differentiator. Tutti knows which panes are agents and what state they
 
 **Acceptance:** start a Claude Code task; badge shows Working; when it asks for
 permission the pane flags Blocked within ~1s; when it finishes, Done until you focus it.
+✅ Met — Phase 3 is done; what remains above is follow-up, not acceptance.
 
 ## Phase 4 — Agent-shaped API & orchestration
 
@@ -206,12 +216,19 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
 
 1. **Wait conditions**: `tutti pane wait <pane> --until done|blocked|idle [--timeout]`
    blocks until the state transition (server-side subscription, not polling).
+   Open — next wave. Every transition source now lands in `publish_transition`,
+   so the wait subscribes to the `StateChanged` stream it emits; a pane already
+   in the wanted state answers at once.
 2. **Structured read**: `pane read --unwrapped` (logical lines, no soft wraps) and
-   `--since` cursors so a supervisor agent can tail incrementally.
+   `--since` cursors so a supervisor agent can tail incrementally. ✅
+   `--unwrapped`. Open — next wave: `--since`.
 3. **Composite verbs**: `tutti run --workspace <ws> -- claude "fix the tests"` =
-   create pane, run agent, return pane id — one call for orchestrators.
+   create pane, run agent, return pane id — one call for orchestrators. Open —
+   next wave: `pane run` targets a `--tab`, not a workspace, so today this is
+   two calls.
 4. **Agent skill**: ship a `skills/tutti/SKILL.md` (Claude Code skill) documenting the
    CLI so any Claude instance inside a tutti pane can herd its own sub-agents.
+   Open — next wave, after 1–3 so it documents the verbs an orchestrator needs.
 5. **jj workspace workflow** (first-class; jj is the required VCS for all
    workspace-level VCS features — no git/hg adapters): a **workspace** is a jj
    checkout nested under a **project** (its origin repo), rendered indented under
@@ -292,6 +309,40 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
 
 **Acceptance:** a script (or an agent) can: create 3 worktree workspaces, launch an
 agent in each, `wait --until done` on all three, read back each diff summary.
+Not yet runnable: it needs items 1 and 3.
+
+### Next waves (as of 2026-10-10)
+
+In order; each lands its TUI path in the same wave as its verbs.
+
+1. **Finish Phase 4** — `pane wait`, `pane read --since`, the one-call `tutti
+   run --workspace`, then the agent skill. Close the wave by running the
+   acceptance script above for real, against live agents.
+2. **State follow-ups** (Phase 3 item 2's opens) — end a Done/Idle program
+   claim when the pane is typed into; stop `OSC 9;N` subcommands surfacing as
+   notifications.
+3. **Debts against the ground rules** — a TUI path for hook install (claude
+   and opencode are CLI-only); a table-driven sidebar and changes-panel keymap
+   (CLAUDE.md's "everything renders from the live keymap table" holds only for
+   prefix keys — `p`, `r` and the panel keys were wired by hand); correlate
+   responses with requests so a refused answer can't cancel a pending
+   fork/merge follow-up.
+4. **Survive a daemon restart** — persist checkpoint lists (they are commit
+   ids) and resume wave 2 (session ids from hook payloads); both want the same
+   small state file.
+5. **Candidates from prior art** — read each one's spec before building:
+   herdr-compatible reporting (TUIOS answers on herdr's env and socket, so
+   Crush and Muse Code — both in our catalog — report with no install step);
+   hook-held approvals answered from the queue; a Codex hook integration
+   (needs a live run).
+
+**Unverified live — cover these in wave 1's acceptance run:** checkpoints
+through a real Claude Code turn (verified only with synthetic hook JSON) and
+through the screen-classifier, agent-exit and focus paths; whether Claude Code
+emits its own OSC 9;4 (a hook-less claude pane would then hold off `Done`
+until the progress clears); opencode's question/error/retry events and `hooks
+opencode --install --project`; `jj util gc` pruning a checkpoint's commit; a
+turn-end probe racing a restore.
 
 ## Phase 5 — Hardening & distribution
 
