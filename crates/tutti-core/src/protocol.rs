@@ -88,11 +88,12 @@ pub enum Request {
     },
     /// The orchestrator's one call: spawn `cmd` in a fresh tab and answer
     /// `Response::Ran`. The workspace is `workspace`, else the one open at
-    /// `dir` (mounted like `WorkspaceNew` when none is), else the current one;
-    /// naming both is an error. A fresh tab because an orchestrated agent must
-    /// never split a tab someone is using — and the session's current tab
-    /// stays put, so an attached client is not yanked over to it. `sandbox`
-    /// works as in `PaneRun`; `title` names the pane.
+    /// `dir` (mounted like `WorkspaceNew` when none is), else `from`'s, else
+    /// the current one; naming both `workspace` and `dir` is an error. A fresh
+    /// tab because an orchestrated agent must never split a tab someone is
+    /// using — and the session's current tab stays put, so an attached client
+    /// is not yanked over to it. `sandbox` works as in `PaneRun`; `title`
+    /// names the pane.
     Run {
         #[serde(default)]
         workspace: Option<WorkspaceId>,
@@ -103,6 +104,11 @@ pub enum Request {
         sandbox: Option<String>,
         #[serde(default)]
         title: Option<String>,
+        /// The calling pane (the CLI's `TUTTI_PANE`), so an agent's run lands
+        /// beside it rather than wherever the human is looking. `None` from
+        /// outside the session's panes and from older clients.
+        #[serde(default)]
+        from: Option<PaneId>,
     },
     PaneRun {
         tab: Option<TabId>,
@@ -768,6 +774,7 @@ mod tests {
             cmd: vec!["claude".into(), "fix the tests".into()],
             sandbox: Some("gke".into()),
             title: Some("fixer".into()),
+            from: None,
         });
         roundtrip(&Request::Run {
             workspace: None,
@@ -775,6 +782,15 @@ mod tests {
             cmd: vec!["sh".into()],
             sandbox: None,
             title: None,
+            from: None,
+        });
+        roundtrip(&Request::Run {
+            workspace: None,
+            dir: None,
+            cmd: vec!["claude".into()],
+            sandbox: None,
+            title: None,
+            from: Some(PaneId(7)),
         });
         roundtrip(&Request::PaneSplit {
             pane: PaneId(1),
@@ -1434,7 +1450,8 @@ mod tests {
             }
         );
         // `run` with only a command runs locally in the current workspace,
-        // under the command's own title.
+        // under the command's own title — and from before `from` existed,
+        // from no pane.
         let run: Request = serde_json::from_str(r#"{"type":"run","cmd":["claude"]}"#).unwrap();
         assert_eq!(
             run,
@@ -1444,6 +1461,7 @@ mod tests {
                 cmd: vec!["claude".into()],
                 sandbox: None,
                 title: None,
+                from: None,
             }
         );
         // A bare `session_restore` restores rather than discards.

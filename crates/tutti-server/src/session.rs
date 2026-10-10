@@ -17,6 +17,7 @@ use tutti_core::{
 };
 
 use crate::checkpoints::{Noted, Turns};
+use crate::herdr;
 use crate::persist::{self, Saved, SavedPane, SavedTab, SavedWorkspace};
 use crate::pty::{PaneSize, PtyPane, PtySpec, StatusReport};
 
@@ -97,6 +98,11 @@ struct PaneSlot {
     alive: Instant,
     /// When an OSC 7501 `msg` last raised a notification here.
     notified: Option<Instant>,
+    /// The herdr reporter (`source`, `agent`) whose report holds the pane's
+    /// hook-ranked claim, while one does (`apply_herdr`).
+    herdr: Option<(String, String)>,
+    /// The last `seq` accepted from each herdr source; it outlives claims.
+    herdr_seqs: HashMap<String, u64>,
 }
 
 #[derive(Default)]
@@ -130,6 +136,9 @@ pub struct Session {
     /// The session name, exported to every spawned pane as `TUTTI_SESSION` so a
     /// Claude Code hook running inside it can reach this daemon's socket.
     name: String,
+    /// herdr's reporting socket once it listens, exported to every pane
+    /// spawned from then on with the rest of `HERDR_*`.
+    herdr: Option<PathBuf>,
 }
 
 impl Session {
@@ -141,7 +150,13 @@ impl Session {
             size,
             ids: Ids::default(),
             name: name.into(),
+            herdr: None,
         }
+    }
+
+    /// Point every pane spawned from now on at herdr's socket, `socket`.
+    pub fn set_herdr_socket(&mut self, socket: PathBuf) {
+        self.herdr = Some(socket);
     }
 
     pub fn workspace_new(&mut self, dir: PathBuf) -> WorkspaceId {
@@ -411,9 +426,9 @@ impl Session {
 
     /// `tutti run` under one guard: resolve the workspace — `workspace`, else
     /// the one with `dir` open (compared canonically), else a fresh mount of
-    /// `dir`, which must exist, else the current one — and spawn `cmd`, titled
-    /// `title` when given, in a fresh tab there: a new tab, or a fresh mount's
-    /// own empty one. The
+    /// `dir`, which must exist, else that of `from` (the calling pane), else
+    /// the current one — and spawn `cmd`, titled `title` when given, in a
+    /// fresh tab there: a new tab, or a fresh mount's own empty one. The
     /// session's current tab stays where it was (an empty session's aside), so
     /// an attached client's launches still land in the tab it is looking at.
     /// A failed spawn leaves nothing behind. Returns the workspace, tab and
@@ -425,6 +440,7 @@ impl Session {
         cmd: Vec<String>,
         sandbox: Option<String>,
         title: Option<String>,
+        from: Option<PaneId>,
     ) -> Result<(WorkspaceId, TabId, PaneId, bool)> {
         let current = self.current_tab;
         let (workspace, tab, mounted) = match (workspace, dir) {
@@ -443,6 +459,13 @@ impl Session {
                 }
             }
             (workspace, None) => {
+                let workspace = match (workspace, from) {
+                    (None, Some(pane)) => Some(
+                        self.workspace_of_pane(pane)
+                            .with_context(|| format!("no pane {pane}"))?,
+                    ),
+                    (workspace, _) => workspace,
+                };
                 let id = self.resolve_workspace(workspace)?;
                 (id, self.tab_new(Some(id))?, false)
             }
@@ -624,10 +647,25 @@ impl Session {
         Ok(())
     }
 
-    pub fn pane_send(&self, pane: PaneId, bytes: &[u8]) -> Result<()> {
-        self.pty(pane)
-            .with_context(|| format!("no pane {pane}"))?
-            .write_input(bytes)
+    /// Type `bytes` into `pane`. Input past a finished program's own report —
+    /// a Program or Progress claim holding Done or Idle — ends that claim, the
+    /// state staying until something moves it, so a reporter that never sent
+    /// its clear cannot shut out the next one. Returns whether that settled
+    /// the pane out of the agent surfaces (the caller rebroadcasts the view).
+    pub fn pane_send(&mut self, pane: PaneId, bytes: &[u8]) -> Result<bool> {
+        let slot = self
+            .panes
+            .get_mut(&pane)
+            .with_context(|| format!("no pane {pane}"))?;
+        slot.pty.write_input(bytes)?;
+        let finished = matches!(
+            slot.meta.source,
+            Some(StateSource::Program | StateSource::Progress)
+        ) && matches!(slot.meta.state, AgentState::Done | AgentState::Idle);
+        if finished {
+            slot.meta.source = None;
+        }
+        Ok(finished && self.settle(pane))
     }
 
     /// A guarded send: answer the prompt a blocked agent is showing, only if it
@@ -729,6 +767,7 @@ impl Session {
         let slot = self.panes.get_mut(&pane)?;
         if event != AgentHookEvent::SessionStarted {
             slot.meta.source = Some(StateSource::Hook);
+            slot.herdr = None;
         }
         let mut relisted = conversation.is_some() && slot.meta.conversation != conversation;
         if relisted {
@@ -785,12 +824,13 @@ impl Session {
 
     /// Record the agent kind detected for a pane. Returns whether it changed. A
     /// change ends any program/progress claim and the self-reported label —
-    /// they spoke for whatever ran there before; a hook claim stays (sticky).
-    /// An agent leaving takes its conversation and its turn's prompt along;
-    /// one appearing keeps what its hooks reported before detection caught up
-    /// with it. An agent appearing notes its start as a checkpoint for the
-    /// caller's next change probe — detection lands well before the agent's
-    /// first edit.
+    /// they spoke for whatever ran there before; a hook claim stays (sticky),
+    /// and so does a herdr claim when the agent detected is the one that
+    /// reported it (detection catching up). An agent leaving takes its
+    /// conversation and its turn's prompt along; one appearing keeps what its
+    /// hooks reported before detection caught up with it. An agent appearing
+    /// notes its start as a checkpoint for the caller's next change probe —
+    /// detection lands well before the agent's first edit.
     pub fn set_agent(&mut self, pane: PaneId, agent: Option<AgentKind>) -> bool {
         match self.panes.get_mut(&pane) {
             Some(slot) if slot.meta.agent != agent => {
@@ -801,11 +841,15 @@ impl Session {
                     slot.meta.conversation = None;
                     slot.turns.set_prompt(None);
                 }
+                let kept = slot.herdr.as_ref().is_none_or(|(_, reporter)| {
+                    agent.as_ref().is_some_and(|kind| kind.0 == *reporter)
+                });
+                if slot.meta.source != Some(StateSource::Hook) || !kept {
+                    slot.meta.source = None;
+                    slot.herdr = None;
+                }
                 slot.meta.agent = agent;
                 slot.label = None;
-                if slot.meta.source != Some(StateSource::Hook) {
-                    slot.meta.source = None;
-                }
                 true
             }
             _ => false,
@@ -901,6 +945,74 @@ impl Session {
             relisted,
             notify,
         }
+    }
+
+    /// Apply a herdr report (see `herdr`) to `pane`: the agent's own exact
+    /// lifecycle, so its states claim at the hook rank, labelled by the agent
+    /// as an OSC 7501 `app` labels and noting a message like a 7501 `msg`
+    /// (`apply_report`). Where a hook claim is sticky, a herdr one ends when
+    /// its reporter releases or clears it — settling as a 7501 clear does —
+    /// when the child exits, and when another agent is detected. herdr leaves
+    /// "done" to the multiplexer: an idle after work a herdr report held is
+    /// Done — not after work another source guessed, like Crush's own OSC 9;4
+    /// racing its startup idle — and an unseen Done stays. A stale `seq`
+    /// changes nothing, nor does a state for an exited pane; the conversation
+    /// follows `agent_session_id`. `None` for an unknown pane.
+    pub fn apply_herdr(
+        &mut self,
+        pane: PaneId,
+        report: herdr::Report,
+        now: Instant,
+    ) -> Option<ReportOutcome> {
+        let slot = self.panes.get_mut(&pane)?;
+        if !report.fresh(&mut slot.herdr_seqs) {
+            return Some(ReportOutcome::default());
+        }
+        let renamed = report.session.is_some() && slot.meta.conversation != report.session;
+        if renamed {
+            slot.meta.conversation = report.session;
+        }
+        let holder = report.source.clone().zip(report.agent.clone());
+        let ends = match report.act {
+            herdr::Act::Release => holder.is_some() && slot.herdr == holder,
+            herdr::Act::Clear => slot.herdr.as_ref().is_some_and(|(held, _)| {
+                report.source.as_ref().is_none_or(|source| source == held)
+            }),
+            herdr::Act::State(..) | herdr::Act::Session => false,
+        };
+        let status = match report.act {
+            herdr::Act::State(Some(state), msg) if slot.meta.exited.is_none() => {
+                let reported_work = slot.herdr.is_some()
+                    && matches!(slot.meta.state, AgentState::Working | AgentState::Blocked);
+                let finished = reported_work || slot.meta.state == AgentState::Done;
+                let state = match state {
+                    AgentState::Idle if finished => AgentState::Done,
+                    state => state,
+                };
+                slot.herdr = holder;
+                Some(StatusReport {
+                    source: StateSource::Hook,
+                    state: Some(state),
+                    app: report.agent,
+                    msg,
+                })
+            }
+            _ if ends => {
+                slot.herdr = None;
+                Some(StatusReport {
+                    source: StateSource::Hook,
+                    state: None,
+                    app: None,
+                    msg: None,
+                })
+            }
+            _ => None,
+        };
+        let mut outcome = status.map_or_else(ReportOutcome::default, |status| {
+            self.apply_report(pane, status, now)
+        });
+        outcome.relisted |= renamed;
+        Some(outcome)
     }
 
     /// Fold one classify pass onto `pane`: PTY output since the last pass is an
@@ -1027,6 +1139,7 @@ impl Session {
                 let to = from.apply(StateEvent::Classified(Observation::Done));
                 slot.meta.state = to;
                 slot.meta.source = None;
+                slot.herdr = None;
                 Some((from, to))
             }
             _ => None,
@@ -1289,6 +1402,14 @@ impl Session {
         let id = self.ids.pane();
         spec.env.push(("TUTTI_PANE".into(), id.0.to_string()));
         spec.env.push(("TUTTI_SESSION".into(), self.name.clone()));
+        // Its herdr reporters reach this daemon, never a herdr the daemon
+        // itself was started inside.
+        let inherited = std::env::vars_os().filter_map(|(key, _)| key.into_string().ok());
+        spec.env_remove
+            .extend(inherited.filter(|key| key.starts_with("HERDR_")));
+        if let (Some(socket), Some(workspace)) = (&self.herdr, self.workspace_of_tab(tab)) {
+            spec.env.extend(herdr::env(socket, workspace, tab, id));
+        }
         let pty = Arc::new(PtyPane::spawn(spec, self.size).context("spawn pty")?);
         let entry = self.tab_mut(tab).context("target tab vanished")?;
         entry.layout = Some(match (&entry.layout, split) {
@@ -1326,6 +1447,8 @@ impl Session {
                 label: None,
                 alive: Instant::now(),
                 notified: None,
+                herdr: None,
+                herdr_seqs: HashMap::new(),
             },
         );
         Ok(id)
@@ -1499,6 +1622,7 @@ mod tests {
         ForkMeta, STALL_AFTER, Session, git_branch, pane_title, parse_head, rename_leaves,
         sandbox_argv, sandbox_name, stop_subagent,
     };
+    use crate::herdr;
     use crate::persist::{Saved, SavedPane};
     use crate::pty::{PaneSize, StatusReport};
     use AgentState::{Blocked, Done, Idle, Unknown, Working};
@@ -1835,6 +1959,222 @@ mod tests {
         assert_eq!(notify(&mut s, Blocked, t0 + Duration::from_secs(2)), None);
         notify(&mut s, Working, t0 + Duration::from_secs(30));
         assert_eq!(notify(&mut s, Blocked, t0 + Duration::from_secs(30)), note);
+    }
+
+    #[test]
+    fn typing_ends_a_finished_program_claim_and_nothing_else() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let t0 = Instant::now();
+        s.apply_report(pane, app_report(Some(Done), "build", None), t0);
+        assert!(
+            !s.pane_send(pane, b"x").unwrap(),
+            "an unseen Done stays listed"
+        );
+        assert_eq!(
+            state_of(&s, pane),
+            (Done, None),
+            "the claim ended, the state stays"
+        );
+        s.apply_report(pane, report(Progress, Some(Working)), t0);
+        assert_eq!(
+            state_of(&s, pane),
+            (Working, Some(Progress)),
+            "so the next report lands"
+        );
+        s.pane_send(pane, b"x").unwrap();
+        assert_eq!(
+            state_of(&s, pane),
+            (Working, Some(Progress)),
+            "a claim in motion holds"
+        );
+        s.apply_report(pane, app_report(Some(Idle), "build", None), t0);
+        assert!(
+            s.pane_send(pane, b"x").unwrap(),
+            "an Idle settles out of the surfaces"
+        );
+        assert_eq!(state_of(&s, pane), (Idle, None));
+        s.apply_agent_event(pane, AgentHookEvent::Done, None);
+        s.pane_send(pane, b"x").unwrap();
+        assert_eq!(
+            state_of(&s, pane),
+            (Done, Some(Hook)),
+            "a hook claim never ends so"
+        );
+    }
+
+    /// A herdr report from Crush (source and agent `crush`) with `seq`.
+    fn crush(seq: u64, act: herdr::Act) -> herdr::Report {
+        herdr::Report {
+            source: Some("crush".into()),
+            agent: Some("crush".into()),
+            seq: Some(seq),
+            session: None,
+            act,
+        }
+    }
+
+    fn crush_state(seq: u64, state: AgentState) -> herdr::Report {
+        crush(seq, herdr::Act::State(Some(state), None))
+    }
+
+    #[test]
+    fn a_herdr_report_claims_at_the_hook_rank_until_released() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let t0 = Instant::now();
+        // Crush's own OSC 9;4;3 races its startup idle (observed live).
+        s.apply_report(pane, report(Progress, Some(Working)), t0);
+        let outcome = s.apply_herdr(pane, crush_state(1, Idle), t0).unwrap();
+        assert!(outcome.relisted, "the agent labels the pane");
+        assert_eq!(
+            state_of(&s, pane),
+            (Idle, Some(Hook)),
+            "idle after work no herdr report held is no finish"
+        );
+        assert_eq!(info(&s, pane).agent, Some("crush".into()));
+
+        s.apply_herdr(pane, crush_state(2, Working), t0);
+        s.apply_report(pane, report(Program, Some(Done)), t0);
+        assert_eq!(s.observe(pane, true, Some(Observation::Blocked), t0), None);
+        assert_eq!(
+            state_of(&s, pane),
+            (Working, Some(Hook)),
+            "nothing below moves it"
+        );
+
+        let blocked = herdr::Act::State(Some(Blocked), Some("allow bash?".into()));
+        let outcome = s.apply_herdr(pane, crush(3, blocked), t0).unwrap();
+        let note = Some((Some("crush".to_string()), "allow bash?".to_string()));
+        assert_eq!(
+            outcome.notify, note,
+            "the message notifies, titled by the agent"
+        );
+        s.apply_herdr(pane, crush_state(4, Idle), t0);
+        assert_eq!(
+            state_of(&s, pane),
+            (Done, Some(Hook)),
+            "idle after work is a finish"
+        );
+        s.apply_herdr(pane, crush_state(5, Idle), t0);
+        assert_eq!(state_of(&s, pane).0, Done, "and an unseen finish stays one");
+
+        let mut stranger = crush(6, herdr::Act::Release);
+        stranger.agent = Some("other".into());
+        s.apply_herdr(pane, stranger, t0);
+        assert_eq!(
+            state_of(&s, pane),
+            (Done, Some(Hook)),
+            "only its holder releases it"
+        );
+        s.apply_herdr(pane, crush(7, herdr::Act::Release), t0);
+        assert_eq!(
+            state_of(&s, pane),
+            (Done, None),
+            "released: an outcome stays"
+        );
+        s.apply_report(pane, report(Program, Some(Working)), t0);
+        assert_eq!(
+            state_of(&s, pane),
+            (Working, Some(Program)),
+            "the claim is gone"
+        );
+    }
+
+    #[test]
+    fn a_herdr_report_follows_seq_and_names_the_conversation() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let t0 = Instant::now();
+        s.apply_herdr(pane, crush_state(10, Working), t0);
+        s.apply_herdr(pane, crush_state(9, Blocked), t0);
+        let mut seqless = crush_state(0, Blocked);
+        seqless.seq = None;
+        s.apply_herdr(pane, seqless, t0);
+        assert_eq!(
+            state_of(&s, pane),
+            (Working, Some(Hook)),
+            "stale reports change nothing"
+        );
+        s.apply_herdr(pane, crush(11, herdr::Act::State(None, None)), t0);
+        assert_eq!(
+            state_of(&s, pane),
+            (Working, Some(Hook)),
+            "unknown changes nothing"
+        );
+
+        let mut named = crush(12, herdr::Act::Session);
+        named.session = Some("s1".into());
+        assert!(s.apply_herdr(pane, named, t0).unwrap().relisted);
+        assert_eq!(info(&s, pane).conversation.as_deref(), Some("s1"));
+        s.apply_herdr(pane, crush(13, herdr::Act::Release), t0);
+        assert_eq!(
+            state_of(&s, pane),
+            (Idle, None),
+            "released mid-work, it settles"
+        );
+        assert!(s.settle(pane), "and leaves the agent surfaces");
+        s.apply_herdr(pane, crush_state(13, Working), t0);
+        assert_eq!(
+            state_of(&s, pane),
+            (Idle, None),
+            "the seq mark outlives the claim"
+        );
+    }
+
+    #[test]
+    fn a_herdr_claim_ends_on_another_agent_but_not_on_its_own() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let t0 = Instant::now();
+        s.apply_herdr(pane, crush_state(1, Working), t0);
+        s.set_agent(pane, Some("crush".into()));
+        assert_eq!(
+            state_of(&s, pane),
+            (Working, Some(Hook)),
+            "detection caught up"
+        );
+        s.set_agent(pane, None);
+        assert_eq!(
+            state_of(&s, pane),
+            (Working, None),
+            "its agent left: the stall decides"
+        );
+
+        s.apply_herdr(pane, crush_state(2, Working), t0);
+        s.set_agent(pane, Some("claude".into()));
+        assert_eq!(
+            state_of(&s, pane),
+            (Working, None),
+            "another agent took over"
+        );
+
+        s.apply_herdr(pane, crush_state(3, Working), t0);
+        let mut clear = crush(4, herdr::Act::Clear);
+        clear.source = Some("other".into());
+        s.apply_herdr(pane, clear, t0);
+        assert_eq!(state_of(&s, pane).1, Some(Hook), "a clear names its source");
+        let mut clear = crush(5, herdr::Act::Clear);
+        (clear.source, clear.agent) = (None, None);
+        s.apply_herdr(pane, clear, t0);
+        assert_eq!(
+            state_of(&s, pane),
+            (Idle, None),
+            "or clears whichever holds"
+        );
+
+        s.apply_herdr(pane, crush_state(6, Working), t0);
+        s.apply_agent_event(pane, AgentHookEvent::Activity { detail: None }, None);
+        s.apply_herdr(pane, crush(7, herdr::Act::Release), t0);
+        assert_eq!(
+            state_of(&s, pane),
+            (Working, Some(Hook)),
+            "a hook took the claim over, for good"
+        );
+
+        s.mark_exited(pane, 0);
+        s.apply_herdr(pane, crush_state(8, Working), t0);
+        assert_eq!(
+            state_of(&s, pane),
+            (Done, None),
+            "an exited pane takes no claim"
+        );
     }
 
     fn sub(id: &str, running: bool) -> SubagentInfo {

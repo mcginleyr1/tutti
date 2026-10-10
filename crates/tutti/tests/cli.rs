@@ -76,12 +76,14 @@ fn run_scenario_with(
         stream.flush().unwrap();
     });
 
-    // A pane's own session would otherwise steer the binary off the fake
-    // server's `tutti` socket when the suite runs inside tutti.
+    // A pane's own session and id would otherwise steer the binary off the
+    // fake server's `tutti` socket, and into its requests, when the suite runs
+    // inside tutti.
     let mut child = Command::new(env!("CARGO_BIN_EXE_tutti"))
         .args(args)
         .env("XDG_RUNTIME_DIR", &base)
         .env_remove("TUTTI_SESSION")
+        .env_remove("TUTTI_PANE")
         .envs(envs.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -416,6 +418,7 @@ fn run_prints_the_bare_pane_id() {
                     cmd: vec!["claude".into(), "fix the tests".into()],
                     sandbox: None,
                     title: None,
+                    from: None,
                 }
             );
         },
@@ -427,6 +430,33 @@ fn run_prints_the_bare_pane_id() {
     );
     assert!(output.status.success());
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "7\n");
+}
+
+/// `run` from inside a pane names that pane as its caller, so the run lands
+/// beside it — but only in the pane's own session: a pane id means nothing
+/// to another session's daemon.
+#[test]
+fn run_from_a_pane_names_its_caller_in_its_own_session_only() {
+    for (session, from) in [("tutti", Some(PaneId(4))), ("work", None)] {
+        let output = run_scenario_with(
+            "runfrom",
+            &["-s", "tutti", "run", "--", "claude"],
+            &[("TUTTI_PANE", "4"), ("TUTTI_SESSION", session)],
+            "",
+            move |req| {
+                assert!(
+                    matches!(req, Request::Run { from: f, .. } if *f == from),
+                    "from {session}: {req:?}"
+                );
+            },
+            Response::Ran {
+                workspace: WorkspaceId(1),
+                tab: tutti_core::TabId(2),
+                pane: PaneId(7),
+            },
+        );
+        assert!(output.status.success());
+    }
 }
 
 /// `server restore` prints what came back on one line and names each skipped

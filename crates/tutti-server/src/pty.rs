@@ -30,6 +30,8 @@ pub struct PtySpec {
     pub cwd: Option<PathBuf>,
     /// Additional environment variables layered onto the inherited environment.
     pub env: Vec<(String, String)>,
+    /// Inherited environment variables dropped before `env` is layered on.
+    pub env_remove: Vec<String>,
 }
 
 impl PtySpec {
@@ -39,6 +41,7 @@ impl PtySpec {
             args: Vec::new(),
             cwd: None,
             env: Vec::new(),
+            env_remove: Vec::new(),
         }
     }
 }
@@ -380,6 +383,9 @@ impl PtyPane {
         cmd.args(&spec.args);
         if let Some(cwd) = &spec.cwd {
             cmd.cwd(cwd);
+        }
+        for key in &spec.env_remove {
+            cmd.env_remove(key);
         }
         for (key, value) in &spec.env {
             cmd.env(key, value);
@@ -849,21 +855,25 @@ impl NotifyScanner {
 /// Parse an OSC payload (the bytes between `ESC ]` and the terminator) for the
 /// commands tutti surfaces: notifications `9;<body>` and
 /// `777;notify;<title>;<body>`, and status reports `9;4;…` and `7501;…`.
-/// Anything else yields `None`.
+/// Anything else yields `None` — ConEmu's other numbered `9;<n>[;…]`
+/// subcommands included.
 fn parse_osc(buf: &[u8]) -> Option<Signal> {
     let text = std::str::from_utf8(buf).ok()?;
     let (cmd, rest) = text.split_once(';')?;
     match cmd {
-        // ConEmu's progress subcommand, never a notification — even malformed.
-        "9" if rest == "4" || rest.starts_with("4;") => {
-            parse_progress(rest.get(2..).unwrap_or_default()).map(Signal::Status)
-        }
-        "9" => non_empty(rest).map(|body| {
-            Signal::Notify(Notification {
-                title: None,
-                body: Some(body),
-            })
-        }),
+        // ConEmu's numbered subcommands are never notifications, even
+        // malformed: `9;4` is progress, and the rest (`9;9;<cwd>`, which
+        // shells emit for Windows Terminal, …) say nothing tutti reads.
+        "9" => match rest.split_once(';').unwrap_or((rest, "")) {
+            ("4", body) => parse_progress(body).map(Signal::Status),
+            (sub, _) if !sub.is_empty() && sub.bytes().all(|b| b.is_ascii_digit()) => None,
+            _ => non_empty(rest).map(|body| {
+                Signal::Notify(Notification {
+                    title: None,
+                    body: Some(body),
+                })
+            }),
+        },
         "777" => {
             let mut fields = rest.splitn(3, ';');
             if fields.next()? != "notify" {
@@ -1066,6 +1076,30 @@ mod tests {
         ] {
             assert!(scan(input).is_empty(), "{input:?} became a notification");
         }
+    }
+
+    /// ConEmu's other numbered subcommands — `9;9;<cwd>`, which shells emit
+    /// for Windows Terminal, and the rest — surface nothing either, while a
+    /// body that merely starts with digits is still a notification.
+    #[test]
+    fn osc9_subcommands_are_never_notifications() {
+        for input in [
+            b"\x1b]9;9;/Users/me/src\x1b\\".as_slice(),
+            b"\x1b]9;9;\x07",
+            b"\x1b]9;1;500\x07",
+            b"\x1b]9;2;hello there\x07",
+            b"\x1b]9;10;1\x07",
+            b"\x1b]9;12\x07",
+        ] {
+            assert!(signals(input).is_empty(), "{input:?} surfaced");
+        }
+        assert_eq!(
+            scan(b"\x1b]9;42 tests passed\x07"),
+            vec![Notification {
+                title: None,
+                body: Some("42 tests passed".into()),
+            }]
+        );
     }
 
     #[test]

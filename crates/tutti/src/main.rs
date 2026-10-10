@@ -484,7 +484,16 @@ fn run(cli: Cli) -> Result<i32> {
         }
         Some(command) => {
             let project = matches!(command, Command::Project { .. });
-            let request = to_request(command)?;
+            let mut request = to_request(command)?;
+            // A run from one of this session's own panes lands beside it.
+            if let Request::Run { from, .. } = &mut request
+                && std::env::var("TUTTI_SESSION").is_ok_and(|s| s == cli.session)
+            {
+                *from = std::env::var("TUTTI_PANE")
+                    .ok()
+                    .and_then(|p| p.parse().ok())
+                    .map(PaneId);
+            }
             let mut client = Client::connect_or_start(&cli.session)?;
             let response = client.request(&request)?;
             Ok(if project {
@@ -747,6 +756,7 @@ fn to_request(command: Command) -> Result<Request> {
                 cmd,
                 sandbox,
                 title,
+                from: None,
             })
         }
         Command::Pane { action } => Ok(match action {
@@ -1878,6 +1888,7 @@ mod tests {
                 cmd: vec!["claude".into(), "fix it".into()],
                 sandbox: None,
                 title: Some("fixer".into()),
+                from: None,
             }
         );
         assert_eq!(
@@ -1888,6 +1899,7 @@ mod tests {
                 cmd: vec!["sh".into()],
                 sandbox: None,
                 title: None,
+                from: None,
             }
         );
         let Request::Run { dir: Some(dir), .. } =

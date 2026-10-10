@@ -1,4 +1,5 @@
 pub mod checkpoints;
+pub mod herdr;
 pub mod jj;
 pub mod keys;
 pub mod persist;

@@ -28,11 +28,12 @@ use tutti_core::{
     prompt_fingerprint,
 };
 
+use crate::herdr;
 use crate::jj;
 use crate::keys;
 use crate::persist::{self, SavedPane};
 use crate::pty::{PaneSize, PtyPane, Signal, StatusReport};
-use crate::session::{Restored, Session};
+use crate::session::{ReportOutcome, Restored, Session};
 
 /// Cadence of the render tick: coalesced pane deltas to attached clients, and
 /// snapshots to watchers.
@@ -249,6 +250,24 @@ pub async fn serve(
         })
     });
 
+    // herdr's reporting socket, beside ours: agents that report to herdr
+    // natively (Crush, …) find it through every pane's HERDR_* and report
+    // here. Without it the daemon runs on and panes carry no HERDR_*.
+    let herdr_path = herdr::socket_path(&socket_path);
+    let herdr_listener = match herdr::bind(&herdr_path) {
+        Ok(listener) => {
+            hub.session().set_herdr_socket(herdr_path.clone());
+            let herdr_hub = Arc::clone(&hub);
+            Some(tokio::spawn(herdr::serve(listener, move |request| {
+                herdr_request(&herdr_hub, request)
+            })))
+        }
+        Err(err) => {
+            eprintln!("tutti: no herdr socket at {}: {err}", herdr_path.display());
+            None
+        }
+    };
+
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -269,6 +288,10 @@ pub async fn serve(
     detector.abort();
     vcs_watcher.abort();
     classifier.abort();
+    if let Some(herdr) = herdr_listener {
+        herdr.abort();
+        let _ = std::fs::remove_file(&herdr_path);
+    }
     // The last save lands before the panes die — a dead pane is not saved —
     // and after the saver has wound down, so none of its writes can land
     // after this one. It writes even when nothing moved, dating the save to
@@ -492,7 +515,7 @@ fn handle_frame(
             ),
         },
         Frame::Input { pane, bytes } => {
-            let _ = hub.session().pane_send(pane, &bytes);
+            let _ = pane_input(hub, pane, &bytes);
             ControlFlow::Continue(())
         }
         Frame::PaneSnapshot(_) | Frame::PaneDelta(_) => ControlFlow::Continue(()),
@@ -562,7 +585,8 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             cmd,
             sandbox,
             title,
-        } => run_in_fresh_tab(hub, workspace, dir, cmd, sandbox, title),
+            from,
+        } => run_in_fresh_tab(hub, workspace, dir, cmd, sandbox, title, from),
         Request::PaneRun {
             tab,
             cmd,
@@ -629,7 +653,7 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             // send can slip between them.
             let r = match &expect {
                 Some(expect) => hub.session().pane_answer(pane, &bytes, expect),
-                None => hub.session().pane_send(pane, &bytes),
+                None => pane_input(hub, pane, &bytes),
             };
             match r {
                 Ok(()) => Response::Ok,
@@ -726,6 +750,19 @@ fn resize_split(hub: &Arc<Hub>, pane: PaneId, axis: Direction, delta: f32) -> Re
     }
 }
 
+/// Type `bytes` into `pane` (an `Input` frame or a plain `PaneSend`),
+/// rebroadcasting the view when that settled a finished program's report out
+/// of the agent surfaces (`Session::pane_send`).
+fn pane_input(hub: &Hub, pane: PaneId, bytes: &[u8]) -> Result<()> {
+    let mut session = hub.session();
+    let view = session.pane_send(pane, bytes)?.then(|| session.view());
+    drop(session);
+    if let Some(view) = view {
+        broadcast_event(hub, Event::LayoutChanged { workspaces: view });
+    }
+    Ok(())
+}
+
 /// Set the ratio of the split separating `a` from `b` — a border drag — and
 /// broadcast the fresh view when it moved, as `resize_split` does.
 fn split_ratio(hub: &Arc<Hub>, a: PaneId, b: PaneId, ratio: f32) -> Response {
@@ -794,20 +831,50 @@ fn publish_transition(hub: &Hub, pane: PaneId, from: AgentState, to: AgentState)
 }
 
 /// Fold a program's own status report (OSC 9;4 / 7501, pulled from `pane`'s
-/// output) onto its state under the source ranking, then broadcast what moved:
-/// the view first when the pane's agent-surface listing changed (so the client
-/// has the row before its state), the transition, and the report's `msg` as a
-/// notification. The session guard is dropped before any broadcast. A state
-/// move refreshes the workspace, as a hook's does: that probe records the
-/// turn's checkpoint, and entering `Working` must probe too, or a first turn's
-/// baseline would only be snapshotted at its end. Progress ticks within one
-/// state move nothing, so a progress bar never runs jj.
+/// output) onto its state under the source ranking, then publish it.
 fn program_status(hub: &Arc<Hub>, pane: PaneId, report: StatusReport) {
-    let mut session = hub.session();
-    let outcome = session.apply_report(pane, report, Instant::now());
-    let relisted = outcome.relisted | session.settle(pane);
-    let view = relisted.then(|| session.view());
-    drop(session);
+    let outcome = hub.session().apply_report(pane, report, Instant::now());
+    publish_report(hub, pane, outcome);
+}
+
+/// Apply one herdr request (see `herdr`): a lifecycle report folds onto the
+/// pane's state much as a program's own report does and is published the
+/// same way; a notification is raised on its pane. `false` for an unknown
+/// pane.
+fn herdr_request(hub: &Arc<Hub>, request: herdr::Request) -> bool {
+    match request {
+        herdr::Request::Report(pane, report) => {
+            let outcome = hub.session().apply_herdr(pane, report, Instant::now());
+            let Some(outcome) = outcome else {
+                return false;
+            };
+            publish_report(hub, pane, outcome);
+            true
+        }
+        herdr::Request::Notify { pane, title, body } => {
+            let known = hub.session().pane_state(pane).is_some();
+            if known {
+                let title = Some(title);
+                broadcast_event(hub, Event::PaneNotification { pane, title, body });
+            }
+            known
+        }
+    }
+}
+
+/// Broadcast what a status report moved: the view first when the pane's
+/// agent-surface listing changed (so the client has the row before its
+/// state), the transition, and the report's `msg` as a notification. The
+/// session guard is dropped before any broadcast. A state move refreshes the
+/// workspace, as a hook's does: that probe records the turn's checkpoint, and
+/// entering `Working` must probe too, or a first turn's baseline would only be
+/// snapshotted at its end. Progress ticks within one state move nothing, so a
+/// progress bar never runs jj.
+fn publish_report(hub: &Arc<Hub>, pane: PaneId, outcome: ReportOutcome) {
+    let view = {
+        let mut session = hub.session();
+        (outcome.relisted | session.settle(pane)).then(|| session.view())
+    };
     if let Some(view) = view {
         broadcast_event(hub, Event::LayoutChanged { workspaces: view });
     }
@@ -894,12 +961,13 @@ fn run_in_fresh_tab(
     cmd: Vec<String>,
     sandbox: Option<String>,
     title: Option<String>,
+    from: Option<PaneId>,
 ) -> Response {
     let declared = declared_agent(hub, sandbox.as_deref(), &cmd);
     let mut ran = None;
     let response = spawn_pane(hub, |s| {
         let (workspace, tab, pane, mounted) =
-            s.run_in_fresh_tab(workspace, dir, cmd, sandbox, title)?;
+            s.run_in_fresh_tab(workspace, dir, cmd, sandbox, title, from)?;
         s.set_agent(pane, declared);
         ran = Some((workspace, tab, mounted));
         Ok(pane)

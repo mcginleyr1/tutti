@@ -525,6 +525,7 @@ fn run_sleep(workspace: Option<WorkspaceId>, dir: Option<PathBuf>, title: Option
         cmd: vec!["/bin/sleep".into(), "30".into()],
         sandbox: None,
         title: title.map(Into::into),
+        from: None,
     }
 }
 
@@ -625,6 +626,7 @@ async fn run_refuses_bad_targets_and_rolls_back_a_failed_spawn() {
         cmd: vec!["/nonexistent/tutti-no-such-program".into()],
         sandbox: None,
         title: None,
+        from: None,
     };
 
     for (request, needle) in [
@@ -1480,6 +1482,161 @@ async fn spawned_pane_carries_tutti_env() {
     server.stop().await;
 }
 
+/// Send one request line to herdr's socket at `socket`; its reply, parsed.
+async fn herdr(socket: &Path, request: serde_json::Value) -> serde_json::Value {
+    let mut stream = UnixStream::connect(socket).await.unwrap();
+    stream
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut reply = String::new();
+    timeout(DEADLINE, stream.read_to_string(&mut reply))
+        .await
+        .expect("timed out waiting for a herdr reply")
+        .unwrap();
+    serde_json::from_str(&reply).unwrap()
+}
+
+/// A pane carries herdr's env, so an agent that reports to herdr natively
+/// reports to tutti: Crush-shaped requests on that socket drive the pane's
+/// state, label and conversation, a stale one changes nothing, and the
+/// release ends the claim.
+#[tokio::test]
+async fn a_herdr_reporter_drives_its_pane() {
+    use serde_json::json;
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let socket = server.path.with_extension("herdr.sock");
+    let pane = run_marker(
+        &mut conn,
+        &format!(
+            "[ \"$HERDR_SOCKET_PATH\" = '{}' ] && printf 'HERDR %s %s %s %s\\n' \"$HERDR_ENV\" \
+             \"$HERDR_PANE_ID\" \"$HERDR_TAB_ID\" \"$HERDR_WORKSPACE_ID\"; sleep 30",
+            socket.display()
+        ),
+    )
+    .await;
+    let id = format!("w1:p{pane}");
+    assert!(
+        read_until(&mut conn, pane, &format!("HERDR 1 {id} w1:t1 w1")).await,
+        "the pane env should point herdr reporters at this daemon's socket"
+    );
+
+    // Crush's seq starts at UnixNano, past what an f64 holds exactly.
+    let seq = 1_791_590_400_123_456_789_u64;
+    let report = |state: &str, seq: u64, session: &str| {
+        json!({
+            "id": format!("crush:report:{seq}"),
+            "method": "pane.report_agent",
+            "params": {"pane_id": id, "source": "crush", "agent": "crush", "state": state,
+                "seq": seq, "agent_session_id": session},
+        })
+    };
+    let ok = |seq: u64| json!({"id": format!("crush:report:{seq}"), "result": {"type": "ok"}});
+    let crush = |p: &PaneInfo| p.agent.as_ref().is_some_and(|a| a.0 == "crush");
+
+    assert_eq!(herdr(&socket, report("idle", seq, "")).await, ok(seq));
+    assert!(
+        wait_pane(&mut conn, pane, |p| p.state == AgentState::Idle
+            && p.source == Some(StateSource::Hook)
+            && crush(p))
+        .await,
+        "Crush's startup idle claims the pane at the hook rank, labelled crush"
+    );
+    assert_eq!(
+        herdr(&socket, report("working", seq + 1, "")).await,
+        ok(seq + 1)
+    );
+    let session = json!({
+        "id": "crush:session",
+        "method": "pane.report_agent_session",
+        "params": {"pane_id": id, "source": "crush", "agent": "crush", "seq": seq + 2,
+            "agent_session_id": "c1"},
+    });
+    assert_eq!(herdr(&socket, session).await["result"]["type"], "ok");
+    assert_eq!(
+        herdr(&socket, report("blocked", seq, "")).await,
+        ok(seq),
+        "a stale report is answered, and ignored"
+    );
+    assert!(
+        wait_pane(&mut conn, pane, |p| p.state == AgentState::Working
+            && p.conversation.as_deref() == Some("c1"))
+        .await,
+        "working, its conversation named, the stale blocked dropped"
+    );
+    assert_eq!(
+        herdr(&socket, report("idle", seq + 3, "c1")).await,
+        ok(seq + 3)
+    );
+    assert!(
+        wait_pane(&mut conn, pane, |p| p.state == AgentState::Done).await,
+        "idle after work is a finish"
+    );
+
+    let release = json!({
+        "id": "crush:release",
+        "method": "pane.release_agent",
+        "params": {"pane_id": id, "source": "crush", "agent": "crush", "state": "",
+            "seq": seq + 4, "agent_session_id": "c1"},
+    });
+    assert_eq!(herdr(&socket, release).await["result"]["type"], "ok");
+    assert!(
+        wait_pane(&mut conn, pane, |p| p.state == AgentState::Done
+            && p.source.is_none())
+        .await,
+        "the release ends the claim; the unseen finish stays"
+    );
+    let mut stranger = report("working", seq + 5, "");
+    stranger["params"]["pane_id"] = json!("w1:p999");
+    assert_eq!(
+        herdr(&socket, stranger).await["error"]["code"],
+        "pane_not_found"
+    );
+
+    server.stop().await;
+    assert!(
+        !socket.exists(),
+        "the daemon removes herdr's socket on its way out"
+    );
+}
+
+/// `run` from inside a pane lands in that pane's workspace rather than the
+/// session's current one, unless a workspace is named; an unknown caller is
+/// an error.
+#[tokio::test]
+async fn run_lands_beside_its_calling_pane() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let caller = run_sleeper(&mut conn).await;
+    let home = workspace_ids(&mut conn).await[0];
+    let away = fresh_dir("run-from");
+    let current = workspace_id(
+        conn.request(Request::WorkspaceNew { dir: away.clone() })
+            .await,
+    );
+    let run = |workspace, from| Request::Run {
+        workspace,
+        dir: None,
+        cmd: vec!["/bin/sleep".into(), "30".into()],
+        sandbox: None,
+        title: None,
+        from,
+    };
+
+    let (beside, _, _) = ran(conn.request(run(None, Some(caller))).await);
+    assert_eq!(beside, home, "beside its caller");
+    let (unnamed, _, _) = ran(conn.request(run(None, None)).await);
+    assert_eq!(unnamed, current, "no caller: the current workspace");
+    let (named, _, _) = ran(conn.request(run(Some(current), Some(caller))).await);
+    assert_eq!(named, current, "a named workspace wins");
+    let message = error_message(conn.request(run(None, Some(PaneId(999)))).await);
+    assert!(message.contains("no pane 999"), "{message}");
+
+    let _ = std::fs::remove_dir_all(&away);
+    server.stop().await;
+}
+
 /// The subagents of `pane` from a fresh `pane list`.
 async fn pane_subagents(conn: &mut Conn, pane: PaneId) -> Vec<SubagentInfo> {
     match conn.request(Request::PaneList).await {
@@ -1779,6 +1936,16 @@ async fn a_shell_panes_own_status_reports_drive_its_state() {
         notes,
         vec![(Some("build".to_string()), Some("Built".to_string()))],
         "only the 7501 msg notifies — no 9;4 report became a notification"
+    );
+
+    // Typing past the finished report ends its claim, so the next one lands:
+    // a reporter that never sends its clear no longer shuts 9;4 out for good.
+    printf_osc(&mut control, pane, "9;4;1;10").await;
+    assert!(
+        wait_pane(&mut control, pane, |p| p.state == AgentState::Working
+            && p.source == Some(StateSource::Progress))
+        .await,
+        "typing ended the finished 7501 claim, so 9;4 claims the pane"
     );
 
     server.stop().await;

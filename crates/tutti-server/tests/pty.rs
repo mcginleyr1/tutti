@@ -43,6 +43,25 @@ async fn spawn_captures_output_and_exits_zero() {
 }
 
 #[tokio::test]
+async fn env_remove_drops_an_inherited_variable() {
+    let mut spec = PtySpec::new("/bin/sh");
+    spec.args = vec![
+        "-c".into(),
+        "printf '[%s]' \"${HOME-dropped}\"; sleep 0.2".into(),
+    ];
+    spec.env_remove = vec!["HOME".into()];
+
+    let pane = PtyPane::spawn(spec, PaneSize::new(24, 80)).expect("spawn");
+
+    let found = wait_for(&pane, |s| s.text().contains("[dropped]")).await;
+    assert!(
+        found,
+        "HOME should be unset, got: {:?}",
+        pane.snapshot().lines
+    );
+}
+
+#[tokio::test]
 async fn resize_updates_snapshot_dimensions() {
     let pane = PtyPane::spawn(PtySpec::new("/bin/cat"), PaneSize::new(24, 80)).expect("spawn");
 

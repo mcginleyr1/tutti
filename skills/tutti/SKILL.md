@@ -38,17 +38,17 @@ does.
 ## Start a sub-agent
 
 ```sh
-tutti run --workspace 2 --title fix-tests -- claude "fix the failing tests in crates/api"
+tutti run --title fix-tests -- claude "fix the failing tests in crates/api"
 ```
 
 It prints the new pane's id, bare (`7`) — keep it: every later command takes
-it. The agent opens in a fresh tab, so it never splits a pane someone is using.
-Always name the target: without `--workspace`, it lands in the session's
-current workspace — whichever one the human is looking at, not necessarily
-yours. To run in another directory instead, name it with `--dir` (tutti opens
-it as a project if it is not one yet):
+it. The agent opens in a fresh tab, so it never splits a pane someone is using,
+and in your own workspace, beside you. To run it in another project or
+workspace, name it with `--workspace`; to run it in another directory, name
+that with `--dir` (tutti opens it as a project if it is not one yet):
 
 ```sh
+tutti run --workspace 2 -- claude "fix the failing tests in crates/api"
 tutti run --dir /srv/repos/web -- claude "upgrade the router dependency"
 ```
 
