@@ -22,7 +22,11 @@ use super::launcher::{self, LaunchKind, LauncherRow};
 use super::layout::{Boundary, boundaries, pane_rects};
 use super::navigate;
 use super::sidebar::{self, Sidebar, SidebarEntry};
-use crate::config::{self, Action, Config, PrefixAction, RESIZE_DELTA, SidebarVisibility};
+use crate::config::{
+    self, Action, ChangesAction, Config, PrefixAction, RESIZE_DELTA, SidebarAction,
+    SidebarVisibility,
+};
+use crate::integrations::{self, Dirs, Integration, Plan, Status};
 
 /// The sidebar's fixed column width, and the minimum total width below which it
 /// is suppressed entirely so panes keep usable room.
@@ -55,6 +59,14 @@ const MAX_COMPLETIONS: usize = 8;
 /// The peek overlay's narrowest width, so its hint row (answer keys, esc, how
 /// to jump in: 62 columns padded) fits between the borders over a narrow pane.
 const PEEK_MIN_WIDTH: u16 = 64;
+
+/// The setup panel's rows, top to bottom: each integration tutti installs and
+/// the name it goes by there.
+const SETUP: [(Integration, &str); 3] = [
+    (Integration::ClaudeHooks, "Claude Code hooks"),
+    (Integration::OpencodePlugin, "opencode plugin"),
+    (Integration::Skill, "tutti skill"),
+];
 
 /// The braille working-spinner frames and their advance interval, shared by
 /// every working agent so they animate in lockstep. Swap for ASCII by editing
@@ -158,6 +170,9 @@ pub enum Mode {
     Launcher,
     /// The launcher's free-form command input.
     LauncherCommand,
+    /// The setup panel: install the agent integrations tutti ships, for the
+    /// user or into the active project.
+    Integrations,
     /// Peeking at a blocked agent from the sidebar: its live prompt floats in an
     /// overlay and answer keys go to it as guarded sends, while focus, tab, and
     /// layout stay exactly where they were.
@@ -239,6 +254,19 @@ pub struct App {
     /// The root the resume harvest reads the agent tools' session stores under
     /// — the real home directory, pointed at a fixture tree in tests.
     resume_home: Option<PathBuf>,
+    /// Where the setup panel installs for the user — the real `$HOME` and
+    /// `$XDG_CONFIG_HOME`, pointed at a fixture tree in tests.
+    pub(crate) setup_dirs: Dirs,
+    /// The project the setup panel installs into, as its name and directory,
+    /// while `s` has switched it there; `None` installs for the user.
+    setup_project: Option<(String, PathBuf)>,
+    /// The setup panel's plans, one per `SETUP` row: made on opening, on a
+    /// scope switch, and after every install, so a row shows the disk.
+    setup_plans: Vec<anyhow::Result<Plan>>,
+    /// The highlighted setup row.
+    setup_selected: usize,
+    /// Whether the setup panel is asking to install the highlighted row.
+    setup_confirm: bool,
     /// The sidebar column from the last size sync, for mouse hit-testing.
     sidebar_rect: Option<Rect>,
     /// The changed-files panel column from the last size sync, for mouse
@@ -356,6 +384,11 @@ impl App {
             launcher_dir: None,
             launcher_sandbox: None,
             resume_home: std::env::var_os("HOME").map(PathBuf::from),
+            setup_dirs: Dirs::from_env(),
+            setup_project: None,
+            setup_plans: Vec::new(),
+            setup_selected: 0,
+            setup_confirm: false,
             sidebar_rect: None,
             diff_panel_rect: None,
             diff_selected: 0,
@@ -789,6 +822,10 @@ impl App {
             Mode::Launcher => self.on_key_launcher(key),
             Mode::Navigate => self.on_key_navigate(key),
             Mode::LauncherCommand => self.on_key_launcher_command(key),
+            Mode::Integrations => {
+                self.on_key_setup(key);
+                Vec::new()
+            }
             Mode::Peek(pane) => self.on_key_peek(key, pane),
             Mode::Help => {
                 self.mode = Mode::Terminal;
@@ -954,6 +991,10 @@ impl App {
                     ws.as_ref().map(|(name, _)| name.clone()),
                     ws.as_ref().map(|(_, dir)| dir.as_path()),
                 );
+                Vec::new()
+            }
+            PrefixAction::Integrations => {
+                self.open_setup();
                 Vec::new()
             }
             PrefixAction::MouseToggle => {
@@ -1335,6 +1376,9 @@ impl App {
         self.sidebar_anchor = anchor_at(sidebar, idx);
     }
 
+    /// Keys while the sidebar is focused, dispatched through
+    /// `config::SIDEBAR_TABLE` — the table the help overlay and the bottom-bar
+    /// hint render, so what they say is what the keys do.
     fn on_key_sidebar(&mut self, key: KeyEvent) -> Vec<WireFrame> {
         if self.enter_prefix(key) {
             return Vec::new();
@@ -1355,46 +1399,48 @@ impl App {
             }
             _ => {}
         }
+        let Some(action) = config::panel_action(config::SIDEBAR_TABLE, key) else {
+            return Vec::new();
+        };
         let sidebar = self.sidebar();
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
+        match action {
+            SidebarAction::Down => {
                 self.select_entry(&sidebar, next_visible(&sidebar, self.sidebar_selected));
                 Vec::new()
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            SidebarAction::Up => {
                 self.select_entry(&sidebar, prev_visible(&sidebar, self.sidebar_selected));
                 Vec::new()
             }
-            KeyCode::Enter => self.jump_to_selected(&sidebar),
-            KeyCode::Char('p') => {
+            SidebarAction::Jump => self.jump_to_selected(&sidebar),
+            SidebarAction::Peek => {
                 self.open_peek(&sidebar);
                 Vec::new()
             }
-            KeyCode::Char('n') => self.new_agent_in_selected(&sidebar),
-            KeyCode::Char('a') => {
+            SidebarAction::NewAgent => self.new_agent_in_selected(&sidebar),
+            SidebarAction::AddProject => {
                 self.open_project_prompt();
                 Vec::new()
             }
-            KeyCode::Char('d') => self.open_diff_pane(&sidebar),
-            KeyCode::Char('w') => {
+            SidebarAction::Diff => self.open_diff_pane(&sidebar),
+            SidebarAction::NewWorkspace => {
                 self.open_workspace_prompt(&sidebar);
                 Vec::new()
             }
-            KeyCode::Char('m') => {
+            SidebarAction::Merge => {
                 self.confirm_merge(&sidebar);
                 Vec::new()
             }
-            KeyCode::Char('u') => self.update_selected(&sidebar),
-            KeyCode::Char('x') => {
+            SidebarAction::Update => self.update_selected(&sidebar),
+            SidebarAction::Kill => {
                 self.confirm_kill_selected(&sidebar);
                 Vec::new()
             }
-            KeyCode::Esc => {
+            SidebarAction::Back => {
                 self.mode = Mode::Terminal;
                 self.status = None;
                 Vec::new()
             }
-            _ => Vec::new(),
         }
     }
 
@@ -1599,15 +1645,14 @@ impl App {
         self.status = None;
     }
 
-    /// Keys while the changed-files panel is focused: vim/less list motion
-    /// (`j`/`k` step, `g`/`G` jump to the ends, `C-d`/`C-u` move half the
-    /// panel, plus their arrow/Home/End/Page equivalents) over the files and
-    /// then the turns, `enter` opens the highlighted file's or turn's diff, `d`
-    /// the whole diff, `r` asks to restore the highlighted turn. The panel is
-    /// the content's right edge, and its edges behave like a pane's:
-    /// `h`/`esc`/`q` and the focus-left binding step back into the pane area
-    /// keeping its focus; `l` and the focus-right binding wrap on to the next
-    /// tab.
+    /// Keys while the changed-files panel is focused, dispatched through
+    /// `config::CHANGES_TABLE` (which the help overlay and bottom-bar hint
+    /// render): vim/less list motion over the files and then the turns,
+    /// `enter` opens the highlighted file's or turn's diff, `d` the whole diff,
+    /// `r` asks to restore the highlighted turn. The panel is the content's
+    /// right edge, and its edges behave like a pane's: `h`/`esc`/`q` and the
+    /// focus-left binding step back into the pane area keeping its focus; `l`
+    /// and the focus-right binding wrap on to the next tab.
     fn on_key_diff_files(&mut self, key: KeyEvent) -> Vec<WireFrame> {
         if self.enter_prefix(key) {
             return Vec::new();
@@ -1631,27 +1676,29 @@ impl App {
             .map_or(0, |r| r.height.saturating_sub(1))
             .max(1) as usize;
         let half = (page / 2).max(1);
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        self.diff_selected = match key.code {
-            KeyCode::Char('j') | KeyCode::Down => (self.diff_selected + 1).min(last),
-            KeyCode::Char('k') | KeyCode::Up => self.diff_selected.saturating_sub(1),
-            KeyCode::Char('d') if ctrl => (self.diff_selected + half).min(last),
-            KeyCode::Char('u') if ctrl => self.diff_selected.saturating_sub(half),
-            KeyCode::PageDown => (self.diff_selected + page).min(last),
-            KeyCode::PageUp => self.diff_selected.saturating_sub(page),
-            KeyCode::Char('g') | KeyCode::Home => 0,
-            KeyCode::Char('G') | KeyCode::End => last,
-            KeyCode::Enter => {
+        let Some(action) = config::panel_action(config::CHANGES_TABLE, key) else {
+            return Vec::new();
+        };
+        self.diff_selected = match action {
+            ChangesAction::Down => (self.diff_selected + 1).min(last),
+            ChangesAction::Up => self.diff_selected.saturating_sub(1),
+            ChangesAction::HalfPageDown => (self.diff_selected + half).min(last),
+            ChangesAction::HalfPageUp => self.diff_selected.saturating_sub(half),
+            ChangesAction::PageDown => (self.diff_selected + page).min(last),
+            ChangesAction::PageUp => self.diff_selected.saturating_sub(page),
+            ChangesAction::Top => 0,
+            ChangesAction::Bottom => last,
+            ChangesAction::Open => {
                 return match self.selected_turn() {
                     Some(turn) => self.open_turn_diff(&turn),
                     None => self.open_selected_file_diff(),
                 };
             }
-            KeyCode::Char('r') => {
+            ChangesAction::Restore => {
                 self.confirm_restore();
                 return Vec::new();
             }
-            KeyCode::Char('d') => {
+            ChangesAction::FullDiff => {
                 let Some(tab) = self.active_tab else {
                     return Vec::new();
                 };
@@ -1664,17 +1711,16 @@ impl App {
                     sandbox: None,
                 })];
             }
-            KeyCode::Char('l') => {
+            ChangesAction::NextTab => {
                 self.mode = Mode::Terminal;
                 self.status = None;
                 return self.switch_tab(1);
             }
-            KeyCode::Esc | KeyCode::Char('q' | 'h') => {
+            ChangesAction::Back => {
                 self.mode = Mode::Terminal;
                 self.status = None;
                 return Vec::new();
             }
-            _ => return Vec::new(),
         };
         Vec::new()
     }
@@ -2465,6 +2511,129 @@ impl App {
             }
             _ => Vec::new(),
         }
+    }
+
+    // ---- setup panel ----------------------------------------------------
+
+    /// Open the setup panel on the user scope, every row planned afresh.
+    fn open_setup(&mut self) {
+        self.mode = Mode::Integrations;
+        self.setup_project = None;
+        self.setup_selected = 0;
+        self.setup_confirm = false;
+        self.replan_setup();
+    }
+
+    /// Plan every setup row for the current scope. A plan reads one file and
+    /// writes nothing, so this runs whenever a row may have changed.
+    fn replan_setup(&mut self) {
+        let dirs = Dirs {
+            project: self.setup_project.as_ref().map(|(_, dir)| dir.clone()),
+            ..self.setup_dirs.clone()
+        };
+        self.setup_plans = SETUP.iter().map(|(i, _)| i.plan(&dirs)).collect();
+    }
+
+    /// Keys in the setup panel: `j`/`k` (or the arrows) move, `s` switches
+    /// between the user's config and the active project's, enter on a row
+    /// with something to install asks first, and `esc` closes. While asking,
+    /// `y` installs and any other key backs out to the list.
+    fn on_key_setup(&mut self, key: KeyEvent) {
+        if std::mem::take(&mut self.setup_confirm) {
+            if matches!(key.code, KeyCode::Char('y' | 'Y')) {
+                self.install_selected();
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.setup_selected = (self.setup_selected + 1).min(SETUP.len() - 1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.setup_selected = self.setup_selected.saturating_sub(1);
+            }
+            KeyCode::Char('s') => self.toggle_setup_scope(),
+            KeyCode::Enter => self.confirm_setup(),
+            KeyCode::Esc => self.mode = Mode::Terminal,
+            _ => {}
+        }
+    }
+
+    /// Switch the setup panel between the user's config and the active
+    /// project's, and plan again there. With no project open it stays put.
+    fn toggle_setup_scope(&mut self) {
+        if self.setup_project.take().is_none() {
+            let Some(w) = self.active_workspace() else {
+                self.set_status("no project open to install into".into());
+                return;
+            };
+            self.setup_project = Some((w.name.clone(), w.dir.clone()));
+        }
+        self.replan_setup();
+    }
+
+    /// Enter on a setup row: one with something to install asks first; the
+    /// rest flash why there is nothing to do — a refusal in red.
+    fn confirm_setup(&mut self) {
+        let label = SETUP[self.setup_selected].1;
+        let message = match &self.setup_plans[self.setup_selected] {
+            Ok(plan) => match &plan.status {
+                Status::Missing(_) | Status::Outdated(_) => {
+                    self.setup_confirm = true;
+                    return;
+                }
+                Status::Installed => format!("{label} already installed"),
+                Status::Foreign => format!(
+                    "error: {} is not tutti's; refusing to overwrite it",
+                    plan.path.display()
+                ),
+                Status::Unreadable(why) => format!("error: {why}"),
+            },
+            Err(e) => format!("error: {e:#}"),
+        };
+        self.set_status(message);
+    }
+
+    /// `y` at the setup confirm: install the highlighted row's plan and flash
+    /// where it went — and where the file it replaced was backed up — or why
+    /// it was refused, then plan again so the row shows the disk as it is.
+    fn install_selected(&mut self) {
+        let label = SETUP[self.setup_selected].1;
+        if let Ok(plan) = &self.setup_plans[self.setup_selected] {
+            let path = plan.path.display();
+            let message = match integrations::apply(plan) {
+                Ok(None) => format!("{label} installed into {path}"),
+                Ok(Some(backup)) => format!(
+                    "{label} installed into {path} · backed up the old one to {}",
+                    backup.display()
+                ),
+                Err(e) => format!("error: {e:#}"),
+            };
+            self.set_status(message);
+        }
+        self.replan_setup();
+    }
+
+    /// The setup panel's rows — each integration's name and plan — for the
+    /// renderer.
+    pub fn setup_rows(&self) -> impl Iterator<Item = (&'static str, &anyhow::Result<Plan>)> {
+        SETUP.iter().map(|(_, label)| *label).zip(&self.setup_plans)
+    }
+
+    /// The highlighted setup row index.
+    pub fn setup_selected(&self) -> usize {
+        self.setup_selected
+    }
+
+    /// Whether the setup panel is asking to install the highlighted row.
+    pub fn setup_confirming(&self) -> bool {
+        self.setup_confirm
+    }
+
+    /// The name of the project the setup panel installs into; `None` while it
+    /// installs for the user.
+    pub fn setup_project(&self) -> Option<&str> {
+        self.setup_project.as_ref().map(|(name, _)| name.as_str())
     }
 
     // ---- go-to overlay --------------------------------------------------
@@ -7731,6 +7900,285 @@ mod tests {
         assert_eq!(app.prompt_completions(), &["gamma".to_string()]);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- setup panel ----------------------------------------------------
+
+    /// A fresh empty directory standing in for `$HOME` or a project, so the
+    /// setup panel never reads or writes the real config.
+    fn fresh_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("tutti-app-setup-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `view_one_pane` (workspace `w`) attached under `config` with the setup
+    /// panel's user scope on a fixture home and the workspace on a fixture
+    /// project dir, then the panel opened with prefix `i`. Returns the app,
+    /// the home, and the project.
+    fn setup_fixture(config: Config) -> (App, PathBuf, PathBuf) {
+        let (home, project) = (fresh_dir(), fresh_dir());
+        let mut app = App::with_config(config);
+        app.setup_dirs = Dirs {
+            home: Some(home.clone()),
+            ..Dirs::default()
+        };
+        let mut view = view_one_pane();
+        view[0].dir = project.clone();
+        attach_with(&mut app, view);
+        app.on_key(ctrl('b'));
+        app.on_key(plain('i'));
+        (app, home, project)
+    }
+
+    fn setup_status(app: &App, row: usize) -> Status {
+        app.setup_plans[row].as_ref().unwrap().status.clone()
+    }
+
+    fn setup_paths(app: &App) -> Vec<PathBuf> {
+        app.setup_rows()
+            .map(|(_, plan)| plan.as_ref().unwrap().path.clone())
+            .collect()
+    }
+
+    #[test]
+    fn prefix_i_opens_the_setup_panel_in_both_presets_and_esc_closes_it() {
+        for config in [Config::default(), vim_config()] {
+            let (mut app, home, project) = setup_fixture(config);
+            assert_eq!(app.mode, Mode::Integrations);
+            let labels: Vec<&str> = app.setup_rows().map(|(label, _)| label).collect();
+            assert_eq!(
+                labels,
+                ["Claude Code hooks", "opencode plugin", "tutti skill"]
+            );
+            assert_eq!(
+                setup_paths(&app),
+                [
+                    home.join(".claude/settings.json"),
+                    home.join(".config/opencode/plugins/tutti.js"),
+                    home.join(".claude/skills/tutti/SKILL.md"),
+                ],
+                "the user scope plans against the home"
+            );
+            assert!((0..3).all(|row| matches!(setup_status(&app, row), Status::Missing(_))));
+
+            let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+            assert_eq!(app.on_key(esc), Vec::new());
+            assert_eq!(app.mode, Mode::Terminal);
+            let _ = std::fs::remove_dir_all(&home);
+            let _ = std::fs::remove_dir_all(&project);
+        }
+    }
+
+    #[test]
+    fn enter_then_y_installs_into_the_home_and_the_row_replans_to_installed() {
+        let (mut app, home, project) = setup_fixture(Config::default());
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let settings = home.join(".claude/settings.json");
+        assert_eq!(app.on_key(enter), Vec::new());
+        assert!(app.setup_confirming(), "enter asks first");
+        assert!(!settings.exists(), "asking writes nothing");
+
+        assert_eq!(
+            app.on_key(plain('y')),
+            Vec::new(),
+            "the daemon hears nothing"
+        );
+        assert!(!app.setup_confirming());
+        assert_eq!(
+            app.mode,
+            Mode::Integrations,
+            "the panel stays on the result"
+        );
+        assert!(
+            std::fs::read_to_string(&settings)
+                .unwrap()
+                .contains(crate::hooks::HOOK_COMMAND)
+        );
+        assert_eq!(setup_status(&app, 0), Status::Installed, "planned again");
+        assert!(
+            app.transient().is_some_and(
+                |t| t == format!("Claude Code hooks installed into {}", settings.display())
+            ),
+            "{:?}",
+            app.transient()
+        );
+
+        app.on_key(enter);
+        assert!(!app.setup_confirming(), "nothing left to install");
+        assert_eq!(app.transient(), Some("Claude Code hooks already installed"));
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn updating_an_older_install_flashes_where_the_old_file_went() {
+        let (mut app, home, project) = setup_fixture(Config::default());
+        let skill = home.join(".claude/skills/tutti/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, "---\nname: tutti\n---\nold\n").unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.on_key(ctrl('b'));
+        app.on_key(plain('i'));
+        assert!(
+            matches!(setup_status(&app, 2), Status::Outdated(_)),
+            "reopening plans again"
+        );
+
+        app.on_key(plain('j'));
+        app.on_key(plain('j'));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.on_key(plain('y'));
+        assert_eq!(setup_status(&app, 2), Status::Installed);
+        assert_eq!(
+            std::fs::read_to_string(&skill).unwrap(),
+            integrations::SKILL
+        );
+        assert!(
+            app.transient().is_some_and(
+                |t| t.contains("backed up the old one to") && t.ends_with("SKILL.md.bak")
+            ),
+            "{:?}",
+            app.transient()
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn n_or_esc_backs_out_of_the_setup_confirm_writing_nothing() {
+        let (mut app, home, project) = setup_fixture(Config::default());
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        app.on_key(enter);
+        assert_eq!(app.on_key(plain('n')), Vec::new());
+        assert!(!app.setup_confirming());
+        assert_eq!(app.mode, Mode::Integrations, "back on the list");
+
+        app.on_key(enter);
+        app.on_key(esc);
+        assert!(!app.setup_confirming());
+        assert_eq!(app.mode, Mode::Integrations, "esc steps back a step");
+        assert!(!home.join(".claude").exists(), "nothing was written");
+        app.on_key(esc);
+        assert_eq!(app.mode, Mode::Terminal, "then closes");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn s_switches_the_setup_panel_to_the_active_project_and_back() {
+        let (mut app, home, project) = setup_fixture(Config::default());
+        app.on_key(plain('s'));
+        assert_eq!(app.setup_project(), Some("w"));
+        assert_eq!(
+            setup_paths(&app),
+            [
+                project.join(".claude/settings.json"),
+                project.join(".opencode/plugins/tutti.js"),
+                project.join(".claude/skills/tutti/SKILL.md"),
+            ],
+            "the project scope plans against the workspace's dir"
+        );
+        app.on_key(plain('j'));
+        app.on_key(plain('j'));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.on_key(plain('y'));
+        assert_eq!(
+            std::fs::read_to_string(project.join(".claude/skills/tutti/SKILL.md")).unwrap(),
+            integrations::SKILL
+        );
+
+        app.on_key(plain('s'));
+        assert_eq!(app.setup_project(), None);
+        assert_eq!(
+            setup_paths(&app)[2],
+            home.join(".claude/skills/tutti/SKILL.md")
+        );
+        assert!(
+            matches!(setup_status(&app, 2), Status::Missing(_)),
+            "the project install left the home alone"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn s_with_no_project_open_stays_on_the_user_scope() {
+        let mut app = App::new();
+        app.setup_dirs = Dirs {
+            home: Some(fresh_dir()),
+            ..Dirs::default()
+        };
+        attach_with(&mut app, Vec::new());
+        app.on_key(ctrl('b'));
+        app.on_key(plain('i'));
+        app.on_key(plain('s'));
+        assert_eq!(app.setup_project(), None);
+        assert!(
+            app.transient()
+                .is_some_and(|t| t.contains("no project open"))
+        );
+        let _ = std::fs::remove_dir_all(app.setup_dirs.home.as_ref().unwrap());
+    }
+
+    #[test]
+    fn rows_tutti_will_not_write_refuse_in_red_without_asking() {
+        let (mut app, home, project) = setup_fixture(Config::default());
+        let settings = home.join(".claude/settings.json");
+        let plugin = home.join(".config/opencode/plugins/tutti.js");
+        for (path, text) in [(&settings, "{nope"), (&plugin, "export const Mine = 1\n")] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.on_key(ctrl('b'));
+        app.on_key(plain('i'));
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+        app.on_key(enter);
+        assert!(
+            !app.setup_confirming(),
+            "an unreadable file is never offered"
+        );
+        assert!(
+            app.transient()
+                .is_some_and(|t| t.starts_with("error: ") && t.contains("not valid JSON")),
+            "{:?}",
+            app.transient()
+        );
+        app.on_key(plain('j'));
+        app.on_key(enter);
+        assert!(!app.setup_confirming(), "nor is someone else's");
+        assert_eq!(
+            app.transient(),
+            Some(
+                format!(
+                    "error: {} is not tutti's; refusing to overwrite it",
+                    plugin.display()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), "{nope");
+        assert_eq!(
+            std::fs::read_to_string(&plugin).unwrap(),
+            "export const Mine = 1\n"
+        );
+
+        // Without a home to name, a user-scope row cannot be planned at all.
+        app.setup_dirs = Dirs::default();
+        app.on_key(plain('k'));
+        app.on_key(plain('s'));
+        app.on_key(plain('s'));
+        app.on_key(enter);
+        assert_eq!(app.transient(), Some("error: HOME is not set"));
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&project);
     }
 
     // ---- agent launcher -------------------------------------------------

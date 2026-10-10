@@ -71,6 +71,9 @@ pub enum PrefixAction {
     DiffFiles,
     /// Open the agent launcher to run a choice in a new pane here.
     Run,
+    /// Open the setup panel: install the Claude Code hooks, the opencode
+    /// plugin, and the tutti skill, for the user or into the active project.
+    Integrations,
     /// Release/re-grab mouse capture so the terminal's own drag-to-select and
     /// copy work while released.
     MouseToggle,
@@ -146,6 +149,7 @@ const DEFAULT_PREFIX_TABLE: &[PrefixBinding] = &[
     b(KeyCode::Char('g'), PrefixAction::Navigate, "go to"),
     b(KeyCode::Char('f'), PrefixAction::DiffFiles, "changed files"),
     b(KeyCode::Char('r'), PrefixAction::Run, "run here"),
+    b(KeyCode::Char('i'), PrefixAction::Integrations, "setup"),
     b(
         KeyCode::Char('o'),
         PrefixAction::FocusCycle,
@@ -178,6 +182,7 @@ const VIM_PREFIX_TABLE: &[PrefixBinding] = &[
     b(KeyCode::Char('g'), PrefixAction::Navigate, "go to"),
     b(KeyCode::Char('f'), PrefixAction::DiffFiles, "changed files"),
     b(KeyCode::Char('r'), PrefixAction::Run, "run here"),
+    b(KeyCode::Char('i'), PrefixAction::Integrations, "setup"),
     b(KeyCode::Char('z'), PrefixAction::Zoom, "zoom pane"),
     b(KeyCode::Char('['), PrefixAction::Scrollback, "scrollback"),
     b(
@@ -192,6 +197,155 @@ const fn b(key: KeyCode, action: PrefixAction, desc: &'static str) -> PrefixBind
     PrefixBinding { key, action, desc }
 }
 
+/// A sidebar action: what a key does while the sidebar holds the keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarAction {
+    Down,
+    Up,
+    /// Jump to the selected row's tab (and an agent row's pane).
+    Jump,
+    /// Peek at a blocked agent's prompt and answer it in place.
+    Peek,
+    NewAgent,
+    NewWorkspace,
+    AddProject,
+    /// Page the selected workspace's diff against trunk.
+    Diff,
+    Merge,
+    /// Update a stale workspace's working copy.
+    Update,
+    Kill,
+    Back,
+}
+
+/// A changes-panel action: what a key does while the changed-files panel
+/// holds the keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangesAction {
+    Down,
+    Up,
+    HalfPageDown,
+    HalfPageUp,
+    PageDown,
+    PageUp,
+    Top,
+    Bottom,
+    /// Page the highlighted file's or turn's diff.
+    Open,
+    /// Page the whole workspace's diff.
+    FullDiff,
+    /// Ask to restore the working copy to the highlighted turn.
+    Restore,
+    /// Step out past the panel's right edge, on to the next tab.
+    NextTab,
+    Back,
+}
+
+/// One sidebar or changes-panel binding: the key, its action, and a short
+/// description the help overlay renders — the bottom-bar hint too, when
+/// `hint` is set. The key's modifiers must be held and extra ones ride along,
+/// so a plain key answers its Ctrl/Alt chord as well unless a chord binding
+/// claims it.
+#[derive(Debug, Clone, Copy)]
+pub struct PanelBinding<A> {
+    pub key: Chord,
+    pub action: A,
+    pub desc: &'static str,
+    pub hint: bool,
+}
+
+/// The sidebar's keys — one source of truth for dispatch, the help overlay,
+/// and the bottom-bar hint. The cursor keys stay out of the hint, table-stakes
+/// list motion, to leave room for the verbs.
+pub const SIDEBAR_TABLE: &[PanelBinding<SidebarAction>] = &[
+    help(KeyCode::Char('j'), SidebarAction::Down, "move"),
+    help(KeyCode::Char('k'), SidebarAction::Up, "move"),
+    help(KeyCode::Down, SidebarAction::Down, "move"),
+    help(KeyCode::Up, SidebarAction::Up, "move"),
+    hint(KeyCode::Enter, SidebarAction::Jump, "jump"),
+    hint(KeyCode::Char('p'), SidebarAction::Peek, "peek"),
+    hint(KeyCode::Char('n'), SidebarAction::NewAgent, "new agent"),
+    hint(
+        KeyCode::Char('w'),
+        SidebarAction::NewWorkspace,
+        "new workspace",
+    ),
+    hint(KeyCode::Char('a'), SidebarAction::AddProject, "add project"),
+    hint(KeyCode::Char('d'), SidebarAction::Diff, "diff"),
+    hint(KeyCode::Char('m'), SidebarAction::Merge, "merge"),
+    hint(KeyCode::Char('u'), SidebarAction::Update, "update stale"),
+    hint(KeyCode::Char('x'), SidebarAction::Kill, "kill"),
+    hint(KeyCode::Esc, SidebarAction::Back, "back"),
+];
+
+/// The changes panel's keys: the diff and restore verbs, vim/less list motion
+/// over the files and then the turns, and the edges a pane has — `h`/`q`/`esc`
+/// back into the panes, `l` on to the next tab.
+pub const CHANGES_TABLE: &[PanelBinding<ChangesAction>] = &[
+    hint(KeyCode::Enter, ChangesAction::Open, "diff"),
+    hint(KeyCode::Char('d'), ChangesAction::FullDiff, "full diff"),
+    hint(KeyCode::Char('r'), ChangesAction::Restore, "restore turn"),
+    hint(KeyCode::Char('j'), ChangesAction::Down, "move"),
+    hint(KeyCode::Char('k'), ChangesAction::Up, "move"),
+    help(KeyCode::Down, ChangesAction::Down, "move"),
+    help(KeyCode::Up, ChangesAction::Up, "move"),
+    help(KeyCode::Char('g'), ChangesAction::Top, "top"),
+    help(KeyCode::Home, ChangesAction::Top, "top"),
+    help(KeyCode::Char('G'), ChangesAction::Bottom, "bottom"),
+    help(KeyCode::End, ChangesAction::Bottom, "bottom"),
+    ctrl_help('d', ChangesAction::HalfPageDown, "half page down"),
+    ctrl_help('u', ChangesAction::HalfPageUp, "half page up"),
+    help(KeyCode::PageDown, ChangesAction::PageDown, "page down"),
+    help(KeyCode::PageUp, ChangesAction::PageUp, "page up"),
+    help(KeyCode::Char('l'), ChangesAction::NextTab, "next tab"),
+    help(KeyCode::Char('h'), ChangesAction::Back, "back"),
+    help(KeyCode::Char('q'), ChangesAction::Back, "back"),
+    hint(KeyCode::Esc, ChangesAction::Back, "back"),
+];
+
+/// A plain-key panel binding the bottom-bar hint shows as well as the help.
+const fn hint<A>(code: KeyCode, action: A, desc: &'static str) -> PanelBinding<A> {
+    panel(code, KeyModifiers::NONE, action, desc, true)
+}
+
+/// A plain-key panel binding only the help overlay lists.
+const fn help<A>(code: KeyCode, action: A, desc: &'static str) -> PanelBinding<A> {
+    panel(code, KeyModifiers::NONE, action, desc, false)
+}
+
+/// A Ctrl-chord panel binding only the help overlay lists.
+const fn ctrl_help<A>(c: char, action: A, desc: &'static str) -> PanelBinding<A> {
+    panel(KeyCode::Char(c), KeyModifiers::CONTROL, action, desc, false)
+}
+
+const fn panel<A>(
+    code: KeyCode,
+    mods: KeyModifiers,
+    action: A,
+    desc: &'static str,
+    hint: bool,
+) -> PanelBinding<A> {
+    PanelBinding {
+        key: Chord { code, mods },
+        action,
+        desc,
+        hint,
+    }
+}
+
+/// The action `key` triggers under a panel's `table`: a chord binding whose
+/// modifiers are held wins, else the bare key's binding — so `d` answers A-d
+/// too, while C-d belongs to its own chord.
+pub fn panel_action<A: Copy>(table: &[PanelBinding<A>], key: KeyEvent) -> Option<A> {
+    let hit = |b: &&PanelBinding<A>| b.key.code == key.code && key.modifiers.contains(b.key.mods);
+    table
+        .iter()
+        .filter(|b| !b.key.mods.is_empty())
+        .find(hit)
+        .or_else(|| table.iter().find(hit))
+        .map(|b| b.action)
+}
+
 /// A short human label for a key code, for the hint, which-key, and help.
 pub fn key_label(code: KeyCode) -> String {
     match code {
@@ -201,6 +355,11 @@ pub fn key_label(code: KeyCode) -> String {
         KeyCode::Up => "↑".into(),
         KeyCode::Down => "↓".into(),
         KeyCode::Esc => "esc".into(),
+        KeyCode::Enter => "enter".into(),
+        KeyCode::PageUp => "pgup".into(),
+        KeyCode::PageDown => "pgdn".into(),
+        KeyCode::Home => "home".into(),
+        KeyCode::End => "end".into(),
         other => format!("{other:?}"),
     }
 }
@@ -799,6 +958,39 @@ kill_pane    = "A-x"
         }
     }
 
+    /// Every sidebar row the help overlay and bottom bar render dispatches to
+    /// its own action — none shadowed by another row.
+    #[test]
+    fn sidebar_rows_are_the_dispatch_table() {
+        for binding in SIDEBAR_TABLE {
+            let key = KeyEvent::new(binding.key.code, binding.key.mods);
+            assert_eq!(panel_action(SIDEBAR_TABLE, key), Some(binding.action));
+        }
+    }
+
+    /// Likewise every changes-panel row, its C-d/C-u chords included.
+    #[test]
+    fn changes_rows_are_the_dispatch_table() {
+        for binding in CHANGES_TABLE {
+            let key = KeyEvent::new(binding.key.code, binding.key.mods);
+            assert_eq!(panel_action(CHANGES_TABLE, key), Some(binding.action));
+        }
+    }
+
+    #[test]
+    fn a_chord_binding_beats_its_bare_key_and_bare_keys_ride_modifiers() {
+        let action = |key| panel_action(CHANGES_TABLE, key);
+        assert_eq!(action(ctrl('d')), Some(ChangesAction::HalfPageDown));
+        assert_eq!(action(plain('d')), Some(ChangesAction::FullDiff));
+        assert_eq!(action(alt('d')), Some(ChangesAction::FullDiff));
+        assert_eq!(action(ctrl('j')), Some(ChangesAction::Down));
+        assert_eq!(action(plain('u')), None, "only C-u is bound");
+        assert_eq!(
+            panel_action(SIDEBAR_TABLE, alt('x')),
+            Some(SidebarAction::Kill)
+        );
+    }
+
     #[test]
     fn keys_override_beats_preset_default() {
         // A [keys] entry wins over the preset-provided default binding table.
@@ -1040,6 +1232,20 @@ ttl_minutes = 15
                 cfg.prefix_action(KeyCode::Char('r')),
                 Some(PrefixAction::Run),
                 "r should open the launcher in every preset"
+            );
+        }
+    }
+
+    #[test]
+    fn both_presets_bind_the_setup_key() {
+        for cfg in [
+            Config::default(),
+            Config::parse("preset = \"vim\"\n").unwrap(),
+        ] {
+            assert_eq!(
+                cfg.prefix_action(KeyCode::Char('i')),
+                Some(PrefixAction::Integrations),
+                "i should open the setup panel in every preset"
             );
         }
     }

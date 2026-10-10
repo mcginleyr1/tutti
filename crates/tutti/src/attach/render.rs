@@ -16,7 +16,8 @@ use super::launcher::LauncherRow;
 use super::navigate::{self, Marker};
 use super::sidebar::{AgentRow, SidebarEntry, WorkspaceRow};
 use super::theme;
-use crate::config::{self, Config, Icons, PrefixAction};
+use crate::config::{self, Config, Icons, PanelBinding, PrefixAction};
+use crate::integrations::Status;
 use crate::render::{age, count, state_label, unix_now};
 
 /// The accent colour of the active theme — the one thing that marks the
@@ -82,23 +83,6 @@ fn glyphs(icons: Icons) -> &'static Glyphs {
     }
 }
 
-/// The sidebar-mode key hint, rendered two-tone in the bottom bar. `j/k move` is
-/// dropped as table-stakes list navigation (the help overlay still documents it)
-/// to make room for the workspace verbs: `w` creates a nested workspace and `m`
-/// merges one back into its project.
-const SIDEBAR_HINT: &[(&str, &str)] = &[
-    ("enter", "jump"),
-    ("p", "peek"),
-    ("n", "new agent"),
-    ("w", "workspace"),
-    ("a", "add project"),
-    ("d", "diff"),
-    ("m", "merge"),
-    ("u", "update"),
-    ("x", "kill"),
-    ("esc", "back"),
-];
-
 /// The peek overlay's hint row, two-tone: the answer keys, how to close, and
 /// how to get at what the overlay will not forward (esc, free typing) — esc
 /// back to the row, then enter jumps into the pane.
@@ -108,15 +92,11 @@ const PEEK_HINT: &[(&str, &str)] = &[
     ("esc enter", "jump in to type"),
 ];
 
-/// The changed-files-panel key hint, rendered two-tone in the bottom bar.
-/// `enter` opens whichever row the cursor is on — a file's or a turn's diff.
-const DIFF_HINT: &[(&str, &str)] = &[
-    ("enter", "diff"),
-    ("d", "full diff"),
-    ("r", "restore turn"),
-    ("j/k", "move"),
-    ("esc", "back"),
-];
+/// How many rows of an install's preview the setup panel's confirm shows.
+const SETUP_PREVIEW_ROWS: usize = 10;
+
+/// The widest a target path renders in the setup panel before it clips.
+const SETUP_PATH_W: usize = 60;
 
 /// The go-to overlay's key hint, two-tone at its input row's right edge —
 /// typing filters, so the movement keys are the ones worth saying.
@@ -219,6 +199,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     if app.mode == Mode::LauncherCommand {
         draw_launcher_command(frame, app, area);
+    }
+    if app.mode == Mode::Integrations {
+        draw_setup(frame, app, area);
     }
     if app.mode == Mode::Navigate {
         draw_navigate(frame, app, content, spinner);
@@ -1331,11 +1314,11 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     }
     if app.mode == Mode::Sidebar {
         spans.push(Span::raw("  "));
-        spans.extend(two_tone(SIDEBAR_HINT).0);
+        spans.extend(two_tone(&key_groups(config::SIDEBAR_TABLE, true)).0);
     }
     if app.mode == Mode::DiffFiles {
         spans.push(Span::raw("  "));
-        spans.extend(two_tone(DIFF_HINT).0);
+        spans.extend(two_tone(&key_groups(config::CHANGES_TABLE, true)).0);
     }
     let line = Line::from(spans);
     let left_width = line.width() as u16;
@@ -1365,6 +1348,7 @@ fn mode_label(mode: Mode) -> Option<&'static str> {
         Mode::SidebarPrompt => Some("ADD PROJECT"),
         Mode::SidebarWorkspaceName | Mode::SidebarWorkspaceDest => Some("WORKSPACE"),
         Mode::Launcher | Mode::LauncherCommand => Some("RUN"),
+        Mode::Integrations => Some("SETUP"),
         Mode::Peek(_) => Some("ANSWER"),
         Mode::Navigate => Some("GO TO"),
     }
@@ -1596,6 +1580,116 @@ fn draw_launcher_command(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line).block(popup_block(&title)), popup);
 }
 
+/// The setup panel: a centred rounded panel titled ` setup · user ` — or
+/// ` setup · project <name> ` once `s` switches it — over the integrations
+/// tutti installs. Each row leads with a status dot (green installed, yellow
+/// out of date, dim not installed, red where tutti cannot or will not write),
+/// then the name bright and the status dim, the target file dim beneath —
+/// clipped from the left so its name survives; the highlighted row takes the
+/// launcher's accent `❯`. While it asks to install, the panel holds that row's
+/// question, change summary, and the head of its preview instead.
+fn draw_setup(frame: &mut Frame, app: &App, area: Rect) {
+    let title = match app.setup_project() {
+        Some(name) => format!(" setup · project {name} "),
+        None => " setup · user ".to_string(),
+    };
+    let rows: Vec<_> = app.setup_rows().collect();
+    let selected = app.setup_selected();
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let target = |path: &std::path::Path| {
+        let (dir, base) = clipped_path(&path.display().to_string(), SETUP_PATH_W);
+        format!("{dir}{base}")
+    };
+    if app.setup_confirming()
+        && let Some((label, Ok(plan))) = rows.get(selected)
+        && let Status::Missing(change) | Status::Outdated(change) = &plan.status
+    {
+        let preview: Vec<&str> = change.preview.lines().collect();
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(format!(" install {label}? "), bold),
+                Span::styled("y/N ", dim()),
+            ]),
+            Line::from(Span::styled(format!(" {} ", target(&plan.path)), dim())),
+            Line::from(format!(" {} ", change.summary)),
+            Line::default(),
+        ];
+        lines.extend(
+            preview
+                .iter()
+                .take(SETUP_PREVIEW_ROWS)
+                .map(|row| Line::from(Span::styled(format!(" {row} "), dim()))),
+        );
+        if preview.len() > SETUP_PREVIEW_ROWS {
+            let more = preview.len() - SETUP_PREVIEW_ROWS;
+            lines.push(Line::from(Span::styled(
+                format!(" … {more} more lines "),
+                dim(),
+            )));
+        }
+        return draw_centered_popup(frame, area, &title, lines);
+    }
+    let palette = theme::current();
+    let glyphs = glyphs(app.config().icons);
+    let colour = |c| Style::default().fg(c);
+    let name_w = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
+    let mut lines = Vec::new();
+    for (i, (label, plan)) in rows.into_iter().enumerate() {
+        let (dot, dot_style, status, file) = match plan {
+            Ok(plan) => {
+                let (dot, style, status) = match &plan.status {
+                    Status::Installed => (glyphs.done, colour(palette.done), "installed".into()),
+                    Status::Outdated(_) => {
+                        (glyphs.idle, colour(palette.working), "needs update".into())
+                    }
+                    Status::Missing(_) => (glyphs.idle, dim(), "not installed".into()),
+                    Status::Foreign => (
+                        glyphs.blocked,
+                        colour(palette.blocked),
+                        "not tutti's".into(),
+                    ),
+                    Status::Unreadable(why) => (
+                        glyphs.blocked,
+                        colour(palette.blocked),
+                        format!("unreadable: {why}"),
+                    ),
+                };
+                (dot, style, status, target(&plan.path))
+            }
+            Err(e) => (
+                glyphs.blocked,
+                colour(palette.blocked),
+                "unavailable".to_string(),
+                format!("{e:#}"),
+            ),
+        };
+        let (marker, name_style) = if i == selected {
+            let accent = Style::default().fg(accent()).add_modifier(Modifier::BOLD);
+            (Span::styled("❯ ", accent), accent)
+        } else {
+            (Span::raw("  "), bold)
+        };
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            marker,
+            Span::styled(format!("{dot} "), dot_style),
+            Span::styled(format!("{label:<name_w$}"), name_style),
+            Span::styled(format!("  {status} "), dim()),
+        ]));
+        lines.push(Line::from(Span::styled(format!("     {file} "), dim())));
+    }
+    let scope = match app.setup_project() {
+        Some(_) => "user scope",
+        None => "project scope",
+    };
+    let mut hint = vec![Span::raw(" ")];
+    hint.extend(two_tone(&[("enter", "install"), ("s", scope), ("esc", "close")]).0);
+    hint.push(Span::raw(" "));
+    lines.push(Line::default());
+    lines.push(Line::from(hint));
+    draw_centered_popup(frame, area, &title, lines);
+}
+
 /// The peek overlay: a centred rounded panel titled ` answer <agent> ·
 /// <workspace> ` showing the live tail of a blocked agent's screen — exactly
 /// the prompt region its fingerprint covers — blitted cell by cell from the
@@ -1765,13 +1859,14 @@ fn popup_block(title: &str) -> Block<'_> {
         .title(title)
 }
 
-/// The help overlay content, generated from the active keymap so it always
-/// matches dispatch. Detach is listed first (it is what a stuck user needs).
-/// Every key hint renders its key in the accent, its label dim.
+/// The help overlay content, generated from the active keymaps so it always
+/// matches dispatch: the prefix table, then the sidebar's and the changes
+/// panel's. Detach is listed first (it is what a stuck user needs). Every key
+/// hint renders its key in the accent, its label dim.
 fn help_lines(cfg: &Config) -> Vec<Line<'static>> {
-    let dim = dim();
+    let prefix = cfg.prefix.label();
     let mut lines = vec![
-        Line::from(format!("tutti — press {}, then:", cfg.prefix.label())),
+        Line::from(format!("tutti — press {prefix}, then:")),
         Line::from(String::new()),
     ];
     if let Some(key) = cfg.prefix_key(PrefixAction::Detach) {
@@ -1784,47 +1879,32 @@ fn help_lines(cfg: &Config) -> Vec<Line<'static>> {
         .filter(|b| b.action != PrefixAction::Detach)
         .map(|b| (config::key_label(b.key), b.desc))
         .collect();
-    for pair in entries.chunks(2) {
-        let mut spans = vec![Span::raw(" ")];
-        for (i, (key, desc)) in pair.iter().enumerate() {
-            spans.push(Span::styled(
-                format!(" {key}"),
-                Style::default().fg(accent()),
-            ));
-            let label = if i == 0 && pair.len() == 2 {
-                format!(" {desc:<14}")
-            } else {
-                format!(" {desc}")
-            };
-            spans.push(Span::styled(label, dim));
-        }
-        lines.push(Line::from(spans));
-    }
+    lines.extend(two_columns(&entries));
     lines.push(Line::from(String::new()));
     lines.push(Line::from("direct keys (no prefix):".to_string()));
     lines.push(popup_key_line("  Ctrl+h/j/k/l", "focus by direction"));
     lines.push(popup_key_line("  Alt+h/j/k/l", "resize split"));
     lines.push(popup_key_line("  Alt+x", "kill pane"));
-    lines.push(Line::from(String::new()));
-    lines.push(Line::from("sidebar (after C-b w):".to_string()));
-    lines.push(popup_key_line("  j/k", "move"));
-    lines.push(popup_key_line(
-        "  p",
-        "peek: answer a blocked agent in place",
-    ));
-    lines.push(popup_key_line("  n / w", "new agent / new workspace"));
-    lines.push(popup_key_line("  a / d", "add project / diff"));
-    lines.push(popup_key_line("  m / u", "merge / update stale"));
-    lines.push(popup_key_line("  x", "kill workspace / agent"));
-    lines.push(Line::from(String::new()));
-    lines.push(Line::from("changed files (after C-b f):".to_string()));
-    lines.push(popup_key_line(
-        "  j/k, g/G, C-d/C-u",
-        "move, top/end, half page",
-    ));
-    lines.push(popup_key_line("  enter / d", "file diff / full diff"));
-    lines.push(popup_key_line("  enter / r", "turn diff / restore to turn"));
-    lines.push(popup_key_line("  h / esc", "back to the panes"));
+    // The panels' own keys, each headed by the prefix key that focuses it.
+    for (panel, focus, entries) in [
+        (
+            "sidebar",
+            PrefixAction::Sidebar,
+            key_groups(config::SIDEBAR_TABLE, false),
+        ),
+        (
+            "changes",
+            PrefixAction::DiffFiles,
+            key_groups(config::CHANGES_TABLE, false),
+        ),
+    ] {
+        let after = cfg.prefix_key(focus).map_or_else(String::new, |key| {
+            format!(" (after {prefix} {})", config::key_label(key))
+        });
+        lines.push(Line::from(String::new()));
+        lines.push(Line::from(format!("{panel}{after}:")));
+        lines.extend(two_columns(&entries));
+    }
     lines.push(Line::from(String::new()));
     lines.push(Line::from(
         "stop the daemon:  tutti server stop".to_string(),
@@ -1832,6 +1912,54 @@ fn help_lines(cfg: &Config) -> Vec<Line<'static>> {
     lines.push(Line::from(String::new()));
     lines.push(Line::from("(any key closes)".to_string()));
     lines
+}
+
+/// Help entries two per row, keys in the accent and labels dim, each column
+/// padded so the rows line up.
+fn two_columns(entries: &[(String, &str)]) -> Vec<Line<'static>> {
+    let key_w = entries
+        .iter()
+        .map(|(key, _)| key.chars().count())
+        .max()
+        .unwrap_or(0);
+    let desc_w = entries
+        .iter()
+        .step_by(2)
+        .map(|(_, desc)| desc.chars().count())
+        .max()
+        .unwrap_or(0);
+    entries
+        .chunks(2)
+        .map(|pair| {
+            let mut spans = vec![Span::raw(" ")];
+            for (i, (key, desc)) in pair.iter().enumerate() {
+                spans.push(Span::styled(
+                    format!(" {key:<key_w$}"),
+                    Style::default().fg(accent()),
+                ));
+                let pad = if i == 0 && pair.len() == 2 { desc_w } else { 0 };
+                spans.push(Span::styled(format!(" {desc:<pad$} "), dim()));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// A panel's bindings as help entries — `hint_only` keeps the ones the bottom
+/// bar shows — neighbours sharing a description merged into one entry under
+/// their joined keys: `j/k move`.
+fn key_groups<A>(table: &[PanelBinding<A>], hint_only: bool) -> Vec<(String, &'static str)> {
+    let mut groups: Vec<(String, &'static str)> = Vec::new();
+    for binding in table.iter().filter(|b| b.hint || !hint_only) {
+        match groups.last_mut() {
+            Some((keys, desc)) if *desc == binding.desc => {
+                keys.push('/');
+                keys.push_str(&binding.key.label());
+            }
+            _ => groups.push((binding.key.label(), binding.desc)),
+        }
+    }
+    groups
 }
 
 /// One popup hint line: the key in the accent colour, its label dim. Used by the
@@ -2805,8 +2933,8 @@ mod tests {
         assert_eq!(app.mode, Mode::Help);
 
         // Tall enough to clear the whole panel, including the sidebar and
-        // changed-files sections.
-        let mut terminal = Terminal::new(TestBackend::new(64, 36)).unwrap();
+        // changes sections.
+        let mut terminal = Terminal::new(TestBackend::new(64, 44)).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("detach"), "help missing detach: {text:?}");
@@ -2820,17 +2948,20 @@ mod tests {
         );
         // The sidebar section documents the workspace, merge, update-stale, and
         // kill keys.
+        let sidebar = &text[text.find("sidebar (after C-b w)").expect("sidebar section")..];
         assert!(
-            text.contains("new workspace")
-                && text.contains("merge")
-                && text.contains("update stale")
-                && text.contains("kill workspace / agent"),
+            sidebar.contains("new workspace")
+                && sidebar.contains("merge")
+                && sidebar.contains("update stale")
+                && sidebar.contains("kill"),
             "help missing the sidebar workspace/merge/update/kill keys: {text:?}"
         );
+        let changes = &text[text.find("changes (after C-b f)").expect("changes section")..];
         assert!(
             text.contains("changed files")
-                && text.contains("file diff / full diff")
-                && text.contains("half page"),
+                && changes.contains("full diff")
+                && changes.contains("restore turn")
+                && changes.contains("half page"),
             "help missing the changed-files panel keys: {text:?}"
         );
         // Detach is listed before the split bindings.
@@ -3426,6 +3557,179 @@ mod tests {
             "the command input prompt is missing: {text:?}"
         );
     }
+
+    /// `app_with_pane` with the setup panel open over a fixture home holding
+    /// the tutti skill, someone else's opencode plugin, and no Claude
+    /// settings. Returns the app and the home.
+    fn setup_app() -> (App, std::path::PathBuf) {
+        use crate::attach::fixtures::{ctrl, plain};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let home =
+            std::env::temp_dir().join(format!("tutti-render-setup-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        for (path, text) in [
+            (".claude/skills/tutti/SKILL.md", crate::integrations::SKILL),
+            (
+                ".config/opencode/plugins/tutti.js",
+                "export const Mine = 1\n",
+            ),
+        ] {
+            let path = home.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let mut app = app_with_pane(b"hi");
+        app.setup_dirs = crate::integrations::Dirs {
+            home: Some(home.clone()),
+            ..Default::default()
+        };
+        app.on_key(ctrl('b'));
+        app.on_key(plain('i'));
+        assert_eq!(app.mode, Mode::Integrations);
+        (app, home)
+    }
+
+    #[test]
+    fn setup_panel_lists_each_integration_with_its_status_dot_and_target() {
+        let (app, home) = setup_app();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let w = buf.area.width as usize;
+        assert!(
+            buffer_text(buf).contains(" setup · user "),
+            "the scope titles it"
+        );
+        let palette = theme::current();
+        for (label, status, file) in [
+            (
+                "Claude Code hooks",
+                "not installed",
+                ".claude/settings.json",
+            ),
+            (
+                "opencode plugin",
+                "not tutti's",
+                ".config/opencode/plugins/tutti.js",
+            ),
+            ("tutti skill", "installed", ".claude/skills/tutti/SKILL.md"),
+        ] {
+            let row = row_containing(buf, label);
+            let text = row_text(buf, row);
+            assert!(text.contains(&format!("  {status} ")), "{text:?}");
+            // A long temp-dir path clips from the left, keeping the file.
+            let (dir, base) = clipped_path(&home.join(file).display().to_string(), SETUP_PATH_W);
+            let beneath = row_text(buf, row + 1);
+            assert!(
+                beneath.contains(&format!("{dir}{base}")) && beneath.contains(file),
+                "the target file sits beneath: {beneath:?}"
+            );
+            let dot = &buf.content()[row * w + col_of(buf, row, label) - 2];
+            match status {
+                "not installed" => assert!(dot.modifier.contains(Modifier::DIM)),
+                "not tutti's" => assert_eq!(dot.fg, palette.blocked),
+                _ => assert_eq!(dot.fg, palette.done),
+            }
+        }
+        let hooks = row_containing(buf, "Claude Code hooks");
+        assert!(
+            row_text(buf, hooks).contains('❯'),
+            "the first row is highlighted"
+        );
+        assert!(
+            buffer_text(buf).contains("enter install  s project scope  esc close"),
+            "the panel's own key hint"
+        );
+        assert!(row_text(buf, 23).contains("SETUP"), "the footer mode chip");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn setup_confirm_asks_with_the_change_summary_and_the_preview_head() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, home) = setup_app();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.setup_confirming());
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("install Claude Code hooks? y/N"), "{text:?}");
+        assert!(text.contains("adding tutti hooks for "), "the summary");
+        assert!(text.contains("--- hooks before ---"), "the preview's head");
+        assert!(text.contains("more lines"), "and how much of it is cut");
+        assert!(
+            !text.contains("opencode plugin"),
+            "the question holds the panel"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn help_overlay_renders_each_panel_section_from_its_table() {
+        use crate::attach::fixtures::{ctrl, plain};
+        let mut app = app_with_pane(b"hi");
+        app.on_key(ctrl('b'));
+        app.on_key(plain('?'));
+        let mut terminal = Terminal::new(TestBackend::new(64, 44)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let sidebar = row_containing(buf, "sidebar (after C-b w):");
+        let changes = row_containing(buf, "changes (after C-b f):");
+        let stop = row_containing(buf, "tutti server stop");
+        for (rows, groups) in [
+            (
+                sidebar + 1..changes,
+                key_groups(config::SIDEBAR_TABLE, false),
+            ),
+            (changes + 1..stop, key_groups(config::CHANGES_TABLE, false)),
+        ] {
+            for (keys, desc) in groups {
+                assert!(
+                    rows.clone().any(|row| {
+                        let text = row_text(buf, row);
+                        text.contains(&format!(" {keys} ")) && text.contains(desc)
+                    }),
+                    "{keys} {desc} missing from rows {rows:?}: {:?}",
+                    buffer_text(buf)
+                );
+            }
+        }
+        assert!(
+            row_text(buf, sidebar + 1).contains(" j/k/↓/↑ move "),
+            "keys sharing a description share an entry"
+        );
+    }
+
+    #[test]
+    fn panel_footer_hints_are_their_tables_hint_rows() {
+        use crate::attach::fixtures::{ctrl, plain};
+        let mut app = changes_app(Config::default());
+        let mut terminal = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        app.sync_sizes(Rect::new(0, 0, 160, 20));
+        app.on_key(ctrl('b'));
+        app.on_key(plain('w'));
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let footer = row_text(terminal.backend().buffer(), 19);
+        assert!(
+            footer.contains(
+                "enter jump  p peek  n new agent  w new workspace  a add project  \
+                 d diff  m merge  u update stale  x kill  esc back"
+            ),
+            "{footer:?}"
+        );
+
+        app.on_key(ctrl('b'));
+        app.on_key(plain('f'));
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let footer = row_text(terminal.backend().buffer(), 19);
+        assert!(
+            footer.contains("enter diff  d full diff  r restore turn  j/k move  esc back"),
+            "{footer:?}"
+        );
+    }
+
     /// An attached app whose one workspace carries two changed files (16 and 1
     /// lines), so the changes panel and its stat surfaces all render.
     fn changes_app(config: Config) -> App {
