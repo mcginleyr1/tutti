@@ -12,7 +12,7 @@
 //! path around them swallows all errors so a hook can never break a session.
 
 use serde_json::{Value, json};
-use tutti_core::AgentHookEvent;
+use tutti_core::{AgentHookEvent, ApprovalDecision};
 
 /// The command a hook runs; also the addressable verb this module documents.
 pub const HOOK_COMMAND: &str = "tutti agent-event claude";
@@ -68,11 +68,19 @@ pub fn map_opencode_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)>
 /// is sent). Verified against the hooks reference: every event carries
 /// `hook_event_name` and `session_id` (a subagent's events carry its parent
 /// session's); tool events carry `tool_name`/`tool_input` (the `Task` tool's
-/// input has `description`/`title`); `Notification` carries `message` and
-/// `notification_type`; `UserPromptSubmit` carries the `prompt`; subagent
-/// events carry `agent_id`/`agent_type`.
+/// input has `description`/`title`), `PermissionRequest` among them, fired
+/// the moment Claude would show a permission dialog; `Notification` carries
+/// `message` and `notification_type`; `UserPromptSubmit` carries the
+/// `prompt`; subagent events carry `agent_id`/`agent_type`.
 pub fn map_claude_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
     let event = match v.get("hook_event_name")?.as_str()? {
+        // Blocked at once — the `permission_prompt` notification only comes
+        // seconds later — naming what would run.
+        "PermissionRequest" => {
+            permission_request(v).map(|(tool, summary)| AgentHookEvent::Blocked {
+                message: Some(format!("{tool} · {summary}")),
+            })
+        }
         "PreToolUse" if tool_name(v) == Some("Task") => {
             let desc = subagent_desc(v);
             Some(AgentHookEvent::SubagentStarted {
@@ -152,6 +160,83 @@ fn subagent_id(v: &Value) -> String {
         .to_string()
 }
 
+/// What a `PermissionRequest` asks to run: its tool, and the tool's input on
+/// one line (`input_summary`). `None` for any other event.
+pub fn permission_request(v: &Value) -> Option<(String, String)> {
+    (v.get("hook_event_name")?.as_str()? == "PermissionRequest").then(|| {
+        let tool = tool_name(v).unwrap_or("tool").to_string();
+        (tool, input_summary(v))
+    })
+}
+
+/// The `tool_input` fields a summary reads, first present wins: Bash's
+/// command, the file tools' paths, WebFetch's URL, WebSearch's query, Glob
+/// and Grep's pattern, then a search path and a subagent's task.
+const SUMMARY_FIELDS: &[&str] = &[
+    "command",
+    "file_path",
+    "notebook_path",
+    "url",
+    "query",
+    "pattern",
+    "path",
+    "description",
+    "prompt",
+];
+
+/// A tool call's input on one line, for a held approval: the first of
+/// `SUMMARY_FIELDS` present — a path relative to the session's `cwd` when
+/// beneath it — else its first string field; line breaks shown as `⏎`,
+/// control characters blanked so nothing reaches the terminal raw, and cut
+/// with `…` past 500 characters, so nothing is hidden without a mark.
+fn input_summary(v: &Value) -> String {
+    let input = v.get("tool_input");
+    let (field, text) = SUMMARY_FIELDS
+        .iter()
+        .find_map(|&field| Some((field, input?.get(field)?.as_str()?)))
+        .or_else(|| Some(("", input?.as_object()?.values().find_map(Value::as_str)?)))
+        .unwrap_or(("", ""));
+    let cwd = v
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|_| field.ends_with("path"));
+    let text: String = cwd
+        .and_then(|cwd| text.strip_prefix(cwd)?.strip_prefix('/'))
+        .unwrap_or(text)
+        .chars()
+        .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
+        .collect();
+    let line = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ⏎ ");
+    let mut chars = line.chars();
+    let mut summary: String = chars.by_ref().take(500).collect();
+    if chars.next().is_some() {
+        summary.push('…');
+    }
+    summary
+}
+
+/// The `PermissionRequest` hook output carrying `decision` to Claude, or
+/// `None` for a pass: the hook prints nothing and Claude shows its own
+/// dialog. A denial gives Claude its reason, else says tutti's user denied it.
+pub fn permission_decision(decision: &ApprovalDecision) -> Option<Value> {
+    let decision = match decision {
+        ApprovalDecision::Allow => json!({ "behavior": "allow" }),
+        ApprovalDecision::Deny { message } => json!({
+            "behavior": "deny",
+            "message": message.as_deref().unwrap_or("the user denied this in tutti"),
+        }),
+        ApprovalDecision::Pass => return None,
+    };
+    Some(json!({
+        "hookSpecificOutput": { "hookEventName": "PermissionRequest", "decision": decision }
+    }))
+}
+
 /// The settings.json `hooks` snippet wiring every relevant event to
 /// `tutti agent-event claude`. Built as JSON so it is always valid.
 pub fn claude_hooks_json() -> Value {
@@ -165,6 +250,7 @@ pub fn claude_hooks_json() -> Value {
         "hooks": {
             "PreToolUse": with_matcher,
             "PostToolUse": with_matcher,
+            "PermissionRequest": with_matcher,
             "SubagentStop": with_matcher,
             "Notification": no_matcher,
             "Stop": no_matcher,
@@ -406,6 +492,131 @@ mod tests {
         }
     }
 
+    /// A `PermissionRequest` (its payload as the hooks reference shows it)
+    /// blocks the pane at once, naming the tool and its input on one line.
+    #[test]
+    fn a_permission_request_blocks_naming_the_tool_and_its_input() {
+        let blocked = |tool: &str, input: Value| {
+            ev(&json!({
+                "session_id": "abc123",
+                "cwd": "/srv/api",
+                "permission_mode": "default",
+                "hook_event_name": "PermissionRequest",
+                "tool_name": tool,
+                "tool_input": input,
+                "permission_suggestions": [],
+            })
+            .to_string())
+        };
+        let message = |text: &str| {
+            Some(AgentHookEvent::Blocked {
+                message: Some(text.into()),
+            })
+        };
+        assert_eq!(
+            blocked(
+                "Bash",
+                json!({ "command": "rm -rf build", "description": "Clean" })
+            ),
+            message("Bash · rm -rf build")
+        );
+        assert_eq!(
+            blocked(
+                "Edit",
+                json!({ "file_path": "/srv/api/src/main.rs", "old_string": "a", "new_string": "b" })
+            ),
+            message("Edit · src/main.rs"),
+            "a path beneath the session's cwd reads relative to it"
+        );
+        assert_eq!(
+            blocked(
+                "Write",
+                json!({ "file_path": "/etc/hosts", "content": "x" })
+            ),
+            message("Write · /etc/hosts")
+        );
+        assert_eq!(
+            blocked("Bash", json!({ "command": "/srv/api/run.sh" })),
+            message("Bash · /srv/api/run.sh"),
+            "a command is never rewritten"
+        );
+        assert_eq!(
+            blocked(
+                "WebFetch",
+                json!({ "url": "https://example.com", "prompt": "summarize" })
+            ),
+            message("WebFetch · https://example.com")
+        );
+        assert_eq!(
+            blocked("Grep", json!({ "pattern": "TODO", "path": "/srv/api/src" })),
+            message("Grep · TODO")
+        );
+        assert_eq!(
+            blocked(
+                "mcp__github__create_issue",
+                json!({ "count": 3, "repo": "tutti" })
+            ),
+            message("mcp__github__create_issue · tutti"),
+            "another tool shows its first string field"
+        );
+        assert_eq!(
+            blocked("Bash", json!({ "command": "cd /tmp\n\n  rm -rf build\n" })),
+            message("Bash · cd /tmp ⏎ rm -rf build"),
+            "every line shows, the breaks marked"
+        );
+        assert_eq!(
+            blocked("Bash", json!({ "command": "echo \u{1b}]52;c;aGk=\u{7}" })),
+            message("Bash · echo  ]52;c;aGk="),
+            "no control character reaches the terminal"
+        );
+        let Some(AgentHookEvent::Blocked {
+            message: Some(long),
+        }) = blocked("Bash", json!({ "command": "x".repeat(600) }))
+        else {
+            panic!("expected a blocked event");
+        };
+        assert_eq!(
+            long,
+            format!("Bash · {}…", "x".repeat(500)),
+            "a cut is marked"
+        );
+        assert_eq!(
+            permission_request(&json!({ "hook_event_name": "PreToolUse", "tool_name": "Bash" })),
+            None
+        );
+    }
+
+    /// A held approval's answer goes back to Claude as the documented
+    /// `PermissionRequest` decision object; a pass prints nothing, so
+    /// Claude's own dialog appears.
+    #[test]
+    fn decisions_print_as_claudes_permission_request_output() {
+        let output = |decision: Value| {
+            json!({
+                "hookSpecificOutput": { "hookEventName": "PermissionRequest", "decision": decision }
+            })
+        };
+        assert_eq!(
+            permission_decision(&ApprovalDecision::Allow),
+            Some(output(json!({ "behavior": "allow" })))
+        );
+        assert_eq!(
+            permission_decision(&ApprovalDecision::Deny {
+                message: Some("not on main".into())
+            }),
+            Some(output(
+                json!({ "behavior": "deny", "message": "not on main" })
+            ))
+        );
+        assert_eq!(
+            permission_decision(&ApprovalDecision::Deny { message: None }),
+            Some(output(
+                json!({ "behavior": "deny", "message": "the user denied this in tutti" })
+            ))
+        );
+        assert_eq!(permission_decision(&ApprovalDecision::Pass), None);
+    }
+
     #[test]
     fn stop_becomes_done() {
         assert_eq!(
@@ -502,6 +713,7 @@ mod tests {
         for event in [
             "PreToolUse",
             "PostToolUse",
+            "PermissionRequest",
             "SubagentStop",
             "Notification",
             "Stop",
@@ -510,7 +722,11 @@ mod tests {
         ] {
             assert!(hooks.get(event).is_some(), "missing {event}");
         }
-        assert_eq!(hooks.as_object().unwrap().len(), 7);
+        assert_eq!(hooks.as_object().unwrap().len(), 8);
+        assert_eq!(
+            hooks["PermissionRequest"][0]["matcher"], "*",
+            "every tool's permission request"
+        );
         assert!(claude_hooks_snippet().contains(HOOK_COMMAND));
     }
 
@@ -559,7 +775,7 @@ mod tests {
     #[test]
     fn merge_installs_into_empty_settings() {
         let (merged, added) = merge_claude_hooks(&json!({})).unwrap().unwrap();
-        assert_eq!(added.len(), 7);
+        assert_eq!(added.len(), 8);
         assert!(merged["hooks"]["Stop"][0]["hooks"][0]["command"] == HOOK_COMMAND);
         assert!(
             merged["hooks"]["UserPromptSubmit"][0]
@@ -569,7 +785,7 @@ mod tests {
     }
 
     /// Re-running `--install` over what the five-event release installed adds
-    /// exactly the two new events and leaves every existing entry alone.
+    /// exactly the events since and leaves every existing entry alone.
     #[test]
     fn merge_upgrades_an_old_install_with_just_the_new_events() {
         let cmd = json!({ "type": "command", "command": HOOK_COMMAND });
@@ -587,7 +803,10 @@ mod tests {
         });
         let (merged, mut added) = merge_claude_hooks(&old).unwrap().unwrap();
         added.sort();
-        assert_eq!(added, ["SessionStart", "UserPromptSubmit"]);
+        assert_eq!(
+            added,
+            ["PermissionRequest", "SessionStart", "UserPromptSubmit"]
+        );
         for event in [
             "PreToolUse",
             "PostToolUse",

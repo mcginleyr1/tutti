@@ -6,7 +6,8 @@
 //! tree order, sort rules, and hit-testing are unit-tested in isolation.
 
 use tutti_core::{
-    AgentKind, AgentState, PaneId, PaneInfo, SubagentInfo, TabId, WorkspaceId, WorkspaceView,
+    AgentKind, AgentState, PaneId, PaneInfo, PendingApproval, SubagentInfo, TabId, WorkspaceId,
+    WorkspaceView,
 };
 
 /// One selectable sidebar row: a workspace (jumps to a tab) or an agent pane
@@ -131,6 +132,9 @@ pub struct AgentRow {
     /// `entry_at_row` accounts for them. Always empty on waiting-section rows,
     /// which stay two rows tall.
     pub subagents: Vec<SubagentInfo>,
+    /// The pane's held approval: it queues the pane — first — whatever its
+    /// state, and its waiting row names what would run.
+    pub approval: Option<PendingApproval>,
 }
 
 /// The sidebar's contents: the project tree (workspaces interleaved with their
@@ -261,7 +265,8 @@ impl Sidebar {
 /// Agents keep pane order — positional stability over urgency, so a state
 /// change never reshuffles the tree under the cursor; attention order lives in
 /// the waiting section, which gathers blocked and done agents across every
-/// project — blocked first, subagents stripped so each row stays two rows tall.
+/// project — any holding an approval first, whatever its state, then blocked —
+/// subagents stripped so each row stays two rows tall.
 pub fn build(workspaces: &[WorkspaceView], active_tab: Option<TabId>) -> Sidebar {
     let present: std::collections::HashSet<_> = workspaces.iter().map(|w| w.id).collect();
     // A workspace nests only when its parent is actually present; a child whose
@@ -338,6 +343,7 @@ pub fn build(workspaces: &[WorkspaceView], active_tab: Option<TabId>) -> Sidebar
                         guide: None,
                         depth,
                         subagents: pane.subagents.clone(),
+                        approval: pane.approval.clone(),
                     })
                 })
             })
@@ -377,7 +383,10 @@ pub fn build(workspaces: &[WorkspaceView], active_tab: Option<TabId>) -> Sidebar
                 tab.panes.iter().filter_map(move |pane| {
                     pane.agent
                         .as_ref()
-                        .filter(|_| matches!(pane.state, AgentState::Blocked | AgentState::Done))
+                        .filter(|_| {
+                            matches!(pane.state, AgentState::Blocked | AgentState::Done)
+                                || pane.approval.is_some()
+                        })
                         .map(|agent| AgentRow {
                             pane: pane.id,
                             tab: tab.id,
@@ -389,12 +398,13 @@ pub fn build(workspaces: &[WorkspaceView], active_tab: Option<TabId>) -> Sidebar
                             guide: None,
                             depth: 0,
                             subagents: Vec::new(),
+                            approval: pane.approval.clone(),
                         })
                 })
             })
         })
         .collect();
-    waiting.sort_by_key(|a| (state_rank(a.state), a.pane.0));
+    waiting.sort_by_key(|a| (a.approval.is_none(), state_rank(a.state), a.pane.0));
     entries.extend(waiting.into_iter().map(SidebarEntry::Agent));
 
     Sidebar {
@@ -572,6 +582,27 @@ mod tests {
             vec![(4, None, 0), (3, None, 0)],
             "blocked first, then done; waiting rows carry no tree dressing"
         );
+    }
+
+    #[test]
+    fn a_held_approval_queues_its_pane_first_whatever_its_state() {
+        let mut view = two_workspace_view();
+        // api's agent holds an approval while a parallel subagent keeps it
+        // working.
+        view[0].tabs[0].panes[0].approval = Some(PendingApproval {
+            id: 7,
+            tool: "Bash".into(),
+            summary: "rm -rf build".into(),
+        });
+        let sidebar = build(&view, Some(TabId(2)));
+        let waiting: Vec<(u64, bool)> = sidebar.entries[sidebar.tree_count..]
+            .iter()
+            .map(|e| match e {
+                SidebarEntry::Agent(a) => (a.pane.0, a.approval.is_some()),
+                _ => panic!("expected waiting agent rows"),
+            })
+            .collect();
+        assert_eq!(waiting, vec![(1, true), (4, false), (3, false)]);
     }
 
     #[test]

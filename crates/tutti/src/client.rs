@@ -32,6 +32,13 @@ impl Client {
         })
     }
 
+    /// Bound every read and write on this connection by `timeout`, so a
+    /// request whose reply has not come by then fails instead of blocking.
+    pub fn set_timeout(&self, timeout: Duration) -> std::io::Result<()> {
+        self.stream.set_read_timeout(Some(timeout))?;
+        self.stream.set_write_timeout(Some(timeout))
+    }
+
     pub fn request(&mut self, request: &Request) -> Result<Response> {
         let json = serde_json::to_vec(request)?;
         self.stream.write_all(&Frame::Control(json).encode())?;

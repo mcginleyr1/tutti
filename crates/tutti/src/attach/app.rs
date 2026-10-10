@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 use tutti_core::{
-    AgentKind, AgentState, Checkpoint, DIFF_RANGE, Direction, Event, FileStat, Frame as WireFrame,
-    Layout, PaneId, PaneInfo, Request, Response, RestoreSummary, TabId, TabView, WorkspaceId,
-    WorkspaceView, prompt_fingerprint, prompt_rows,
+    AgentKind, AgentState, ApprovalDecision, Checkpoint, DIFF_RANGE, Direction, Event, FileStat,
+    Frame as WireFrame, Layout, PaneId, PaneInfo, Request, Response, RestoreSummary, TabId,
+    TabView, WorkspaceId, WorkspaceView, prompt_fingerprint, prompt_rows,
 };
 
 use tutti_agents::Registry;
@@ -180,6 +180,11 @@ pub enum Mode {
     /// The full-screen go-to: every agent grouped by state over the project
     /// tree, fuzzy-filtered as you type; enter jumps to the highlighted row.
     Navigate,
+    /// Answering a held approval — a Claude permission request waiting on
+    /// tutti: the tool and its input float in an overlay framed like the
+    /// peek; `y` allows, `n` denies, `esc` passes it on to Claude's own
+    /// dialog.
+    Approval(PaneId),
 }
 
 pub struct App {
@@ -277,9 +282,16 @@ pub struct App {
     diff_selected: usize,
     /// The top tab-bar row from the last size sync, for mouse hit-testing.
     tab_bar_rect: Option<Rect>,
-    /// The peek overlay from the last size sync, for mouse hit-testing.
-    /// `None` while not peeking.
+    /// The peek or approval overlay from the last size sync, for mouse
+    /// hit-testing. `None` while neither is open.
     peek_rect: Option<Rect>,
+    /// The approval the approval overlay last opened for: it opens once per
+    /// approval — never again after that one is answered or dismissed — and
+    /// an answer names it.
+    approval_shown: Option<u64>,
+    /// The mode the approval overlay hands back to on closing: the sidebar it
+    /// was opened from, or the terminal of the pane it opened over.
+    approval_back: Mode,
     /// The go-to overlay's filter text.
     navigate_query: String,
     /// The highlighted go-to row's identity, captured whenever the highlight
@@ -394,6 +406,8 @@ impl App {
             diff_selected: 0,
             tab_bar_rect: None,
             peek_rect: None,
+            approval_shown: None,
+            approval_back: Mode::Terminal,
             navigate_query: String::new(),
             navigate_anchor: None,
             navigate_rect: None,
@@ -478,8 +492,12 @@ impl App {
 
     /// The `PaneFocus` frame to send if focus changed since the last call, so
     /// the server can mark the newly-focused pane seen (`Done → Idle`) and track
-    /// the active pane. Returns `None` when focus is unchanged.
+    /// the active pane. Returns `None` when focus is unchanged. The event loop
+    /// calls it once a pass, after input, so it is also where an approval the
+    /// focused pane holds opens its overlay: focus just moved onto the pane, or
+    /// a key just closed what covered it.
     pub fn focus_change(&mut self) -> Option<WireFrame> {
+        self.open_focused_approval();
         if self.focus_sent == self.focused {
             return None;
         }
@@ -555,6 +573,14 @@ impl App {
         {
             self.mode = Mode::Sidebar;
         }
+        // An approval overlay closes with its approval — answered from here or
+        // anywhere else, passed on, timed out — or its pane.
+        if let Mode::Approval(pane) = self.mode
+            && self.approval_id(pane) != self.approval_shown
+        {
+            self.mode = self.approval_back;
+        }
+        self.open_focused_approval();
     }
 
     fn handle_event(&mut self, event: Event) {
@@ -831,6 +857,7 @@ impl App {
                 self.mode = Mode::Terminal;
                 Vec::new()
             }
+            Mode::Approval(pane) => self.on_key_approval(key, pane),
         }
     }
 
@@ -1138,8 +1165,8 @@ impl App {
     }
 
     /// Whether the sidebar currently holds keyboard focus. The sidebar-raised
-    /// confirms count: while one is open the agents filter and the selection
-    /// highlight must not shift under the question being asked.
+    /// confirms and overlays count: while one is open the agents filter and
+    /// the selection highlight must not shift under the question being asked.
     pub fn sidebar_focused(&self) -> bool {
         matches!(
             self.mode,
@@ -1152,7 +1179,7 @@ impl App {
                 | Mode::ConfirmMerge(_)
                 | Mode::ConfirmCleanup(_)
                 | Mode::Peek(_)
-        )
+        ) || (matches!(self.mode, Mode::Approval(_)) && self.approval_back == Mode::Sidebar)
     }
 
     pub fn sidebar_selected(&self) -> usize {
@@ -1484,9 +1511,16 @@ impl App {
 
     /// Peek at the selected agent row when it is blocked: open the overlay over
     /// its live prompt. Nothing else moves — no focus, tab, or layout change —
-    /// so the pane underneath and the prompt being fingerprinted stay put.
+    /// so the pane underneath and the prompt being fingerprinted stay put. A
+    /// row whose pane holds an approval opens the approval overlay instead:
+    /// Claude's dialog is held back, so there is no prompt on screen to peek.
     fn open_peek(&mut self, sidebar: &Sidebar) {
         match sidebar.entries.get(self.sidebar_selected) {
+            Some(SidebarEntry::Agent(sidebar::AgentRow {
+                pane,
+                approval: Some(approval),
+                ..
+            })) => self.open_approval(*pane, approval.id, Mode::Sidebar),
             Some(SidebarEntry::Agent(a)) if a.state == AgentState::Blocked => {
                 self.mode = Mode::Peek(a.pane);
                 self.status = None;
@@ -1560,6 +1594,102 @@ impl App {
         );
         let shown = region.len().min(height.saturating_sub(3) as usize);
         Some((pane, popup, region.end - shown..region.end))
+    }
+
+    /// The id of the approval `pane` holds, if any.
+    fn approval_id(&self, pane: PaneId) -> Option<u64> {
+        self.panes.get(&pane)?.info.approval.as_ref().map(|a| a.id)
+    }
+
+    /// Open the approval overlay on `pane`'s approval `id`, handing the keys
+    /// back to `back` once it closes.
+    fn open_approval(&mut self, pane: PaneId, id: u64, back: Mode) {
+        self.mode = Mode::Approval(pane);
+        self.approval_shown = Some(id);
+        self.approval_back = back;
+        self.status = None;
+    }
+
+    /// Open the approval overlay over the focused pane when it holds an
+    /// approval the overlay has not opened for yet — the pane in view is
+    /// asking, as Claude's own dialog would — but only from the terminal: a
+    /// panel, prompt or overlay in use is never cut into.
+    fn open_focused_approval(&mut self) {
+        let Some(pane) = self.focused.filter(|_| self.mode == Mode::Terminal) else {
+            return;
+        };
+        if let Some(id) = self
+            .approval_id(pane)
+            .filter(|id| Some(*id) != self.approval_shown)
+        {
+            self.open_approval(pane, id, Mode::Terminal);
+        }
+    }
+
+    /// Keys over the approval overlay: `y` allows the held tool call, `n`
+    /// denies it, `esc` passes it on to Claude's own dialog — each answers the
+    /// approval the overlay shows, by id, and closes it. Anything else, chords
+    /// included, is dropped.
+    fn on_key_approval(&mut self, key: KeyEvent, pane: PaneId) -> Vec<WireFrame> {
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return Vec::new();
+        }
+        let decision = match key.code {
+            KeyCode::Char('y' | 'Y') => ApprovalDecision::Allow,
+            KeyCode::Char('n' | 'N') => ApprovalDecision::Deny { message: None },
+            KeyCode::Esc => ApprovalDecision::Pass,
+            _ => return Vec::new(),
+        };
+        self.mode = self.approval_back;
+        vec![control(&Request::ApprovalAnswer {
+            pane,
+            id: self.approval_shown,
+            decision,
+        })]
+    }
+
+    /// The approval overlay while one is open: its pane, the popup rect —
+    /// sized and centred as the peek's — and the body rows: the tool, then
+    /// its input hard-wrapped to the popup's inner width, a column of padding
+    /// each side; a terminal too short for every row cuts the last one shown
+    /// with `…`. The one geometry source the renderer and the mouse hit-test
+    /// share.
+    pub fn approval_popup(&self, area: Rect) -> Option<(PaneId, Rect, Vec<String>)> {
+        let Mode::Approval(pane) = self.mode else {
+            return None;
+        };
+        let state = self.panes.get(&pane)?;
+        let approval = state.info.approval.as_ref()?;
+        let width = (state.parser.screen().size().1 + 2)
+            .max(PEEK_MIN_WIDTH)
+            .min(area.width);
+        let summary: Vec<char> = approval.summary.chars().collect();
+        let mut rows = vec![approval.tool.clone()];
+        rows.extend(
+            summary
+                .chunks(usize::from(width.saturating_sub(4)).max(1))
+                .map(|chunk| chunk.iter().collect()),
+        );
+        // Two border rows and the hint row around the body.
+        let height = (rows.len() as u16 + 3).min(area.height);
+        let shown = usize::from(height.saturating_sub(3));
+        if rows.len() > shown {
+            rows.truncate(shown);
+            if let Some(last) = rows.last_mut() {
+                last.pop();
+                last.push('…');
+            }
+        }
+        let popup = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
+        Some((pane, popup, rows))
     }
 
     /// Jump to the selected entry's workspace — its active-or-first tab, the
@@ -2787,13 +2917,17 @@ impl App {
         if self.mode == Mode::RestoreOffer {
             return Vec::new();
         }
-        // The peek overlay is modal: a press inside it is swallowed — the pane
-        // beneath must not take focus — and a press outside dismisses it.
-        if matches!(self.mode, Mode::Peek(_)) {
+        // The peek and approval overlays are modal: a press inside one is
+        // swallowed — the pane beneath must not take focus — and a press
+        // outside dismisses it, answering nothing.
+        if let Mode::Peek(_) | Mode::Approval(_) = self.mode {
             if matches!(kind, MouseEventKind::Down(_))
                 && !self.peek_rect.is_some_and(|r| contains(r, col, row))
             {
-                self.mode = Mode::Sidebar;
+                self.mode = match self.mode {
+                    Mode::Approval(_) => self.approval_back,
+                    _ => Mode::Sidebar,
+                };
             }
             return Vec::new();
         }
@@ -3277,7 +3411,10 @@ impl App {
         self.sidebar_rect = sidebar_rect;
         self.diff_panel_rect = diff_panel_rect;
         self.tab_bar_rect = Some(self.tab_bar_rect(app_bar));
-        self.peek_rect = self.peek_popup(area).map(|(_, rect, _)| rect);
+        self.peek_rect = self
+            .peek_popup(area)
+            .map(|(_, rect, _)| rect)
+            .or_else(|| self.approval_popup(area).map(|(_, rect, _)| rect));
         self.navigate_rect = (self.mode == Mode::Navigate).then_some(content);
         self.rects = self.compute_rects(content);
         let zoom = if self.zoom { self.focused } else { None };
@@ -4024,6 +4161,7 @@ fn placeholder_info(pane: PaneId) -> PaneInfo {
         exited: None,
         subagents: Vec::new(),
         checkpoints: Vec::new(),
+        approval: None,
         source: None,
         sandbox: None,
         conversation: None,
@@ -5122,6 +5260,175 @@ mod tests {
         // Too short a terminal clips from the top, keeping the options in view.
         let (_, popup, shown) = app.peek_popup(Rect::new(0, 0, 100, 7)).unwrap();
         assert_eq!((popup.height, shown), (7, 2..6));
+    }
+
+    // ---- approval overlay -------------------------------------------------
+
+    /// `view_two_workspaces`, blocked pane 3 holding approval `id` when given.
+    fn view_holding(id: Option<u64>) -> Vec<WorkspaceView> {
+        let mut view = view_two_workspaces();
+        view[1].tabs[0].panes[1].approval = id.map(|id| tutti_core::PendingApproval {
+            id,
+            tool: "Bash".into(),
+            summary: "rm -rf build".into(),
+        });
+        view
+    }
+
+    fn layout_changed(app: &mut App, workspaces: Vec<WorkspaceView>) {
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Event::LayoutChanged { workspaces }).unwrap(),
+        ));
+    }
+
+    /// The answer to pane 3's approval `id`.
+    fn answer(id: u64, decision: ApprovalDecision) -> Vec<WireFrame> {
+        vec![control(&Request::ApprovalAnswer {
+            pane: PaneId(3),
+            id: Some(id),
+            decision,
+        })]
+    }
+
+    /// Pane 3 holding approval 7, the sidebar focused with the cursor on its
+    /// waiting row, and `p` pressed there.
+    fn approval_fixture() -> App {
+        let mut app = App::new();
+        attach_with(&mut app, view_holding(Some(7)));
+        focus_sidebar(&mut app);
+        let waiting = app
+            .sidebar()
+            .index_of(sidebar::EntryIdent::Waiting(PaneId(3)));
+        for _ in 0..waiting.expect("pane 3 waits in the queue") {
+            app.on_key(plain('j'));
+        }
+        assert_eq!(app.on_key(plain('p')), Vec::new(), "opening sends nothing");
+        app
+    }
+
+    #[test]
+    fn p_on_a_held_approval_opens_its_overlay_and_y_n_esc_answer_it() {
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        for (key, decision) in [
+            (plain('y'), ApprovalDecision::Allow),
+            (plain('n'), ApprovalDecision::Deny { message: None }),
+            (esc, ApprovalDecision::Pass),
+        ] {
+            let mut app = approval_fixture();
+            assert_eq!(app.mode, Mode::Approval(PaneId(3)));
+            assert!(
+                app.sidebar_focused(),
+                "the queue keeps its highlight beneath"
+            );
+            assert_eq!(app.on_key(ctrl('y')), Vec::new(), "a chord answers nothing");
+            assert_eq!(app.on_key(plain('1')), Vec::new());
+            assert_eq!(app.on_key(key), answer(7, decision));
+            assert_eq!(
+                app.mode,
+                Mode::Sidebar,
+                "back on the row it was opened from"
+            );
+        }
+    }
+
+    #[test]
+    fn the_approval_overlay_closes_itself_once_its_approval_ends() {
+        // Answered from another client, passed on, timed out — or the pane
+        // gone with it.
+        for after in [view_holding(None), view_one_pane()] {
+            let mut app = approval_fixture();
+            state_changed(&mut app, PaneId(2), AgentState::Working, AgentState::Done);
+            assert_eq!(
+                app.mode,
+                Mode::Approval(PaneId(3)),
+                "another pane's news is not ours"
+            );
+            layout_changed(&mut app, after);
+            assert_eq!(app.mode, Mode::Sidebar);
+        }
+    }
+
+    /// The focused pane gaining an approval opens the overlay over it, as
+    /// Claude's own dialog would appear — once: dismissed or answered, that
+    /// approval never reopens it, while the pane's next one does.
+    #[test]
+    fn the_focused_panes_approval_opens_over_it_once() {
+        let mut app = App::new();
+        attach_with(&mut app, view_holding(None));
+        app.active_tab = Some(TabId(2));
+        app.focused = Some(PaneId(3));
+        app.focus_change();
+        layout_changed(&mut app, view_holding(Some(7)));
+        assert_eq!(app.mode, Mode::Approval(PaneId(3)), "the pane in view asks");
+        assert!(!app.sidebar_focused());
+
+        // A click outside dismisses it, answering nothing, for good.
+        app.sync_sizes(Rect::new(0, 0, 100, 24));
+        let click = MouseEventKind::Down(MouseButton::Left);
+        assert_eq!(app.on_mouse(click, 99, 23), Vec::new());
+        assert_eq!(app.mode, Mode::Terminal, "back on the pane");
+        layout_changed(&mut app, view_holding(Some(7)));
+        app.focus_change();
+        assert_eq!(
+            app.mode,
+            Mode::Terminal,
+            "a dismissed approval stays dismissed"
+        );
+
+        layout_changed(&mut app, view_holding(Some(8)));
+        assert_eq!(app.mode, Mode::Approval(PaneId(3)), "the next one opens it");
+        assert_eq!(app.on_key(plain('y')), answer(8, ApprovalDecision::Allow));
+        assert_eq!(app.mode, Mode::Terminal);
+        layout_changed(&mut app, view_holding(Some(8)));
+        assert_eq!(
+            app.mode,
+            Mode::Terminal,
+            "nor does an answered one, its end still in flight"
+        );
+    }
+
+    /// Only the terminal is ever cut into: a panel open over the focused pane
+    /// holds the overlay back until it closes, and an approval elsewhere waits
+    /// in the queue until a jump lands on its pane.
+    #[test]
+    fn an_approval_never_cuts_into_a_panel_in_use() {
+        let mut app = App::new();
+        attach_with(&mut app, view_holding(None));
+        app.active_tab = Some(TabId(2));
+        app.focused = Some(PaneId(3));
+        app.on_key(ctrl('b'));
+        app.on_key(plain('?'));
+        assert_eq!(app.mode, Mode::Help);
+        layout_changed(&mut app, view_holding(Some(7)));
+        app.focus_change();
+        assert_eq!(app.mode, Mode::Help, "the help stays up");
+        app.on_key(plain('q'));
+        app.focus_change();
+        assert_eq!(
+            app.mode,
+            Mode::Approval(PaneId(3)),
+            "closing it uncovers the ask"
+        );
+
+        let mut app = App::new();
+        attach_with(&mut app, view_holding(Some(7)));
+        app.focus_change();
+        assert_eq!(app.mode, Mode::Terminal, "pane 1 is in view, pane 3 asks");
+        focus_sidebar(&mut app);
+        let tree_row = app
+            .sidebar()
+            .index_of(sidebar::EntryIdent::Agent(PaneId(3)));
+        for _ in 0..tree_row.expect("pane 3 sits in the tree") {
+            app.on_key(plain('j'));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.focused, Some(PaneId(3)));
+        app.focus_change();
+        assert_eq!(
+            app.mode,
+            Mode::Approval(PaneId(3)),
+            "the jump lands on the ask"
+        );
     }
 
     // ---- go-to overlay ----------------------------------------------------

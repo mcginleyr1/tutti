@@ -13,8 +13,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
 use tutti_core::{
-    AgentHookEvent, AgentState, Checkpoint, Direction, Event, Frame, Layout, PaneData, PaneId,
-    PaneInfo, Request, Response, StateSource, SubagentInfo, WatchPane, WorkspaceId,
+    AgentHookEvent, AgentState, ApprovalDecision, Checkpoint, Direction, Event, Frame, Layout,
+    PaneData, PaneId, PaneInfo, PendingApproval, Request, Response, StateSource, SubagentInfo,
+    WatchPane, WorkspaceId,
 };
 use tutti_server::{PaneSize, serve};
 
@@ -1690,6 +1691,190 @@ async fn agent_event_blocks_and_broadcasts() {
 
     let mut order = Vec::new();
     wait_state_event(&mut viewer, pane, AgentState::Blocked, &mut order).await;
+
+    server.stop().await;
+}
+
+/// The hold `tutti agent-event` sends for a Claude permission request on
+/// `pane` under `approvals = "hold"`.
+fn hold(pane: PaneId) -> Request {
+    Request::ApprovalHold {
+        pane,
+        conversation: Some("c1".into()),
+        tool: "Bash".into(),
+        summary: "rm -rf build".into(),
+    }
+}
+
+fn approval(response: Response) -> ApprovalDecision {
+    match response {
+        Response::Approval { decision } => decision,
+        other => panic!("expected Approval, got {other:?}"),
+    }
+}
+
+/// Connect a client and attach it, so a hold has someone to answer it.
+async fn attached_viewer(server: &TestServer) -> Conn {
+    let mut viewer = server.connect().await;
+    viewer.send(&Request::Attach { terminal: None }).await;
+    assert!(matches!(viewer.response().await, Response::Attached { .. }));
+    viewer
+}
+
+/// Read an attached `viewer`'s frames until a view shows `pane` holding an
+/// approval (`held`) or none, returning what it holds.
+async fn view_approval(viewer: &mut Conn, pane: PaneId, held: bool) -> Option<PendingApproval> {
+    timeout(DEADLINE, async {
+        loop {
+            if let Frame::Control(json) = viewer.read_frame().await
+                && let Ok(Event::LayoutChanged { workspaces }) =
+                    serde_json::from_slice::<Event>(&json)
+                && let Some(info) = workspaces
+                    .iter()
+                    .flat_map(|w| &w.tabs)
+                    .flat_map(|t| &t.panes)
+                    .find(|p| p.id == pane)
+                && info.approval.is_some() == held
+            {
+                return info.approval.clone();
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no view with the approval held: {held}"))
+}
+
+/// With no client attached nobody could answer: the hold answers `Pass` at
+/// once — Claude's own dialog appears — yet the pane blocks as the request's
+/// hook event would have blocked it, and nothing stays held.
+#[tokio::test]
+async fn an_approval_hold_with_no_client_attached_passes_at_once() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let pane = run_sleeper(&mut control).await;
+
+    let mut hook = server.connect().await;
+    assert_eq!(
+        approval(hook.request(hold(pane)).await),
+        ApprovalDecision::Pass
+    );
+    assert!(
+        wait_pane(&mut control, pane, |p| p.state == AgentState::Blocked
+            && p.source == Some(StateSource::Hook)
+            && p.conversation.as_deref() == Some("c1")
+            && p.approval.is_none())
+        .await
+    );
+
+    server.stop().await;
+}
+
+/// With a client attached the hold waits: the pane blocks holding the
+/// approval, the view says so, and the answer naming it reaches the hook —
+/// the approval leaving the pane and the view.
+#[tokio::test]
+async fn a_held_approval_waits_for_the_answer_naming_it() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let pane = run_sleeper(&mut control).await;
+    let mut viewer = attached_viewer(&server).await;
+
+    let mut hook = server.connect().await;
+    hook.send(&hold(pane)).await;
+    let held = view_approval(&mut viewer, pane, true).await.unwrap();
+    assert_eq!(
+        (held.tool.as_str(), held.summary.as_str()),
+        ("Bash", "rm -rf build")
+    );
+    assert!(wait_state(&mut control, pane, AgentState::Blocked).await);
+
+    let deny = ApprovalDecision::Deny {
+        message: Some("not on main".into()),
+    };
+    let answered = control
+        .request(Request::ApprovalAnswer {
+            pane,
+            id: Some(held.id),
+            decision: deny.clone(),
+        })
+        .await;
+    assert_eq!(answered, Response::Ok);
+    assert_eq!(approval(hook.response().await), deny);
+    assert_eq!(view_approval(&mut viewer, pane, false).await, None);
+    assert!(wait_pane(&mut control, pane, |p| p.approval.is_none()).await);
+
+    server.stop().await;
+}
+
+/// The approval lives as long as its hook: the hook hanging up — Claude
+/// timed it out, or quit — drops it from the pane and the view.
+#[tokio::test]
+async fn a_hook_hanging_up_drops_its_approval() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let pane = run_sleeper(&mut control).await;
+    let mut viewer = attached_viewer(&server).await;
+
+    let mut hook = server.connect().await;
+    hook.send(&hold(pane)).await;
+    let held = view_approval(&mut viewer, pane, true).await.unwrap();
+    drop(hook);
+    assert_eq!(view_approval(&mut viewer, pane, false).await, None);
+    let late = control
+        .request(Request::ApprovalAnswer {
+            pane,
+            id: Some(held.id),
+            decision: ApprovalDecision::Allow,
+        })
+        .await;
+    assert!(error_message(late).contains("no pending approval"));
+
+    server.stop().await;
+}
+
+/// An answer lands only on the approval it names: a stale id is refused, as
+/// is any answer once nothing is held, while `None` answers whichever is. A
+/// second request while one is held goes straight on to Claude's dialog.
+#[tokio::test]
+async fn a_stale_approval_answer_is_refused() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let pane = run_sleeper(&mut control).await;
+    let _viewer = attached_viewer(&server).await;
+
+    let mut hook = server.connect().await;
+    hook.send(&hold(pane)).await;
+    assert!(wait_pane(&mut control, pane, |p| p.approval.is_some()).await);
+    let mut second = server.connect().await;
+    assert_eq!(
+        approval(second.request(hold(pane)).await),
+        ApprovalDecision::Pass,
+        "one is held at a time"
+    );
+    let answer = |id| Request::ApprovalAnswer {
+        pane,
+        id,
+        decision: ApprovalDecision::Allow,
+    };
+    let held = match control.request(Request::PaneList).await {
+        Response::Panes { panes } => panes.into_iter().find(|p| p.id == pane).unwrap().approval,
+        other => panic!("expected Panes, got {other:?}"),
+    }
+    .unwrap();
+    let stale = control.request(answer(Some(held.id + 1))).await;
+    assert_eq!(
+        error_message(stale),
+        format!("pane {pane} has no pending approval #{}", held.id + 1)
+    );
+    assert_eq!(control.request(answer(None)).await, Response::Ok);
+    assert_eq!(approval(hook.response().await), ApprovalDecision::Allow);
+    let again = control.request(answer(Some(held.id))).await;
+    assert!(error_message(again).contains("no pending approval"));
+    let none = control.request(answer(None)).await;
+    assert_eq!(
+        error_message(none),
+        format!("pane {pane} has no pending approval")
+    );
 
     server.stop().await;
 }

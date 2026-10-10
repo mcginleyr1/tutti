@@ -241,6 +241,30 @@ pub enum Request {
         #[serde(default)]
         conversation: Option<String>,
     },
+    /// Hold a Claude permission request on `pane` for an answer from tutti —
+    /// what `tutti agent-event` sends under `approvals = "hold"` in place of
+    /// the request's `AgentEvent`, so the pane blocks just the same. `tool`
+    /// is what would run, `summary` its input on one line. Answered with
+    /// `Response::Approval` once an `ApprovalAnswer` names it, or at once with
+    /// `Pass` — Claude's own dialog — when no client is attached to answer,
+    /// the pane is unknown, or it already holds one. The approval lives as
+    /// long as this connection: hanging up drops it.
+    ApprovalHold {
+        pane: PaneId,
+        #[serde(default)]
+        conversation: Option<String>,
+        tool: String,
+        summary: String,
+    },
+    /// Answer `pane`'s held approval: `id` names the one the sender looked at
+    /// (`PaneInfo::approval`), `None` whichever the pane holds. Error when the
+    /// pane holds no such approval — it was answered, or its hook gave up.
+    ApprovalAnswer {
+        pane: PaneId,
+        #[serde(default)]
+        id: Option<u64>,
+        decision: ApprovalDecision,
+    },
     /// List `pane`'s per-turn checkpoints, oldest first. Answered with
     /// `Response::Checkpoints` (empty for a pane outside a jj workspace).
     PaneCheckpoints {
@@ -335,6 +359,20 @@ pub enum AgentHookEvent {
     },
 }
 
+/// The answer to a held approval: let the tool call run, refuse it — with
+/// the reason Claude is told, else a stock one — or pass it on to Claude's
+/// own permission dialog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "behavior", rename_all = "snake_case")]
+pub enum ApprovalDecision {
+    Allow,
+    Deny {
+        #[serde(default)]
+        message: Option<String>,
+    },
+    Pass,
+}
+
 /// A state `PaneWait` waits for. `Done` reads "finished, seen or not", so it
 /// matches `Idle` too and a wait never hangs on a pane someone already looked
 /// at; `Idle` alone is "finished and seen".
@@ -400,6 +438,11 @@ pub struct PaneInfo {
     /// servers.
     #[serde(default)]
     pub checkpoints: Vec<Checkpoint>,
+    /// The permission request the pane's agent holds for an answer from
+    /// tutti (`approvals = "hold"`), until it is answered or its hook gives
+    /// up. `None` without one and from older servers.
+    #[serde(default)]
+    pub approval: Option<PendingApproval>,
     /// What set `state`: a hook, the pane's own program report (OSC 7501 /
     /// 9;4), the screen classifier, or output activity. `None` until something
     /// has, and after a claim ends. Defaults `None` for older servers.
@@ -448,6 +491,15 @@ pub struct Checkpoint {
     pub files: usize,
     pub insertions: u64,
     pub deletions: u64,
+}
+
+/// A held permission request: the tool it would run, that tool's input on
+/// one line, and the id an answer names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingApproval {
+    pub id: u64,
+    pub tool: String,
+    pub summary: String,
 }
 
 /// One pane in a watcher's `Event::Snapshot`, flat: where it lives, by name,
@@ -600,6 +652,10 @@ pub enum Response {
     /// A `PaneFingerprint` reply: the pane's prompt fingerprint, 16 hex digits.
     Fingerprint {
         fingerprint: String,
+    },
+    /// An `ApprovalHold` reply: how the held permission request was answered.
+    Approval {
+        decision: ApprovalDecision,
     },
     /// A pane's checkpoints, oldest first.
     Checkpoints {
@@ -896,6 +952,29 @@ mod tests {
             event: AgentHookEvent::Prompt { text: None },
             conversation: None,
         });
+        roundtrip(&Request::ApprovalHold {
+            pane: PaneId(3),
+            conversation: Some("ses_1".into()),
+            tool: "Bash".into(),
+            summary: "rm -rf build".into(),
+        });
+        roundtrip(&Request::ApprovalAnswer {
+            pane: PaneId(3),
+            id: Some(7),
+            decision: ApprovalDecision::Allow,
+        });
+        roundtrip(&Request::ApprovalAnswer {
+            pane: PaneId(3),
+            id: None,
+            decision: ApprovalDecision::Deny {
+                message: Some("not on main".into()),
+            },
+        });
+        roundtrip(&Request::ApprovalAnswer {
+            pane: PaneId(3),
+            id: Some(7),
+            decision: ApprovalDecision::Pass,
+        });
         roundtrip(&Request::PaneCheckpoints { pane: PaneId(3) });
         roundtrip(&Request::PaneCheckpointDiff {
             pane: PaneId(3),
@@ -964,6 +1043,45 @@ mod tests {
         assert_eq!(prompt, AgentHookEvent::Prompt { text: None });
     }
 
+    /// A decision rides the wire tagged by `behavior`, as Claude's hook
+    /// output spells it; a hold without a conversation, an answer without an
+    /// id (whichever is held), and a denial without a reason all parse.
+    #[test]
+    fn approvals_ride_the_wire_behavior_tagged() {
+        assert_eq!(
+            serde_json::to_string(&Response::Approval {
+                decision: ApprovalDecision::Allow
+            })
+            .unwrap(),
+            r#"{"type":"approval","decision":{"behavior":"allow"}}"#
+        );
+        let hold: Request = serde_json::from_str(
+            r#"{"type":"approval_hold","pane":3,"tool":"Edit","summary":"src/main.rs"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            hold,
+            Request::ApprovalHold {
+                pane: PaneId(3),
+                conversation: None,
+                tool: "Edit".into(),
+                summary: "src/main.rs".into(),
+            }
+        );
+        let answer: Request = serde_json::from_str(
+            r#"{"type":"approval_answer","pane":3,"decision":{"behavior":"deny"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            answer,
+            Request::ApprovalAnswer {
+                pane: PaneId(3),
+                id: None,
+                decision: ApprovalDecision::Deny { message: None },
+            }
+        );
+    }
+
     #[test]
     fn wait_for_done_means_finished_seen_or_not() {
         use AgentState::*;
@@ -1013,6 +1131,7 @@ mod tests {
                     exited: None,
                     subagents: Vec::new(),
                     checkpoints: vec![sample_checkpoint()],
+                    approval: None,
                     source: None,
                     sandbox: None,
                     conversation: None,
@@ -1056,6 +1175,11 @@ mod tests {
                     running: true,
                 }],
                 checkpoints: Vec::new(),
+                approval: Some(PendingApproval {
+                    id: 7,
+                    tool: "Bash".into(),
+                    summary: "rm -rf build".into(),
+                }),
                 source: Some(StateSource::Hook),
                 sandbox: Some("gke".into()),
                 conversation: Some("0b9e6c1e-3d2a-4f5b-9c8d-7e6f5a4b3c2d".into()),
@@ -1071,6 +1195,7 @@ mod tests {
                 exited: None,
                 subagents: Vec::new(),
                 checkpoints: Vec::new(),
+                approval: None,
                 source: Some(StateSource::Program),
                 sandbox: None,
                 conversation: None,
@@ -1119,6 +1244,16 @@ mod tests {
         roundtrip(&Response::Fingerprint {
             fingerprint: "af63dc4c8601ec8c".into(),
         });
+        for decision in [
+            ApprovalDecision::Allow,
+            ApprovalDecision::Deny {
+                message: Some("not on main".into()),
+            },
+            ApprovalDecision::Deny { message: None },
+            ApprovalDecision::Pass,
+        ] {
+            roundtrip(&Response::Approval { decision });
+        }
         roundtrip(&Response::Merged {
             pushed: true,
             bookmark: "main".into(),
@@ -1317,6 +1452,7 @@ mod tests {
         assert_eq!(pane.sandbox, None, "and before `sandbox`, a local pane");
         assert_eq!(pane.conversation, None, "and before `conversation`, none");
         assert_eq!(pane.sandbox_name, None, "and before `sandbox_name`, none");
+        assert_eq!(pane.approval, None, "and before `approval`, nothing held");
         // ...and before `checkpoints` existed, to no checkpoints.
         assert!(pane.checkpoints.is_empty());
         // A checkpoint from before `prompt` existed lists as its label.

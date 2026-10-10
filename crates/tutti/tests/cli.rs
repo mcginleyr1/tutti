@@ -10,8 +10,8 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 
 use tutti_core::{
-    AgentHookEvent, AgentState, Event, Frame, PaneId, Request, Response, WatchPane, WorkspaceId,
-    WorkspaceInfo,
+    AgentHookEvent, AgentState, ApprovalDecision, Event, Frame, PaneId, Request, Response,
+    WatchPane, WorkspaceId, WorkspaceInfo,
 };
 
 fn unique_base(label: &str) -> PathBuf {
@@ -164,6 +164,173 @@ fn agent_event_claude_forwards_a_prompt_with_its_conversation() {
     );
     assert!(output.status.success());
     assert!(output.stdout.is_empty() && output.stderr.is_empty());
+}
+
+/// A Claude Code `PermissionRequest`, as the hooks reference records one.
+const PERMISSION_REQUEST: &str = r#"{"session_id":"abc123","transcript_path":"/tmp/t.jsonl",
+    "cwd":"/srv/api","permission_mode":"default","hook_event_name":"PermissionRequest",
+    "tool_name":"Bash","tool_input":{"command":"rm -rf build","description":"Clean"},
+    "permission_suggestions":[]}"#;
+
+/// A fresh config dir holding `config`, for `XDG_CONFIG_HOME`.
+fn config_dir(label: &str, config: &str) -> PathBuf {
+    let dir = unique_base(label);
+    std::fs::create_dir_all(dir.join("tutti")).unwrap();
+    std::fs::write(dir.join("tutti/config.toml"), config).unwrap();
+    dir
+}
+
+/// Pipe `PERMISSION_REQUEST` to `agent-event claude` in pane 7 under
+/// `config`, the fake daemon checking the request and answering `reply`.
+fn permission_request(
+    label: &str,
+    config: &str,
+    assert_request: impl FnOnce(&Request) + Send + 'static,
+    reply: Response,
+) -> Output {
+    let dir = config_dir(label, config);
+    let xdg = dir.to_str().unwrap().to_string();
+    let output = run_scenario_with(
+        label,
+        &["agent-event", "claude"],
+        &[
+            ("TUTTI_PANE", "7"),
+            ("TUTTI_SESSION", "tutti"),
+            ("XDG_CONFIG_HOME", &xdg),
+        ],
+        PERMISSION_REQUEST,
+        assert_request,
+        reply,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    output
+}
+
+/// By default a permission request is only watched: it reaches the daemon as
+/// a `Blocked` naming the tool and its input, and the hook prints nothing, so
+/// Claude shows its own dialog.
+#[test]
+fn agent_event_claude_watches_a_permission_request_by_default() {
+    let output = permission_request(
+        "ccwatch",
+        "",
+        |req| {
+            assert_eq!(
+                *req,
+                Request::AgentEvent {
+                    pane: PaneId(7),
+                    event: AgentHookEvent::Blocked {
+                        message: Some("Bash · rm -rf build".into()),
+                    },
+                    conversation: Some("abc123".into()),
+                }
+            );
+        },
+        Response::Ok,
+    );
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty() && output.stderr.is_empty());
+}
+
+/// Under `approvals = "hold"` the hook holds the request on the daemon and
+/// prints its answer as Claude's decision object — allow, or deny with the
+/// reason. A pass prints nothing, so Claude's own dialog appears. Every way,
+/// the hook exits 0.
+#[test]
+fn agent_event_claude_holds_a_permission_request_for_its_answer() {
+    let held = |label: &str, decision: ApprovalDecision| {
+        let output = permission_request(
+            label,
+            "approvals = \"hold\"\n",
+            |req| {
+                assert_eq!(
+                    *req,
+                    Request::ApprovalHold {
+                        pane: PaneId(7),
+                        conversation: Some("abc123".into()),
+                        tool: "Bash".into(),
+                        summary: "rm -rf build".into(),
+                    }
+                );
+            },
+            Response::Approval { decision },
+        );
+        assert!(output.status.success(), "{label}");
+        output.stdout
+    };
+    let decision =
+        |stdout: Vec<u8>| -> serde_json::Value { serde_json::from_slice(&stdout).unwrap() };
+    let output = |decision: serde_json::Value| {
+        serde_json::json!({
+            "hookSpecificOutput": { "hookEventName": "PermissionRequest", "decision": decision }
+        })
+    };
+    assert_eq!(
+        decision(held("holdallow", ApprovalDecision::Allow)),
+        output(serde_json::json!({ "behavior": "allow" }))
+    );
+    assert_eq!(
+        decision(held(
+            "holddeny",
+            ApprovalDecision::Deny {
+                message: Some("not on main".into())
+            }
+        )),
+        output(serde_json::json!({ "behavior": "deny", "message": "not on main" }))
+    );
+    assert!(held("holdpass", ApprovalDecision::Pass).is_empty());
+}
+
+/// A hold nobody answers gives up after `approval_timeout_secs`: the hook
+/// prints nothing and exits 0, and Claude's own dialog appears.
+#[test]
+fn agent_event_claude_passes_an_unanswered_hold_on_after_its_timeout() {
+    let config = config_dir(
+        "holdcfg",
+        "approvals = \"hold\"\napproval_timeout_secs = 1\n",
+    );
+    let base = unique_base("holdwait");
+    std::fs::create_dir_all(base.join("tutti")).unwrap();
+    let listener = UnixListener::bind(base.join("tutti/tutti.sock")).unwrap();
+    // A daemon that takes the hold and never answers it: it waits out the
+    // hook hanging up.
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        assert!(matches!(
+            read_request(&mut stream),
+            Request::ApprovalHold { .. }
+        ));
+        let _ = stream.read_to_end(&mut Vec::new());
+    });
+    let started = std::time::Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tutti"))
+        .args(["agent-event", "claude"])
+        .env("XDG_RUNTIME_DIR", &base)
+        .env("XDG_CONFIG_HOME", &config)
+        .env("TUTTI_PANE", "7")
+        .env("TUTTI_SESSION", "tutti")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(PERMISSION_REQUEST.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    server.join().unwrap();
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty(), "Claude's own dialog appears");
+    let waited = started.elapsed();
+    assert!(
+        waited >= std::time::Duration::from_secs(1) && waited < std::time::Duration::from_secs(5),
+        "{waited:?}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&config);
 }
 
 /// `agent-event opencode` never fails: outside a tutti pane, and on an

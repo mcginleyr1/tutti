@@ -5,6 +5,7 @@
 //! hard error naming the offending entry — never silently ignored.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -101,6 +102,17 @@ pub enum Theme {
     Terminal,
     Dark,
     Light,
+}
+
+/// What a Claude permission request does to tutti. `Watch` (the default)
+/// only learns of it: the pane blocks with the tool named and Claude shows
+/// its own dialog. `Hold` keeps that dialog back until the request is
+/// answered from tutti's queue or `pane approve`, handing it on to Claude's
+/// own after `approval_timeout`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Approvals {
+    Watch,
+    Hold,
 }
 
 /// The glyph set for the sidebar's dots and markers. `Unicode` (the default) is
@@ -448,6 +460,12 @@ pub struct Config {
     /// Whether pane notifications re-emit to the real terminal and flash the
     /// status bar. The sidebar bell mark is unaffected — always on.
     pub notifications: bool,
+    /// What a Claude permission request does to tutti. Default `Watch`.
+    pub approvals: Approvals,
+    /// How long a held permission request waits for an answer before it
+    /// passes on to Claude's own dialog: `approval_timeout_secs`, default
+    /// 120, under Claude's 600 s hook timeout.
+    pub approval_timeout: Duration,
     /// Startup projects: workspace dirs to mount (idempotently) on attach, each
     /// `~`-expanded. Empty by default.
     pub projects: Vec<PathBuf>,
@@ -537,6 +555,20 @@ impl Config {
             }
         };
 
+        let approvals = match raw.approvals.as_deref() {
+            None | Some("watch") => Approvals::Watch,
+            Some("hold") => Approvals::Hold,
+            Some(other) => {
+                bail!("approvals: unknown value {other:?} (expected \"watch\" or \"hold\")")
+            }
+        };
+        let approval_timeout = match raw.approval_timeout_secs.unwrap_or(120) {
+            secs @ 1..600 => Duration::from_secs(secs),
+            other => bail!(
+                "approval_timeout_secs: {other} is out of range (1 to 599 — Claude Code stops a hook at 600)"
+            ),
+        };
+
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let projects = raw
             .projects
@@ -582,6 +614,8 @@ impl Config {
             icons,
             theme,
             notifications,
+            approvals,
+            approval_timeout,
             projects,
             sandboxes,
             prefix_bindings,
@@ -643,6 +677,8 @@ struct RawConfig {
     icons: Option<String>,
     theme: Option<String>,
     notifications: Option<bool>,
+    approvals: Option<String>,
+    approval_timeout_secs: Option<u64>,
     #[serde(default)]
     keys: RawKeys,
     #[serde(default)]
@@ -1190,6 +1226,26 @@ ttl_minutes = 15
                 .unwrap()
                 .notifications
         );
+    }
+
+    #[test]
+    fn approvals_default_to_watch_and_a_hold_waits_two_minutes_unless_told() {
+        let config = Config::default();
+        assert_eq!(config.approvals, Approvals::Watch);
+        assert_eq!(config.approval_timeout, Duration::from_secs(120));
+        let held = Config::parse("approvals = \"hold\"\napproval_timeout_secs = 30\n").unwrap();
+        assert_eq!(
+            (held.approvals, held.approval_timeout),
+            (Approvals::Hold, Duration::from_secs(30))
+        );
+        for (text, needle) in [
+            ("approvals = \"ask\"\n", "ask"),
+            ("approval_timeout_secs = 0\n", "out of range"),
+            ("approval_timeout_secs = 600\n", "out of range"),
+        ] {
+            let err = format!("{:#}", Config::parse(text).unwrap_err());
+            assert!(err.contains(needle), "{text:?} → {err}");
+        }
     }
 
     #[test]

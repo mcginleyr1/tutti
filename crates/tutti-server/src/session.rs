@@ -12,8 +12,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tutti_core::{
     AgentHookEvent, AgentKind, AgentState, Direction, FileStat, Layout, Observation, PaneId,
-    PaneInfo, StateEvent, StateSource, SubagentInfo, TabId, TabInfo, TabView, WatchPane,
-    WorkspaceId, WorkspaceInfo, WorkspaceView, prompt_fingerprint,
+    PaneInfo, PendingApproval, StateEvent, StateSource, SubagentInfo, TabId, TabInfo, TabView,
+    WatchPane, WorkspaceId, WorkspaceInfo, WorkspaceView, prompt_fingerprint,
 };
 
 use crate::checkpoints::{Noted, Turns};
@@ -110,6 +110,7 @@ struct Ids {
     workspace: u64,
     tab: u64,
     pane: u64,
+    approval: u64,
 }
 
 impl Ids {
@@ -124,6 +125,10 @@ impl Ids {
     fn pane(&mut self) -> PaneId {
         self.pane += 1;
         PaneId(self.pane)
+    }
+    fn approval(&mut self) -> u64 {
+        self.approval += 1;
+        self.approval
     }
 }
 
@@ -822,6 +827,33 @@ impl Session {
         })
     }
 
+    /// Hold a permission request on `pane` for an answer from tutti: the
+    /// pending approval its view carries, under a fresh id an answer must
+    /// name. `None` — the request goes straight on to Claude's own dialog —
+    /// for an unknown pane, or one already holding an approval (parallel
+    /// subagents can ask at once; one is held at a time).
+    pub fn hold_approval(&mut self, pane: PaneId, tool: String, summary: String) -> Option<u64> {
+        let slot = self
+            .panes
+            .get_mut(&pane)
+            .filter(|s| s.meta.approval.is_none())?;
+        let id = self.ids.approval();
+        slot.meta.approval = Some(PendingApproval { id, tool, summary });
+        Some(id)
+    }
+
+    /// End `pane`'s pending approval if it is `id` (whichever it is, when
+    /// `None`) — answered, or its hook gone — returning the id it held.
+    pub fn take_approval(&mut self, pane: PaneId, id: Option<u64>) -> Option<u64> {
+        let slot = self.panes.get_mut(&pane)?;
+        let held = slot.meta.approval.as_ref()?.id;
+        if id.is_some_and(|id| id != held) {
+            return None;
+        }
+        slot.meta.approval = None;
+        Some(held)
+    }
+
     /// Record the agent kind detected for a pane. Returns whether it changed. A
     /// change ends any program/progress claim and the self-reported label —
     /// they spoke for whatever ran there before; a hook claim stays (sticky),
@@ -1433,6 +1465,7 @@ impl Session {
                     exited: None,
                     subagents: Vec::new(),
                     checkpoints: Vec::new(),
+                    approval: None,
                     source: None,
                     sandbox: None,
                     conversation: None,
@@ -1633,7 +1666,7 @@ mod tests {
     use std::time::{Duration, Instant};
     use tutti_core::{
         AgentHookEvent, AgentState, Direction, FileStat, Layout, Observation, PaneId, PaneInfo,
-        StateSource, SubagentInfo,
+        PendingApproval, StateSource, SubagentInfo,
     };
 
     /// A session holding one live `sleep` pane (titled `sleep`). The temp dir is
@@ -1847,6 +1880,48 @@ mod tests {
             conversation(&s).as_deref(),
             Some("c2"),
             "a `/clear` moves it on"
+        );
+    }
+
+    #[test]
+    fn a_pane_holds_one_approval_until_it_is_taken_by_id() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let held = |s: &Session| info(s, pane).approval;
+        let first = s
+            .hold_approval(pane, "Bash".into(), "rm -rf build".into())
+            .unwrap();
+        assert_eq!(
+            held(&s),
+            Some(PendingApproval {
+                id: first,
+                tool: "Bash".into(),
+                summary: "rm -rf build".into(),
+            })
+        );
+        assert_eq!(
+            s.hold_approval(pane, "Edit".into(), "src/main.rs".into()),
+            None,
+            "one is held at a time: a second goes on to Claude's dialog"
+        );
+        assert_eq!(s.take_approval(pane, Some(first + 1)), None, "a stale id");
+        assert!(held(&s).is_some(), "takes nothing");
+        assert_eq!(s.take_approval(pane, Some(first)), Some(first));
+        assert_eq!(held(&s), None);
+        assert_eq!(s.take_approval(pane, None), None, "nothing left to take");
+
+        let second = s
+            .hold_approval(pane, "Edit".into(), "src/main.rs".into())
+            .unwrap();
+        assert!(second > first, "an id is never reused");
+        assert_eq!(
+            s.take_approval(pane, None),
+            Some(second),
+            "`None` takes whichever is held"
+        );
+        assert_eq!(
+            s.hold_approval(PaneId(99), "Bash".into(), "ls".into()),
+            None,
+            "an unknown pane holds nothing"
         );
     }
 

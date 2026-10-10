@@ -98,6 +98,10 @@ const SETUP_PREVIEW_ROWS: usize = 10;
 /// The widest a target path renders in the setup panel before it clips.
 const SETUP_PATH_W: usize = 60;
 
+/// The approval overlay's hint row, two-tone: the three answers. `esc`
+/// answers too — it hands the request on to Claude's own dialog.
+const APPROVAL_HINT: &[(&str, &str)] = &[("y", "allow"), ("n", "deny"), ("esc", "pass to claude")];
+
 /// The go-to overlay's key hint, two-tone at its input row's right edge —
 /// typing filters, so the movement keys are the ones worth saying.
 const NAVIGATE_HINT: &[(&str, &str)] = &[("↑↓", "move"), ("enter", "jump"), ("esc", "back")];
@@ -178,6 +182,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_footer(frame, app, footer);
     // Under the band, so a refused answer's flash stays readable over it.
     draw_peek(frame, app, area);
+    draw_approval(frame, app, area);
     // A transient fires the one-row notification band over the last content row,
     // just above the footer.
     if app.transient().is_some() && footer.y > content.y {
@@ -1021,19 +1026,26 @@ fn agent_subtitle_inner(
 /// The dim `project · kind` second line for a waiting-section row — the rows
 /// are cross-project, so the project is the orienting fact — plus the bell mark
 /// when a notification is pending. A default-titled pane already says the kind
-/// in its title row, so the kind is dropped there rather than stuttered.
+/// in its title row, so the kind is dropped there rather than stuttered. A
+/// held approval says what it would run instead: `tool · input`, the tool at
+/// full intensity.
 fn waiting_subtitle_inner(
     a: &AgentRow,
     sel: bool,
     notified: bool,
     content_w: u16,
 ) -> Vec<Span<'static>> {
-    let text = if a.kind == a.title {
-        format!("  {}", a.project_name)
-    } else {
-        format!("  {} · {}", a.project_name, a.kind)
+    let mut spans = match &a.approval {
+        Some(approval) => vec![
+            Span::raw(format!("  {}", approval.tool)),
+            Span::styled(format!(" · {}", approval.summary), dim()),
+        ],
+        None if a.kind == a.title => vec![Span::styled(format!("  {}", a.project_name), dim())],
+        None => vec![Span::styled(
+            format!("  {} · {}", a.project_name, a.kind),
+            dim(),
+        )],
     };
-    let mut spans = vec![Span::styled(text, dim())];
     if notified {
         spans.push(Span::styled(
             " 🔔",
@@ -1351,6 +1363,7 @@ fn mode_label(mode: Mode) -> Option<&'static str> {
         Mode::Integrations => Some("SETUP"),
         Mode::Peek(_) => Some("ANSWER"),
         Mode::Navigate => Some("GO TO"),
+        Mode::Approval(_) => Some("APPROVE"),
     }
 }
 
@@ -1702,20 +1715,9 @@ fn draw_peek(frame: &mut Frame, app: &App, area: Rect) {
     let Some(state) = app.panes.get(&pane) else {
         return;
     };
-    let workspace = app
-        .workspaces
-        .iter()
-        .find(|w| w.tabs.iter().any(|t| t.panes.iter().any(|p| p.id == pane)))
-        .map_or_else(String::new, |w| format!(" · {}", w.name));
-    let title = format!(" answer {}{workspace} ", identity(&state.info));
-    clear(frame, popup, theme::current().pane_bg);
-    let block = popup_block(&title);
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-    if inner.height == 0 {
+    let Some(body) = draw_overlay_frame(frame, app, popup, pane, "answer", PEEK_HINT) else {
         return;
-    }
-    let body = Rect::new(inner.x, inner.y, inner.width, inner.height - 1);
+    };
     draw_screen(
         frame.buffer_mut(),
         body,
@@ -1723,10 +1725,64 @@ fn draw_peek(frame: &mut Frame, app: &App, area: Rect) {
         rows.start as u16,
         None,
     );
-    let hint = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
+}
+
+/// The approval overlay, framed as the peek is — ` approve <agent> ·
+/// <workspace> ` — naming the tool a held permission request would run, in
+/// bold, over its input and the two-tone hint row. Geometry comes from
+/// `App::approval_popup`, which the mouse hit-test shares.
+fn draw_approval(frame: &mut Frame, app: &App, area: Rect) {
+    let Some((pane, popup, rows)) = app.approval_popup(area) else {
+        return;
+    };
+    let Some(body) = draw_overlay_frame(frame, app, popup, pane, "approve", APPROVAL_HINT) else {
+        return;
+    };
+    let lines: Vec<Line> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let style = if i == 0 {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(format!(" {row}"), style))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), body);
+}
+
+/// Clear `popup` and frame a floating overlay over `pane` in it: the rounded
+/// ` <verb> <agent> · <workspace> ` panel with `hint` two-tone on its last
+/// row. Returns the body rect above the hint, `None` when there is no room.
+fn draw_overlay_frame(
+    frame: &mut Frame,
+    app: &App,
+    popup: Rect,
+    pane: PaneId,
+    verb: &str,
+    hint: &[(&str, &str)],
+) -> Option<Rect> {
+    let info = &app.panes.get(&pane)?.info;
+    let workspace = app
+        .workspaces
+        .iter()
+        .find(|w| w.tabs.iter().any(|t| t.panes.iter().any(|p| p.id == pane)))
+        .map_or_else(String::new, |w| format!(" · {}", w.name));
+    let title = format!(" {verb} {}{workspace} ", identity(info));
+    clear(frame, popup, theme::current().pane_bg);
+    let block = popup_block(&title);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if inner.height == 0 {
+        return None;
+    }
     let mut spans = vec![Span::raw(" ")];
-    spans.extend(two_tone(PEEK_HINT).0);
-    frame.render_widget(Paragraph::new(Line::from(spans)), hint);
+    spans.extend(two_tone(hint).0);
+    let hint_row = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
+    frame.render_widget(Paragraph::new(Line::from(spans)), hint_row);
+    Some(Rect::new(inner.x, inner.y, inner.width, inner.height - 1))
 }
 
 /// The go-to overlay (navigate mode): an opaque panel over the whole content
@@ -2052,6 +2108,7 @@ fn placeholder_title(pane: PaneId) -> PaneInfo {
         exited: None,
         subagents: Vec::new(),
         checkpoints: Vec::new(),
+        approval: None,
         source: None,
         sandbox: None,
         conversation: None,
@@ -2630,6 +2687,7 @@ mod tests {
             exited: None,
             subagents: Vec::new(),
             checkpoints: Vec::new(),
+            approval: None,
             source: None,
             sandbox: None,
             conversation: None,
@@ -2648,6 +2706,7 @@ mod tests {
             exited: None,
             subagents: Vec::new(),
             checkpoints: Vec::new(),
+            approval: None,
             source: None,
             sandbox: None,
             conversation: None,
@@ -2681,6 +2740,7 @@ mod tests {
             exited: None,
             subagents: Vec::new(),
             checkpoints: Vec::new(),
+            approval: None,
             source: None,
             sandbox: None,
             conversation: None,
@@ -2699,6 +2759,7 @@ mod tests {
             exited: Some(0),
             subagents: Vec::new(),
             checkpoints: Vec::new(),
+            approval: None,
             source: None,
             sandbox: None,
             conversation: None,
@@ -3428,6 +3489,58 @@ mod tests {
         assert!(row_text(buf, 23).contains("ANSWER"), "the footer mode chip");
     }
 
+    /// A held approval's waiting row names what would run, and its overlay
+    /// — framed as the peek is — puts the tool over its input above the
+    /// three answers, the footer chip saying APPROVE.
+    #[test]
+    fn a_held_approval_shows_in_its_waiting_row_and_its_overlay() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = app_two_workspaces();
+        let mut view = app.workspaces.clone();
+        view[1].tabs[0].panes[0].approval = Some(tutti_core::PendingApproval {
+            id: 7,
+            tool: "Bash".into(),
+            summary: "rm -rf build".into(),
+        });
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&tutti_core::Event::LayoutChanged { workspaces: view }).unwrap(),
+        ));
+        let area = Rect::new(0, 0, 100, 24);
+        app.sync_sizes(area);
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("Bash · rm -rf build"),
+            "the waiting row: {text:?}"
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        // api, web, web's agent, then the agent's waiting row.
+        for _ in 0..3 {
+            app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Approval(PaneId(2)));
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let (_, popup, _) = app.approval_popup(area).unwrap();
+        let row = |n: u16| row_text(buf, usize::from(popup.y + n));
+        assert!(row(0).contains("approve claude · web"), "{:?}", row(0));
+        assert!(row(1).contains(" Bash "), "the tool: {:?}", row(1));
+        assert!(row(2).contains(" rm -rf build "), "its input: {:?}", row(2));
+        assert!(
+            row(3).contains("y allow  n deny  esc pass to claude"),
+            "the answers: {:?}",
+            row(3)
+        );
+        assert!(
+            row_text(buf, 23).contains("APPROVE"),
+            "the footer mode chip"
+        );
+    }
+
     /// `app_two_workspaces` with the go-to overlay open: its rows are the
     /// needs-you header over web's blocked agent, a spacer, then the projects
     /// header over api, tab 1, zsh, web, tab 2, and web's agent again.
@@ -4127,6 +4240,7 @@ mod tests {
             exited: None,
             subagents: Vec::new(),
             checkpoints: Vec::new(),
+            approval: None,
             source: None,
             sandbox: None,
             conversation: None,

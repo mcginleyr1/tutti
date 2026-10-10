@@ -237,6 +237,7 @@ mod tests {
             exited: None,
             subagents: Vec::new(),
             checkpoints: Vec::new(),
+            approval: None,
             source: None,
             sandbox: None,
             conversation: None,

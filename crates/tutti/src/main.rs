@@ -6,11 +6,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use tutti_core::{
-    AgentHookEvent, Direction, Event, PaneId, Request, Response, TabId, WaitFor, WorkspaceId,
+    AgentHookEvent, ApprovalDecision, Direction, Event, PaneId, Request, Response, TabId,
+    WaitFor, WorkspaceId,
 };
 
 use tutti::client::{self, Client, StopOutcome};
-use tutti::config::Config;
+use tutti::config::{Approvals, Config};
 use tutti::hooks;
 use tutti::integrations::{self, Dirs, Integration, Status};
 use tutti::render;
@@ -330,6 +331,18 @@ enum PaneAction {
         /// then the screen, and the next cursor on stderr. Start from 0.
         #[arg(long)]
         since: Option<u64>,
+    },
+    /// Answer the pane's held approval — a Claude permission request waiting
+    /// on tutti under `approvals = "hold"`: allow the tool call, or `--deny`
+    /// it.
+    Approve {
+        pane: u64,
+        /// Refuse the tool call instead.
+        #[arg(long)]
+        deny: bool,
+        /// The reason Claude is told it was refused.
+        #[arg(long, requires = "deny")]
+        message: Option<String>,
     },
     /// Mark a pane focused (records it active and clears its Done badge).
     Focus {
@@ -815,6 +828,19 @@ fn to_request(command: Command) -> Result<Request> {
                 unwrapped,
                 since,
             },
+            PaneAction::Approve {
+                pane,
+                deny,
+                message,
+            } => Request::ApprovalAnswer {
+                pane: PaneId(pane),
+                id: None,
+                decision: if deny {
+                    ApprovalDecision::Deny { message }
+                } else {
+                    ApprovalDecision::Allow
+                },
+            },
             PaneAction::Focus { pane } => Request::PaneFocus { pane: PaneId(pane) },
             PaneAction::Wait { .. } => bail!("pane wait sends a request per pane"),
             PaneAction::Checkpoints { pane } => Request::PaneCheckpoints { pane: PaneId(pane) },
@@ -889,9 +915,9 @@ fn run_wait(
 /// never break an agent session: outside a tutti-spawned pane (`TUTTI_PANE`
 /// unset) it exits 0 silently; a malformed or irrelevant event sends nothing; a
 /// connect/send failure is a stderr note, never a failure exit. This is the one
-/// deliberately never-fail path in the CLI. It never writes stdout either: on
-/// `UserPromptSubmit` and `SessionStart` Claude Code hands a hook's stdout to
-/// the model as context.
+/// deliberately never-fail path in the CLI. It writes stdout only to answer a
+/// held permission request (`approvals = "hold"`): on `UserPromptSubmit` and
+/// `SessionStart` Claude Code hands a hook's stdout to the model as context.
 fn run_agent_event(session: &str, agent: HookAgent) -> Result<i32> {
     let Some(pane) = std::env::var("TUTTI_PANE")
         .ok()
@@ -915,10 +941,63 @@ fn run_agent_event(session: &str, agent: HookAgent) -> Result<i32> {
     let Some((event, conversation)) = mapped else {
         return Ok(0);
     };
+    if let Some((tool, summary)) = hooks::permission_request(&value)
+        && let Some(timeout) = approval_hold_timeout()
+    {
+        let held = hold_approval(&session, PaneId(pane), conversation, tool, summary, timeout);
+        match held.map(|decision| hooks::permission_decision(&decision)) {
+            Ok(Some(output)) => println!("{output}"),
+            Ok(None) => {}
+            Err(err) => eprintln!("tutti agent-event: {err:#}"),
+        }
+        return Ok(0);
+    }
     if let Err(err) = send_agent_event(&session, PaneId(pane), event, conversation) {
         eprintln!("tutti agent-event: {err:#}");
     }
     Ok(0)
+}
+
+/// How long a permission request is held under `approvals = "hold"`, `None`
+/// when it is only watched. The config is read only once a request comes;
+/// one that will not load is a stderr note and reads as watch.
+fn approval_hold_timeout() -> Option<Duration> {
+    match Config::load() {
+        Ok(config) => (config.approvals == Approvals::Hold).then_some(config.approval_timeout),
+        Err(err) => {
+            eprintln!("tutti agent-event: {err:#}");
+            None
+        }
+    }
+}
+
+/// Hold a permission request on the session's daemon until it is answered —
+/// in place of its `AgentEvent`, which the hold blocks the pane for just the
+/// same. `timeout` running out is an error, as is any failure: Claude's own
+/// dialog then appears. Never auto-starts a server.
+fn hold_approval(
+    session: &str,
+    pane: PaneId,
+    conversation: Option<String>,
+    tool: String,
+    summary: String,
+    timeout: Duration,
+) -> Result<ApprovalDecision> {
+    let mut client = Client::connect(session).context("connecting to tutti-server")?;
+    client.set_timeout(timeout)?;
+    let hold = Request::ApprovalHold {
+        pane,
+        conversation,
+        tool,
+        summary,
+    };
+    let reply = client
+        .request(&hold)
+        .with_context(|| format!("no answer within {}s", timeout.as_secs()))?;
+    match reply {
+        Response::Approval { decision } => Ok(decision),
+        other => bail!("unexpected reply to an approval hold: {other:?}"),
+    }
 }
 
 /// Send an `AgentEvent` to the session's daemon. Never auto-starts a server — a
@@ -1229,6 +1308,8 @@ fn emit(response: Response, json: bool) -> i32 {
             println!("attached to {session}");
             0
         }
+        // An approval hold's reply is consumed by `agent-event`, never here.
+        Response::Approval { .. } => 0,
     }
 }
 
@@ -1742,6 +1823,40 @@ mod tests {
                 "3"
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn pane_approve_allows_or_denies_with_a_reason() {
+        assert_eq!(
+            request_of(&["tutti", "pane", "approve", "3"]),
+            Request::ApprovalAnswer {
+                pane: PaneId(3),
+                id: None,
+                decision: ApprovalDecision::Allow,
+            }
+        );
+        assert_eq!(
+            request_of(&[
+                "tutti",
+                "pane",
+                "approve",
+                "3",
+                "--deny",
+                "--message",
+                "not on main"
+            ]),
+            Request::ApprovalAnswer {
+                pane: PaneId(3),
+                id: None,
+                decision: ApprovalDecision::Deny {
+                    message: Some("not on main".into())
+                },
+            }
+        );
+        assert!(
+            Cli::try_parse_from(["tutti", "pane", "approve", "3", "--message", "why"]).is_err(),
+            "a reason is a denial's"
         );
     }
 

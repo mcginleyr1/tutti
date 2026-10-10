@@ -13,9 +13,9 @@ pub use ids::{PaneId, TabId, WorkspaceId};
 pub use paths::{socket_dir, socket_path, state_dir};
 pub use prompt::{PROMPT_LINES, prompt_fingerprint, prompt_rows};
 pub use protocol::{
-    AgentHookEvent, Checkpoint, DIFF_RANGE, Event, FileStat, PaneInfo, Request, Response,
-    RestoreSummary, SubagentInfo, TabInfo, TabView, WIRE_REV, WaitFor, WatchPane, WorkspaceInfo,
-    WorkspaceView,
+    AgentHookEvent, ApprovalDecision, Checkpoint, DIFF_RANGE, Event, FileStat, PaneInfo,
+    PendingApproval, Request, Response, RestoreSummary, SubagentInfo, TabInfo, TabView,
+    WIRE_REV, WaitFor, WatchPane, WorkspaceInfo, WorkspaceView,
 };
 pub use sandbox::{pick_remote, sandbox_branch};
 pub use state::{AgentState, Observation, StateEvent, StateSource};

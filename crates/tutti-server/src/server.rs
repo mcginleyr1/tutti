@@ -23,8 +23,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use tutti_agents::{ProcessTree, Registry};
 use tutti_core::{
-    AgentHookEvent, AgentKind, AgentState, Checkpoint, Direction, Event, Frame, Observation,
-    PaneData, PaneId, PaneInfo, Request, Response, StateEvent, WaitFor, WorkspaceId,
+    AgentHookEvent, AgentKind, AgentState, ApprovalDecision, Checkpoint, Direction, Event, Frame,
+    Observation, PaneData, PaneId, PaneInfo, Request, Response, StateEvent, WaitFor, WorkspaceId,
     prompt_fingerprint,
 };
 
@@ -116,6 +116,9 @@ pub struct Hub {
     /// Where the layout is saved and the previous daemon's is offered back
     /// (`persist`); `None` with persistence off.
     state: Option<PathBuf>,
+    /// Each held approval's way back to the hook holding it, by approval id:
+    /// an answer sends its decision down the channel.
+    approvals: Mutex<HashMap<u64, oneshot::Sender<ApprovalDecision>>>,
 }
 
 /// One workspace's VCS-watch state: `mark` is the op-heads mtime as of the last
@@ -191,6 +194,7 @@ pub async fn serve(
         vcs: Mutex::new(HashMap::new()),
         signals: broadcast::channel(SIGNAL_CAP).0,
         state,
+        approvals: Mutex::new(HashMap::new()),
     });
 
     let tick_hub = Arc::clone(&hub);
@@ -481,6 +485,12 @@ fn handle_frame(
             }
             Ok(Request::PaneScroll { pane, offset }) => scroll(hub, cid, tx, pane, offset),
             Ok(Request::WorkspaceDiff { id, stat }) => workspace_diff(hub, tx, id, stat),
+            Ok(Request::ApprovalHold {
+                pane,
+                conversation,
+                tool,
+                summary,
+            }) => approval_hold(hub, cid, tx, pane, conversation, tool, summary),
             Ok(Request::PaneWait {
                 pane,
                 until,
@@ -706,6 +716,7 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             event,
             conversation,
         } => agent_event(hub, pane, event, conversation),
+        Request::ApprovalAnswer { pane, id, decision } => approval_answer(hub, pane, id, decision),
         Request::PaneCheckpoints { pane } => {
             let checkpoints = hub.session().turns(pane).map(|t| t.entries().to_vec());
             match checkpoints {
@@ -722,6 +733,7 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
         | Request::PaneFocus { .. }
         | Request::PaneScroll { .. }
         | Request::WorkspaceDiff { .. }
+        | Request::ApprovalHold { .. }
         | Request::PaneWait { .. }
         | Request::WorkspaceKill { .. }
         | Request::WorkspaceFork { .. }
@@ -921,6 +933,104 @@ fn agent_event(
         publish_transition(hub, pane, from, to);
         refresh_pane_workspace(hub, pane);
     }
+    Response::Ok
+}
+
+/// Hold a permission request on `pane` until it is answered. The approval is
+/// registered, and the view carrying it broadcast, before the pane blocks —
+/// as the request's own hook event would block it — so whoever that move
+/// wakes (a `pane wait`) finds an approval to answer. A spawned task then
+/// holds the reply until an answer comes down the approval's channel or the
+/// hook hangs up; either way the approval leaves the pane. With no client
+/// attached nobody could answer: the reply is `Pass` at once, as it is for an
+/// unknown pane or one already holding an approval.
+fn approval_hold(
+    hub: &Arc<Hub>,
+    cid: u64,
+    tx: &mpsc::Sender<Vec<u8>>,
+    pane: PaneId,
+    conversation: Option<String>,
+    tool: String,
+    summary: String,
+) -> ControlFlow<()> {
+    let message = Some(format!("{tool} · {summary}"));
+    let attached = !hub.clients.lock().expect("clients poisoned").is_empty();
+    let held = if attached {
+        hub.session().hold_approval(pane, tool, summary)
+    } else {
+        None
+    };
+    let (answer, answered) = oneshot::channel();
+    if let Some(id) = held {
+        hub.approvals
+            .lock()
+            .expect("approvals poisoned")
+            .insert(id, answer);
+        let view = hub.session().view();
+        broadcast_event(hub, Event::LayoutChanged { workspaces: view });
+    }
+    agent_event(hub, pane, AgentHookEvent::Blocked { message }, conversation);
+    let Some(id) = held else {
+        let pass = Response::Approval {
+            decision: ApprovalDecision::Pass,
+        };
+        return send_reply(hub, cid, tx, encode_json(&pass));
+    };
+    let hub = Arc::clone(hub);
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let decision = tokio::select! {
+            () = tx.closed() => None,
+            decision = answered => decision.ok(),
+        };
+        hub.approvals
+            .lock()
+            .expect("approvals poisoned")
+            .remove(&id);
+        let view = {
+            let mut session = hub.session();
+            session
+                .take_approval(pane, Some(id))
+                .map(|_| session.view())
+        };
+        if let Some(view) = view {
+            broadcast_event(&hub, Event::LayoutChanged { workspaces: view });
+        }
+        if let Some(decision) = decision {
+            let _ = tx.send(encode_json(&Response::Approval { decision })).await;
+        }
+    });
+    ControlFlow::Continue(())
+}
+
+/// Answer `pane`'s held approval — `id`'s, or whichever it holds when `None`:
+/// end it, send the decision down its channel to the hook holding the
+/// request (one that has just hung up hears nothing, which is fine), and
+/// broadcast the view without it. Error when the pane holds no such approval.
+fn approval_answer(
+    hub: &Arc<Hub>,
+    pane: PaneId,
+    id: Option<u64>,
+    decision: ApprovalDecision,
+) -> Response {
+    let mut session = hub.session();
+    let Some(held) = session.take_approval(pane, id) else {
+        let which = id.map_or_else(String::new, |id| format!(" #{id}"));
+        return Response::Error {
+            message: format!("pane {pane} has no pending approval{which}"),
+        };
+    };
+    let view = session.view();
+    drop(session);
+    let answer = hub
+        .approvals
+        .lock()
+        .expect("approvals poisoned")
+        .remove(&held);
+    if let Some(answer) = answer {
+        let _ = answer.send(decision);
+    }
+    broadcast_event(hub, Event::LayoutChanged { workspaces: view });
     Response::Ok
 }
 
