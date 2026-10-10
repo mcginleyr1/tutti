@@ -7,6 +7,7 @@ mod connection;
 mod input;
 mod launcher;
 mod layout;
+mod navigate;
 mod render;
 mod sidebar;
 mod theme;

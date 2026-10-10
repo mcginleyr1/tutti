@@ -13,6 +13,7 @@ use tutti_core::{AgentState, Checkpoint, PaneId, PaneInfo, SubagentInfo};
 
 use super::app::{App, Mode};
 use super::launcher::LauncherRow;
+use super::navigate::{self, Marker};
 use super::sidebar::{AgentRow, SidebarEntry, WorkspaceRow};
 use super::theme;
 use crate::config::{self, Config, Icons, PrefixAction};
@@ -117,6 +118,10 @@ const DIFF_HINT: &[(&str, &str)] = &[
     ("esc", "back"),
 ];
 
+/// The go-to overlay's key hint, two-tone at its input row's right edge —
+/// typing filters, so the movement keys are the ones worth saying.
+const NAVIGATE_HINT: &[(&str, &str)] = &[("↑↓", "move"), ("enter", "jump"), ("esc", "back")];
+
 /// The metadata style of the active theme — DIM on the terminal theme, an
 /// explicit muted colour on the truecolor ones — applied to nearly everything
 /// that is not a name or the accent.
@@ -211,6 +216,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     if app.mode == Mode::LauncherCommand {
         draw_launcher_command(frame, app, area);
+    }
+    if app.mode == Mode::Navigate {
+        draw_navigate(frame, app, content, spinner);
     }
 }
 
@@ -1340,6 +1348,7 @@ fn mode_label(mode: Mode) -> Option<&'static str> {
         Mode::SidebarWorkspaceName | Mode::SidebarWorkspaceDest => Some("WORKSPACE"),
         Mode::Launcher | Mode::LauncherCommand => Some("RUN"),
         Mode::Peek(_) => Some("ANSWER"),
+        Mode::Navigate => Some("GO TO"),
     }
 }
 
@@ -1583,6 +1592,111 @@ fn draw_peek(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans = vec![Span::raw(" ")];
     spans.extend(two_tone(PEEK_HINT).0);
     frame.render_widget(Paragraph::new(Line::from(spans)), hint);
+}
+
+/// The go-to overlay (navigate mode): an opaque panel over the whole content
+/// `area`. The `go to` filter input leads, its key hint at the right edge;
+/// then the rows — with no filter the state groups (`needs you`, `done`,
+/// `working`) over the project tree, while filtering one flat ranked list, or
+/// a dim `no matches`. Headers are the sidebar's bold-dim labels and entries
+/// draw like its rows, so the highlight is the one accent: a full-row bar with
+/// the `▎` gutter and the name chip. The window follows the highlight through
+/// `App::navigate_list`, which the click hit-test shares.
+fn draw_navigate(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
+    if area.width < 3 || area.height < 3 {
+        return;
+    }
+    clear(frame, area, theme::current().panel_bg);
+    let input = Line::from(vec![
+        Span::styled("▍", Style::default().fg(accent())),
+        Span::styled("go to ", dim()),
+        Span::raw(app.navigate_query().to_string()),
+        Span::styled("█", Style::default().fg(accent())),
+    ]);
+    let input_w = input.width() as u16;
+    frame.render_widget(
+        Paragraph::new(input),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let (hint, hint_w) = two_tone(NAVIGATE_HINT);
+    if input_w + 2 + hint_w < area.width {
+        let rect = Rect::new(area.x + area.width - hint_w - 1, area.y, hint_w, 1);
+        frame.render_widget(Paragraph::new(Line::from(hint)), rect);
+    }
+
+    let (rows, selected) = app.navigate_rows();
+    let (list, first) = App::navigate_list(area, selected);
+    if rows.is_empty() {
+        let none = Line::from(Span::styled(" no matches", dim()));
+        frame.render_widget(Paragraph::new(none), list);
+        return;
+    }
+    let content_w = list.width.saturating_sub(2);
+    let glyphs = glyphs(app.config().icons);
+    let lines: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(list.height as usize)
+        .map(|(i, row)| match row {
+            navigate::Row::Header { title, count } => {
+                let count = count.to_string();
+                let gap = (list.width as usize).saturating_sub(2 + title.len() + count.len());
+                Line::from(vec![
+                    Span::styled(format!(" {title}"), header_style(false)),
+                    Span::raw(" ".repeat(gap)),
+                    Span::styled(format!("{count} "), dim()),
+                ])
+            }
+            navigate::Row::Spacer => Line::default(),
+            navigate::Row::Entry(e) => {
+                let sel = selected == Some(i);
+                bare_row(navigate_inner(e, sel, spinner, content_w, glyphs), sel)
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), list);
+}
+
+/// One go-to entry: its tree guide in the projects section, then what leads
+/// it — a workspace's dot (accent while it owns the active tab), a tab's dim
+/// app-bar number, an agent's state dot or spinner, nothing for a plain pane —
+/// the name at full intensity (bold for a workspace, the accent chip when
+/// selected), and the dim meta.
+fn navigate_inner(
+    e: &navigate::Entry,
+    sel: bool,
+    spinner: char,
+    content_w: u16,
+    glyphs: &Glyphs,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    if let Some(guide) = e.guide {
+        let indent = "  ".repeat(e.depth.saturating_sub(1) as usize);
+        spans.push(Span::styled(format!("{indent}{guide} "), dim()));
+    }
+    let (lead, lead_style, name) = match e.marker {
+        Marker::Workspace { active: true } => (
+            glyphs.ws_active.to_string(),
+            Style::default().fg(accent()),
+            Modifier::BOLD,
+        ),
+        Marker::Workspace { active: false } => {
+            (glyphs.ws_inactive.to_string(), dim(), Modifier::BOLD)
+        }
+        Marker::Tab(n) => (n.to_string(), dim(), Modifier::empty()),
+        Marker::Pane(Some(state)) => {
+            let (dot, style) = agent_dot(state, spinner, glyphs);
+            (dot.to_string(), style, Modifier::empty())
+        }
+        Marker::Pane(None) => (" ".into(), Style::default(), Modifier::empty()),
+    };
+    spans.push(Span::styled(format!("{lead} "), lead_style));
+    spans.push(name_span(&e.name, sel, name));
+    if !e.meta.is_empty() {
+        spans.push(Span::styled(format!("  {}", e.meta), dim()));
+    }
+    pad_inner(spans, sel, content_w)
 }
 
 /// Render `lines` in a rounded panel titled `title`, centred over `area`. Shared
@@ -2958,6 +3072,103 @@ mod tests {
         assert!(inside("2. No"), "its options: {text:?}");
         assert!(inside("jump in to type"), "the hint row: {text:?}");
         assert!(row_text(buf, 23).contains("ANSWER"), "the footer mode chip");
+    }
+
+    /// `app_two_workspaces` with the go-to overlay open: its rows are the
+    /// needs-you header over web's blocked agent, a spacer, then the projects
+    /// header over api, tab 1, zsh, web, tab 2, and web's agent again.
+    fn navigating() -> App {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = app_two_workspaces();
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Navigate);
+        app
+    }
+
+    #[test]
+    fn navigate_overlay_draws_the_groups_over_the_tree_with_one_accent_row() {
+        let app = navigating();
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let w = 100usize;
+        // The overlay is the content area, rows 2-14: the input and its hint,
+        // a spacer, then the list.
+        assert!(row_text(buf, 2).contains("go to"), "{:?}", row_text(buf, 2));
+        assert!(row_text(buf, 2).contains("enter jump"), "the key hint");
+        let header = row_text(buf, 4);
+        assert!(
+            header.contains("needs you") && header.trim_end().ends_with('1'),
+            "the header and its count: {header:?}"
+        );
+        let label = &buf.content()[4 * w + col_of(buf, 4, "needs")];
+        assert!(
+            label.modifier.contains(Modifier::BOLD) && label.modifier.contains(Modifier::DIM),
+            "headers are the sidebar's bold-dim labels"
+        );
+        let agent = row_text(buf, 5);
+        assert!(
+            agent.contains("agent  web · 2 · claude"),
+            "the title, then where it lives and its kind: {agent:?}"
+        );
+        let gutter = &buf.content()[5 * w];
+        assert_eq!(
+            (gutter.symbol(), gutter.fg, gutter.bg),
+            ("▎", accent(), select_bg()),
+            "the highlighted row leads with the accent gutter"
+        );
+        assert_eq!(
+            buf.content()[5 * w + col_of(buf, 5, "●")].fg,
+            Color::Red,
+            "the sidebar's blocked dot"
+        );
+        assert_eq!(
+            buf.content()[5 * w + col_of(buf, 5, "agent")].bg,
+            accent(),
+            "the name chip"
+        );
+        assert_eq!(
+            (2..15)
+                .filter(|r| buf.content()[r * w..(r + 1) * w]
+                    .iter()
+                    .any(|c| c.bg == select_bg()))
+                .count(),
+            1,
+            "one highlighted row, nothing of the sidebar beneath"
+        );
+        assert!(row_text(buf, 7).contains("projects"));
+        assert!(row_text(buf, 13).contains("└ ● agent  claude"), "the tree");
+        assert!(row_text(buf, 15).contains("GO TO"), "the footer mode chip");
+    }
+
+    #[test]
+    fn navigate_overlay_keeps_the_highlight_in_view_and_says_when_nothing_matches() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = navigating();
+        for _ in 0..6 {
+            app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        // Ten rows leave the list five below the input: the tree's last row,
+        // highlighted, scrolls up to the window's foot.
+        let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        assert!(
+            row_text(buf, 8).starts_with('▎') && row_text(buf, 8).contains("agent"),
+            "{:?}",
+            buffer_text(buf)
+        );
+        assert!(
+            !buffer_text(buf).contains("needs you"),
+            "the top scrolled off"
+        );
+
+        for c in "zzz".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert!(buffer_text(terminal.backend().buffer()).contains("no matches"));
     }
 
     #[test]

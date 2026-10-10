@@ -64,6 +64,9 @@ pub enum PrefixAction {
     TabPrev,
     TabNew,
     Sidebar,
+    /// Open the full-screen go-to: every agent grouped by state over the
+    /// project tree, fuzzy-filtered as you type.
+    Navigate,
     /// Focus the changed-files panel (the per-file diff stats on the right).
     DiffFiles,
     /// Open the agent launcher to run a choice in a new pane here.
@@ -140,6 +143,7 @@ const DEFAULT_PREFIX_TABLE: &[PrefixBinding] = &[
     b(KeyCode::Char('p'), PrefixAction::TabPrev, "prev tab"),
     b(KeyCode::Char('c'), PrefixAction::TabNew, "new tab"),
     b(KeyCode::Char('w'), PrefixAction::Sidebar, "workspaces"),
+    b(KeyCode::Char('g'), PrefixAction::Navigate, "go to"),
     b(KeyCode::Char('f'), PrefixAction::DiffFiles, "changed files"),
     b(KeyCode::Char('r'), PrefixAction::Run, "run here"),
     b(
@@ -171,6 +175,7 @@ const VIM_PREFIX_TABLE: &[PrefixBinding] = &[
     b(KeyCode::Char('n'), PrefixAction::TabNext, "next tab"),
     b(KeyCode::Char('p'), PrefixAction::TabPrev, "prev tab"),
     b(KeyCode::Char('w'), PrefixAction::Sidebar, "workspaces"),
+    b(KeyCode::Char('g'), PrefixAction::Navigate, "go to"),
     b(KeyCode::Char('f'), PrefixAction::DiffFiles, "changed files"),
     b(KeyCode::Char('r'), PrefixAction::Run, "run here"),
     b(KeyCode::Char('z'), PrefixAction::Zoom, "zoom pane"),
@@ -1035,6 +1040,20 @@ ttl_minutes = 15
                 cfg.prefix_action(KeyCode::Char('r')),
                 Some(PrefixAction::Run),
                 "r should open the launcher in every preset"
+            );
+        }
+    }
+
+    #[test]
+    fn both_presets_bind_the_go_to_key() {
+        for cfg in [
+            Config::default(),
+            Config::parse("preset = \"vim\"\n").unwrap(),
+        ] {
+            assert_eq!(
+                cfg.prefix_action(KeyCode::Char('g')),
+                Some(PrefixAction::Navigate),
+                "g should open the go-to overlay in every preset"
             );
         }
     }

@@ -407,7 +407,7 @@ pub fn build(workspaces: &[WorkspaceView], active_tab: Option<TabId>) -> Sidebar
 
 /// An agent row's kind line: the agent, plus `on <profile>` when it runs in a
 /// sandbox, so a remote agent never passes for a local one.
-fn kind_label(agent: &AgentKind, pane: &PaneInfo) -> String {
+pub fn kind_label(agent: &AgentKind, pane: &PaneInfo) -> String {
     match &pane.sandbox {
         Some(profile) => format!("{agent} on {profile}"),
         None => agent.to_string(),
