@@ -116,6 +116,9 @@ pub struct AgentRow {
     pub title: String,
     pub state: AgentState,
     pub kind: String,
+    /// The id of the tracker issue the agent was deployed on, shown dim after
+    /// the title.
+    pub issue: Option<String>,
     /// The top-level project owning this agent's workspace, and its display
     /// name. The cursor's fallback anchor; the waiting section shows the name
     /// so a cross-project row says where it lives.
@@ -338,6 +341,7 @@ pub fn build(workspaces: &[WorkspaceView], active_tab: Option<TabId>) -> Sidebar
                         title: pane.title.clone(),
                         state: pane.state,
                         kind: kind_label(agent, pane),
+                        issue: pane.issue.as_ref().map(|i| i.id.clone()),
                         project: project_of(w),
                         project_name: name_of(project_of(w)),
                         guide: None,
@@ -393,6 +397,7 @@ pub fn build(workspaces: &[WorkspaceView], active_tab: Option<TabId>) -> Sidebar
                             title: pane.title.clone(),
                             state: pane.state,
                             kind: kind_label(agent, pane),
+                            issue: pane.issue.as_ref().map(|i| i.id.clone()),
                             project: project_of(w),
                             project_name: name_of(project_of(w)),
                             guide: None,

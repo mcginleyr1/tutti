@@ -13,9 +13,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
 use tutti_core::{
-    AgentHookEvent, AgentState, ApprovalDecision, Checkpoint, Direction, Event, Frame, Layout,
-    Note, NoteKind, PaneData, PaneDims, PaneId, PaneInfo, PendingApproval, Request, Response,
-    StateSource, SubagentInfo, Tagged, WatchPane, WorkspaceId,
+    AgentHookEvent, AgentState, ApprovalDecision, Checkpoint, Direction, Event, Frame, IssueRef,
+    Layout, Note, NoteKind, PaneData, PaneDims, PaneId, PaneInfo, PendingApproval, Request,
+    Response, StateSource, SubagentInfo, Tagged, WatchPane, WorkspaceId,
 };
 use tutti_server::{PaneSize, serve};
 
@@ -527,6 +527,7 @@ fn run_sleep(workspace: Option<WorkspaceId>, dir: Option<PathBuf>, title: Option
         sandbox: None,
         title: title.map(Into::into),
         from: None,
+        issue: None,
     }
 }
 
@@ -612,6 +613,43 @@ async fn run_reuses_an_open_dir_and_mounts_a_new_one() {
     server.stop().await;
 }
 
+/// A `run` deploying an issue links its pane to it — what `pane list` and
+/// every view carry — and a plain run links none.
+#[tokio::test]
+async fn run_links_its_pane_to_the_issue_it_deploys() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let workspace = new_workspace(&mut conn).await;
+    let issue = IssueRef {
+        source: "gh".into(),
+        id: "123".into(),
+        title: "Fix the login redirect".into(),
+        url: Some("https://github.com/acme/app/issues/123".into()),
+    };
+    let (_, _, deployed) = ran(conn
+        .request(Request::Run {
+            workspace: Some(workspace),
+            dir: None,
+            cmd: vec!["/bin/sleep".into(), "30".into()],
+            sandbox: None,
+            title: None,
+            issue: Some(issue.clone()),
+            from: None,
+        })
+        .await);
+    let (_, _, plain) = ran(conn.request(run_sleep(Some(workspace), None, None)).await);
+    match conn.request(Request::PaneList).await {
+        Response::Panes { panes } => {
+            let linked = |pane| panes.iter().find(|p| p.id == pane).unwrap().issue.clone();
+            assert_eq!(linked(deployed), Some(Box::new(issue)));
+            assert_eq!(linked(plain), None);
+        }
+        other => panic!("expected Panes, got {other:?}"),
+    }
+
+    server.stop().await;
+}
+
 /// `run` refuses a directory that is not on disk and a workspace named beside
 /// a directory, and a command that cannot spawn leaves no empty tab or
 /// workspace behind.
@@ -628,6 +666,7 @@ async fn run_refuses_bad_targets_and_rolls_back_a_failed_spawn() {
         sandbox: None,
         title: None,
         from: None,
+        issue: None,
     };
 
     for (request, needle) in [
@@ -1968,6 +2007,7 @@ async fn run_lands_beside_its_calling_pane() {
         cmd: vec!["/bin/sleep".into(), "30".into()],
         sandbox: None,
         title: None,
+        issue: None,
         from,
     };
 

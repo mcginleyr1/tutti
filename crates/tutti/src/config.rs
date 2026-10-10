@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Deserialize;
 
+use crate::issues::{self, Kind};
 use crate::sandbox::{Profile, Source};
 
 /// The default ratio boundary at which the direct nav keys resize a split.
@@ -75,6 +76,9 @@ pub enum PrefixAction {
     Notes,
     /// Open the agent launcher to run a choice in a new pane here.
     Run,
+    /// Open the issues panel: every configured tracker's issues for the
+    /// active project, each deployable to an agent.
+    Issues,
     /// Open the setup panel: install the Claude Code hooks, the opencode
     /// plugin, and the tutti skill, for the user or into the active project.
     Integrations,
@@ -165,6 +169,7 @@ const DEFAULT_PREFIX_TABLE: &[PrefixBinding] = &[
     b(KeyCode::Char('f'), PrefixAction::DiffFiles, "changed files"),
     b(KeyCode::Char('N'), PrefixAction::Notes, "notifications"),
     b(KeyCode::Char('r'), PrefixAction::Run, "run here"),
+    b(KeyCode::Char('I'), PrefixAction::Issues, "issues"),
     b(KeyCode::Char('i'), PrefixAction::Integrations, "setup"),
     b(
         KeyCode::Char('o'),
@@ -199,6 +204,7 @@ const VIM_PREFIX_TABLE: &[PrefixBinding] = &[
     b(KeyCode::Char('f'), PrefixAction::DiffFiles, "changed files"),
     b(KeyCode::Char('N'), PrefixAction::Notes, "notifications"),
     b(KeyCode::Char('r'), PrefixAction::Run, "run here"),
+    b(KeyCode::Char('I'), PrefixAction::Issues, "issues"),
     b(KeyCode::Char('i'), PrefixAction::Integrations, "setup"),
     b(KeyCode::Char('z'), PrefixAction::Zoom, "zoom pane"),
     b(KeyCode::Char('['), PrefixAction::Scrollback, "scrollback"),
@@ -477,6 +483,9 @@ pub struct Config {
     /// The k8s sandbox profiles agents may launch into, in config order. Empty
     /// by default — the launcher then offers only local runs.
     pub sandboxes: Vec<Profile>,
+    /// The issue trackers deploys draw from, in config order. Empty by
+    /// default.
+    pub issues: Vec<issues::Source>,
     prefix_bindings: Vec<PrefixBinding>,
 }
 
@@ -594,6 +603,19 @@ impl Config {
             bail!("sandboxes: duplicate name {:?}", dup.1.name);
         }
 
+        let issues = raw
+            .issues
+            .into_iter()
+            .map(|raw| raw.into_source(home.as_deref()))
+            .collect::<Result<Vec<issues::Source>>>()?;
+        if let Some(dup) = issues
+            .iter()
+            .enumerate()
+            .find(|(i, s)| issues[..*i].iter().any(|t| t.name == s.name))
+        {
+            bail!("issues: duplicate name {:?}", dup.1.name);
+        }
+
         let mut overrides = raw.keys.into_map();
         let mut bindings = Vec::new();
         for (action, name, default) in DEFAULTS {
@@ -623,6 +645,7 @@ impl Config {
             approval_timeout,
             projects,
             sandboxes,
+            issues,
             prefix_bindings,
         })
     }
@@ -637,6 +660,25 @@ impl Config {
                 let names: Vec<&str> = self.sandboxes.iter().map(|p| p.name.as_str()).collect();
                 format!(
                     "no sandbox profile {name:?} in {} (configured: {})",
+                    config_path().display(),
+                    if names.is_empty() {
+                        "none".into()
+                    } else {
+                        names.join(", ")
+                    }
+                )
+            })
+    }
+
+    /// The issue source called `name`, or an error naming what is configured.
+    pub fn issue_source(&self, name: &str) -> Result<&issues::Source> {
+        self.issues
+            .iter()
+            .find(|s| s.name == name)
+            .with_context(|| {
+                let names: Vec<&str> = self.issues.iter().map(|s| s.name.as_str()).collect();
+                format!(
+                    "no issue source {name:?} in {} (configured: {})",
                     config_path().display(),
                     if names.is_empty() {
                         "none".into()
@@ -690,6 +732,8 @@ struct RawConfig {
     projects: Vec<RawProject>,
     #[serde(default)]
     sandboxes: Vec<RawSandbox>,
+    #[serde(default)]
+    issues: Vec<RawIssues>,
 }
 
 #[derive(Deserialize)]
@@ -717,11 +761,7 @@ impl RawSandbox {
     /// and a TTL of at least a minute (default 60).
     fn into_profile(self) -> Result<Profile> {
         let name = self.name;
-        if name.is_empty()
-            || !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
+        if !valid_name(&name) {
             bail!("sandboxes: name {name:?} must be [A-Za-z0-9_-]+");
         }
         let source = match (self.image, self.warm_pool) {
@@ -749,6 +789,113 @@ impl RawSandbox {
             ttl: std::time::Duration::from_secs(ttl_minutes * 60),
         })
     }
+}
+
+/// An `[[issues]]` entry: a `kind` and the keys that kind takes, any other
+/// key an error.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+enum RawIssues {
+    Github {
+        name: String,
+        prompt: Option<String>,
+        repo: Option<String>,
+        search: Option<String>,
+        limit: Option<u32>,
+    },
+    Linear {
+        name: String,
+        prompt: Option<String>,
+        api_key_env: Option<String>,
+        team: Option<String>,
+        filter: Option<serde_json::Map<String, serde_json::Value>>,
+        limit: Option<u32>,
+    },
+    Command {
+        name: String,
+        prompt: Option<String>,
+        command: Vec<String>,
+    },
+}
+
+impl RawIssues {
+    /// Validate into a source: a name usable as a CLI argument, a command
+    /// naming a program (`~` expanded), and a limit of at least one — 50 by
+    /// default, Linear's own page size. Linear's key defaults to
+    /// `LINEAR_API_KEY`.
+    fn into_source(self, home: Option<&Path>) -> Result<issues::Source> {
+        let limit = |limit: Option<u32>| limit.unwrap_or(50);
+        let (name, prompt, kind) = match self {
+            RawIssues::Github {
+                name,
+                prompt,
+                repo,
+                search,
+                limit: n,
+            } => (
+                name,
+                prompt,
+                Kind::Github {
+                    repo,
+                    search,
+                    limit: limit(n),
+                },
+            ),
+            RawIssues::Linear {
+                name,
+                prompt,
+                api_key_env,
+                team,
+                filter,
+                limit: n,
+            } => (
+                name,
+                prompt,
+                Kind::Linear {
+                    api_key_env: api_key_env.unwrap_or_else(|| "LINEAR_API_KEY".into()),
+                    team,
+                    filter,
+                    limit: limit(n),
+                },
+            ),
+            RawIssues::Command {
+                name,
+                prompt,
+                mut command,
+            } => {
+                if let Some(program) = command.first_mut() {
+                    *program = expand_home(program, home).to_string_lossy().into_owned();
+                }
+                (name, prompt, Kind::Command(command))
+            }
+        };
+        if !valid_name(&name) {
+            bail!("issues: name {name:?} must be [A-Za-z0-9_-]+");
+        }
+        match &kind {
+            Kind::Command(argv) if argv.is_empty() => {
+                bail!("issues.{name}: command must name a program")
+            }
+            Kind::Github { limit: 0, .. } | Kind::Linear { limit: 0, .. } => {
+                bail!("issues.{name}: limit must be at least 1")
+            }
+            _ => {}
+        }
+        Ok(issues::Source {
+            name,
+            kind,
+            prompt: prompt.unwrap_or_else(|| issues::DEFAULT_PROMPT.into()),
+        })
+    }
+}
+
+/// Whether `name` can name a sandbox profile or an issue source on the command
+/// line: `[A-Za-z0-9_-]+`.
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 #[derive(Deserialize, Default)]
@@ -1194,6 +1341,133 @@ ttl_minutes = 15
     }
 
     #[test]
+    fn issues_default_empty_and_parse_each_kind() {
+        assert!(Config::default().issues.is_empty());
+        let cfg = Config::parse(
+            r#"
+[[issues]]
+name = "gh"
+kind = "github"
+
+[[issues]]
+name = "web"
+kind = "github"
+repo = "acme/web"
+search = "label:agent"
+limit = 10
+prompt = "Fix {id}: {title}"
+
+[[issues]]
+name = "linear"
+kind = "linear"
+team = "ENG"
+filter = { priority = { lte = 2 } }
+
+[[issues]]
+name = "jira"
+kind = "command"
+command = ["~/bin/jira-issues", "--json"]
+"#,
+        )
+        .unwrap();
+        let home = std::env::var("HOME").unwrap();
+        let source = |name: &str, kind: Kind, prompt: &str| issues::Source {
+            name: name.into(),
+            kind,
+            prompt: prompt.into(),
+        };
+        assert_eq!(
+            cfg.issues,
+            vec![
+                source(
+                    "gh",
+                    Kind::Github {
+                        repo: None,
+                        search: None,
+                        limit: 50,
+                    },
+                    issues::DEFAULT_PROMPT,
+                ),
+                source(
+                    "web",
+                    Kind::Github {
+                        repo: Some("acme/web".into()),
+                        search: Some("label:agent".into()),
+                        limit: 10,
+                    },
+                    "Fix {id}: {title}",
+                ),
+                source(
+                    "linear",
+                    Kind::Linear {
+                        api_key_env: "LINEAR_API_KEY".into(),
+                        team: Some("ENG".into()),
+                        filter: serde_json::json!({"priority": {"lte": 2}})
+                            .as_object()
+                            .cloned(),
+                        limit: 50,
+                    },
+                    issues::DEFAULT_PROMPT,
+                ),
+                source(
+                    "jira",
+                    Kind::Command(vec![format!("{home}/bin/jira-issues"), "--json".into()]),
+                    issues::DEFAULT_PROMPT,
+                ),
+            ]
+        );
+        assert_eq!(cfg.issue_source("web").unwrap().name, "web");
+        let missing = cfg.issue_source("gitlab").unwrap_err();
+        assert!(
+            format!("{missing:#}").contains("configured: gh, web, linear, jira"),
+            "a missing source names the configured ones: {missing:#}"
+        );
+    }
+
+    #[test]
+    fn an_issue_source_is_validated() {
+        let cases = [
+            (
+                "[[issues]]\nname = \"j\"\nkind = \"jira\"\n",
+                "unknown variant `jira`",
+            ),
+            ("[[issues]]\nname = \"j\"\n", "missing field `kind`"),
+            (
+                "[[issues]]\nname = \"j\"\nkind = \"command\"\n",
+                "missing field `command`",
+            ),
+            (
+                "[[issues]]\nname = \"j\"\nkind = \"command\"\ncommand = []\n",
+                "command must name a program",
+            ),
+            (
+                "[[issues]]\nname = \"a b\"\nkind = \"github\"\n",
+                "[A-Za-z0-9_-]+",
+            ),
+            (
+                "[[issues]]\nname = \"gh\"\nkind = \"github\"\nlimit = 0\n",
+                "limit must be at least 1",
+            ),
+            (
+                "[[issues]]\nname = \"j\"\nkind = \"command\"\ncommand = [\"x\"]\nrepo = \"a/b\"\n",
+                "unknown field `repo`",
+            ),
+            (
+                "[[issues]]\nname = \"l\"\nkind = \"linear\"\nfilter = \"mine\"\n",
+                "expected a map",
+            ),
+            (
+                "[[issues]]\nname = \"a\"\nkind = \"github\"\n\n[[issues]]\nname = \"a\"\nkind = \"linear\"\n",
+                "duplicate name",
+            ),
+        ];
+        for (text, needle) in cases {
+            let err = format!("{:#}", Config::parse(text).unwrap_err());
+            assert!(err.contains(needle), "{text:?} → {err}");
+        }
+    }
+
+    #[test]
     fn expand_home_expands_tilde_only() {
         let home = Path::new("/home/alice");
         assert_eq!(expand_home("~", Some(home)), PathBuf::from("/home/alice"));
@@ -1309,6 +1583,20 @@ ttl_minutes = 15
                 cfg.prefix_action(KeyCode::Char('r')),
                 Some(PrefixAction::Run),
                 "r should open the launcher in every preset"
+            );
+        }
+    }
+
+    #[test]
+    fn both_presets_bind_the_issues_key() {
+        for cfg in [
+            Config::default(),
+            Config::parse("preset = \"vim\"\n").unwrap(),
+        ] {
+            assert_eq!(
+                cfg.prefix_action(KeyCode::Char('I')),
+                Some(PrefixAction::Issues),
+                "I should open the issues panel in every preset"
             );
         }
     }

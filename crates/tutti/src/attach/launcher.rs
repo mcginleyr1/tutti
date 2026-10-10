@@ -59,7 +59,7 @@ pub fn build_rows(registry: &Registry, path: Option<&OsStr>) -> Vec<LauncherRow>
         LauncherRow {
             name: spec.kind.to_string(),
             role,
-            kind: LaunchKind::Agent(agent_argv(spec)),
+            kind: LaunchKind::Agent(spec.argv()),
             available,
         }
     };
@@ -104,7 +104,7 @@ pub fn sandbox_rows(registry: &Registry) -> Vec<LauncherRow> {
         .map(|spec| LauncherRow {
             name: spec.kind.to_string(),
             role: spec.display.clone(),
-            kind: LaunchKind::Agent(agent_argv(spec)),
+            kind: LaunchKind::Agent(spec.argv()),
             available: true,
         })
         .chain([
@@ -124,15 +124,21 @@ pub fn sandbox_rows(registry: &Registry) -> Vec<LauncherRow> {
         .collect()
 }
 
-/// The argv an agent row runs: its binary, plus any launch args.
-fn agent_argv(spec: &tutti_agents::AgentSpec) -> Vec<String> {
-    let binary = spec
-        .process_names
-        .first()
-        .cloned()
-        .unwrap_or_else(|| spec.kind.to_string());
-    std::iter::once(binary)
-        .chain(spec.launch_args.iter().cloned())
+/// The rows of a launcher armed to deploy an issue on `prompt`: the rows of
+/// the agents that take a first message (a shell, command or resume row names
+/// no agent), each running its agent on the prompt — still dim when it is not
+/// installed.
+pub fn armed_rows(rows: Vec<LauncherRow>, registry: &Registry, prompt: &str) -> Vec<LauncherRow> {
+    rows.into_iter()
+        .filter_map(|row| {
+            let argv = registry
+                .spec(&row.name.as_str().into())?
+                .prompted_argv(prompt)?;
+            Some(LauncherRow {
+                kind: LaunchKind::Agent(argv),
+                ..row
+            })
+        })
         .collect()
 }
 
@@ -191,7 +197,7 @@ fn age_label(then: SystemTime, now: SystemTime) -> String {
 }
 
 /// `text` capped to `max` characters, the last one replaced by `…` when cut.
-fn truncate(text: &str, max: usize) -> String {
+pub fn truncate(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.into();
     }
@@ -396,6 +402,39 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Armed to deploy, the picker keeps only the agents that take a first
+    /// message, each launching on the prompt, an uninstalled one still dim.
+    #[test]
+    fn armed_rows_keep_the_agents_that_take_a_prompt() {
+        let registry = Registry::default();
+        let rows = vec![
+            agent_row("claude", true),
+            agent_row("crush", true),
+            agent_row("codex", false),
+            LauncherRow {
+                name: "shell".into(),
+                role: "zsh".into(),
+                kind: LaunchKind::Shell,
+                available: true,
+            },
+            LauncherRow {
+                name: "resume".into(),
+                role: "claude · 2h · old".into(),
+                kind: LaunchKind::Resume(vec!["claude".into(), "--resume".into(), "a".into()]),
+                available: true,
+            },
+        ];
+        let armed = armed_rows(rows, &registry, "fix it");
+        let names: Vec<&str> = armed.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["claude", "codex"], "crush takes no prompt");
+        assert_eq!(
+            armed[0].kind,
+            LaunchKind::Agent(vec!["claude".into(), "fix it".into()])
+        );
+        assert!(armed[0].selectable());
+        assert!(!armed[1].selectable(), "codex is not installed");
     }
 
     #[test]

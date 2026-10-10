@@ -31,6 +31,7 @@ use crate::config::{
     SidebarVisibility,
 };
 use crate::integrations::{self, Dirs, Integration, Plan, Status};
+use crate::issues::{self, Issue};
 
 /// The sidebar's fixed column width, and the minimum total width below which it
 /// is suppressed entirely so panes keep usable room.
@@ -107,7 +108,7 @@ impl PaneState {
 }
 
 /// What the reply to a tagged request completes (`App::follow`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum FollowUp {
     /// A `WorkspaceNew` from add-project, whose refusal disarms the jump to
     /// the new workspace's tab.
@@ -117,6 +118,11 @@ enum FollowUp {
     Fork,
     /// A `WorkspaceMerge` of this workspace: `Merged` offers its cleanup.
     Merge(WorkspaceId),
+    /// A `WorkspaceFork` made for an issue: `WorkspaceCreated` sends this,
+    /// the `Run` of the agent deployed on it, into the new workspace.
+    Deploy(Box<Request>),
+    /// A deploy's `Run`: `Ran` jumps to the agent.
+    Deployed,
 }
 
 /// An in-progress or just-finished mouse text selection within one pane. `anchor`
@@ -213,6 +219,19 @@ pub enum Mode {
     /// Confirming a clear of the notification history, raised from its panel
     /// (`y` clears, anything else cancels).
     ConfirmClearNotes,
+    /// The issues panel: every configured tracker's issues for the active
+    /// project, `/` filtering them; enter opens the launcher armed to deploy
+    /// the highlighted one.
+    Issues,
+}
+
+/// One issues-panel row: a source still loading or failed, or an issue.
+pub enum IssueRow<'a> {
+    Status {
+        source: &'a str,
+        error: Option<&'a str>,
+    },
+    Issue(&'a Issue),
 }
 
 pub struct App {
@@ -286,6 +305,10 @@ pub struct App {
     /// Where the open launcher runs its pick: `None` locally, else the index
     /// of a configured sandbox profile. `Tab` cycles it.
     launcher_sandbox: Option<usize>,
+    /// The issue the open launcher deploys, with the prompt it renders to —
+    /// armed from the issues panel: the agent rows run on that prompt, and
+    /// the pick deploys rather than runs.
+    launcher_issue: Option<(Issue, String)>,
     /// The root the resume harvest reads the agent tools' session stores under
     /// — the real home directory, pointed at a fixture tree in tests.
     resume_home: Option<PathBuf>,
@@ -333,6 +356,28 @@ pub struct App {
     /// The go-to overlay (the content area) from the last size sync, for mouse
     /// hit-testing. `None` while not navigating.
     navigate_rect: Option<Rect>,
+    /// What each configured issue source's fetch returned, in config order:
+    /// `None` while it loads, else its issues or why it failed.
+    issues: Vec<Option<Result<Vec<Issue>, String>>>,
+    /// Bumped each time the issues panel opens, so a fetch the panel has
+    /// since moved on from is dropped when it lands.
+    issues_generation: u64,
+    /// The fetch an opening panel asks of the event loop: its generation and
+    /// the project directory the sources run in.
+    issues_fetch: Option<(u64, PathBuf)>,
+    /// The project the panel lists for and deploys into, and whether it is
+    /// a jj repo — so a deploy can give the issue its own workspace — probed
+    /// once as the panel opens.
+    issues_project: Option<WorkspaceId>,
+    issues_jj: bool,
+    /// The panel's filter, and whether keys are typing into it.
+    issues_query: String,
+    issues_filtering: bool,
+    /// The highlighted issue: an index into the filtered issues.
+    issues_selected: usize,
+    /// Deploy into a fresh tab of the project itself rather than a workspace
+    /// of its own — the panel's `h`.
+    issues_here: bool,
     /// When the client attached — the epoch the working spinner advances from,
     /// so every working agent shares one frame counter.
     spinner_epoch: Instant,
@@ -444,6 +489,7 @@ impl App {
             launcher_target: None,
             launcher_dir: None,
             launcher_sandbox: None,
+            launcher_issue: None,
             resume_home: std::env::var_os("HOME").map(PathBuf::from),
             setup_dirs: Dirs::from_env(),
             setup_project: None,
@@ -460,6 +506,15 @@ impl App {
             navigate_query: String::new(),
             navigate_anchor: None,
             navigate_rect: None,
+            issues: Vec::new(),
+            issues_generation: 0,
+            issues_fetch: None,
+            issues_project: None,
+            issues_jj: false,
+            issues_query: String::new(),
+            issues_filtering: false,
+            issues_selected: 0,
+            issues_here: false,
             spinner_epoch: Instant::now(),
             last_content_width: 0,
             adopt_active_view: false,
@@ -595,10 +650,10 @@ impl App {
 
     /// Apply one frame received from the server, mutating client state, and
     /// return what it calls for: a fresh snapshot of a pane whose frame broke
-    /// its parser.
+    /// its parser, a deploy's next step.
     pub fn handle_frame(&mut self, frame: WireFrame) -> Vec<WireFrame> {
         match frame {
-            WireFrame::Control(json) => self.handle_control(&json),
+            WireFrame::Control(json) => return self.handle_control(&json),
             WireFrame::PaneSnapshot(data) => {
                 let info = self
                     .panes
@@ -638,11 +693,12 @@ impl App {
         vec![control(&Request::PaneScroll { pane, offset: 0 })]
     }
 
-    fn handle_control(&mut self, json: &[u8]) {
+    fn handle_control(&mut self, json: &[u8]) -> Vec<WireFrame> {
+        let mut frames = Vec::new();
         if let Ok(event) = serde_json::from_slice::<Event>(json) {
             self.handle_event(event);
         } else if let Ok(Tagged { req, body }) = serde_json::from_slice::<Tagged<Response>>(json) {
-            self.handle_response(req, body);
+            frames = self.handle_response(req, body);
         }
         // A peek only ever answers a blocked agent: once the agent moves on —
         // answered from here or from anywhere else — or vanishes, the overlay
@@ -663,6 +719,7 @@ impl App {
             self.mode = self.approval_back;
         }
         self.open_focused_approval();
+        frames
     }
 
     fn handle_event(&mut self, event: Event) {
@@ -779,8 +836,9 @@ impl App {
         }
     }
 
-    /// Apply a reply; `req` is the one its request rode out with, echoed.
-    fn handle_response(&mut self, req: Option<u64>, response: Response) {
+    /// Apply a reply — `req` is the one its request rode out with, echoed —
+    /// and return what it calls for: a deploy's next step.
+    fn handle_response(&mut self, req: Option<u64>, response: Response) -> Vec<WireFrame> {
         match response {
             Response::Attached {
                 session,
@@ -820,32 +878,44 @@ impl App {
             Response::WorkspaceCreated { id } => {
                 // Add-project ignores this (it armed its jump + launcher up
                 // front); guided create waited for it: jump to the new workspace,
-                // open the launcher over it, and flash what it made and where.
-                let creates = |f| matches!(f, FollowUp::Mount | FollowUp::Fork);
-                if self.take_follow_up(req, creates) == Some(FollowUp::Fork) {
-                    let created = self
-                        .workspaces
-                        .iter()
-                        .find(|w| w.id == id)
-                        .map(|w| (w.name.clone(), w.dir.clone()));
-                    if !self.jump_to_workspace(id) {
-                        // The fresh view has not landed yet; adopt on the next.
-                        self.adopt_active_view = true;
+                // open the launcher over it, and flash what it made and where. A
+                // deploy waited for its issue's workspace: run the agent there.
+                let creates = |f: &FollowUp| {
+                    matches!(f, FollowUp::Mount | FollowUp::Fork | FollowUp::Deploy(_))
+                };
+                match self.take_follow_up(req, creates) {
+                    Some(FollowUp::Fork) => {
+                        let created = self
+                            .workspaces
+                            .iter()
+                            .find(|w| w.id == id)
+                            .map(|w| (w.name.clone(), w.dir.clone()));
+                        if !self.jump_to_workspace(id) {
+                            // The fresh view has not landed yet; adopt on the next.
+                            self.adopt_active_view = true;
+                        }
+                        self.open_launcher(
+                            false,
+                            created.as_ref().map(|(name, _)| name.clone()),
+                            created.as_ref().map(|(_, dir)| dir.as_path()),
+                        );
+                        if let Some((name, dir)) = created {
+                            self.set_status(format!("workspace {name} → {}", dir.display()));
+                        }
                     }
-                    self.open_launcher(
-                        false,
-                        created.as_ref().map(|(name, _)| name.clone()),
-                        created.as_ref().map(|(_, dir)| dir.as_path()),
-                    );
-                    if let Some((name, dir)) = created {
-                        self.set_status(format!("workspace {name} → {}", dir.display()));
+                    Some(FollowUp::Deploy(mut run)) => {
+                        if let Request::Run { workspace, .. } = run.as_mut() {
+                            *workspace = Some(id);
+                        }
+                        return vec![self.follow(&run, FollowUp::Deployed)];
                     }
+                    _ => {}
                 }
             }
             Response::Merged { pushed, bookmark } => {
                 // The merge landed: report where, then offer to clean up (discard)
                 // the now-merged workspace.
-                let merges = |f| matches!(f, FollowUp::Merge(_));
+                let merges = |f: &FollowUp| matches!(f, FollowUp::Merge(_));
                 if let Some(FollowUp::Merge(id)) = self.take_follow_up(req, merges) {
                     let mut msg = format!("merged into {bookmark}");
                     if pushed {
@@ -854,6 +924,25 @@ impl App {
                     msg.push_str(" — clean up workspace? y/N");
                     self.set_status(msg);
                     self.mode = Mode::ConfirmCleanup(id);
+                }
+            }
+            // A deploy's run landed: follow it to the agent's pane.
+            Response::Ran { tab, pane, .. } => {
+                let deploys = |f: &FollowUp| *f == FollowUp::Deployed;
+                if self.take_follow_up(req, deploys) == Some(FollowUp::Deployed) {
+                    let frames = self.jump_to(tab, Some(pane));
+                    let deployed = self.panes.get(&pane).and_then(|s| {
+                        let issue = s.info.issue.as_ref()?;
+                        Some(format!(
+                            "deployed {} to {}",
+                            issues::label(&issue.id),
+                            s.info.title
+                        ))
+                    });
+                    if let Some(deployed) = deployed {
+                        self.set_status(deployed);
+                    }
+                    return frames;
                 }
             }
             Response::Restored { n, saved } => self.set_status(match saved {
@@ -876,11 +965,11 @@ impl App {
                 self.set_status(crate::render::restored(workspaces, revived, skipped.len()));
             }
             Response::Error { message } => {
-                // A failed new-workspace, guided-create, or merge request must not
-                // later hijack the tab, the launcher, or the cleanup confirm —
-                // and cancels only its own: a refused answer leaves a merge's
-                // cleanup offer standing. An old daemon names no request, so
-                // its refusal cancels them all.
+                // A failed new-workspace, guided-create, merge, or deploy request
+                // must not later hijack the tab, the launcher, the cleanup
+                // confirm, or another workspace — and cancels only its own: a
+                // refused answer leaves a merge's cleanup offer standing. An old
+                // daemon names no request, so its refusal cancels them all.
                 let mounted = match req {
                     Some(req) => self.pending.remove(&req) == Some(FollowUp::Mount),
                     None if self.old_daemon => {
@@ -896,6 +985,7 @@ impl App {
             }
             _ => {}
         }
+        Vec::new()
     }
 
     /// Tag `request` with a fresh `req` and note what its reply completes, so
@@ -911,14 +1001,14 @@ impl App {
     fn take_follow_up(
         &mut self,
         req: Option<u64>,
-        fits: impl Fn(FollowUp) -> bool,
+        fits: impl Fn(&FollowUp) -> bool,
     ) -> Option<FollowUp> {
         let req = match req {
             Some(req) => req,
             None if self.old_daemon => *self
                 .pending
                 .iter()
-                .filter(|(_, f)| fits(**f))
+                .filter(|(_, f)| fits(f))
                 .map(|(req, _)| req)
                 .min()?,
             None => return None,
@@ -1007,6 +1097,10 @@ impl App {
             Mode::Approval(pane) => self.on_key_approval(key, pane),
             Mode::Notes => self.on_key_notes(key),
             Mode::ConfirmClearNotes => self.on_key_confirm_clear_notes(key),
+            Mode::Issues => {
+                self.on_key_issues(key);
+                Vec::new()
+            }
         }
     }
 
@@ -1178,6 +1272,10 @@ impl App {
                     ws.as_ref().map(|(name, _)| name.clone()),
                     ws.as_ref().map(|(_, dir)| dir.as_path()),
                 );
+                Vec::new()
+            }
+            PrefixAction::Issues => {
+                self.open_issues();
                 Vec::new()
             }
             PrefixAction::Integrations => {
@@ -2631,9 +2729,10 @@ impl App {
     /// agents found on PATH, with resume rows for the directory. In a sandbox:
     /// the whole catalog, since what an image carries can't be probed from
     /// here, and no resume rows — those conversations live on this machine.
+    /// Armed with an issue, only the agents, each on the issue's prompt.
     fn rebuild_launcher(&mut self) {
         let registry = Registry::default();
-        self.launcher = match self.launcher_sandbox {
+        let rows = match self.launcher_sandbox {
             Some(_) => launcher::sandbox_rows(&registry),
             None => {
                 let mut rows = launcher::build_rows(&registry, std::env::var_os("PATH").as_deref());
@@ -2650,6 +2749,10 @@ impl App {
                 }
                 rows
             }
+        };
+        self.launcher = match &self.launcher_issue {
+            Some((_, prompt)) => launcher::armed_rows(rows, &registry, prompt),
+            None => rows,
         };
         self.launcher_selected = launcher::first_selectable(&self.launcher);
     }
@@ -2688,11 +2791,17 @@ impl App {
 
     /// The launcher panel title, naming the workspace the choice will run in so
     /// the target is never ambiguous — ` run in <name> `, or a bare ` run ` when
-    /// the target is unknown — and the sandbox, when it runs in one.
+    /// the target is unknown, ` deploy <id> · <title> ` when armed with an
+    /// issue — and the sandbox, when it runs in one.
     pub fn launcher_title(&self) -> String {
-        let place = match &self.launcher_target {
-            Some(name) => format!(" run in {name}"),
-            None => " run".into(),
+        let place = match (&self.launcher_issue, &self.launcher_target) {
+            (Some((issue, _)), _) => format!(
+                " deploy {} · {}",
+                issues::label(&issue.id),
+                launcher::truncate(&issue.title, 40)
+            ),
+            (None, Some(name)) => format!(" run in {name}"),
+            (None, None) => " run".into(),
         };
         match self.launcher_profile() {
             Some(profile) => format!("{place} · sandbox {profile} "),
@@ -2728,7 +2837,12 @@ impl App {
                     self.launcher_sandbox = None;
                     self.launch_shell_and_close()
                 } else {
+                    // An armed launcher backs out to the issues panel.
+                    let armed = self.launcher_issue.is_some();
                     self.close_launcher();
+                    if armed {
+                        self.mode = Mode::Issues;
+                    }
                     Vec::new()
                 }
             }
@@ -2745,7 +2859,10 @@ impl App {
             _ => return Vec::new(),
         };
         match kind {
-            LaunchKind::Agent(cmd) | LaunchKind::Resume(cmd) => self.launch_frames(cmd),
+            LaunchKind::Agent(cmd) | LaunchKind::Resume(cmd) => match self.launcher_issue.take() {
+                Some((issue, _)) => self.deploy_frames(&issue, cmd),
+                None => self.launch_frames(cmd),
+            },
             LaunchKind::Shell => self.launch_shell_and_close(),
             LaunchKind::Command => {
                 self.launcher_command.clear();
@@ -2803,6 +2920,39 @@ impl App {
         vec![run_pane(cmd, sandbox)]
     }
 
+    /// Close the launcher and deploy `issue` on `cmd` — the picked agent
+    /// already on its prompt: a `Run` in a fresh tab of the panel's project
+    /// when deploying here, else a workspace named for the issue first, the
+    /// `Run` following its `WorkspaceCreated`. The `Ran` jumps to the agent.
+    fn deploy_frames(&mut self, issue: &Issue, cmd: Vec<String>) -> Vec<WireFrame> {
+        let sandbox = self.launcher_profile().map(String::from);
+        self.close_launcher();
+        let Some(project) = self.issues_project else {
+            return Vec::new();
+        };
+        let run = Request::Run {
+            workspace: Some(project),
+            dir: None,
+            cmd,
+            sandbox,
+            title: None,
+            issue: Some(issue.link()),
+            from: None,
+        };
+        if self.issues_deploy_here() {
+            return vec![self.follow(&run, FollowUp::Deployed)];
+        }
+        let name = issues::workspace_name(issue);
+        self.set_status(format!("creating workspace {name}…"));
+        let fork = Request::WorkspaceFork {
+            id: project,
+            name,
+            revision: None,
+            dest: None,
+        };
+        vec![self.follow(&fork, FollowUp::Deploy(Box::new(run)))]
+    }
+
     /// Dismiss the launcher back to terminal mode, dropping its transient state.
     fn close_launcher(&mut self) {
         self.mode = Mode::Terminal;
@@ -2814,6 +2964,7 @@ impl App {
         self.launcher_target = None;
         self.launcher_dir = None;
         self.launcher_sandbox = None;
+        self.launcher_issue = None;
         self.status = None;
     }
 
@@ -2969,6 +3120,207 @@ impl App {
     /// installs for the user.
     pub fn setup_project(&self) -> Option<&str> {
         self.setup_project.as_ref().map(|(name, _)| name.as_str())
+    }
+
+    // ---- issues panel ---------------------------------------------------
+
+    /// Open the issues panel over the active project and ask the event loop
+    /// to fetch every configured source there (`take_issue_fetch`).
+    fn open_issues(&mut self) {
+        let Some((id, dir)) = self
+            .active_project()
+            .and_then(|id| self.workspaces.iter().find(|w| w.id == id))
+            .map(|w| (w.id, w.dir.clone()))
+        else {
+            self.set_status("add a project first".into());
+            return;
+        };
+        self.issues_generation += 1;
+        self.issues = vec![None; self.config.issues.len()];
+        self.issues_jj = is_jj_workspace(&dir);
+        self.issues_fetch = (!self.issues.is_empty()).then_some((self.issues_generation, dir));
+        self.issues_project = Some(id);
+        self.issues_query.clear();
+        self.issues_filtering = false;
+        self.issues_selected = 0;
+        self.issues_here = false;
+        self.mode = Mode::Issues;
+        self.status = None;
+    }
+
+    /// The fetch the issues panel asked for as it opened, for the event loop
+    /// to run off its thread: the panel's generation, the project directory
+    /// to run each source in, and the sources. Each result comes back through
+    /// `issues_loaded`.
+    pub fn take_issue_fetch(&mut self) -> Option<(u64, PathBuf, Vec<issues::Source>)> {
+        let (generation, dir) = self.issues_fetch.take()?;
+        Some((generation, dir, self.config.issues.clone()))
+    }
+
+    /// Land what source `index` fetched for panel `generation` — dropped when
+    /// the panel has been reopened since.
+    pub fn issues_loaded(
+        &mut self,
+        generation: u64,
+        index: usize,
+        fetched: Result<Vec<Issue>, String>,
+    ) {
+        if generation == self.issues_generation
+            && let Some(slot) = self.issues.get_mut(index)
+        {
+            *slot = Some(fetched);
+        }
+    }
+
+    /// The panel's rows, source by source in config order: one status row
+    /// for a source still loading or one that failed, else the source's
+    /// issues the filter matches — fuzzily over source, id, title and labels,
+    /// as the go-to overlay filters.
+    pub fn issue_rows(&self) -> Vec<IssueRow<'_>> {
+        let matches = |i: &Issue| {
+            self.issues_query.is_empty()
+                || navigate::score(
+                    &self.issues_query,
+                    &format!("{} {} {} {}", i.source, i.id, i.title, i.labels.join(" ")),
+                )
+                .is_some()
+        };
+        self.config
+            .issues
+            .iter()
+            .zip(&self.issues)
+            .flat_map(|(source, fetched)| match fetched {
+                None => vec![IssueRow::Status {
+                    source: &source.name,
+                    error: None,
+                }],
+                Some(Err(error)) => vec![IssueRow::Status {
+                    source: &source.name,
+                    error: Some(error),
+                }],
+                Some(Ok(found)) => found
+                    .iter()
+                    .filter(|i| matches(i))
+                    .map(IssueRow::Issue)
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// The listed issues, in row order.
+    fn listed_issues(&self) -> Vec<&Issue> {
+        self.issue_rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                IssueRow::Issue(issue) => Some(issue),
+                IssueRow::Status { .. } => None,
+            })
+            .collect()
+    }
+
+    /// The highlighted issue's index into the listed ones, kept in range as
+    /// fetches land and the filter narrows.
+    pub fn issues_selected(&self) -> usize {
+        self.issues_selected
+            .min(self.listed_issues().len().saturating_sub(1))
+    }
+
+    /// The panel's filter text, and whether keys are typing into it.
+    pub fn issues_query(&self) -> (&str, bool) {
+        (&self.issues_query, self.issues_filtering)
+    }
+
+    /// Whether the panel's project is a jj repo, so a deploy can give the
+    /// issue a workspace of its own.
+    pub fn issues_jj(&self) -> bool {
+        self.issues_jj
+    }
+
+    /// Whether a deploy from the panel lands in a fresh tab of its project
+    /// rather than a new workspace: `h` toggles it, and a project outside
+    /// jj, which can have no workspaces, always does.
+    pub fn issues_deploy_here(&self) -> bool {
+        self.issues_here || !self.issues_jj
+    }
+
+    /// The issues panel's title, naming the project it lists for.
+    pub fn issues_title(&self) -> String {
+        match self.issues_project.and_then(|id| self.workspace_name(id)) {
+            Some(name) => format!(" issues · {name} "),
+            None => " issues ".into(),
+        }
+    }
+
+    /// Keys in the issues panel. While the filter is typed (after `/`),
+    /// characters edit it, `enter` keeps it and `esc` clears it; otherwise
+    /// `j`/`k` move, `/` starts the filter, `h` toggles deploying here,
+    /// `enter` opens the launcher armed for the highlighted issue, and `esc`
+    /// closes. The arrows move either way.
+    fn on_key_issues(&mut self, key: KeyEvent) {
+        let typing = self.issues_filtering
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let selected = self.issues_selected();
+        match key.code {
+            KeyCode::Esc if typing => {
+                self.issues_filtering = false;
+                self.issues_query.clear();
+                self.issues_selected = 0;
+            }
+            KeyCode::Enter if typing => self.issues_filtering = false,
+            KeyCode::Backspace if typing => {
+                self.issues_query.pop();
+                self.issues_selected = 0;
+            }
+            KeyCode::Char(c) if typing => {
+                self.issues_query.push(c);
+                self.issues_selected = 0;
+            }
+            KeyCode::Char('j') | KeyCode::Down => self.issues_selected = selected + 1,
+            KeyCode::Char('k') | KeyCode::Up => self.issues_selected = selected.saturating_sub(1),
+            KeyCode::Char('/') => self.issues_filtering = true,
+            KeyCode::Char('h') => self.issues_here = !self.issues_here,
+            KeyCode::Enter => self.arm_deploy(),
+            KeyCode::Esc => {
+                self.mode = Mode::Terminal;
+                self.status = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Open the launcher over the panel's project armed to deploy the
+    /// highlighted issue: its rows run each agent on the issue's rendered
+    /// prompt, and the pick deploys (`deploy_frames`).
+    fn arm_deploy(&mut self) {
+        let Some(issue) = self
+            .listed_issues()
+            .get(self.issues_selected())
+            .map(|&i| i.clone())
+        else {
+            return;
+        };
+        let Some(template) = self
+            .config
+            .issues
+            .iter()
+            .find(|s| s.name == issue.source)
+            .map(|s| s.prompt.clone())
+        else {
+            return;
+        };
+        let Some((name, dir)) = self
+            .issues_project
+            .and_then(|id| self.workspaces.iter().find(|w| w.id == id))
+            .map(|w| (w.name.clone(), w.dir.clone()))
+        else {
+            self.set_status("that project is gone".into());
+            return;
+        };
+        let prompt = issues::prompt(&template, &issue);
+        self.launcher_issue = Some((issue, prompt));
+        self.open_launcher(false, Some(name), Some(&dir));
     }
 
     // ---- go-to overlay --------------------------------------------------
@@ -4600,6 +4952,7 @@ fn placeholder_info(pane: PaneId) -> PaneInfo {
         approval: None,
         source: None,
         sandbox: None,
+        issue: None,
         conversation: None,
         sandbox_name: None,
     }
@@ -9866,5 +10219,303 @@ mod tests {
         assert_eq!(app.launcher_selected(), 2, "j skips the unavailable row");
         app.on_key(plain('k'));
         assert_eq!(app.launcher_selected(), 0, "k skips it too");
+    }
+
+    // ---- issues panel ---------------------------------------------------
+
+    /// Two sources — GitHub, Linear — and a sandbox, so the armed launcher's
+    /// rows (the whole catalog in a sandbox) never depend on this machine's
+    /// PATH.
+    const ISSUES_CONFIG: &str = "[[sandboxes]]\nname = \"orb\"\nimage = \"i\"\n\n\
+         [[issues]]\nname = \"gh\"\nkind = \"github\"\n\n\
+         [[issues]]\nname = \"linear\"\nkind = \"linear\"\n";
+
+    fn issues_config() -> Config {
+        Config::parse(ISSUES_CONFIG).unwrap()
+    }
+
+    /// Project `api` (id 1, one shell in tab 1) at `dir`.
+    fn project_at(dir: &Path) -> Vec<WorkspaceView> {
+        let mut api = workspace(
+            1,
+            "api",
+            None,
+            vec![tab(1, "1", true, leaf(1), vec![shell(1)])],
+        );
+        api.dir = dir.to_path_buf();
+        vec![api]
+    }
+
+    /// A project directory that is a jj repo, as far as the client can tell.
+    fn jj_project(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tutti-issues-{label}-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".jj")).unwrap();
+        dir
+    }
+
+    fn gh_issue(id: &str, title: &str) -> Issue {
+        Issue {
+            source: "gh".into(),
+            id: id.into(),
+            title: title.into(),
+            body: "It loops.".into(),
+            url: Some(format!("https://github.com/acme/api/issues/{id}")),
+            labels: vec!["bug".into()],
+        }
+    }
+
+    /// The panel opened over `dir`'s project, GitHub's fetch landed with two
+    /// issues and Linear's failed.
+    fn issues_panel(dir: &Path) -> App {
+        let mut app = App::with_config(issues_config());
+        attach_with(&mut app, project_at(dir));
+        app.on_key(ctrl('b'));
+        app.on_key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::SHIFT));
+        let (generation, _, _) = app.take_issue_fetch().unwrap();
+        app.issues_loaded(
+            generation,
+            0,
+            Ok(vec![
+                gh_issue("123", "Fix the login redirect"),
+                gh_issue("120", "Docs typo"),
+            ]),
+        );
+        app.issues_loaded(generation, 1, Err("LINEAR_API_KEY is not set".into()));
+        app
+    }
+
+    fn listed(app: &App) -> Vec<String> {
+        app.issue_rows()
+            .iter()
+            .map(|row| match row {
+                IssueRow::Issue(issue) => issue.id.clone(),
+                IssueRow::Status { source, error } => {
+                    format!("[{source}] {}", error.unwrap_or("loading"))
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn prefix_shift_i_opens_the_panel_and_asks_the_loop_to_fetch() {
+        let dir = jj_project("open");
+        let vim = Config::parse(&format!("preset = \"vim\"\n{ISSUES_CONFIG}")).unwrap();
+        for cfg in [issues_config(), vim] {
+            let mut app = App::with_config(cfg);
+            attach_with(&mut app, project_at(&dir));
+            app.on_key(ctrl('b'));
+            let out = app.on_key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::SHIFT));
+            assert!(out.is_empty(), "opening the panel sends nothing");
+            assert_eq!(app.mode, Mode::Issues);
+            assert_eq!(app.issues_title(), " issues · api ");
+            let (generation, at, sources) = app.take_issue_fetch().expect("a fetch to run");
+            assert_eq!(at, dir, "each source runs in the project directory");
+            assert_eq!(sources.len(), 2);
+            assert!(app.take_issue_fetch().is_none(), "asked once");
+            assert_eq!(listed(&app), ["[gh] loading", "[linear] loading"]);
+
+            // A fetch from before the panel reopened is dropped.
+            app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert_eq!(app.mode, Mode::Terminal, "esc closes the panel");
+            app.on_key(ctrl('b'));
+            app.on_key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::SHIFT));
+            app.issues_loaded(generation, 0, Ok(vec![gh_issue("1", "stale")]));
+            assert_eq!(listed(&app), ["[gh] loading", "[linear] loading"]);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn landed_issues_list_by_source_and_slash_filters_them() {
+        let dir = jj_project("filter");
+        let mut app = issues_panel(&dir);
+        assert_eq!(
+            listed(&app),
+            ["123", "120", "[linear] LINEAR_API_KEY is not set"]
+        );
+        app.on_key(plain('j'));
+        assert_eq!(app.issues_selected(), 1);
+        app.on_key(plain('j'));
+        assert_eq!(app.issues_selected(), 1, "stays on the last issue");
+
+        app.on_key(plain('/'));
+        for c in "login".chars() {
+            app.on_key(plain(c));
+        }
+        assert_eq!(app.issues_query(), ("login", true));
+        assert_eq!(
+            listed(&app),
+            ["123", "[linear] LINEAR_API_KEY is not set"],
+            "the filter narrows the issues, not the sources' status"
+        );
+        assert_eq!(app.issues_selected(), 0, "typing re-highlights the top");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.issues_query(), ("login", false), "enter keeps it");
+        assert_eq!(app.mode, Mode::Issues);
+
+        app.on_key(plain('/'));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.issues_query(), ("", false), "esc clears it");
+        assert_eq!(listed(&app).len(), 3);
+        assert_eq!(app.mode, Mode::Issues, "and leaves the panel open");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn enter_arms_the_launcher_and_the_pick_gives_the_issue_its_own_workspace() {
+        let dir = jj_project("deploy");
+        let mut app = issues_panel(&dir);
+        assert!(!app.issues_deploy_here(), "a jj project gets a workspace");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Launcher);
+        assert_eq!(
+            app.launcher_title(),
+            " deploy #123 · Fix the login redirect "
+        );
+        let prompt = "Work on this issue and commit your changes when done.\n\n\
+                      123: Fix the login redirect\n\nIt loops.\n\n\
+                      https://github.com/acme/api/issues/123";
+        let names = |app: &App| -> Vec<String> {
+            app.launcher_rows().iter().map(|r| r.name.clone()).collect()
+        };
+        let claude = app
+            .launcher_rows()
+            .iter()
+            .find(|r| r.name == "claude")
+            .unwrap();
+        assert_eq!(
+            claude.kind,
+            LaunchKind::Agent(vec!["claude".into(), prompt.into()])
+        );
+
+        // In the sandbox every agent that takes a prompt is selectable — and
+        // only those, no shell or command.
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            app.launcher_title(),
+            " deploy #123 · Fix the login redirect · sandbox orb "
+        );
+        assert_eq!(
+            names(&app),
+            [
+                "claude", "codex", "gemini", "opencode", "muse", "vibe", "ori"
+            ]
+        );
+        assert!(app.launcher_rows().iter().all(LauncherRow::selectable));
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let fork = Request::WorkspaceFork {
+            id: WorkspaceId(1),
+            name: "gh-123".into(),
+            revision: None,
+            dest: None,
+        };
+        assert_eq!(out, vec![tagged(&fork, 1)], "the issue's workspace first");
+        assert_eq!(app.mode, Mode::Terminal);
+
+        // Another request's reply moves nothing; the fork's own sends the run.
+        let unrelated = Response::WorkspaceCreated { id: WorkspaceId(7) };
+        assert!(app.handle_response(Some(9), unrelated).is_empty());
+        let out = app.handle_response(Some(1), Response::WorkspaceCreated { id: WorkspaceId(2) });
+        let link = gh_issue("123", "Fix the login redirect").link();
+        let run = Request::Run {
+            workspace: Some(WorkspaceId(2)),
+            dir: None,
+            cmd: vec!["claude".into(), prompt.into()],
+            sandbox: Some("orb".into()),
+            title: None,
+            issue: Some(link.clone()),
+            from: None,
+        };
+        assert_eq!(
+            out,
+            vec![tagged(&run, 2)],
+            "the agent runs there on the issue"
+        );
+
+        // The view carrying the agent lands before its `Ran`, which the
+        // client follows to the agent.
+        let mut view = project_at(&dir);
+        let mut deployed = agent(9, "claude", AgentState::Working);
+        deployed.title = "claude".into();
+        deployed.issue = Some(Box::new(link));
+        view.push(workspace(
+            2,
+            "api-gh-123",
+            None,
+            vec![tab(5, "5", false, leaf(9), vec![deployed])],
+        ));
+        app.handle_event(Event::LayoutChanged { workspaces: view });
+        let ran = Response::Ran {
+            workspace: WorkspaceId(2),
+            tab: TabId(5),
+            pane: PaneId(9),
+        };
+        let out = app.handle_response(Some(2), ran);
+        assert_eq!(
+            (app.active_tab, app.focused),
+            (Some(TabId(5)), Some(PaneId(9)))
+        );
+        assert_eq!(out, vec![control(&Request::TabSelect { id: TabId(5) })]);
+        assert_eq!(app.transient(), Some("deployed #123 to claude"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn h_deploys_into_a_fresh_tab_of_the_project_and_a_failed_workspace_runs_nothing() {
+        let dir = jj_project("here");
+        let mut app = issues_panel(&dir);
+        app.on_key(plain('h'));
+        assert!(app.issues_deploy_here());
+        app.on_key(plain('j'));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let typo = gh_issue("120", "Docs typo");
+        let run = Request::Run {
+            workspace: Some(WorkspaceId(1)),
+            dir: None,
+            cmd: vec![
+                "claude".into(),
+                issues::prompt(issues::DEFAULT_PROMPT, &typo),
+            ],
+            sandbox: Some("orb".into()),
+            title: None,
+            issue: Some(typo.link()),
+            from: None,
+        };
+        assert_eq!(
+            out,
+            vec![tagged(&run, 1)],
+            "here, the run goes straight to the project"
+        );
+
+        // A workspace that fails to come up runs nothing.
+        let mut app = issues_panel(&dir);
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let refused = Response::Error {
+            message: "workspace destination already exists".into(),
+        };
+        assert!(app.handle_response(Some(1), refused).is_empty());
+        let late = Response::WorkspaceCreated { id: WorkspaceId(3) };
+        assert!(app.handle_response(Some(1), late).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_project_outside_jj_deploys_here_and_esc_backs_out_to_the_panel() {
+        // `/tmp/w`, the fixtures' directory, is no jj repo.
+        let mut app = issues_panel(Path::new("/tmp/w"));
+        assert!(!app.issues_jj());
+        assert!(app.issues_deploy_here(), "no workspace to give the issue");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Launcher);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Issues, "esc backs out to the panel");
+        assert_eq!(app.launcher_title(), " run ", "disarmed");
+        assert_eq!(listed(&app).len(), 3, "its issues still listed");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Terminal);
     }
 }

@@ -47,6 +47,11 @@ pub struct AgentSpec {
     /// Argv after the binary for the launcher — empty for agents that open
     /// on a bare run; `ori` needs `code` or it just prints its help.
     pub launch_args: Vec<String>,
+    /// How the agent's interactive mode takes a first message on its command
+    /// line: these args, then the message — empty for a positional prompt
+    /// (`claude <prompt>`), `--prompt` for opencode. `None` when it takes
+    /// none, so nothing can be deployed to it.
+    pub prompt_flags: Option<Vec<String>>,
     pub blocked_patterns: Vec<String>,
     pub working_patterns: Vec<String>,
     pub done_patterns: Vec<String>,
@@ -78,10 +83,44 @@ impl AgentSpec {
             url: url.into(),
             process_names: owned(process_names),
             launch_args: Vec::new(),
+            prompt_flags: None,
             blocked_patterns: owned(blocked_patterns),
             working_patterns: owned(working_patterns),
             done_patterns: owned(done_patterns),
         }
+    }
+
+    /// This spec taking its first message after `flags` (see `prompt_flags`).
+    fn prompted(self, flags: &[&str]) -> Self {
+        AgentSpec {
+            prompt_flags: Some(owned(flags)),
+            ..self
+        }
+    }
+
+    /// The argv launching the agent: its binary, then any launch args.
+    pub fn argv(&self) -> Vec<String> {
+        let binary = self
+            .process_names
+            .first()
+            .cloned()
+            .unwrap_or_else(|| self.kind.to_string());
+        std::iter::once(binary)
+            .chain(self.launch_args.iter().cloned())
+            .collect()
+    }
+
+    /// The argv launching the agent with `prompt` as its first message, or
+    /// `None` when it takes no prompt.
+    pub fn prompted_argv(&self, prompt: &str) -> Option<Vec<String>> {
+        let flags = self.prompt_flags.as_ref()?;
+        Some(
+            self.argv()
+                .into_iter()
+                .chain(flags.iter().cloned())
+                .chain([prompt.to_string()])
+                .collect(),
+        )
     }
 
     /// Blocked (needs input) outranks Working (active task) outranks Done, so the
@@ -176,6 +215,12 @@ impl Default for Registry {
         let guess = |kind: &str, display: &str, url: &str, names: &[&str]| {
             AgentSpec::new(kind, display, url, names, GUESS_BLOCKED, GUESS_WORKING, &[])
         };
+        // Prompt flags come from each tool's own `--help` (claude, opencode,
+        // ori, vibe, muse), or its docs where it isn't installed here (codex:
+        // "Optional text instruction to start the session"; gemini's
+        // `--prompt-interactive`: "Execute prompt and continue in interactive
+        // mode"). crush's interactive mode takes no prompt — `crush run` is
+        // headless — and the rest are unverified, so they take none.
         Registry {
             specs: vec![
                 AgentSpec::new(
@@ -186,7 +231,8 @@ impl Default for Registry {
                     &["Do you want", "y/n", "Waiting for your input", "permission"],
                     &["esc to interrupt", "Thinking", "Running"],
                     &["❯"],
-                ),
+                )
+                .prompted(&[]),
                 AgentSpec::new(
                     "codex",
                     "Codex CLI",
@@ -195,7 +241,8 @@ impl Default for Registry {
                     &["Allow command", "approve", "y/n"],
                     &["esc to interrupt", "Working", "Thinking"],
                     &["»"],
-                ),
+                )
+                .prompted(&[]),
                 // The catalog: name-detection plus guess patterns only. crush
                 // resumes via `crush --session <id>`, but its store is sqlite,
                 // so the resume harvest stays claude-only for now.
@@ -204,8 +251,11 @@ impl Default for Registry {
                     "Gemini CLI",
                     "https://github.com/google-gemini/gemini-cli",
                     &["gemini"],
-                ),
-                guess("opencode", "OpenCode", "https://opencode.ai", &["opencode"]),
+                )
+                .prompted(&["--prompt-interactive"]),
+                // Its TUI submits `--prompt` once a model is ready.
+                guess("opencode", "OpenCode", "https://opencode.ai", &["opencode"])
+                    .prompted(&["--prompt"]),
                 guess(
                     "crush",
                     "Crush",
@@ -252,7 +302,8 @@ impl Default for Registry {
                     GUESS_BLOCKED,
                     &["esc to interrupt", "Thinking", "Working"],
                     &["⟩"],
-                ),
+                )
+                .prompted(&[]),
                 // Mistral Vibe's strings, from its source (2.23.3): the loading
                 // line reads `Thinking (3s Esc to interrupt)` and the approval
                 // dialog is titled `Permission for the <tool> tool`. Its input
@@ -265,7 +316,8 @@ impl Default for Registry {
                     &["Permission for the", "Always allow"],
                     &["to interrupt", "Thinking", "Retrying"],
                     &[],
-                ),
+                )
+                .prompted(&[]),
                 guess(
                     "auggie",
                     "Augment Code",
@@ -290,7 +342,8 @@ impl Default for Registry {
                 // the approval dialog is titled `Permission requested` with
                 // `Allow once` first. Its lowercase transcript echo,
                 // `⚠ permission requested: …`, outlives the dialog — never a
-                // Blocked marker.
+                // Blocked marker. A bare `--prompt` runs one headless turn;
+                // `--interactive` opens the TUI with it as the first.
                 AgentSpec {
                     launch_args: owned(&["code"]),
                     ..AgentSpec::new(
@@ -302,7 +355,8 @@ impl Default for Registry {
                         &["Enter steer", "Thinking…"],
                         &["Ask Ori anything"],
                     )
-                },
+                }
+                .prompted(&["--interactive", "--prompt"]),
             ],
         }
     }
@@ -547,6 +601,37 @@ mod tests {
             Some(&AgentKind::from("codex"))
         );
         assert!(reg.spec(&AgentKind::from("nope")).is_none());
+    }
+
+    /// Each agent takes its first message the way its own CLI does — after
+    /// its launch argv — and one whose interactive mode takes none, or whose
+    /// way is unverified, can't be deployed to.
+    #[test]
+    fn agents_take_a_first_message_their_own_way() {
+        let reg = Registry::default();
+        let argv = |kind: &str| reg.spec(&AgentKind::from(kind))?.prompted_argv("fix it");
+        for (kind, expected) in [
+            ("claude", &["claude", "fix it"][..]),
+            ("codex", &["codex", "fix it"]),
+            ("gemini", &["gemini", "--prompt-interactive", "fix it"]),
+            ("opencode", &["opencode", "--prompt", "fix it"]),
+            (
+                "ori",
+                &["ori", "code", "--interactive", "--prompt", "fix it"],
+            ),
+            ("vibe", &["vibe", "fix it"]),
+            ("muse", &["muse", "fix it"]),
+        ] {
+            assert_eq!(argv(kind).expect(kind), expected);
+        }
+        for kind in ["crush", "aider", "goose", "amazon-q"] {
+            assert_eq!(argv(kind), None, "{kind}");
+        }
+        assert_eq!(
+            reg.spec(&AgentKind::from("ori")).unwrap().argv(),
+            ["ori", "code"],
+            "a plain launch runs the binary and its launch args"
+        );
     }
 
     #[test]

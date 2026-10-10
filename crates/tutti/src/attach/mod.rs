@@ -88,6 +88,8 @@ fn event_loop(
     let mut dirty = true;
     let mut whichkey = false;
     let mut spinner = app.spinner_frame();
+    // The issues panel's fetches report back from their threads.
+    let (issues_tx, issues_rx) = std::sync::mpsc::channel();
 
     loop {
         match conn.drain() {
@@ -102,6 +104,10 @@ fn event_loop(
                 }
             }
             Err(_) => break, // server closed the connection
+        }
+        while let Ok((generation, index, fetched)) = issues_rx.try_recv() {
+            app.issues_loaded(generation, index, fetched);
+            dirty = true;
         }
 
         // The which-key popup appears purely on elapsed time; redraw when its
@@ -148,6 +154,18 @@ fn event_loop(
                 if !event::poll(Duration::ZERO).context("poll terminal input")? {
                     break;
                 }
+            }
+        }
+
+        // An opening issues panel fetches each source on a thread of its own:
+        // `gh` and `curl` must never stall the loop.
+        if let Some((generation, dir, sources)) = app.take_issue_fetch() {
+            for (index, source) in sources.into_iter().enumerate() {
+                let (tx, dir) = (issues_tx.clone(), dir.clone());
+                std::thread::spawn(move || {
+                    let fetched = crate::issues::list(&source, &dir).map_err(|e| format!("{e:#}"));
+                    let _ = tx.send((generation, index, fetched));
+                });
             }
         }
 

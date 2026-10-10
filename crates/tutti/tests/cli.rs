@@ -560,6 +560,93 @@ fn pane_run_sandbox_sends_a_configured_profile_and_refuses_an_unknown_one() {
     let _ = std::fs::remove_dir_all(&config);
 }
 
+/// `issue list` runs a `kind = "command"` source's script in the current
+/// directory and prints what it lists — a table, or the issues as JSON — and
+/// a source that fails is named on stderr, failing the exit without hiding
+/// the others. No daemon is involved.
+#[test]
+fn issue_list_prints_what_a_command_source_lists() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = unique_base("issues");
+    let project = base.join("api");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(base.join("tutti")).unwrap();
+    let script = base.join("jira-issues");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf '[{\"id\":\"PROJ-7\",\"title\":\"Fix the login\",\
+         \"url\":\"https://jira.example/PROJ-7\",\"labels\":[\"p1\"]},\
+         {\"id\":8,\"title\":\"Listed from %s\"}]' \"$(basename \"$(pwd)\")\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        base.join("tutti/config.toml"),
+        format!(
+            "[[issues]]\nname = \"jira\"\nkind = \"command\"\ncommand = [\"{}\"]\n\n\
+             [[issues]]\nname = \"broken\"\nkind = \"command\"\n\
+             command = [\"/bin/sh\", \"-c\", \"echo offline >&2; exit 1\"]\n",
+            script.display()
+        ),
+    )
+    .unwrap();
+    let issue_list = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_tutti"))
+            .args(args)
+            .env("XDG_CONFIG_HOME", &base)
+            .current_dir(&project)
+            .output()
+            .unwrap()
+    };
+
+    let jira = issue_list(&["issue", "list", "--source", "jira"]);
+    assert!(
+        jira.status.success(),
+        "{}",
+        String::from_utf8_lossy(&jira.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(jira.stdout).unwrap(),
+        "SOURCE  ID      TITLE            LABELS  URL\n\
+         jira    PROJ-7  Fix the login    p1      https://jira.example/PROJ-7\n\
+         jira    8       Listed from api  -       -\n",
+        "the script ran in the current directory, `api`"
+    );
+
+    let json = issue_list(&["--json", "issue", "list", "--source", "jira"]);
+    let listed: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(
+        listed[0],
+        serde_json::json!({
+            "source": "jira", "id": "PROJ-7", "title": "Fix the login", "body": "",
+            "url": "https://jira.example/PROJ-7", "labels": ["p1"],
+        })
+    );
+
+    let all = issue_list(&["issue", "list"]);
+    assert_eq!(all.status.code(), Some(1), "a source failed");
+    assert_eq!(
+        String::from_utf8(all.stderr).unwrap(),
+        "error: broken: /bin/sh: offline\n"
+    );
+    assert!(
+        String::from_utf8(all.stdout)
+            .unwrap()
+            .contains("jira    PROJ-7"),
+        "the other source still lists"
+    );
+
+    let unknown = issue_list(&["issue", "list", "--source", "gitlab"]);
+    assert_eq!(unknown.status.code(), Some(1));
+    assert!(
+        String::from_utf8(unknown.stderr)
+            .unwrap()
+            .contains("no issue source \"gitlab\""),
+        "an unknown source is named"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// `pane wait` prints the state that ended the wait, and exits 124 — with a
 /// note on stderr — when the daemon answers that it timed out.
 #[test]
@@ -632,6 +719,7 @@ fn run_prints_the_bare_pane_id() {
                     sandbox: None,
                     title: None,
                     from: None,
+                    issue: None,
                 }
             );
         },

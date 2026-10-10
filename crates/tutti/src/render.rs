@@ -1,5 +1,7 @@
 use tutti_core::{AgentState, Checkpoint, Note, NoteKind, PaneInfo, TabInfo, WorkspaceInfo};
 
+use crate::issues::Issue;
+
 /// Every entry, projects and the workspaces nested under them, each with the
 /// id of the entry it is nested under (`-` for a top-level project).
 pub fn workspaces(items: &[WorkspaceInfo]) -> String {
@@ -63,6 +65,27 @@ pub fn panes(items: &[PaneInfo]) -> String {
         })
         .collect();
     table(&["ID", "TITLE", "AGENT", "STATE", "EXIT"], &rows)
+}
+
+/// Tracker issues: source, the id `issue deploy` takes, title, labels, url.
+pub fn issues(items: &[Issue]) -> String {
+    let rows: Vec<Vec<String>> = items
+        .iter()
+        .map(|i| {
+            vec![
+                i.source.clone(),
+                i.id.clone(),
+                i.title.clone(),
+                if i.labels.is_empty() {
+                    "-".into()
+                } else {
+                    i.labels.join(",")
+                },
+                i.url.clone().unwrap_or_else(|| "-".into()),
+            ]
+        })
+        .collect();
+    table(&["SOURCE", "ID", "TITLE", "LABELS", "URL"], &rows)
 }
 
 /// A pane's checkpoints, newest first: number, age, the turn's stat, the short
@@ -285,6 +308,7 @@ mod tests {
             approval: None,
             source: None,
             sandbox: None,
+            issue: None,
             conversation: None,
             sandbox_name: None,
         }]);

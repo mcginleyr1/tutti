@@ -11,13 +11,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use tutti_core::{AgentState, Checkpoint, Note, NoteKind, PaneId, PaneInfo, SubagentInfo};
 
-use super::app::{App, Mode};
+use super::app::{App, IssueRow, Mode};
 use super::launcher::LauncherRow;
 use super::navigate::{self, Marker};
 use super::sidebar::{AgentRow, SidebarEntry, WorkspaceRow};
 use super::theme;
 use crate::config::{self, Config, Icons, PanelBinding, PrefixAction};
 use crate::integrations::Status;
+use crate::issues::{self, Issue};
 use crate::render::{age, count, note_kind_label, state_label, unix_now};
 
 /// The accent colour of the active theme — the one thing that marks the
@@ -220,6 +221,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_navigate(frame, app, content, spinner);
     }
     draw_notes(frame, app, area);
+    if app.mode == Mode::Issues {
+        draw_issues(frame, app, area);
+    }
 }
 
 /// The top app bar (full width): the accent bar and bold `tutti — <session>`
@@ -987,7 +991,7 @@ fn right_tagged(
 }
 
 /// An agent row: a state dot (a spinner while working) then the pane title (an
-/// accent chip when selected).
+/// accent chip when selected), and the issue it was deployed on, dim.
 fn agent_inner(
     a: &AgentRow,
     sel: bool,
@@ -1003,6 +1007,9 @@ fn agent_inner(
     }
     spans.push(Span::styled(format!("{dot} "), dot_style));
     spans.push(name_span(&a.title, sel, Modifier::empty()));
+    if let Some(issue) = &a.issue {
+        spans.push(Span::styled(format!(" {}", issues::label(issue)), dim()));
+    }
     pad_inner(spans, sel, content_w)
 }
 
@@ -1372,6 +1379,7 @@ fn mode_label(mode: Mode) -> Option<&'static str> {
         Mode::Integrations => Some("SETUP"),
         Mode::Peek(_) => Some("ANSWER"),
         Mode::Navigate => Some("GO TO"),
+        Mode::Issues => Some("ISSUES"),
         Mode::Approval(_) => Some("APPROVE"),
         Mode::Notes => Some("NOTES"),
         Mode::ConfirmClearNotes => Some("CONFIRM"),
@@ -1602,6 +1610,119 @@ fn draw_launcher_command(frame: &mut Frame, app: &App, area: Rect) {
     clear(frame, popup, theme::current().pane_bg);
     let title = app.launcher_title();
     frame.render_widget(Paragraph::new(line).block(popup_block(&title)), popup);
+}
+
+/// The issues panel: a centred popup titled ` issues · <project> ` listing
+/// every configured source's issues — `[source] id  title`, labels and url
+/// dim, the highlighted row with the accent `❯` — with a dim `loading…` row
+/// while a source fetches and its error dim-red when it fails. The filter
+/// input leads while it is typed or set; the keys close the panel, `enter`
+/// saying where a deploy lands. A list taller than the screen shows the
+/// window around the highlight.
+fn draw_issues(frame: &mut Frame, app: &App, area: Rect) {
+    let selected = app.issues_selected();
+    let (mut at, mut n) = (0, 0);
+    let mut body: Vec<Line> = Vec::new();
+    for row in app.issue_rows() {
+        let line = match row {
+            IssueRow::Status {
+                source,
+                error: None,
+            } => Line::from(Span::styled(format!("   [{source}] loading…"), dim())),
+            IssueRow::Status {
+                source,
+                error: Some(error),
+            } => Line::from(Span::styled(
+                format!("   [{source}] {}", error.lines().next().unwrap_or_default()),
+                dim().fg(theme::current().blocked),
+            )),
+            IssueRow::Issue(issue) => {
+                if n == selected {
+                    at = body.len();
+                }
+                n += 1;
+                issue_line(issue, n - 1 == selected)
+            }
+        };
+        body.push(line);
+    }
+    if body.is_empty() {
+        let empty = if app.config().issues.is_empty() {
+            "   no [[issues]] sources in the config"
+        } else {
+            "   no issues"
+        };
+        body.push(Line::from(Span::styled(empty, dim())));
+    }
+    let (query, typing) = app.issues_query();
+    let mut head = Vec::new();
+    if typing || !query.is_empty() {
+        let cursor = if typing { "█" } else { "" };
+        head.push(Line::from(vec![
+            Span::styled(" ▍", Style::default().fg(accent())),
+            Span::styled("filter ", dim()),
+            Span::raw(query.to_string()),
+            Span::styled(cursor, Style::default().fg(accent())),
+        ]));
+    }
+    let here = app.issues_deploy_here();
+    let mut keys = vec![(
+        "enter",
+        if here {
+            "deploy here"
+        } else {
+            "deploy in a new workspace"
+        },
+    )];
+    if app.issues_jj() {
+        keys.push(("h", if here { "new workspace" } else { "here" }));
+    }
+    keys.extend([("/", "filter"), ("esc", "close")]);
+    let mut hint = vec![Span::raw(" ")];
+    hint.extend(two_tone(&keys).0);
+    let foot = [Line::default(), Line::from(hint)];
+    // The list gets what the borders, the input and the keys leave.
+    let room = (area.height as usize)
+        .saturating_sub(2 + head.len() + foot.len())
+        .max(1);
+    let lines = head
+        .into_iter()
+        .chain(
+            body.into_iter()
+                .skip(at.saturating_sub(room - 1))
+                .take(room),
+        )
+        .chain(foot)
+        .collect();
+    draw_centered_popup(frame, area, &app.issues_title(), lines);
+}
+
+/// One issue row: `[source] id  title`, then its labels and url dim. The
+/// highlighted row leads with the accent `❯` and takes the accent on its id
+/// and title.
+fn issue_line(issue: &Issue, selected: bool) -> Line<'static> {
+    let lit = Style::default().fg(accent()).add_modifier(Modifier::BOLD);
+    let (marker, name) = if selected {
+        (Span::styled(" ❯ ", lit), lit)
+    } else {
+        (Span::raw("   "), Style::default())
+    };
+    let mut meta = String::new();
+    if !issue.labels.is_empty() {
+        meta = format!("  {}", issue.labels.join(", "));
+    }
+    if let Some(url) = &issue.url {
+        meta.push_str(&format!("  {url}"));
+    }
+    Line::from(vec![
+        marker,
+        Span::styled(format!("[{}] ", issue.source), dim()),
+        Span::styled(
+            format!("{}  {}", issues::label(&issue.id), issue.title),
+            name,
+        ),
+        Span::styled(meta, dim()),
+    ])
 }
 
 /// The setup panel: a centred rounded panel titled ` setup · user ` — or
@@ -2138,12 +2259,12 @@ fn identity(info: &PaneInfo) -> String {
 }
 
 /// The border badge. The name is dim-bold, followed by a dim `on <profile>`
-/// for a pane running in a sandbox; a detected agent adds a dim `·` then the
-/// state in its colour (a spinner precedes `working`); a plain shell shows
-/// just its name. An exited pane appends a dim `exited <code>` plus the keys
-/// that act on the corpse — `p` pulls a sandbox's pushed work — each in the
-/// accent, so the way back to a dead agent's conversation is visible right
-/// where it died.
+/// for a pane running in a sandbox and the dim id of the issue it was
+/// deployed on; a detected agent adds a dim `·` then the state in its colour
+/// (a spinner precedes `working`); a plain shell shows just its name. An
+/// exited pane appends a dim `exited <code>` plus the keys that act on the
+/// corpse — `p` pulls a sandbox's pushed work — each in the accent, so the
+/// way back to a dead agent's conversation is visible right where it died.
 fn border_title(info: &PaneInfo, spinner: char) -> Line<'static> {
     let mut spans = vec![Span::styled(
         identity(info),
@@ -2151,6 +2272,12 @@ fn border_title(info: &PaneInfo, spinner: char) -> Line<'static> {
     )];
     if let Some(profile) = &info.sandbox {
         spans.push(Span::styled(format!(" on {profile}"), dim()));
+    }
+    if let Some(issue) = &info.issue {
+        spans.push(Span::styled(
+            format!(" {}", issues::label(&issue.id)),
+            dim(),
+        ));
     }
     if info.agent.is_some() {
         spans.push(Span::styled(" · ", dim()));
@@ -2212,6 +2339,7 @@ fn placeholder_title(pane: PaneId) -> PaneInfo {
         approval: None,
         source: None,
         sandbox: None,
+        issue: None,
         conversation: None,
         sandbox_name: None,
     }
@@ -2944,6 +3072,7 @@ mod tests {
             approval: None,
             source: None,
             sandbox: None,
+            issue: None,
             conversation: None,
             sandbox_name: None,
         };
@@ -2963,6 +3092,7 @@ mod tests {
             approval: None,
             source: None,
             sandbox: None,
+            issue: None,
             conversation: None,
             sandbox_name: None,
         };
@@ -2997,6 +3127,7 @@ mod tests {
             approval: None,
             source: None,
             sandbox: None,
+            issue: None,
             conversation: None,
             sandbox_name: None,
         };
@@ -3016,6 +3147,7 @@ mod tests {
             approval: None,
             source: None,
             sandbox: None,
+            issue: None,
             conversation: None,
             sandbox_name: None,
         };
@@ -3685,6 +3817,142 @@ mod tests {
             text.contains("command"),
             "the command row is missing: {text:?}"
         );
+    }
+
+    /// The issues panel over `w`: GitHub's two issues landed, Linear failed.
+    fn issues_app() -> App {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config = Config::parse(
+            "[[issues]]\nname = \"gh\"\nkind = \"github\"\n\n\
+             [[issues]]\nname = \"linear\"\nkind = \"linear\"\n",
+        )
+        .unwrap();
+        let mut app = App::with_config(config);
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Response::Attached {
+                wire_rev: tutti_core::WIRE_REV,
+                session: "demo".into(),
+                workspaces: vec![workspace(
+                    1,
+                    "w",
+                    None,
+                    vec![tab(
+                        1,
+                        "main",
+                        true,
+                        leaf(1),
+                        vec![pane(1, "shell", None, AgentState::Idle)],
+                    )],
+                )],
+                restorable: None,
+                notes: Vec::new(),
+            })
+            .unwrap(),
+        ));
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::SHIFT));
+        let (generation, _, _) = app.take_issue_fetch().unwrap();
+        let issue = |id: &str, title: &str, labels: &[&str]| Issue {
+            source: "gh".into(),
+            id: id.into(),
+            title: title.into(),
+            body: String::new(),
+            url: Some(format!("https://github.com/acme/w/issues/{id}")),
+            labels: labels.iter().map(|l| l.to_string()).collect(),
+        };
+        app.issues_loaded(
+            generation,
+            0,
+            Ok(vec![
+                issue("123", "Fix the login redirect", &["bug"]),
+                issue("120", "Docs typo", &[]),
+            ]),
+        );
+        app.issues_loaded(
+            generation,
+            1,
+            Err("LINEAR_API_KEY is not set (a Linear personal API key)".into()),
+        );
+        app
+    }
+
+    #[test]
+    fn the_issues_panel_lists_each_sources_issues_over_its_keys() {
+        let app = issues_app();
+        let mut terminal = Terminal::new(TestBackend::new(110, 16)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let text = buffer_text(buf);
+        assert!(text.contains(" issues · w "), "the title: {text:?}");
+        let top = row_containing(buf, "#123");
+        let row = row_text(buf, top);
+        assert!(
+            row.contains(
+                "❯ [gh] #123  Fix the login redirect  bug  https://github.com/acme/w/issues/123"
+            ),
+            "the highlighted issue, its labels and url: {row:?}"
+        );
+        let x = col_of(buf, top, "#123") as u16;
+        assert_eq!(
+            buf.cell((x, top as u16)).unwrap().fg,
+            accent(),
+            "one accent"
+        );
+        assert!(row_text(buf, top + 1).contains("   [gh] #120  Docs typo"));
+        let failed = row_containing(buf, "[linear]");
+        assert!(row_text(buf, failed).contains("LINEAR_API_KEY is not set"));
+        let x = col_of(buf, failed, "LINEAR") as u16;
+        assert_eq!(
+            buf.cell((x, failed as u16)).unwrap().fg,
+            theme::current().blocked,
+            "a failed source reads dim-red"
+        );
+        assert!(
+            text.contains("enter deploy here")
+                && text.contains("/ filter")
+                && text.contains("esc close"),
+            "the keys, here because `w` is no jj repo: {text:?}"
+        );
+        assert!(!text.contains("h new workspace"), "nothing for h to toggle");
+        assert!(text.contains(" ISSUES "), "the footer's mode chip");
+    }
+
+    #[test]
+    fn an_issue_linked_agent_shows_its_issue_in_the_sidebar_and_pane_title() {
+        let mut app = app_two_workspaces();
+        let mut view = app.workspaces.clone();
+        view[1].tabs[0].panes[0].issue = Some(Box::new(tutti_core::IssueRef {
+            source: "linear".into(),
+            id: "ENG-42".into(),
+            title: "Fix the login redirect".into(),
+            url: None,
+        }));
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&tutti_core::Event::LayoutChanged { workspaces: view }).unwrap(),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let row = row_containing(buf, "agent ENG-42");
+        let x = col_of(buf, row, "ENG-42") as u16;
+        assert!(
+            buf.cell((x, row as u16))
+                .unwrap()
+                .modifier
+                .contains(Modifier::DIM),
+            "the issue id is metadata: dim beside the bright title"
+        );
+
+        let info = PaneInfo {
+            issue: Some(Box::new(tutti_core::IssueRef {
+                source: "gh".into(),
+                id: "123".into(),
+                title: "Fix it".into(),
+                url: None,
+            })),
+            ..crate::attach::fixtures::agent(1, "claude", AgentState::Blocked)
+        };
+        assert_eq!(title_text(&info), "claude #123 · blocked");
     }
 
     #[test]
@@ -4502,6 +4770,7 @@ mod tests {
             approval: None,
             source: None,
             sandbox: None,
+            issue: None,
             conversation: None,
             sandbox_name: None,
         };

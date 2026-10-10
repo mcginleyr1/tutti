@@ -28,8 +28,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tutti_agents::{ProcessTree, Registry};
 use tutti_core::{
     AgentHookEvent, AgentKind, AgentState, ApprovalDecision, Checkpoint, Direction, Event, Frame,
-    NOTES_CAP, Note, NoteKind, Observation, PaneData, PaneDims, PaneId, PaneInfo, Request,
-    Response, StateEvent, Tagged, WaitFor, WorkspaceId, prompt_fingerprint,
+    IssueRef, NOTES_CAP, Note, NoteKind, Observation, PaneData, PaneDims, PaneId, PaneInfo,
+    Request, Response, StateEvent, Tagged, WaitFor, WorkspaceId, prompt_fingerprint,
 };
 
 use crate::herdr;
@@ -37,7 +37,7 @@ use crate::jj;
 use crate::keys;
 use crate::persist::{self, SavedPane};
 use crate::pty::{PaneSize, PtyPane, Signal, StatusReport};
-use crate::session::{ReportOutcome, Restored, Session};
+use crate::session::{ReportOutcome, Restored, RunTarget, Session};
 
 /// Cadence of the render tick: coalesced pane deltas to attached clients, and
 /// snapshots to watchers.
@@ -783,8 +783,16 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             cmd,
             sandbox,
             title,
+            issue,
             from,
-        } => run_in_fresh_tab(hub, workspace, dir, cmd, sandbox, title, from),
+        } => {
+            let target = RunTarget {
+                workspace,
+                dir,
+                from,
+            };
+            run_in_fresh_tab(hub, target, cmd, sandbox, title, issue)
+        }
         Request::PaneRun {
             tab,
             cmd,
@@ -1351,18 +1359,17 @@ fn declared_agent(hub: &Hub, sandbox: Option<&str>, cmd: &[String]) -> Option<Ag
 /// stat seeded, as `WorkspaceNew` does.
 fn run_in_fresh_tab(
     hub: &Arc<Hub>,
-    workspace: Option<WorkspaceId>,
-    dir: Option<PathBuf>,
+    target: RunTarget,
     cmd: Vec<String>,
     sandbox: Option<String>,
     title: Option<String>,
-    from: Option<PaneId>,
+    issue: Option<IssueRef>,
 ) -> Response {
     let declared = declared_agent(hub, sandbox.as_deref(), &cmd);
     let mut ran = None;
     let response = spawn_pane(hub, |s| {
         let (workspace, tab, pane, mounted) =
-            s.run_in_fresh_tab(workspace, dir, cmd, sandbox, title, from)?;
+            s.run_in_fresh_tab(target, cmd, sandbox, title, issue)?;
         s.set_agent(pane, declared);
         ran = Some((workspace, tab, mounted));
         Ok(pane)

@@ -5,15 +5,17 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
+use tutti_agents::Registry;
 use tutti_core::{
     AgentHookEvent, ApprovalDecision, Direction, Event, PaneId, Request, Response, TabId, WaitFor,
-    WorkspaceId,
+    WorkspaceId, WorkspaceInfo,
 };
 
 use tutti::client::{self, Client, StopOutcome};
 use tutti::config::{Approvals, Config};
 use tutti::hooks;
 use tutti::integrations::{self, Dirs, Integration, Status};
+use tutti::issues;
 use tutti::render;
 
 #[derive(Parser)]
@@ -85,6 +87,12 @@ enum Command {
     Sandbox {
         #[command(subcommand)]
         action: SandboxAction,
+    },
+    /// List tracker issues (`[[issues]]` in the config) and deploy one to an
+    /// agent. Read-only toward the trackers.
+    Issue {
+        #[command(subcommand)]
+        action: IssueAction,
     },
     /// Stream the session's state as JSON lines: a full snapshot of every pane
     /// now and on each change, until the daemon exits. Read-only, beside any
@@ -197,6 +205,41 @@ enum NotesAction {
     },
     /// Empty the history.
     Clear,
+}
+
+#[derive(Subcommand)]
+enum IssueAction {
+    /// List the open issues of every configured source, fetched in the
+    /// current directory (`gh` names its repository from there).
+    List {
+        /// Only this source.
+        #[arg(long)]
+        source: Option<String>,
+    },
+    /// Launch an agent on an issue, the issue as its prompt and the pane
+    /// linked back to it: in a new jj workspace named after the issue under
+    /// the project, or a fresh tab of the project itself with `--here` (or
+    /// when the project is not a jj repo). Prints the new pane's id.
+    Deploy {
+        /// The configured source.
+        source: String,
+        /// The issue's id there (`123`, `ENG-42`).
+        id: String,
+        /// The agent to run; it must take a first message on its command
+        /// line.
+        #[arg(long, default_value = "claude")]
+        agent: String,
+        /// The project to deploy into (default: the one open at the current
+        /// directory).
+        #[arg(long)]
+        project: Option<u64>,
+        /// Run in a fresh tab of the project instead of a new workspace.
+        #[arg(long)]
+        here: bool,
+        /// Run the agent in a k8s sandbox from this config profile.
+        #[arg(long)]
+        sandbox: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -489,6 +532,7 @@ fn run(cli: Cli) -> Result<i32> {
         Some(Command::Sandbox {
             action: SandboxAction::Run { profile, name, cmd },
         }) => tutti::sandbox::run(Config::load()?.sandbox(&profile)?, &name, &cmd),
+        Some(Command::Issue { action }) => run_issue(action, &cli.session, cli.json),
         Some(Command::Watch) => run_watch(&cli.session),
         Some(Command::Hooks {
             agent,
@@ -816,6 +860,7 @@ fn to_request(command: Command) -> Result<Request> {
                 sandbox,
                 title,
                 from: None,
+                issue: None,
             })
         }
         Command::Pane { action } => Ok(match action {
@@ -912,6 +957,7 @@ fn to_request(command: Command) -> Result<Request> {
         | Command::Sandbox {
             action: SandboxAction::Run { .. },
         }
+        | Command::Issue { .. }
         | Command::Watch
         | Command::AgentEvent { .. }
         | Command::Hooks { .. }
@@ -955,6 +1001,136 @@ fn run_wait(
         }
     }
     Ok(0)
+}
+
+/// `issue list` and `issue deploy`. A listing talks to the trackers alone,
+/// from the current directory; a deploy fetches the issue in its project's
+/// directory, then asks the daemon for a workspace named after it (unless
+/// `--here`, or a project outside jj) and the run there.
+fn run_issue(action: IssueAction, session: &str, json: bool) -> Result<i32> {
+    let config = Config::load()?;
+    match action {
+        IssueAction::List { source } => {
+            let sources = match &source {
+                Some(name) => vec![config.issue_source(name)?],
+                None if config.issues.is_empty() => {
+                    bail!("no issue sources configured: add [[issues]] to the config")
+                }
+                None => config.issues.iter().collect(),
+            };
+            let dir = std::env::current_dir().context("resolve current directory")?;
+            let mut listed = Vec::new();
+            let mut failed = false;
+            for source in sources {
+                match issues::list(source, &dir) {
+                    Ok(found) => listed.extend(found),
+                    Err(e) => {
+                        eprintln!("error: {}: {e:#}", source.name);
+                        failed = true;
+                    }
+                }
+            }
+            if json {
+                println!("{}", serde_json::to_string(&listed)?);
+            } else {
+                print!("{}", render::issues(&listed));
+            }
+            Ok(i32::from(failed))
+        }
+        IssueAction::Deploy {
+            source,
+            id,
+            agent,
+            project,
+            here,
+            sandbox,
+        } => {
+            let source = config.issue_source(&source)?;
+            if let Some(name) = &sandbox {
+                config.sandbox(name)?;
+            }
+            // The agent's argv on `prompt`, or why it can't take an issue.
+            let registry = Registry::default();
+            let on = |prompt: &str| {
+                registry
+                    .spec(&agent.as_str().into())
+                    .and_then(|spec| spec.prompted_argv(prompt))
+                    .with_context(|| {
+                        let able: Vec<String> = registry
+                            .specs()
+                            .iter()
+                            .filter(|s| s.prompt_flags.is_some())
+                            .map(|s| s.kind.to_string())
+                            .collect();
+                        format!(
+                            "{agent:?} can't take an issue: a deploy needs an agent that takes its first message on the command line ({})",
+                            able.join(", ")
+                        )
+                    })
+            };
+            on("")?; // before fetching anything
+            let mut client = Client::connect_or_start(session)?;
+            let project = deploy_project(&mut client, project)?;
+            let issue = issues::fetch(source, &id, &project.dir)?;
+            let cmd = on(&issues::prompt(&source.prompt, &issue))?;
+            let workspace = if here || !project.dir.ancestors().any(|d| d.join(".jj").exists()) {
+                project.id
+            } else {
+                match client.request(&Request::WorkspaceFork {
+                    id: project.id,
+                    name: issues::workspace_name(&issue),
+                    revision: None,
+                    dest: None,
+                })? {
+                    Response::WorkspaceCreated { id } => id,
+                    Response::Error { message } => bail!("{message}"),
+                    other => bail!("unexpected reply to workspace add: {other:?}"),
+                }
+            };
+            let response = client.request(&Request::Run {
+                workspace: Some(workspace),
+                dir: None,
+                cmd,
+                sandbox,
+                title: None,
+                issue: Some(issue.link()),
+                from: None,
+            })?;
+            Ok(emit(response, json))
+        }
+    }
+}
+
+/// The project an issue deploys into: project `id`, else the one open at the
+/// current directory — the top-level project either way, as a workspace
+/// stands for the project it is nested under.
+fn deploy_project(client: &mut Client, id: Option<u64>) -> Result<WorkspaceInfo> {
+    let workspaces = match client.request(&Request::WorkspaceList)? {
+        Response::Workspaces { workspaces } => workspaces,
+        other => bail!("unexpected reply to workspace list: {other:?}"),
+    };
+    let cwd = absolutize(Path::new("."));
+    let entry = match id {
+        Some(id) => workspaces
+            .iter()
+            .find(|w| w.id == WorkspaceId(id))
+            .with_context(|| format!("no project {id}"))?,
+        None => workspaces
+            .iter()
+            .filter(|w| cwd.starts_with(&w.dir))
+            .max_by_key(|w| w.dir.components().count())
+            .with_context(|| {
+                format!(
+                    "no project is open at {}; pass --project <id>",
+                    cwd.display()
+                )
+            })?,
+    };
+    Ok(entry
+        .parent
+        .and_then(|p| workspaces.iter().find(|w| w.id == p))
+        .unwrap_or(entry)
+        .clone())
 }
 
 /// Forward one agent hook event (read as JSON on stdin) to the daemon. Built to
@@ -2106,6 +2282,7 @@ mod tests {
                 sandbox: None,
                 title: Some("fixer".into()),
                 from: None,
+                issue: None,
             }
         );
         assert_eq!(
@@ -2117,6 +2294,7 @@ mod tests {
                 sandbox: None,
                 title: None,
                 from: None,
+                issue: None,
             }
         );
         let Request::Run { dir: Some(dir), .. } =
@@ -2171,6 +2349,56 @@ mod tests {
         assert!(
             Cli::try_parse_from(["tutti", "sandbox", "run", "orb", "--", "claude"]).is_err(),
             "the daemon names every sandbox it runs"
+        );
+    }
+
+    #[test]
+    fn issue_verbs_parse() {
+        let issue = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Some(Command::Issue { action }) => action,
+            _ => panic!("expected an issue verb: {args:?}"),
+        };
+        assert!(matches!(
+            issue(&["tutti", "issue", "list"]),
+            IssueAction::List { source: None }
+        ));
+        assert!(matches!(
+            issue(&["tutti", "issue", "list", "--source", "gh"]),
+            IssueAction::List { source: Some(s) } if s == "gh"
+        ));
+        let IssueAction::Deploy {
+            source,
+            id,
+            agent,
+            project,
+            here,
+            sandbox,
+        } = issue(&["tutti", "issue", "deploy", "linear", "ENG-42"])
+        else {
+            panic!("expected a deploy");
+        };
+        assert_eq!(
+            (source.as_str(), id.as_str(), agent.as_str()),
+            ("linear", "ENG-42", "claude"),
+            "claude unless told otherwise"
+        );
+        assert_eq!((project, here, sandbox), (None, false, None));
+        assert!(matches!(
+            issue(&[
+                "tutti", "issue", "deploy", "gh", "123", "--agent", "opencode", "--project",
+                "2", "--here", "--sandbox", "orb"
+            ]),
+            IssueAction::Deploy { agent, project: Some(2), here: true, sandbox: Some(s), .. }
+                if agent == "opencode" && s == "orb"
+        ));
+        assert!(
+            Cli::try_parse_from(["tutti", "issue", "deploy", "gh"]).is_err(),
+            "deploy names the issue"
+        );
+        let cli = Cli::try_parse_from(["tutti", "issue", "list"]).unwrap();
+        assert!(
+            to_request(cli.command.unwrap()).is_err(),
+            "issues are the client's business, not the daemon's"
         );
     }
 

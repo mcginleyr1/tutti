@@ -253,7 +253,7 @@ fn tree(workspaces: &[WorkspaceView], active_tab: Option<TabId>) -> Vec<Entry> {
 /// starts a word (the text's head, or after a space or punctuation). The match
 /// is tried from every occurrence of the query's first char, keeping the best,
 /// so a later clean run beats an early scattered one.
-fn score(query: &str, text: &str) -> Option<u32> {
+pub(super) fn score(query: &str, text: &str) -> Option<u32> {
     let query: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
     let text: Vec<char> = text.chars().flat_map(char::to_lowercase).collect();
     let first = *query.first()?;

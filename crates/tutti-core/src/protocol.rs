@@ -97,7 +97,8 @@ pub enum Request {
     /// tab because an orchestrated agent must never split a tab someone is
     /// using — and the session's current tab stays put, so an attached client
     /// is not yanked over to it. `sandbox` works as in `PaneRun`; `title`
-    /// names the pane.
+    /// names the pane; `issue` links it to the tracker issue it was deployed
+    /// on (`PaneInfo::issue`).
     Run {
         #[serde(default)]
         workspace: Option<WorkspaceId>,
@@ -108,6 +109,8 @@ pub enum Request {
         sandbox: Option<String>,
         #[serde(default)]
         title: Option<String>,
+        #[serde(default)]
+        issue: Option<IssueRef>,
         /// The calling pane (the CLI's `TUTTI_PANE`), so an agent's run lands
         /// beside it rather than wherever the human is looking. `None` from
         /// outside the session's panes and from older clients.
@@ -494,6 +497,11 @@ pub struct PaneInfo {
     /// local pane and from older servers.
     #[serde(default)]
     pub sandbox: Option<String>,
+    /// The tracker issue the pane's agent was deployed on (`Run::issue`);
+    /// `None` for every other pane and from older servers. Boxed: few panes
+    /// carry one, and every `PaneInfo` would carry its room.
+    #[serde(default)]
+    pub issue: Option<Box<IssueRef>>,
     /// The conversation the pane's agent holds, by the agent's own id for it
     /// (Claude's `session_id`, opencode's root `sessionID`) from the latest
     /// hook event naming one — what resuming it takes. Dropped when the agent
@@ -505,6 +513,18 @@ pub struct PaneInfo {
     /// `SandboxPull` fetches. `None` for a local pane and from older servers.
     #[serde(default)]
     pub sandbox_name: Option<String>,
+}
+
+/// The tracker issue a pane was deployed on: the configured source it came
+/// from, its id there (`123`, `ENG-42`), its title, and its link when the
+/// tracker has one. Display only — tutti never writes back to a tracker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueRef {
+    pub source: String,
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 /// One agent turn's checkpoint: the commit id of the workspace's `@` right
@@ -953,6 +973,7 @@ mod tests {
             sandbox: Some("gke".into()),
             title: Some("fixer".into()),
             from: None,
+            issue: Some(sample_issue()),
         });
         roundtrip(&Request::Run {
             workspace: None,
@@ -960,6 +981,7 @@ mod tests {
             cmd: vec!["sh".into()],
             sandbox: None,
             title: None,
+            issue: None,
             from: None,
         });
         roundtrip(&Request::Run {
@@ -968,6 +990,7 @@ mod tests {
             cmd: vec!["claude".into()],
             sandbox: None,
             title: None,
+            issue: None,
             from: Some(PaneId(7)),
         });
         roundtrip(&Request::PaneSplit {
@@ -1146,6 +1169,15 @@ mod tests {
             terminal: Some("com.mitchellh.ghostty".into()),
         });
         roundtrip(&Request::Watch);
+    }
+
+    fn sample_issue() -> IssueRef {
+        IssueRef {
+            source: "linear".into(),
+            id: "ENG-42".into(),
+            title: "Fix the login redirect".into(),
+            url: Some("https://linear.app/acme/issue/ENG-42/fix-the-login-redirect".into()),
+        }
     }
 
     fn sample_checkpoint() -> Checkpoint {
@@ -1329,6 +1361,7 @@ mod tests {
                     approval: None,
                     source: None,
                     sandbox: None,
+                    issue: None,
                     conversation: None,
                     sandbox_name: None,
                 }],
@@ -1377,6 +1410,7 @@ mod tests {
                 }),
                 source: Some(StateSource::Hook),
                 sandbox: Some("gke".into()),
+                issue: Some(Box::new(sample_issue())),
                 conversation: Some("0b9e6c1e-3d2a-4f5b-9c8d-7e6f5a4b3c2d".into()),
                 sandbox_name: Some("tutti-p1-18f2a9c0de".into()),
             }],
@@ -1393,6 +1427,7 @@ mod tests {
                 approval: None,
                 source: Some(StateSource::Program),
                 sandbox: None,
+                issue: None,
                 conversation: None,
                 sandbox_name: None,
             }],
@@ -1713,6 +1748,7 @@ mod tests {
         assert!(pane.subagents.is_empty());
         assert_eq!(pane.source, None);
         assert_eq!(pane.sandbox, None, "and before `sandbox`, a local pane");
+        assert_eq!(pane.issue, None, "and before `issue`, no issue");
         assert_eq!(pane.conversation, None, "and before `conversation`, none");
         assert_eq!(pane.sandbox_name, None, "and before `sandbox_name`, none");
         assert_eq!(pane.approval, None, "and before `approval`, nothing held");
@@ -1849,8 +1885,8 @@ mod tests {
             }
         );
         // `run` with only a command runs locally in the current workspace,
-        // under the command's own title — and from before `from` existed,
-        // from no pane.
+        // under the command's own title, linked to no issue — and from before
+        // `from` existed, from no pane.
         let run: Request = serde_json::from_str(r#"{"type":"run","cmd":["claude"]}"#).unwrap();
         assert_eq!(
             run,
@@ -1861,8 +1897,13 @@ mod tests {
                 sandbox: None,
                 title: None,
                 from: None,
+                issue: None,
             }
         );
+        // An issue from a tracker without links carries no url.
+        let issue: IssueRef =
+            serde_json::from_str(r#"{"source":"jira","id":"PROJ-7","title":"Fix it"}"#).unwrap();
+        assert_eq!(issue.url, None);
         // A bare `session_restore` restores rather than discards.
         let restore: Request = serde_json::from_str(r#"{"type":"session_restore"}"#).unwrap();
         assert_eq!(restore, Request::SessionRestore { discard: false });

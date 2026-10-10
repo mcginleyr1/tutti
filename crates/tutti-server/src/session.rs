@@ -11,9 +11,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tutti_core::{
-    AgentHookEvent, AgentKind, AgentState, Direction, FileStat, Layout, Observation, PaneId,
-    PaneInfo, PendingApproval, StateEvent, StateSource, SubagentInfo, TabId, TabInfo, TabView,
-    WatchPane, WorkspaceId, WorkspaceInfo, WorkspaceView, prompt_fingerprint,
+    AgentHookEvent, AgentKind, AgentState, Direction, FileStat, IssueRef, Layout, Observation,
+    PaneId, PaneInfo, PendingApproval, StateEvent, StateSource, SubagentInfo, TabId, TabInfo,
+    TabView, WatchPane, WorkspaceId, WorkspaceInfo, WorkspaceView, prompt_fingerprint,
 };
 
 use crate::checkpoints::{Noted, Turns};
@@ -429,23 +429,27 @@ impl Session {
         )
     }
 
-    /// `tutti run` under one guard: resolve the workspace — `workspace`, else
-    /// the one with `dir` open (compared canonically), else a fresh mount of
-    /// `dir`, which must exist, else that of `from` (the calling pane), else
-    /// the current one — and spawn `cmd`, titled `title` when given, in a
-    /// fresh tab there: a new tab, or a fresh mount's own empty one. The
-    /// session's current tab stays where it was (an empty session's aside), so
-    /// an attached client's launches still land in the tab it is looking at.
-    /// A failed spawn leaves nothing behind. Returns the workspace, tab and
-    /// pane, and whether the workspace was mounted.
+    /// `tutti run` under one guard: resolve the workspace — `target`'s
+    /// `workspace`, else the one with its `dir` open (compared canonically),
+    /// else a fresh mount of `dir`, which must exist, else that of `from` (the
+    /// calling pane), else the current one — and spawn `cmd`, titled `title`
+    /// when given and linked to `issue`, in a fresh tab there: a new tab, or a
+    /// fresh mount's own empty one. The session's current tab stays where it
+    /// was (an empty session's aside), so an attached client's launches still
+    /// land in the tab it is looking at. A failed spawn leaves nothing behind.
+    /// Returns the workspace, tab and pane, and whether the workspace was
+    /// mounted.
     pub fn run_in_fresh_tab(
         &mut self,
-        workspace: Option<WorkspaceId>,
-        dir: Option<PathBuf>,
+        RunTarget {
+            workspace,
+            dir,
+            from,
+        }: RunTarget,
         cmd: Vec<String>,
         sandbox: Option<String>,
         title: Option<String>,
-        from: Option<PaneId>,
+        issue: Option<IssueRef>,
     ) -> Result<(WorkspaceId, TabId, PaneId, bool)> {
         let current = self.current_tab;
         let (workspace, tab, mounted) = match (workspace, dir) {
@@ -479,10 +483,11 @@ impl Session {
         match &spawned {
             Ok(pane) => {
                 self.current_tab = current.or(Some(tab));
-                if let Some(title) = title
-                    && let Some(slot) = self.panes.get_mut(pane)
-                {
-                    slot.meta.title = title;
+                if let Some(slot) = self.panes.get_mut(pane) {
+                    if let Some(title) = title {
+                        slot.meta.title = title;
+                    }
+                    slot.meta.issue = issue.map(Box::new);
                 }
             }
             Err(_) => {
@@ -1468,6 +1473,7 @@ impl Session {
                     approval: None,
                     source: None,
                     sandbox: None,
+                    issue: None,
                     conversation: None,
                     sandbox_name: None,
                 },
@@ -1507,6 +1513,16 @@ pub struct ReportOutcome {
     pub relisted: bool,
     /// A `(title, body)` notification from the report's `msg`.
     pub notify: Option<(Option<String>, String)>,
+}
+
+/// Where a `tutti run` lands (`Session::run_in_fresh_tab`): `workspace`, else
+/// the one open at `dir`, else a fresh mount of it, else the calling pane
+/// `from`'s workspace, else the current one.
+#[derive(Debug, Default)]
+pub struct RunTarget {
+    pub workspace: Option<WorkspaceId>,
+    pub dir: Option<PathBuf>,
+    pub from: Option<PaneId>,
 }
 
 /// What `Session::restore` brought back, so the server can wire it up.
