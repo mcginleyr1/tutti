@@ -352,13 +352,14 @@ and its answer reach the pane as `Input`.
 | Asked | Bytes | Answered |
 |---|---|---|
 | DA1 | `CSI c`, `CSI 0 c` | `CSI ? 62 ; 22 c` — a VT220 with ANSI colour |
-| DA2 | `CSI > c`, `CSI > 0 c` | `CSI > 1 ; 10 ; 0 c` — a VT220 at firmware 10: old enough that a program sniffing for xterm's version turns nothing extra on |
+| DA2 | `CSI > c`, `CSI > 0 c` | `CSI > 1 ; 277 ; 0 c` — xterm patch 277, as WezTerm answers: Emacs asks a terminal its colours (OSC 10/11, below) only from 242 up, and guesses a light background under it |
 | DSR | `CSI 5 n` | `CSI 0 n` |
 | CPR | `CSI 6 n` | `CSI row ; col R`, 1-based, read once the parser has every byte before the query; a pending wrap reports the last column |
 | Colours | `OSC 10 ; ?`, `OSC 11 ; ?`, `OSC 12 ; ?` | `OSC 1x ; rgb:rrrr/gggg/bbbb`, closed as asked (BEL, or `ESC \`) — only once a client has reported its terminal's colours, and OSC 12 only with a cursor colour; else unanswered, and passed on |
 | Light/dark | `CSI ? 996 n` | `CSI ? 997 ; 1 n` (dark) or `; 2 n` (light) — only with colours reported |
 | Mode 2031 | `CSI ? 2031 h` / `l` | nothing: the daemon keeps the mode per pane, and never passes it on |
 | DECRQM 2031 | `CSI ? 2031 $ p` | `CSI ? 2031 ; 1 $ y` (set) or `; 2 $ y` (reset) |
+| modifyOtherKeys | `CSI > 4 m`, `CSI > 4 ; 0 m`, `; 1 m`, `; 2 m` | nothing: dropped, never passed on. A pane only ever gets legacy keys — the TUI encodes no other — and a `pane attach` terminal that took it (nvim and vim ask for level 2, Emacs for 1) would encode the prefix where the detach cannot see it, and keep it after the detach |
 
 Each is matched exactly as spelled — parameter and intermediate bytes and final byte; C0
 controls inside execute as in vte — so `CSI 00 c`, `CSI ? 6 n` or `CSI ? 1049 ; 2031 h` go

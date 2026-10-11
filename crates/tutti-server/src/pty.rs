@@ -354,7 +354,7 @@ impl Term {
     fn owned(&mut self, owned: Owned, answers: &mut Vec<u8>) -> bool {
         match owned {
             Owned::Primary => answers.extend_from_slice(b"\x1b[?62;22c"),
-            Owned::Secondary => answers.extend_from_slice(b"\x1b[>1;10;0c"),
+            Owned::Secondary => answers.extend_from_slice(b"\x1b[>1;277;0c"),
             Owned::Status => answers.extend_from_slice(b"\x1b[0n"),
             Owned::Cursor => {
                 let screen = self.parser.screen();
@@ -373,6 +373,7 @@ impl Term {
                 let mode = if self.theme_updates { 1 } else { 2 };
                 answers.extend(format!("\x1b[?2031;{mode}$y").into_bytes());
             }
+            Owned::OtherKeys => {}
         }
         true
     }
@@ -654,9 +655,10 @@ enum Hit {
 enum Owned {
     /// DA1, answered as a VT220 with ANSI colour: `CSI ? 62 ; 22 c`.
     Primary,
-    /// DA2, answered as a VT220 at firmware 10 (`CSI > 1 ; 10 ; 0 c`): an
-    /// identity old enough that a program sniffing for xterm's version turns
-    /// nothing extra on.
+    /// DA2, answered as xterm patch 277 (`CSI > 1 ; 277 ; 0 c`, as WezTerm
+    /// does): Emacs asks a terminal its colours (OSC 10/11), which the daemon
+    /// answers, only from version 242 up, and guesses a light background
+    /// below it.
     Secondary,
     /// DSR, answered "OK": `CSI 0 n`.
     Status,
@@ -669,12 +671,17 @@ enum Owned {
     ThemeUpdates(bool),
     /// DECRQM for mode 2031, answered `CSI ? 2031 ; 1|2 $ y` (1 set).
     ThemeUpdatesMode,
+    /// xterm's modifyOtherKeys set or reset (`CSI > 4 ; N m`): dropped. A
+    /// pane only ever gets legacy keys — the TUI encodes no other — and a
+    /// `pane attach` terminal that took it would encode the prefix where the
+    /// detach cannot see it (nvim and vim ask for level 2, Emacs for 1).
+    OtherKeys,
 }
 
 /// Each owned CSI by its parameter and intermediate bytes and final byte —
 /// exactly so: `CSI 00 c`, `CSI ? 6 n`, `CSI ? 1049 ; 2031 h` are not ones.
 /// C0 controls inside execute as vte executes them.
-const CSI_OWNED: [(&[u8], u8, Owned); 10] = [
+const CSI_OWNED: [(&[u8], u8, Owned); 14] = [
     (b"", b'c', Owned::Primary),
     (b"0", b'c', Owned::Primary),
     (b">", b'c', Owned::Secondary),
@@ -685,6 +692,10 @@ const CSI_OWNED: [(&[u8], u8, Owned); 10] = [
     (b"?2031", b'h', Owned::ThemeUpdates(true)),
     (b"?2031", b'l', Owned::ThemeUpdates(false)),
     (b"?2031$", b'p', Owned::ThemeUpdatesMode),
+    (b">4", b'm', Owned::OtherKeys),
+    (b">4;0", b'm', Owned::OtherKeys),
+    (b">4;1", b'm', Owned::OtherKeys),
+    (b">4;2", b'm', Owned::OtherKeys),
 ];
 
 /// More CSI parameter and intermediate bytes than any owned one has.
@@ -2657,22 +2668,24 @@ mod tests {
 
     /// Every CSI the daemon owns and every colour query, wherever reads cut
     /// the stream: each answered once and in order — a cursor report where
-    /// the cursor stood, a row scrolled and all; mode 2031 tracked — and
-    /// dropped from what the taps get, which is everything else: near
-    /// misses, an OSC query an `ESC` cuts short, the `ESC` before another.
+    /// the cursor stood, a row scrolled and all; mode 2031 tracked;
+    /// modifyOtherKeys ignored — and dropped from what the taps get, which is
+    /// everything else: near misses, an OSC query an `ESC` cuts short, the
+    /// `ESC` before another.
     #[test]
     fn owned_queries_are_answered_and_kept_from_the_taps_across_any_cut() {
         let stream: &[u8] = b"ab\x1b[c\x1b[0cX\x1b[>c\x1b[>0c\r\nL1\r\nL2\r\nL3\x1b[5n\x1b[6n\
             \x1b[?996n\x1b[?2031$p\x1b[?2031h\x1b[?2031$p\x1b[?2031l\
+            \x1b[>4;2m\x1b[>4;1m\x1b[>4;0m\x1b[>4m\
             \x1b]10;?\x07\x1b]11;?\x1b\\\x1b]12;?\x07\
-            \x1b[?6n\x1b[1c\x1b[00c\x1b[=c\x1b[6;1n\x1b[?2031;1h\x1b[\x076n\
+            \x1b[?6n\x1b[1c\x1b[00c\x1b[=c\x1b[6;1n\x1b[?2031;1h\x1b[\x076n\x1b[>4;2;1m\x1b[?4m\
             \x1b]11;?x\x07\x1b]110\x07\x1b]11;rgb:0/0/0\x07\x1b]0;t\x1b\\\
             \x1b]11;?\x1b[c\x1b]1\x1b[5nend\x1b\x1b[6n";
         let raw: &[u8] = b"abX\r\nL1\r\nL2\r\nL3\
-            \x1b[?6n\x1b[1c\x1b[00c\x1b[=c\x1b[6;1n\x1b[?2031;1h\
+            \x1b[?6n\x1b[1c\x1b[00c\x1b[=c\x1b[6;1n\x1b[?2031;1h\x1b[>4;2;1m\x1b[?4m\
             \x1b]11;?x\x07\x1b]110\x07\x1b]11;rgb:0/0/0\x07\x1b]0;t\x1b\\\
             \x1b]11;?\x1b]1end\x1b";
-        let answers: &[u8] = b"\x1b[?62;22c\x1b[?62;22c\x1b[>1;10;0c\x1b[>1;10;0c\
+        let answers: &[u8] = b"\x1b[?62;22c\x1b[?62;22c\x1b[>1;277;0c\x1b[>1;277;0c\
             \x1b[0n\x1b[3;3R\x1b[?997;2n\x1b[?2031;2$y\x1b[?2031;1$y\
             \x1b]10;rgb:6565/7b7b/8383\x07\x1b]11;rgb:fdfd/f6f6/e3e3\x1b\\\
             \x1b]12;rgb:5858/6e6e/7575\x07\x1b[3;3R\x1b[?62;22c\x1b[0n\x1b[3;6R";

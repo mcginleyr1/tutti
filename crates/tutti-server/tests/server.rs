@@ -1906,7 +1906,7 @@ async fn a_panes_terminal_queries_are_answered_and_kept_from_its_streams() {
     let server = TestServer::start();
     let mut control = server.connect().await;
     let script = "stty -echo -icanon; echo ready; read -r go; \
-                  printf 'ab\\033[c\\033[>c\\033[5n\\033[6n'; head -c 29 | tr '\\033' E; sleep 30";
+                  printf 'ab\\033[c\\033[>c\\033[5n\\033[6n'; head -c 30 | tr '\\033' E; sleep 30";
     let pane = run_marker(&mut control, script).await;
     assert!(read_until(&mut control, pane, "ready").await);
     let mut stream = server.connect().await;
@@ -1917,7 +1917,7 @@ async fn a_panes_terminal_queries_are_answered_and_kept_from_its_streams() {
             bytes: b"go\r".to_vec(),
         })
         .await;
-    let answered = "abE[?62;22cE[>1;10;0cE[0nE[2;3R";
+    let answered = "abE[?62;22cE[>1;277;0cE[0nE[2;3R";
     let mut terminal = vt100::Parser::new(24, 80, 0);
     let (raw, _) = stream_until(&mut stream, &mut terminal, |screen| {
         screen.contents().contains(answered)
