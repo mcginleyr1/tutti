@@ -2163,6 +2163,10 @@ fn help_lines(cfg: &Config) -> Vec<Line<'static>> {
     lines.push(popup_key_line("  Ctrl+h/j/k/l", "focus by direction"));
     lines.push(popup_key_line("  Alt+h/j/k/l", "resize split"));
     lines.push(popup_key_line("  Alt+x", "kill pane"));
+    lines.push(Line::styled(
+        "  (a pane setting TUTTI_KEYS=pane gets these itself)",
+        dim(),
+    ));
     // The panels' own keys, each headed by the prefix key that focuses it.
     for (panel, focus, entries) in [
         (
@@ -2342,6 +2346,7 @@ fn placeholder_title(pane: PaneId) -> PaneInfo {
         issue: None,
         conversation: None,
         sandbox_name: None,
+        user_vars: Default::default(),
     }
 }
 
@@ -3075,6 +3080,7 @@ mod tests {
             issue: None,
             conversation: None,
             sandbox_name: None,
+            user_vars: Default::default(),
         };
         assert_eq!(title_text(&info), "claude · blocked");
     }
@@ -3095,6 +3101,7 @@ mod tests {
             issue: None,
             conversation: None,
             sandbox_name: None,
+            user_vars: Default::default(),
         };
         assert_eq!(title_text(&info), "claude · ⠋ working");
     }
@@ -3130,6 +3137,7 @@ mod tests {
             issue: None,
             conversation: None,
             sandbox_name: None,
+            user_vars: Default::default(),
         };
         assert_eq!(title_text(&info), "zsh", "no `· unknown` suffix");
     }
@@ -3150,6 +3158,7 @@ mod tests {
             issue: None,
             conversation: None,
             sandbox_name: None,
+            user_vars: Default::default(),
         };
         assert_eq!(
             title_text(&info),
@@ -3417,6 +3426,10 @@ mod tests {
         assert!(
             text.contains("direct keys"),
             "help missing direct keys section: {text:?}"
+        );
+        assert!(
+            text.contains("TUTTI_KEYS=pane"),
+            "help missing the direct keys' hand-off: {text:?}"
         );
         // The sidebar section documents the workspace, merge, update-stale, and
         // kill keys.
@@ -4773,6 +4786,7 @@ mod tests {
             issue: None,
             conversation: None,
             sandbox_name: None,
+            user_vars: Default::default(),
         };
         let focused = pane_title_line(&info, true, ' ');
         assert_eq!(

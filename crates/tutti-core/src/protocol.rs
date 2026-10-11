@@ -1,8 +1,9 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{AgentKind, Direction, Layout};
+use crate::domain::{AgentKind, Direction, Layout, Toward};
 use crate::ids::{PaneId, TabId, WorkspaceId};
 use crate::state::{AgentState, StateSource};
 
@@ -10,7 +11,7 @@ use crate::state::{AgentState, StateSource};
 /// Response / Event shapes (including additive fields): the daemon reports it
 /// on attach and mismatched clients tell the user to restart the daemon —
 /// binaries upgrade on install, running daemons do not.
-pub const WIRE_REV: u32 = 9;
+pub const WIRE_REV: u32 = 10;
 
 /// The most notes the daemon's notification history keeps, the oldest going
 /// first. A client caps its copy the same, so the two agree.
@@ -219,6 +220,29 @@ pub enum Request {
     PaneFocus {
         pane: PaneId,
     },
+    /// Focus the pane `toward` of `from` in its tab (`Layout::neighbor`, with
+    /// `wrap`) as `PaneFocus` would, answered with `Response::Neighbor` —
+    /// whose `pane` is `None` at an edge, nothing focused. `from` defaults to
+    /// the attached client's focused pane; Error when there is none.
+    PaneFocusToward {
+        #[serde(default)]
+        from: Option<PaneId>,
+        toward: Toward,
+        #[serde(default)]
+        wrap: bool,
+    },
+    /// Move the border of the nearest split enclosing `from` on `toward`'s
+    /// axis that way by `delta` — what a direct resize key's
+    /// `PaneResizeSplit` does. `from` defaults as in `PaneFocusToward`.
+    PaneResizeToward {
+        #[serde(default)]
+        from: Option<PaneId>,
+        toward: Toward,
+        delta: f32,
+    },
+    /// The session's whole view, as an attached client renders it, answered
+    /// with `Response::View` — without attaching.
+    View,
     /// The notification history, oldest first — only its unread notes with
     /// `unread` — answered with `Response::Notes`.
     NotesList {
@@ -513,6 +537,11 @@ pub struct PaneInfo {
     /// `SandboxPull` fetches. `None` for a local pane and from older servers.
     #[serde(default)]
     pub sandbox_name: Option<String>,
+    /// What the pane's programs set with OSC 1337 `SetUserVar` (iTerm2's
+    /// user variables) — `TUTTI_KEYS`, `TUTTI_EDITOR` — by name. Gone with
+    /// the daemon: a restored pane starts with none. Empty from older servers.
+    #[serde(default)]
+    pub user_vars: BTreeMap<String, String>,
 }
 
 /// The tracker issue a pane was deployed on: the configured source it came
@@ -583,6 +612,9 @@ pub struct WatchPane {
     pub exited: Option<i32>,
     /// Whether this is the attached client's focused pane.
     pub focused: bool,
+    /// As `PaneInfo::user_vars`.
+    #[serde(default)]
+    pub user_vars: BTreeMap<String, String>,
 }
 
 /// One subagent row under a hook-driven agent in the sidebar: a short
@@ -675,6 +707,17 @@ pub enum Response {
     },
     PaneCreated {
         id: PaneId,
+    },
+    /// A `PaneFocusToward` answered: the pane it started `from`, and the one
+    /// `toward` it now focused — `None` at an edge, where nothing moved.
+    Neighbor {
+        from: PaneId,
+        toward: Toward,
+        pane: Option<PaneId>,
+    },
+    /// A `View` answered: every workspace, its tabs, layouts and panes.
+    View {
+        workspaces: Vec<WorkspaceView>,
     },
     /// A `PaneWait` ended: `pane` as it is now, its `state` the one that
     /// satisfied the wait — or, when `timed_out`, the one it is still in.
@@ -1053,6 +1096,22 @@ mod tests {
             offset: 120,
         });
         roundtrip(&Request::PaneFocus { pane: PaneId(2) });
+        roundtrip(&Request::PaneFocusToward {
+            from: Some(PaneId(2)),
+            toward: Toward::Left,
+            wrap: true,
+        });
+        roundtrip(&Request::PaneFocusToward {
+            from: None,
+            toward: Toward::Down,
+            wrap: false,
+        });
+        roundtrip(&Request::PaneResizeToward {
+            from: Some(PaneId(2)),
+            toward: Toward::Up,
+            delta: 0.05,
+        });
+        roundtrip(&Request::View);
         roundtrip(&Request::NotesList { unread: true });
         roundtrip(&Request::NotesRead {
             up_to: Some(7),
@@ -1364,6 +1423,7 @@ mod tests {
                     issue: None,
                     conversation: None,
                     sandbox_name: None,
+                    user_vars: BTreeMap::from([("TUTTI_KEYS".into(), "pane".into())]),
                 }],
             }],
         }]
@@ -1413,6 +1473,7 @@ mod tests {
                 issue: Some(Box::new(sample_issue())),
                 conversation: Some("0b9e6c1e-3d2a-4f5b-9c8d-7e6f5a4b3c2d".into()),
                 sandbox_name: Some("tutti-p1-18f2a9c0de".into()),
+                user_vars: BTreeMap::from([("TUTTI_EDITOR".into(), "nvim /tmp/nvim.sock".into())]),
             }],
         });
         roundtrip(&Response::Panes {
@@ -1430,7 +1491,18 @@ mod tests {
                 issue: None,
                 conversation: None,
                 sandbox_name: None,
+                user_vars: BTreeMap::new(),
             }],
+        });
+        for pane in [Some(PaneId(3)), None] {
+            roundtrip(&Response::Neighbor {
+                from: PaneId(2),
+                toward: Toward::Right,
+                pane,
+            });
+        }
+        roundtrip(&Response::View {
+            workspaces: sample_view(),
         });
         roundtrip(&Response::Notes {
             notes: vec![sample_note()],
@@ -1585,6 +1657,7 @@ mod tests {
                 source: Some(StateSource::Hook),
                 exited: None,
                 focused: true,
+                user_vars: BTreeMap::from([("TUTTI_KEYS".into(), "pane".into())]),
             }],
         }
     }
@@ -1598,7 +1671,8 @@ mod tests {
             concat!(
                 r#"{"type":"snapshot","session":"tutti","wire_rev":6,"attached_terminal":"com.mitchellh.ghostty","#,
                 r#""panes":[{"id":3,"workspace":"smartnotch","dir":"/Users/me/develop/smartnotch","tab":"main","#,
-                r#""title":"claude","agent":"claude","state":"working","source":"hook","exited":null,"focused":true}]}"#
+                r#""title":"claude","agent":"claude","state":"working","source":"hook","exited":null,"focused":true,"#,
+                r#""user_vars":{"TUTTI_KEYS":"pane"}}]}"#
             )
         );
     }
@@ -1751,7 +1825,27 @@ mod tests {
         assert_eq!(pane.issue, None, "and before `issue`, no issue");
         assert_eq!(pane.conversation, None, "and before `conversation`, none");
         assert_eq!(pane.sandbox_name, None, "and before `sandbox_name`, none");
+        assert!(pane.user_vars.is_empty(), "and before `user_vars`, none");
         assert_eq!(pane.approval, None, "and before `approval`, nothing held");
+        // A watcher's pane from before `user_vars` existed has none.
+        let watched: WatchPane = serde_json::from_str(concat!(
+            r#"{"id":3,"workspace":"w","dir":"/w","tab":"t","title":"sh","agent":null,"#,
+            r#""state":"idle","source":null,"exited":null,"focused":false}"#
+        ))
+        .unwrap();
+        assert!(watched.user_vars.is_empty());
+        // A directional focus naming neither its source nor `wrap` starts at
+        // the attached client's pane and stops at the edge.
+        let focus: Request =
+            serde_json::from_str(r#"{"type":"pane_focus_toward","toward":"left"}"#).unwrap();
+        assert_eq!(
+            focus,
+            Request::PaneFocusToward {
+                from: None,
+                toward: Toward::Left,
+                wrap: false,
+            }
+        );
         // ...and before `checkpoints` existed, to no checkpoints.
         assert!(pane.checkpoints.is_empty());
         // A checkpoint from before `prompt` existed lists as its label.

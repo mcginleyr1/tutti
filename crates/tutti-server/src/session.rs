@@ -3,7 +3,7 @@
 //! it just answers the operations the dispatcher maps requests onto and reports
 //! which panes it touched so the caller can drive the pty lifecycle.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tutti_core::{
     AgentHookEvent, AgentKind, AgentState, Direction, FileStat, IssueRef, Layout, Observation,
     PaneId, PaneInfo, PendingApproval, StateEvent, StateSource, SubagentInfo, TabId, TabInfo,
-    TabView, WatchPane, WorkspaceId, WorkspaceInfo, WorkspaceView, prompt_fingerprint,
+    TabView, Toward, WatchPane, WorkspaceId, WorkspaceInfo, WorkspaceView, prompt_fingerprint,
 };
 
 use crate::checkpoints::{Noted, Turns};
@@ -31,6 +31,9 @@ pub const STALL_AFTER: Duration = Duration::from_secs(30);
 /// The least gap between two OSC 7501 `msg` notifications from one pane (the
 /// program-status spec's rate limit).
 const REPORT_NOTIFY_EVERY: Duration = Duration::from_secs(30);
+/// The most user vars (OSC 1337) one pane keeps; a new name past it is
+/// dropped.
+const USER_VARS_CAP: usize = 16;
 
 struct TabEntry {
     id: TabId,
@@ -572,6 +575,7 @@ impl Session {
                         source: slot.meta.source,
                         exited: slot.meta.exited,
                         focused: focused == Some(slot.meta.id),
+                        user_vars: slot.meta.user_vars.clone(),
                     })
             })
             .collect()
@@ -655,6 +659,44 @@ impl Session {
             .with_context(|| format!("no pane {pane}"))?;
         slot.meta.title = title;
         Ok(())
+    }
+
+    /// Set one of `pane`'s user vars (OSC 1337 `SetUserVar`); an empty
+    /// `value` unsets it, and a new name past `USER_VARS_CAP` is dropped.
+    /// Returns whether the pane's vars changed.
+    pub fn set_user_var(&mut self, pane: PaneId, name: String, value: String) -> bool {
+        let Some(vars) = self.panes.get_mut(&pane).map(|s| &mut s.meta.user_vars) else {
+            return false;
+        };
+        if value.is_empty() {
+            return vars.remove(&name).is_some();
+        }
+        if vars.len() >= USER_VARS_CAP && !vars.contains_key(&name) {
+            return false;
+        }
+        vars.insert(name, value.clone()) != Some(value)
+    }
+
+    /// The pane `toward` of `pane` in its tab (`Layout::neighbor`), `None` at
+    /// an edge.
+    pub fn pane_neighbor(
+        &self,
+        pane: PaneId,
+        toward: Toward,
+        wrap: bool,
+    ) -> Result<Option<PaneId>> {
+        let tab = self
+            .panes
+            .get(&pane)
+            .with_context(|| format!("no pane {pane}"))?
+            .tab;
+        Ok(self
+            .workspaces
+            .iter()
+            .flat_map(|w| &w.tabs)
+            .find(|t| t.id == tab)
+            .and_then(|t| t.layout.as_ref())
+            .and_then(|layout| layout.neighbor(pane, toward, wrap)))
     }
 
     /// Type `bytes` into `pane`. Input past a finished program's own report —
@@ -1478,6 +1520,7 @@ impl Session {
                     issue: None,
                     conversation: None,
                     sandbox_name: None,
+                    user_vars: BTreeMap::new(),
                 },
                 pty,
                 tab,
@@ -1728,6 +1771,33 @@ mod tests {
     fn state_of(session: &Session, pane: PaneId) -> (AgentState, Option<StateSource>) {
         let info = info(session, pane);
         (info.state, info.source)
+    }
+
+    #[test]
+    fn user_vars_set_replace_unset_and_cap_at_sixteen() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let mut set = |name: &str, value: &str| s.set_user_var(pane, name.into(), value.into());
+        assert!(set("TUTTI_KEYS", "pane"));
+        assert!(!set("TUTTI_KEYS", "pane"), "the same value changes nothing");
+        assert!(set("TUTTI_KEYS", "tutti"));
+        assert!(set("TUTTI_KEYS", ""), "an empty value unsets");
+        assert!(
+            !set("TUTTI_KEYS", ""),
+            "unsetting an unset var changes nothing"
+        );
+        for n in 0..super::USER_VARS_CAP {
+            assert!(set(&format!("V{n}"), "1"));
+        }
+        assert!(
+            !set("ONE_TOO_MANY", "1"),
+            "a new name past the cap is dropped"
+        );
+        assert!(set("V0", "2"), "a held name still changes");
+        assert!(!s.set_user_var(PaneId(99), "A".into(), "1".into()));
+        let vars = info(&s, pane).user_vars;
+        assert_eq!(vars.len(), super::USER_VARS_CAP);
+        assert_eq!(vars.get("V0").map(String::as_str), Some("2"));
+        assert!(!vars.contains_key("ONE_TOO_MANY"));
     }
 
     #[test]

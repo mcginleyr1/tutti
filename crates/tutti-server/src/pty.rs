@@ -360,7 +360,8 @@ pub struct PtyPane {
     /// Bells and OSC 9 / 777 desktop notifications pulled from the raw output
     /// stream, drained by the broadcast tick — interleaved, in stream order,
     /// with the program's own status reports (OSC 9;4 / 7501), the one signal
-    /// here that does feed pane state (under the source ranking).
+    /// here that does feed pane state (under the source ranking), and its
+    /// user vars (OSC 1337).
     notifications: Arc<Mutex<Vec<Signal>>>,
     reader_thread: Option<JoinHandle<()>>,
     wait_thread: Option<JoinHandle<()>>,
@@ -742,12 +743,14 @@ pub struct StatusReport {
     pub msg: Option<String>,
 }
 
-/// What the scanner pulls from a raw pty stream: an attention signal, or the
-/// program's word on its state.
+/// What the scanner pulls from a raw pty stream: an attention signal, the
+/// program's word on its state, or one of its user vars (OSC 1337
+/// `SetUserVar`) — an empty `value` unsets it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Signal {
     Notify(Notification),
     Status(StatusReport),
+    UserVar { name: String, value: String },
 }
 
 /// Largest OSC payload buffered; a longer sequence is consumed but discarded so
@@ -763,6 +766,10 @@ const KEY_MAX: usize = 16;
 const APP_MAX: usize = 32;
 const MSG_MAX: (usize, usize) = (2732, 2048);
 const TITLE_MAX: (usize, usize) = (256, 192);
+/// OSC 1337 user var limits: the longest name, and the longest value once
+/// decoded.
+const USER_VAR_NAME_MAX: usize = 64;
+const USER_VAR_VALUE_MAX: usize = 1024;
 /// Standard-alphabet base64 that takes padding or leaves it off, as OSC 7501
 /// allows.
 const BASE64: GeneralPurpose = GeneralPurpose::new(
@@ -783,9 +790,9 @@ enum ScanState {
 }
 
 /// Incremental scanner pulling bells, OSC 9 / OSC 777 desktop-notification
-/// sequences, and OSC 9;4 / OSC 7501 status reports from a raw pty byte
-/// stream. State persists across `feed` calls, so a sequence split over
-/// read-chunk boundaries is still recognised.
+/// sequences, OSC 9;4 / OSC 7501 status reports and OSC 1337 user vars from a
+/// raw pty byte stream. State persists across `feed` calls, so a sequence
+/// split over read-chunk boundaries is still recognised.
 #[derive(Default)]
 struct NotifyScanner {
     state: ScanState,
@@ -868,9 +875,9 @@ impl NotifyScanner {
 
 /// Parse an OSC payload (the bytes between `ESC ]` and the terminator) for the
 /// commands tutti surfaces: notifications `9;<body>` and
-/// `777;notify;<title>;<body>`, and status reports `9;4;…` and `7501;…`.
-/// Anything else yields `None` — ConEmu's other numbered `9;<n>[;…]`
-/// subcommands included.
+/// `777;notify;<title>;<body>`, status reports `9;4;…` and `7501;…`, and user
+/// vars `1337;SetUserVar=…`. Anything else yields `None` — ConEmu's other
+/// numbered `9;<n>[;…]` subcommands and iTerm2's other 1337 ones included.
 fn parse_osc(buf: &[u8]) -> Option<Signal> {
     let text = std::str::from_utf8(buf).ok()?;
     let (cmd, rest) = text.split_once(';')?;
@@ -899,8 +906,23 @@ fn parse_osc(buf: &[u8]) -> Option<Signal> {
                 .then_some(Signal::Notify(Notification { title, body }))
         }
         "7501" => parse_program_status(rest).map(Signal::Status),
+        "1337" => parse_user_var(rest),
         _ => None,
     }
+}
+
+/// Parse an OSC 1337 body for iTerm2's `SetUserVar=<name>=<base64 value>`:
+/// a name of `[A-Za-z0-9_]`, at most 64 bytes, and a value decoding to UTF-8
+/// of at most 1024 bytes — empty to unset the var. Anything else is dropped.
+fn parse_user_var(body: &str) -> Option<Signal> {
+    let (name, value) = body.strip_prefix("SetUserVar=")?.split_once('=')?;
+    let value = String::from_utf8(BASE64.decode(value).ok()?).ok()?;
+    let named = (1..=USER_VAR_NAME_MAX).contains(&name.len())
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    (named && value.len() <= USER_VAR_VALUE_MAX).then(|| Signal::UserVar {
+        name: name.to_string(),
+        value,
+    })
 }
 
 /// Parse an OSC 9;4 progress body (after `9;4;`): `<state>[;<percent>]`.
@@ -1026,7 +1048,7 @@ mod tests {
             .into_iter()
             .filter_map(|s| match s {
                 Signal::Notify(note) => Some(note),
-                Signal::Status(_) => None,
+                _ => None,
             })
             .collect()
     }
@@ -1041,7 +1063,7 @@ mod tests {
             .into_iter()
             .filter_map(|s| match s {
                 Signal::Status(report) => Some(report),
-                Signal::Notify(_) => None,
+                _ => None,
             })
             .collect()
     }
@@ -1268,6 +1290,65 @@ mod tests {
                 Signal::Status(program(None, None, None)),
             ]
         );
+        for cut in 0..=input.len() {
+            assert_eq!(
+                signals_split(input, cut),
+                whole,
+                "mismatch cutting at {cut}"
+            );
+        }
+    }
+
+    fn user_var(name: &str, value: &str) -> Signal {
+        Signal::UserVar {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+
+    #[test]
+    fn osc1337_sets_and_unsets_user_vars() {
+        let set = |name: &str, value: &str| {
+            format!("\x1b]1337;SetUserVar={name}={}\x07", BASE64.encode(value))
+        };
+        assert_eq!(
+            signals(b"\x1b]1337;SetUserVar=TUTTI_KEYS=cGFuZQ==\x07"),
+            vec![user_var("TUTTI_KEYS", "pane")]
+        );
+        // ST-terminated, unpadded, and an empty value — which unsets.
+        assert_eq!(
+            signals(
+                b"\x1b]1337;SetUserVar=TUTTI_KEYS=cGFuZQ\x1b\\\x1b]1337;SetUserVar=TUTTI_KEYS=\x07"
+            ),
+            vec![user_var("TUTTI_KEYS", "pane"), user_var("TUTTI_KEYS", "")]
+        );
+        let name = "N".repeat(USER_VAR_NAME_MAX);
+        let value = "é".repeat(USER_VAR_VALUE_MAX / 2);
+        assert_eq!(
+            signals(set(&name, &value).as_bytes()),
+            vec![user_var(&name, &value)],
+            "both limits are inclusive"
+        );
+        for input in [
+            set("TUTTI-KEYS", "pane"),
+            set("", "pane"),
+            set(&"N".repeat(USER_VAR_NAME_MAX + 1), "pane"),
+            set("TUTTI_EDITOR", &"v".repeat(USER_VAR_VALUE_MAX + 1)),
+            format!("\x1b]1337;SetUserVar=K={}\x07", BASE64.encode([0xff, 0xfe])),
+            "\x1b]1337;SetUserVar=K=cGF$ZQ==\x07".into(),
+            "\x1b]1337;SetUserVar=K\x07".into(),
+            "\x1b]1337;CurrentDir=/tmp\x07".into(),
+            "\x1b]1337;SetMark\x07".into(),
+        ] {
+            assert!(signals(input.as_bytes()).is_empty(), "{input:?} was kept");
+        }
+    }
+
+    #[test]
+    fn osc1337_is_incremental_across_every_cut_point() {
+        let input = b"x\x1b]1337;SetUserVar=A=b2s=\x1b\\y\x1b]1337;SetUserVar=A=\x07";
+        let whole = signals(input);
+        assert_eq!(whole, vec![user_var("A", "ok"), user_var("A", "")]);
         for cut in 0..=input.len() {
             assert_eq!(
                 signals_split(input, cut),

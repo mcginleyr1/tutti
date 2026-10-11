@@ -27,6 +27,28 @@ pub enum Direction {
     Vertical,
 }
 
+/// A way out of a pane: where `pane focus --direction` looks for the next one,
+/// and which way `pane resize --direction` moves its split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Toward {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl std::fmt::Display for Toward {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Toward::Left => "left",
+            Toward::Right => "right",
+            Toward::Up => "up",
+            Toward::Down => "down",
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Layout {
     Leaf(PaneId),
@@ -197,6 +219,86 @@ impl Layout {
             first,
             second,
         })
+    }
+
+    /// The pane `toward` of `from`, the layout laid out on the unit square, by
+    /// the TUI's directional focus rule (`FocusDir::accepts`): of the panes
+    /// lying wholly on that side, the one whose centre is nearest `from`'s.
+    /// With `wrap`, a `from` at that edge takes the pane farthest on the
+    /// opposite side instead, of those level with it on the cross axis — the
+    /// nearest centre on that axis breaking a tie. `None` at an edge, and for
+    /// a pane not in the layout. Ties go to layout order.
+    pub fn neighbor(&self, from: PaneId, toward: Toward, wrap: bool) -> Option<PaneId> {
+        const EPS: f32 = 1e-4;
+        let mut tiles = Vec::new();
+        self.tile([0.0, 0.0, 1.0, 1.0], &mut tiles);
+        // Each pane as (along start, along end, cross start, cross end), the
+        // along axis flipped for left and up so `toward` always runs forward.
+        let spans: Vec<(PaneId, [f32; 4])> = tiles
+            .into_iter()
+            .map(|(pane, [x, y, w, h])| {
+                let span = match toward {
+                    Toward::Right => [x, x + w, y, y + h],
+                    Toward::Left => [-x - w, -x, y, y + h],
+                    Toward::Down => [y, y + h, x, x + w],
+                    Toward::Up => [-y - h, -y, x, x + w],
+                };
+                (pane, span)
+            })
+            .collect();
+        let source = spans.iter().find(|(pane, _)| *pane == from)?.1;
+        let [_, end, low, high] = source;
+        let middle = |s: [f32; 4]| ((s[0] + s[1]) / 2.0, (s[2] + s[3]) / 2.0);
+        let (fa, fc) = middle(source);
+        // A pane's centre as (along, cross) offsets from the source's.
+        let offset = |span: [f32; 4]| {
+            let (a, c) = middle(span);
+            (a - fa, c - fc)
+        };
+        let distance = |span: [f32; 4]| {
+            let (a, c) = offset(span);
+            a * a + c * c
+        };
+        let others = || spans.iter().filter(|(pane, _)| *pane != from);
+        others()
+            .filter(|(_, span)| span[0] >= end - EPS)
+            .min_by(|(_, s), (_, t)| distance(*s).total_cmp(&distance(*t)))
+            .or_else(|| {
+                others()
+                    .filter(|(_, span)| wrap && span[2] < high - EPS && span[3] > low + EPS)
+                    .min_by(|(_, s), (_, t)| {
+                        let ((sa, sc), (ta, tc)) = (offset(*s), offset(*t));
+                        sa.total_cmp(&ta).then(sc.abs().total_cmp(&tc.abs()))
+                    })
+            })
+            .map(|(pane, _)| *pane)
+    }
+
+    /// Every pane's `[x, y, width, height]` with the layout laid out in the
+    /// one given, in layout order — the TUI's `pane_rects` arithmetic,
+    /// unrounded.
+    fn tile(&self, [x, y, w, h]: [f32; 4], out: &mut Vec<(PaneId, [f32; 4])>) {
+        match self {
+            Layout::Leaf(id) => out.push((*id, [x, y, w, h])),
+            Layout::Split {
+                direction: Direction::Horizontal,
+                ratio,
+                first,
+                second,
+            } => {
+                first.tile([x, y, w * ratio, h], out);
+                second.tile([x + w * ratio, y, w * (1.0 - ratio), h], out);
+            }
+            Layout::Split {
+                direction: Direction::Vertical,
+                ratio,
+                first,
+                second,
+            } => {
+                first.tile([x, y, w, h * ratio], out);
+                second.tile([x, y + h * ratio, w, h * (1.0 - ratio)], out);
+            }
+        }
     }
 }
 
@@ -409,5 +511,87 @@ mod tests {
         assert!(refuses(9, 1));
         assert!(refuses(2, 2), "one pane is never separated from itself");
         assert!(leaf(1).set_split_ratio(PaneId(1), PaneId(2), 0.3).is_none());
+    }
+
+    #[test]
+    fn neighbor_takes_the_nearest_centre_wholly_on_that_side() {
+        use Toward::*;
+        // 1 on the left; 2 over 3 on the right.
+        let layout = split(
+            Direction::Horizontal,
+            0.5,
+            leaf(1),
+            split(Direction::Vertical, 0.5, leaf(2), leaf(3)),
+        );
+        let next = |from, toward| layout.neighbor(PaneId(from), toward, false).map(|p| p.0);
+        assert_eq!(next(1, Right), Some(2), "a tie goes to layout order");
+        assert_eq!(next(3, Left), Some(1));
+        assert_eq!(next(2, Down), Some(3));
+        assert_eq!(next(3, Up), Some(2));
+        assert_eq!(next(1, Left), None, "the left edge");
+        assert_eq!(next(2, Up), None, "the top edge");
+        assert_eq!(next(9, Right), None, "a pane not in the layout");
+        assert_eq!(leaf(1).neighbor(PaneId(1), Right, true), None);
+        // A pane needn't share the source's row, as in the TUI: from a
+        // full-width bottom pane, up reaches either top pane.
+        let stacked = split(
+            Direction::Vertical,
+            0.5,
+            split(Direction::Horizontal, 0.5, leaf(1), leaf(2)),
+            leaf(3),
+        );
+        assert_eq!(stacked.neighbor(PaneId(3), Up, false), Some(PaneId(1)));
+        assert_eq!(stacked.neighbor(PaneId(2), Down, false), Some(PaneId(3)));
+    }
+
+    #[test]
+    fn neighbor_wraps_to_the_farthest_pane_level_with_the_source() {
+        use Toward::*;
+        // Three columns: 1, 2, then 3 over 4 split at 0.3.
+        let layout = split(
+            Direction::Horizontal,
+            0.25,
+            leaf(1),
+            split(
+                Direction::Horizontal,
+                0.5,
+                leaf(2),
+                split(Direction::Vertical, 0.3, leaf(3), leaf(4)),
+            ),
+        );
+        let wrap = |from, toward| layout.neighbor(PaneId(from), toward, true).map(|p| p.0);
+        assert_eq!(
+            wrap(1, Left),
+            Some(4),
+            "the far column, nearest on the cross axis"
+        );
+        assert_eq!(
+            wrap(4, Right),
+            Some(1),
+            "the far column, not the middle one"
+        );
+        assert_eq!(
+            wrap(2, Right),
+            Some(4),
+            "no edge, no wrap: the nearest centre"
+        );
+        assert_eq!(wrap(3, Up), Some(4));
+        assert_eq!(wrap(4, Down), Some(3));
+        assert_eq!(wrap(1, Up), None, "nothing else level with it: an edge");
+        // The cross axis picks between the far column's panes.
+        let columns = split(
+            Direction::Horizontal,
+            0.5,
+            split(Direction::Vertical, 0.5, leaf(1), leaf(2)),
+            split(Direction::Vertical, 0.3, leaf(3), leaf(4)),
+        );
+        assert_eq!(columns.neighbor(PaneId(1), Left, true), Some(PaneId(3)));
+        assert_eq!(columns.neighbor(PaneId(2), Left, true), Some(PaneId(4)));
+    }
+
+    #[test]
+    fn toward_reads_and_rides_the_wire_lowercase() {
+        assert_eq!(Toward::Left.to_string(), "left");
+        assert_eq!(serde_json::to_string(&Toward::Down).unwrap(), r#""down""#);
     }
 }

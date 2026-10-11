@@ -15,7 +15,7 @@ use tokio::time::{sleep, timeout};
 use tutti_core::{
     AgentHookEvent, AgentState, ApprovalDecision, Checkpoint, Direction, Event, Frame, IssueRef,
     Layout, Note, NoteKind, PaneData, PaneDims, PaneId, PaneInfo, PendingApproval, Request,
-    Response, StateSource, SubagentInfo, Tagged, WatchPane, WorkspaceId,
+    Response, StateSource, SubagentInfo, Tagged, Toward, WatchPane, WorkspaceId,
 };
 use tutti_server::{PaneSize, serve};
 
@@ -3610,6 +3610,7 @@ async fn a_watcher_snapshots_the_session_beside_an_attached_client() {
             source: None,
             exited: None,
             focused: false,
+            user_vars: Default::default(),
         }]
     );
 
@@ -3717,6 +3718,156 @@ async fn a_scripted_focus_is_relayed_to_the_attached_client() {
     })
     .await
     .expect("the scripted focus was never relayed");
+
+    server.stop().await;
+}
+
+/// Read control frames off `conn` until one parses as `want`.
+async fn read_until_control<T: serde::de::DeserializeOwned>(
+    conn: &mut Conn,
+    want: impl Fn(&T) -> bool,
+) -> T {
+    timeout(DEADLINE, async {
+        loop {
+            if let Frame::Control(json) = conn.read_frame().await
+                && let Ok(found) = serde_json::from_slice::<T>(&json)
+                && want(&found)
+            {
+                return found;
+            }
+        }
+    })
+    .await
+    .expect("the awaited control frame never came")
+}
+
+/// A directional focus moves to the neighbor in its source pane's tab — the
+/// pane named, else the attached client's focused one — relayed like a
+/// scripted `pane focus`; at an edge it names no pane and moves nothing,
+/// unless it wraps. A directional resize nudges the split a direct key would.
+#[tokio::test]
+async fn directional_focus_and_resize_start_from_the_named_or_attached_pane() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    new_workspace(&mut control).await;
+    let run = Request::PaneRun {
+        tab: None,
+        cmd: vec!["/bin/cat".into()],
+        ephemeral: false,
+        sandbox: None,
+    };
+    let left = pane_id(control.request(run).await);
+    let split = Request::PaneSplit {
+        pane: left,
+        direction: Direction::Horizontal,
+    };
+    let right = pane_id(control.request(split).await);
+    let focus = |from, toward, wrap| Request::PaneFocusToward { from, toward, wrap };
+    let moved = |from, toward, pane| Response::Neighbor { from, toward, pane };
+    assert!(
+        matches!(
+            control.request(focus(None, Toward::Right, false)).await,
+            Response::Error { .. }
+        ),
+        "no pane named and nobody attached"
+    );
+
+    let mut viewer = server.connect().await;
+    viewer.send(&Request::Attach { terminal: None }).await;
+    viewer.send(&Request::PaneFocus { pane: left }).await;
+    read_until_control(&mut viewer, |r: &Response| *r == Response::Ok).await;
+
+    assert_eq!(
+        control.request(focus(None, Toward::Right, false)).await,
+        moved(left, Toward::Right, Some(right))
+    );
+    read_until_control(&mut viewer, |e: &Event| {
+        *e == Event::PaneFocused { pane: right }
+    })
+    .await;
+    assert_eq!(
+        control
+            .request(focus(Some(right), Toward::Right, false))
+            .await,
+        moved(right, Toward::Right, None),
+        "the right edge"
+    );
+    assert_eq!(
+        control
+            .request(focus(Some(right), Toward::Right, true))
+            .await,
+        moved(right, Toward::Right, Some(left)),
+        "wrapping round it"
+    );
+    assert!(matches!(
+        control
+            .request(focus(Some(PaneId(99)), Toward::Left, false))
+            .await,
+        Response::Error { .. }
+    ));
+
+    // The viewer never reported the relayed focus, so it still has `left`.
+    let resize = Request::PaneResizeToward {
+        from: None,
+        toward: Toward::Left,
+        delta: 0.05,
+    };
+    assert_eq!(control.request(resize).await, Response::Ok);
+    let ratio = next_split_ratio(&mut viewer).await;
+    assert!(
+        (ratio - 0.45).abs() < 1e-3,
+        "left moves the border left: {ratio}"
+    );
+
+    server.stop().await;
+}
+
+/// A pane's OSC 1337 user vars land on its `PaneInfo` — in `pane list`, the
+/// attached client's view and a watcher's snapshot — and an empty value
+/// unsets one.
+#[tokio::test]
+async fn a_panes_user_vars_reach_its_listing_view_and_watchers() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    new_workspace(&mut control).await;
+    let run = Request::PaneRun {
+        tab: None,
+        cmd: vec!["/bin/sh".into()],
+        ephemeral: false,
+        sandbox: None,
+    };
+    let pane = pane_id(control.request(run).await);
+    let mut viewer = server.connect().await;
+    viewer.send(&Request::Attach { terminal: None }).await;
+    let mut watcher = server.connect().await;
+    watcher.send(&Request::Watch).await;
+    let keys = |p: &PaneInfo| p.user_vars.get("TUTTI_KEYS").cloned();
+
+    printf_osc(&mut control, pane, "1337;SetUserVar=TUTTI_KEYS=cGFuZQ==").await;
+    assert!(
+        wait_pane(&mut control, pane, |p| keys(p).as_deref() == Some("pane")).await,
+        "pane list carries the var"
+    );
+    read_until_control(&mut viewer, |e: &Event| match e {
+        Event::LayoutChanged { workspaces } => workspaces
+            .iter()
+            .flat_map(|w| &w.tabs)
+            .flat_map(|t| &t.panes)
+            .any(|p| p.id == pane && keys(p).as_deref() == Some("pane")),
+        _ => false,
+    })
+    .await;
+    snapshot_until(&mut watcher, |_, panes| {
+        panes[0].user_vars.get("TUTTI_KEYS").map(String::as_str) == Some("pane")
+    })
+    .await;
+
+    printf_osc(&mut control, pane, "1337;SetUserVar=TUTTI_KEYS=").await;
+    assert!(
+        wait_pane(&mut control, pane, |p| p.user_vars.is_empty()).await,
+        "an empty value unsets it"
+    );
+    snapshot_until(&mut watcher, |_, panes| panes[0].user_vars.is_empty()).await;
 
     server.stop().await;
 }

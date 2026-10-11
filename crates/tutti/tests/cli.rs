@@ -11,7 +11,7 @@ use std::thread;
 
 use tutti_core::{
     AgentHookEvent, AgentState, ApprovalDecision, Event, Frame, Note, NoteKind, PaneId, Request,
-    Response, WatchPane, WorkspaceId, WorkspaceInfo,
+    Response, Toward, WatchPane, WorkspaceId, WorkspaceInfo, WorkspaceView,
 };
 
 fn unique_base(label: &str) -> PathBuf {
@@ -760,6 +760,174 @@ fn run_from_a_pane_names_its_caller_in_its_own_session_only() {
     }
 }
 
+/// `pane focus --direction` from inside a pane starts from it and prints the
+/// bare id it moved to; at an edge it says `no pane <direction> of <id>` on
+/// stderr and exits 1 — the contract smart-splits.nvim's backend reads.
+#[test]
+fn pane_focus_by_direction_prints_the_pane_or_exits_1_at_an_edge() {
+    let output = run_scenario_with(
+        "focusdir",
+        &["pane", "focus", "--direction", "left"],
+        &[("TUTTI_PANE", "4"), ("TUTTI_SESSION", "tutti")],
+        "",
+        |req| {
+            assert_eq!(
+                *req,
+                Request::PaneFocusToward {
+                    from: Some(PaneId(4)),
+                    toward: Toward::Left,
+                    wrap: false,
+                }
+            );
+        },
+        Response::Neighbor {
+            from: PaneId(4),
+            toward: Toward::Left,
+            pane: Some(PaneId(2)),
+        },
+    );
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "2\n");
+
+    let output = run_scenario(
+        "focusedge",
+        &["pane", "focus", "--direction", "up", "--from", "3"],
+        |req| {
+            assert!(matches!(
+                req,
+                Request::PaneFocusToward {
+                    from: Some(PaneId(3)),
+                    ..
+                }
+            ))
+        },
+        Response::Neighbor {
+            from: PaneId(3),
+            toward: Toward::Up,
+            pane: None,
+        },
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "no pane up of 3\n"
+    );
+}
+
+/// `edit` with no editor pane in the caller's workspace says so and exits 1,
+/// having asked the daemon for nothing but its view.
+#[test]
+fn edit_without_an_editor_pane_exits_1() {
+    let view: Vec<WorkspaceView> = serde_json::from_str(
+        r#"[{"id":1,"name":"api","dir":"/srv/api","branch":null,"tabs":[{"id":1,"name":"1",
+            "active":true,"layout":{"Leaf":4},"active_pane":4,"panes":[{"id":4,"title":"sh",
+            "agent":null,"state":"idle","exited":null}]}]}]"#,
+    )
+    .unwrap();
+    let output = run_scenario_with(
+        "editnone",
+        &["edit", "src/main.rs:3"],
+        &[("TUTTI_PANE", "4"), ("TUTTI_SESSION", "tutti")],
+        "",
+        |req| assert_eq!(*req, Request::View),
+        Response::View { workspaces: view },
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "no editor pane in workspace api\n"
+    );
+}
+
+/// Kills its child when dropped, so a failing test leaves no editor behind.
+struct Reaped(std::process::Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// `edit` hands the file to a real Neovim through the server address its
+/// pane's `TUTTI_EDITOR` names — at the line and column asked, a quote in the
+/// name and all — then focuses that pane. Skipped without `nvim` on PATH.
+#[test]
+fn edit_opens_the_file_in_a_real_nvim_then_focuses_its_pane() {
+    if Command::new("nvim").arg("--version").output().is_err() {
+        return;
+    }
+    let base = unique_base("editnvim");
+    std::fs::create_dir_all(base.join("tutti")).unwrap();
+    let address = base.join("nvim.sock");
+    let _nvim = Reaped(
+        Command::new("nvim")
+            .args(["--clean", "--headless", "--listen"])
+            .arg(&address)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !address.exists() {
+        assert!(std::time::Instant::now() < deadline, "nvim never listened");
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    std::fs::write(base.join("it's here.txt"), "one\ntwo\nthree\n").unwrap();
+    let view: Vec<WorkspaceView> = serde_json::from_value(serde_json::json!([{
+        "id": 1, "name": "api", "dir": "/srv/api", "branch": null,
+        "tabs": [{"id": 1, "name": "1", "active": true, "layout": null, "active_pane": 4,
+            "panes": [
+                {"id": 4, "title": "sh", "agent": null, "state": "idle", "exited": null},
+                {"id": 5, "title": "nvim", "agent": null, "state": "idle", "exited": null,
+                 "user_vars": {"TUTTI_EDITOR": format!("nvim {}", address.display())}}
+            ]}]
+    }]))
+    .unwrap();
+    let listener = UnixListener::bind(base.join("tutti/tutti.sock")).unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        for (want, reply) in [
+            (Request::View, Response::View { workspaces: view }),
+            (Request::PaneFocus { pane: PaneId(5) }, Response::Ok),
+        ] {
+            assert_eq!(read_request(&mut stream), want);
+            let frame = Frame::Control(serde_json::to_vec(&reply).unwrap());
+            stream.write_all(&frame.encode()).unwrap();
+        }
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tutti"))
+        .args(["edit", "it's here.txt:2:3"])
+        .current_dir(&base)
+        .env("XDG_RUNTIME_DIR", &base)
+        .env("TUTTI_PANE", "4")
+        .env("TUTTI_SESSION", "tutti")
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "edit is quiet: {output:?}");
+    let probe = Command::new("nvim")
+        .arg("--server")
+        .arg(&address)
+        .args([
+            "--remote-expr",
+            "bufname() .. ':' .. line('.') .. ':' .. col('.')",
+        ])
+        .output()
+        .unwrap();
+    let file = std::fs::canonicalize(base.join("it's here.txt")).unwrap();
+    assert_eq!(
+        String::from_utf8(probe.stdout).unwrap().trim(),
+        format!("{}:2:3", file.display())
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// `notes --unread` asks for the unread history and prints it newest first —
 /// what an agent reads to learn what blocked while it was busy — and `notes
 /// read --pane` marks one pane's notes read.
@@ -907,6 +1075,7 @@ fn watch_prints_snapshot_lines_until_the_daemon_goes() {
             source: None,
             exited: None,
             focused: false,
+            user_vars: Default::default(),
         }],
     };
     let lines: Vec<String> = [AgentState::Working, AgentState::Blocked]

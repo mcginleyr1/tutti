@@ -7,12 +7,12 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use tutti_agents::Registry;
 use tutti_core::{
-    AgentHookEvent, ApprovalDecision, Direction, Event, PaneId, Request, Response, TabId, WaitFor,
-    WorkspaceId, WorkspaceInfo,
+    AgentHookEvent, ApprovalDecision, Direction, Event, PaneId, Request, Response, TabId, TabView,
+    Toward, WaitFor, WorkspaceId, WorkspaceInfo, WorkspaceView,
 };
 
 use tutti::client::{self, Client, StopOutcome};
-use tutti::config::{Approvals, Config};
+use tutti::config::{Approvals, Config, RESIZE_DELTA};
 use tutti::hooks;
 use tutti::integrations::{self, Dirs, Integration, Status};
 use tutti::issues;
@@ -83,6 +83,16 @@ enum Command {
         title: Option<String>,
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
+    },
+    /// Open a file in your workspace's editor pane — a Neovim or Emacs whose
+    /// tutti plugin set the `TUTTI_EDITOR` user var — and focus that pane.
+    /// Returns at once: not a blocking $EDITOR.
+    Edit {
+        /// `<path>[:<line>[:<col>]]`, relative to the current directory.
+        target: String,
+        /// The workspace whose editor to use (default: this pane's own).
+        #[arg(long)]
+        workspace: Option<u64>,
     },
     /// Run commands in k8s sandboxes (`[[sandboxes]]` in the config).
     Sandbox {
@@ -417,9 +427,40 @@ enum PaneAction {
         #[arg(long, requires = "deny")]
         message: Option<String>,
     },
-    /// Mark a pane focused (records it active and clears its Done badge).
+    /// Mark a pane focused (records it active and clears its Done badge) —
+    /// or, with `--direction`, the pane beside one, printing its id. At an
+    /// edge that says `no pane <direction> of <id>` on stderr and exits 1.
     Focus {
-        pane: u64,
+        /// The pane to focus.
+        #[arg(
+            required_unless_present = "direction",
+            conflicts_with_all = ["direction", "from", "wrap"]
+        )]
+        pane: Option<u64>,
+        /// Focus the pane on this side instead.
+        #[arg(long, value_enum)]
+        direction: Option<Side>,
+        /// The pane to look beside (default: this pane, else the attached
+        /// TUI's focused one).
+        #[arg(long, requires = "direction")]
+        from: Option<u64>,
+        /// At an edge, go round to the farthest pane on the other side.
+        #[arg(long, requires = "direction")]
+        wrap: bool,
+    },
+    /// Move the border of the split beside a pane toward a side, as the TUI's
+    /// Alt+h/j/k/l do.
+    Resize {
+        /// The way the border moves.
+        #[arg(long, value_enum)]
+        direction: Side,
+        /// How far, as a fraction of the split.
+        #[arg(long, default_value_t = RESIZE_DELTA)]
+        amount: f32,
+        /// The pane whose split moves (default: this pane, else the attached
+        /// TUI's focused one).
+        #[arg(long)]
+        from: Option<u64>,
     },
     /// Block until each pane reaches a state (`done` unless `--until` says
     /// otherwise), printing each one's; exits 124 on `--timeout`.
@@ -471,6 +512,26 @@ impl From<SplitDir> for Direction {
         match dir {
             SplitDir::Right => Direction::Horizontal,
             SplitDir::Down => Direction::Vertical,
+        }
+    }
+}
+
+/// The side `pane focus|resize --direction` names: `Toward`'s CLI face.
+#[derive(Clone, Copy, ValueEnum)]
+enum Side {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl From<Side> for Toward {
+    fn from(side: Side) -> Toward {
+        match side {
+            Side::Left => Toward::Left,
+            Side::Right => Toward::Right,
+            Side::Up => Toward::Up,
+            Side::Down => Toward::Down,
         }
     }
 }
@@ -549,6 +610,7 @@ fn run(cli: Cli) -> Result<i32> {
             tutti::sandbox::run(Config::load()?.sandbox(&profile)?, &name, &cmd)
         }
         Some(Command::Issue { action }) => run_issue(action, &cli.session, cli.json),
+        Some(Command::Edit { target, workspace }) => run_edit(&cli.session, &target, workspace),
         Some(Command::Watch) => run_watch(&cli.session),
         Some(Command::Hooks {
             agent,
@@ -589,14 +651,14 @@ fn run(cli: Cli) -> Result<i32> {
         Some(command) => {
             let project = matches!(command, Command::Project { .. });
             let mut request = to_request(command)?;
-            // A run from one of this session's own panes lands beside it.
-            if let Request::Run { from, .. } = &mut request
-                && std::env::var("TUTTI_SESSION").is_ok_and(|s| s == cli.session)
+            // A run from one of this session's own panes lands beside it; a
+            // directional verb there starts from it unless told otherwise.
+            if let Request::Run { from, .. }
+            | Request::PaneFocusToward { from, .. }
+            | Request::PaneResizeToward { from, .. } = &mut request
+                && from.is_none()
             {
-                *from = std::env::var("TUTTI_PANE")
-                    .ok()
-                    .and_then(|p| p.parse().ok())
-                    .map(PaneId);
+                *from = caller_pane(&cli.session);
             }
             let mut client = Client::connect_or_start(&cli.session)?;
             let response = client.request(&request)?;
@@ -607,6 +669,15 @@ fn run(cli: Cli) -> Result<i32> {
             })
         }
     }
+}
+
+/// The pane this command runs in (`TUTTI_PANE`) when it is one of `session`'s
+/// own: a pane id means nothing to another session's daemon.
+fn caller_pane(session: &str) -> Option<PaneId> {
+    std::env::var("TUTTI_SESSION")
+        .ok()
+        .filter(|s| s == session)?;
+    std::env::var("TUTTI_PANE").ok()?.parse().ok().map(PaneId)
 }
 
 /// The session a command targets unless `-s` names one: inside a tutti pane
@@ -948,7 +1019,28 @@ fn to_request(command: Command) -> Result<Request> {
                     ApprovalDecision::Allow
                 },
             },
-            PaneAction::Focus { pane } => Request::PaneFocus { pane: PaneId(pane) },
+            PaneAction::Focus {
+                pane: Some(pane), ..
+            } => Request::PaneFocus { pane: PaneId(pane) },
+            PaneAction::Focus {
+                direction,
+                from,
+                wrap,
+                ..
+            } => Request::PaneFocusToward {
+                from: from.map(PaneId),
+                toward: direction.context("name a pane or a --direction")?.into(),
+                wrap,
+            },
+            PaneAction::Resize {
+                direction,
+                amount,
+                from,
+            } => Request::PaneResizeToward {
+                from: from.map(PaneId),
+                toward: direction.into(),
+                delta: amount,
+            },
             PaneAction::Wait { .. } => bail!("pane wait sends a request per pane"),
             PaneAction::Checkpoints { pane } => Request::PaneCheckpoints { pane: PaneId(pane) },
             PaneAction::CheckpointDiff { pane, n, stat } => Request::PaneCheckpointDiff {
@@ -974,6 +1066,7 @@ fn to_request(command: Command) -> Result<Request> {
             action: SandboxAction::Run { .. },
         }
         | Command::Issue { .. }
+        | Command::Edit { .. }
         | Command::Watch
         | Command::AgentEvent { .. }
         | Command::Hooks { .. }
@@ -1147,6 +1240,127 @@ fn deploy_project(client: &mut Client, id: Option<u64>) -> Result<WorkspaceInfo>
         .and_then(|p| workspaces.iter().find(|w| w.id == p))
         .unwrap_or(entry)
         .clone())
+}
+
+/// `edit`: hand a file to the editor pane of a workspace — `--workspace`, else
+/// this pane's own — through the editor's own remote CLI, then focus that pane
+/// as `pane focus` does. The daemon only names the pane.
+fn run_edit(session: &str, target: &str, workspace: Option<u64>) -> Result<i32> {
+    let (path, line, col) = edit_target(target);
+    let path = std::path::absolute(path).with_context(|| format!("resolve {path:?}"))?;
+    let mut client = Client::connect(session).context("connecting to tutti-server")?;
+    let workspaces = match client.request(&Request::View)? {
+        Response::View { workspaces } => workspaces,
+        Response::Error { message } => bail!("{message}"),
+        other => bail!("unexpected reply to view: {other:?}"),
+    };
+    let caller = caller_pane(session);
+    let (name, editor) = editor_pane(&workspaces, caller, workspace.map(WorkspaceId))?;
+    let Some((pane, editor)) = editor else {
+        eprintln!("no editor pane in workspace {name}");
+        return Ok(1);
+    };
+    open_in(editor, &path, line, col)?;
+    match client.request(&Request::PaneFocus { pane })? {
+        Response::Ok => Ok(0),
+        other => Ok(emit(other, false)),
+    }
+}
+
+/// Split `edit`'s `<path>[:<line>[:<col>]]`; a suffix that is not a number
+/// stays part of the path.
+fn edit_target(target: &str) -> (&str, Option<u32>, Option<u32>) {
+    /// `s` up to its last `:`, and the number after it — when it is one.
+    fn suffix(s: &str) -> Option<(&str, u32)> {
+        let (rest, n) = s.rsplit_once(':')?;
+        let digits = n.bytes().all(|b| b.is_ascii_digit());
+        Some((rest, n.parse().ok().filter(|_| digits)?))
+    }
+    match suffix(target) {
+        None => (target, None, None),
+        Some((rest, last)) => match suffix(rest) {
+            Some((path, line)) => (path, Some(line), Some(last)),
+            None => (rest, Some(last), None),
+        },
+    }
+}
+
+/// The workspace `edit` looks in — `workspace`, else `caller`'s — by name,
+/// and its editor pane with that pane's `TUTTI_EDITOR` value: a live pane
+/// whose editor set the var, the caller's own tab first, then layout order.
+fn editor_pane(
+    workspaces: &[WorkspaceView],
+    caller: Option<PaneId>,
+    workspace: Option<WorkspaceId>,
+) -> Result<(&str, Option<(PaneId, &str)>)> {
+    let holds_caller = |tab: &TabView| tab.panes.iter().any(|p| Some(p.id) == caller);
+    let found = match workspace {
+        Some(id) => workspaces.iter().find(|w| w.id == id),
+        None => workspaces.iter().find(|w| w.tabs.iter().any(holds_caller)),
+    };
+    let found = found.with_context(|| match (workspace, caller) {
+        (Some(id), _) => format!("no workspace {id}"),
+        (None, Some(pane)) => format!("no pane {pane} in this session"),
+        (None, None) => "not inside a tutti pane: pass --workspace <id>".into(),
+    })?;
+    let mut tabs: Vec<&TabView> = found.tabs.iter().collect();
+    tabs.sort_by_key(|tab| !holds_caller(tab));
+    let editor = tabs
+        .into_iter()
+        .flat_map(|tab| &tab.panes)
+        .filter(|p| p.exited.is_none())
+        .find_map(|p| Some((p.id, p.user_vars.get("TUTTI_EDITOR")?.as_str())));
+    Ok((&found.name, editor))
+}
+
+/// Open `path` in the editor a `TUTTI_EDITOR` value names, at `line` and `col`
+/// (default 1) when given: `nvim <server address>` through `nvim --server`,
+/// `emacs [<server name or socket>]` through `emacsclient -n`. Returns once it
+/// has the file.
+fn open_in(editor: &str, path: &Path, line: Option<u32>, col: Option<u32>) -> Result<()> {
+    let col = col.unwrap_or(1);
+    let mut command = match editor.split_once(' ').unwrap_or((editor, "")) {
+        ("nvim", address) if !address.is_empty() => {
+            // An expression, not `--remote-send` keys, which would be typed
+            // into whatever mode the editor is in. A Vim string doubles its
+            // quotes; `fnameescape` guards the command line.
+            let path = path.display().to_string().replace('\'', "''");
+            let jump = line.map_or_else(String::new, |line| {
+                format!(", 'call cursor({line}, {col})'")
+            });
+            let expr = format!("execute(['drop ' .. fnameescape('{path}'){jump}])");
+            let mut command = std::process::Command::new("nvim");
+            command.args(["--server", address, "--remote-expr", &expr]);
+            command
+        }
+        ("emacs", server) => {
+            let mut command = std::process::Command::new("emacsclient");
+            command.arg("-n");
+            if !server.is_empty() {
+                command.args(["-s", server]);
+            }
+            if let Some(line) = line {
+                command.arg(format!("+{line}:{col}"));
+            }
+            command.arg(path);
+            command
+        }
+        _ => bail!(
+            "TUTTI_EDITOR {editor:?} names no editor tutti can drive: `nvim <server address>` or `emacs [<server name or socket>]`"
+        ),
+    };
+    let program = command.get_program().to_string_lossy().into_owned();
+    let output = command
+        .output()
+        .with_context(|| format!("running {program}"))?;
+    if !output.status.success() {
+        bail!(
+            "{program} could not open {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Forward one agent hook event (read as JSON on stdin) to the daemon. Built to
@@ -1428,6 +1642,8 @@ fn emit_project(response: Response, json: bool) -> i32 {
 
 fn emit(response: Response, json: bool) -> i32 {
     let is_error = matches!(response, Response::Error { .. });
+    // A directional focus at an edge exits 1 with `--json` too.
+    let edge = matches!(response, Response::Neighbor { pane: None, .. });
     if json {
         let text = serde_json::to_string(&response).expect("Response serializes");
         if is_error {
@@ -1445,7 +1661,7 @@ fn emit(response: Response, json: bool) -> i32 {
         return if timed_out {
             TIMED_OUT
         } else {
-            i32::from(is_error)
+            i32::from(is_error || edge)
         };
     }
     match response {
@@ -1475,6 +1691,21 @@ fn emit(response: Response, json: bool) -> i32 {
         Response::PaneCreated { id } => {
             println!("pane {id} created");
             0
+        }
+        // Bare, for `p=$(tutti pane focus --direction left)`.
+        Response::Neighbor {
+            pane: Some(pane), ..
+        } => {
+            println!("{pane}");
+            0
+        }
+        Response::Neighbor {
+            from,
+            toward,
+            pane: None,
+        } => {
+            eprintln!("no pane {toward} of {from}");
+            1
         }
         Response::Waited {
             pane,
@@ -1568,8 +1799,9 @@ fn emit(response: Response, json: bool) -> i32 {
             println!("attached to {session}");
             0
         }
-        // An approval hold's reply is consumed by `agent-event`, never here.
-        Response::Approval { .. } => 0,
+        // An approval hold's reply is consumed by `agent-event`, a view by
+        // `edit`, never here.
+        Response::Approval { .. } | Response::View { .. } => 0,
     }
 }
 
@@ -2233,6 +2465,173 @@ mod tests {
             request_of(&["tutti", "pane", "focus", "3"]),
             Request::PaneFocus { pane: PaneId(3) }
         );
+    }
+
+    /// A directional focus or resize names its source only when told to:
+    /// left out, the caller's pane (or the daemon's attached one) fills in.
+    #[test]
+    fn pane_focus_and_resize_by_direction_parse() {
+        assert_eq!(
+            request_of(&["tutti", "pane", "focus", "--direction", "left"]),
+            Request::PaneFocusToward {
+                from: None,
+                toward: Toward::Left,
+                wrap: false,
+            }
+        );
+        assert_eq!(
+            request_of(&[
+                "tutti",
+                "pane",
+                "focus",
+                "--direction=down",
+                "--from",
+                "4",
+                "--wrap"
+            ]),
+            Request::PaneFocusToward {
+                from: Some(PaneId(4)),
+                toward: Toward::Down,
+                wrap: true,
+            }
+        );
+        assert_eq!(
+            request_of(&["tutti", "pane", "resize", "--direction", "up"]),
+            Request::PaneResizeToward {
+                from: None,
+                toward: Toward::Up,
+                delta: RESIZE_DELTA,
+            }
+        );
+        assert_eq!(
+            request_of(&[
+                "tutti",
+                "pane",
+                "resize",
+                "--direction",
+                "right",
+                "--amount",
+                "0.1",
+                "--from",
+                "2"
+            ]),
+            Request::PaneResizeToward {
+                from: Some(PaneId(2)),
+                toward: Toward::Right,
+                delta: 0.1,
+            }
+        );
+        for refused in [
+            &["tutti", "pane", "focus"][..],
+            &["tutti", "pane", "focus", "3", "--direction", "left"],
+            &["tutti", "pane", "focus", "3", "--wrap"],
+            &["tutti", "pane", "focus", "--direction", "north"],
+            &["tutti", "pane", "resize"],
+        ] {
+            assert!(Cli::try_parse_from(refused).is_err(), "{refused:?} parsed");
+        }
+    }
+
+    #[test]
+    fn edit_targets_split_off_a_line_and_column() {
+        assert_eq!(edit_target("src/a.rs"), ("src/a.rs", None, None));
+        assert_eq!(edit_target("src/a.rs:12"), ("src/a.rs", Some(12), None));
+        assert_eq!(
+            edit_target("src/a.rs:12:5"),
+            ("src/a.rs", Some(12), Some(5))
+        );
+        assert_eq!(edit_target("a:b.rs:3"), ("a:b.rs", Some(3), None));
+        assert_eq!(edit_target("notes:todo"), ("notes:todo", None, None));
+        assert_eq!(edit_target("a.rs:+3"), ("a.rs:+3", None, None));
+        assert_eq!(edit_target("a.rs:"), ("a.rs:", None, None));
+    }
+
+    /// `edit` finds the editor in the caller's workspace — its own tab first,
+    /// then layout order, never an exited one — or in `--workspace`'s.
+    #[test]
+    fn edit_finds_the_editor_pane_of_the_callers_workspace() {
+        let pane = |id: u64, editor: Option<&str>, exited: Option<i32>| {
+            let mut info: tutti_core::PaneInfo = serde_json::from_str(&format!(
+                r#"{{"id":{id},"title":"sh","agent":null,"state":"idle","exited":null}}"#
+            ))
+            .unwrap();
+            if let Some(editor) = editor {
+                info.user_vars.insert("TUTTI_EDITOR".into(), editor.into());
+            }
+            info.exited = exited;
+            info
+        };
+        let tab = |id: u64, panes: Vec<tutti_core::PaneInfo>| TabView {
+            id: TabId(id),
+            name: id.to_string(),
+            active: false,
+            layout: None,
+            active_pane: None,
+            panes,
+        };
+        let workspace = |id: u64, name: &str, tabs: Vec<TabView>| WorkspaceView {
+            id: WorkspaceId(id),
+            name: name.into(),
+            dir: PathBuf::from("/w"),
+            branch: None,
+            changes: None,
+            changed_files: Vec::new(),
+            stale: false,
+            parent: None,
+            tabs,
+        };
+        let view = vec![
+            workspace(
+                1,
+                "api",
+                vec![
+                    tab(
+                        1,
+                        vec![
+                            pane(1, Some("emacs"), Some(0)),
+                            pane(2, Some("nvim /a"), None),
+                        ],
+                    ),
+                    tab(2, vec![pane(3, None, None), pane(4, Some("nvim /b"), None)]),
+                ],
+            ),
+            workspace(2, "web", vec![tab(3, vec![pane(5, None, None)])]),
+        ];
+        let find = |caller: Option<u64>, workspace: Option<u64>| {
+            editor_pane(&view, caller.map(PaneId), workspace.map(WorkspaceId))
+                .map(|(name, editor)| (name.to_string(), editor.map(|(p, e)| (p.0, e.to_string()))))
+                .map_err(|e| e.to_string())
+        };
+        let found = |name: &str, pane: u64, editor: &str| {
+            Ok((name.to_string(), Some((pane, editor.to_string()))))
+        };
+        assert_eq!(
+            find(Some(3), None),
+            found("api", 4, "nvim /b"),
+            "the caller's tab first"
+        );
+        assert_eq!(
+            find(Some(1), None),
+            found("api", 2, "nvim /a"),
+            "an exited editor is passed over"
+        );
+        assert_eq!(
+            find(None, Some(1)),
+            found("api", 2, "nvim /a"),
+            "else layout order"
+        );
+        assert_eq!(
+            find(Some(5), Some(1)),
+            found("api", 2, "nvim /a"),
+            "--workspace wins"
+        );
+        assert_eq!(find(Some(5), None), Ok(("web".to_string(), None)));
+        assert_eq!(find(None, Some(9)), Err("no workspace 9".to_string()));
+        assert_eq!(
+            find(Some(9), None),
+            Err("no pane 9 in this session".to_string())
+        );
+        assert!(find(None, None).unwrap_err().contains("--workspace"));
     }
 
     #[test]

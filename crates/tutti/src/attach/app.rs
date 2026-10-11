@@ -1118,8 +1118,20 @@ impl App {
         if self.enter_prefix(key) {
             return Vec::new();
         }
-        // Direct bindings intercept their chords before they reach the pane.
-        if let Some(action) = self.config.keys.action_for(key) {
+        // Direct bindings intercept their chords before they reach the pane —
+        // unless the pane's program claimed them with the user var
+        // `TUTTI_KEYS=pane` (an editor moving through its own splits first).
+        let pane_keys = self
+            .focused
+            .and_then(|pane| self.panes.get(&pane))
+            .is_some_and(|s| {
+                s.info.exited.is_none()
+                    && s.info
+                        .user_vars
+                        .get("TUTTI_KEYS")
+                        .is_some_and(|v| v == "pane")
+            });
+        if !pane_keys && let Some(action) = self.config.keys.action_for(key) {
             return self.direct_action(action);
         }
         // An exited pane has no child to type at; the keys its title
@@ -4971,6 +4983,7 @@ fn placeholder_info(pane: PaneId) -> PaneInfo {
         issue: None,
         conversation: None,
         sandbox_name: None,
+        user_vars: Default::default(),
     }
 }
 
@@ -5758,6 +5771,51 @@ mod tests {
                 bytes: vec![0x04],
             }],
             "Ctrl+D must reach the pane so EOF still works"
+        );
+    }
+
+    /// A pane whose program set the user var `TUTTI_KEYS=pane` gets the direct
+    /// chords as its own bytes, as unbound keys; the prefix stays tutti's, and
+    /// any other value — or the pane exiting — hands the chords back.
+    #[test]
+    fn tutti_keys_pane_hands_the_direct_chords_to_the_pane() {
+        let with_keys = |value: &str, exited| {
+            let mut view = view_2x2();
+            let pane = &mut view[0].tabs[0].panes[0];
+            pane.user_vars.insert("TUTTI_KEYS".into(), value.into());
+            pane.exited = exited;
+            view
+        };
+        let mut app = App::new();
+        attach_with(&mut app, with_keys("pane", None));
+        app.sync_sizes(Rect::new(0, 0, 80, 24));
+        let input = |bytes: &[u8]| {
+            vec![WireFrame::Input {
+                pane: PaneId(1),
+                bytes: bytes.to_vec(),
+            }]
+        };
+        assert_eq!(app.on_key(ctrl('l')), input(&[0x0c]));
+        assert_eq!(app.on_key(alt('h')), input(b"\x1bh"));
+        assert_eq!(app.on_key(alt('x')), input(b"\x1bx"));
+        assert_eq!((app.focused, app.mode), (Some(PaneId(1)), Mode::Terminal));
+        app.on_key(ctrl('b'));
+        assert_eq!(app.mode, Mode::Prefix, "the prefix is still tutti's");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        layout_changed(&mut app, with_keys("pane", Some(0)));
+        assert!(
+            app.on_key(ctrl('j')).is_empty(),
+            "an exited pane claims nothing"
+        );
+        assert_eq!(app.focused, Some(PaneId(3)));
+        app.on_key(ctrl('k'));
+        layout_changed(&mut app, with_keys("tutti", None));
+        assert!(app.on_key(ctrl('l')).is_empty());
+        assert_eq!(
+            app.focused,
+            Some(PaneId(2)),
+            "only `pane` claims the chords"
         );
     }
 

@@ -7,7 +7,7 @@ mod protocol;
 mod sandbox;
 mod state;
 
-pub use domain::{AgentKind, Direction, Layout};
+pub use domain::{AgentKind, Direction, Layout, Toward};
 pub use frame::{Frame, FrameError, MAX_FRAME_LEN, PaneData};
 pub use ids::{PaneId, TabId, WorkspaceId};
 pub use paths::{log_path, socket_dir, socket_path, state_dir};

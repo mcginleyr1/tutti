@@ -311,6 +311,7 @@ mod tests {
             issue: None,
             conversation: None,
             sandbox_name: None,
+            user_vars: Default::default(),
         }]);
         assert_eq!(
             rendered,

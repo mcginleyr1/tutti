@@ -29,7 +29,7 @@ use tutti_agents::{ProcessTree, Registry};
 use tutti_core::{
     AgentHookEvent, AgentKind, AgentState, ApprovalDecision, Checkpoint, Direction, Event, Frame,
     IssueRef, NOTES_CAP, Note, NoteKind, Observation, PaneData, PaneDims, PaneId, PaneInfo,
-    Request, Response, StateEvent, Tagged, WaitFor, WorkspaceId, prompt_fingerprint,
+    Request, Response, StateEvent, Tagged, Toward, WaitFor, WorkspaceId, prompt_fingerprint,
 };
 
 use crate::herdr;
@@ -606,6 +606,10 @@ fn handle_frame(
                 let response = focus_pane(hub, cid, pane);
                 send_reply(hub, cid, tx, reply.encode(&response))
             }
+            Ok(Request::PaneFocusToward { from, toward, wrap }) => {
+                let response = focus_toward(hub, cid, from, toward, wrap);
+                send_reply(hub, cid, tx, reply.encode(&response))
+            }
             Ok(Request::PaneScroll { pane, offset }) => scroll(hub, cid, tx, pane, offset),
             Ok(Request::WorkspaceDiff { id, stat }) => workspace_diff(hub, &reply, id, stat),
             Ok(Request::ApprovalHold {
@@ -906,6 +910,26 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             direction,
             delta,
         } => resize_split(hub, pane, direction, delta),
+        Request::PaneResizeToward {
+            from,
+            toward,
+            delta,
+        } => {
+            let pane = match source_pane(hub, from) {
+                Ok(pane) => pane,
+                Err(err) => return error(err),
+            };
+            let (axis, delta) = match toward {
+                Toward::Left => (Direction::Horizontal, -delta),
+                Toward::Right => (Direction::Horizontal, delta),
+                Toward::Up => (Direction::Vertical, -delta),
+                Toward::Down => (Direction::Vertical, delta),
+            };
+            resize_split(hub, pane, axis, delta)
+        }
+        Request::View => Response::View {
+            workspaces: hub.session().view(),
+        },
         Request::PaneSplitRatio { a, b, ratio } => split_ratio(hub, a, b, ratio),
         Request::AgentEvent {
             pane,
@@ -948,6 +972,7 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
         | Request::ViewSizes { .. }
         | Request::Watch
         | Request::PaneFocus { .. }
+        | Request::PaneFocusToward { .. }
         | Request::PaneScroll { .. }
         | Request::WorkspaceDiff { .. }
         | Request::ApprovalHold { .. }
@@ -1042,6 +1067,44 @@ fn focus_pane(hub: &Arc<Hub>, cid: u64, pane: PaneId) -> Response {
         broadcast_event(hub, Event::PaneFocused { pane });
     }
     Response::Ok
+}
+
+/// Focus the pane `toward` of `from` as `focus_pane` does, and answer which it
+/// was — `None` at an edge, where nothing moves.
+fn focus_toward(
+    hub: &Arc<Hub>,
+    cid: u64,
+    from: Option<PaneId>,
+    toward: Toward,
+    wrap: bool,
+) -> Response {
+    let from = match source_pane(hub, from) {
+        Ok(from) => from,
+        Err(err) => return error(err),
+    };
+    // Bound first: `focus_pane` re-locks the session.
+    let neighbor = hub.session().pane_neighbor(from, toward, wrap);
+    let pane = match neighbor {
+        Ok(pane) => pane,
+        Err(err) => return error(err),
+    };
+    match pane.map(|pane| focus_pane(hub, cid, pane)) {
+        None | Some(Response::Ok) => Response::Neighbor { from, toward, pane },
+        Some(refusal) => refusal,
+    }
+}
+
+/// The pane a directional request starts from: `from`, else the attached
+/// client's focused pane — the newest client's, as a watcher's snapshot
+/// names it.
+fn source_pane(hub: &Hub, from: Option<PaneId>) -> Result<PaneId> {
+    from.or_else(|| {
+        hub.clients()
+            .iter()
+            .max_by_key(|(cid, _)| **cid)
+            .and_then(|(_, client)| client.focused)
+    })
+    .context("no pane to start from: name one, or focus one in an attached client")
 }
 
 /// Publish one pane's state transition — the single funnel every transition
@@ -2306,14 +2369,23 @@ fn broadcast_tick(hub: &Arc<Hub>) {
     // bounded even with nobody attached; `broadcast_event` is a no-op then,
     // but the history still records them. Status reports ride the same
     // queue, so a program's word lands within a tick, in stream order with
-    // the notifications around it.
+    // the notifications around it. User vars do too, and whatever they moved
+    // goes out as one fresh view per tick.
+    let mut vars_moved = false;
     for (pane, pty) in &panes {
         for signal in pty.take_notifications() {
             match signal {
                 Signal::Notify(note) => pane_notification(hub, *pane, note.title, note.body),
                 Signal::Status(report) => program_status(hub, *pane, report),
+                Signal::UserVar { name, value } => {
+                    vars_moved |= hub.session().set_user_var(*pane, name, value);
+                }
             }
         }
+    }
+    if vars_moved {
+        let view = hub.session().view();
+        broadcast_event(hub, Event::LayoutChanged { workspaces: view });
     }
 
     if hub.clients().is_empty() {
