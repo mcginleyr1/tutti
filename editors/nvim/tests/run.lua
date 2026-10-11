@@ -56,6 +56,10 @@ test('inert without $TUTTI_PANE', function()
   eq('', vim.fn.maparg('<C-h>', 'n'))
   eq(false, backend.detect())
   eq({}, sent)
+  vim.cmd.vsplit()
+  tutti.navigate('left')
+  eq({ false, false }, { tutti.focus('left'), tutti.resize('up', 0.1) })
+  eq({}, calls())
 end)
 
 vim.env.TUTTI_PANE = '7'

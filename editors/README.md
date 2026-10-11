@@ -88,8 +88,9 @@ The Lua API is `require('tutti')`:
 
 `focus`, `resize` and `navigate` give tutti 500 ms
 (`require('tutti').timeout`), and tutti never makes them throw. A tutti that is
-missing, slow or refusing reads as "did not move". An unknown direction is an
-error.
+missing, slow or refusing reads as "did not move". Outside a tutti pane they
+never call tutti at all: `focus` and `resize` return false, and `navigate`
+stays among Neovim's windows. An unknown direction is an error.
 
 ### smart-splits.nvim
 
@@ -152,7 +153,8 @@ whatever environment `tutti edit` runs in. Turn the mode on after
 
 `tutti-windmove-left`, `-right`, `-up` and `-down` move like `windmove`. Where
 windmove would refuse, at the frame's edge or toward an inactive minibuffer,
-they focus the tutti pane in that direction instead. Nothing is bound by
+they focus the tutti pane in that direction instead. Outside a tutti pane they
+are plain windmove, refusal included, so the same bindings work everywhere. Nothing is bound by
 default. The shifted arrows above follow `windmove-default-keybindings`; pick
 `C-c <arrow>` instead if Org mode already claims them.
 

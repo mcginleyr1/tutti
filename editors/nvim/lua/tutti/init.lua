@@ -40,15 +40,21 @@ function M.run(args)
   return ok and result and result.code or -1
 end
 
--- Focuses the tutti pane beyond this one; true when focus moved.
-function M.focus(direction, wrap)
-  local args = { 'pane', 'focus', '--direction', direction, '--from', vim.env.TUTTI_PANE }
-  return M.run(wrap and vim.list_extend(args, { '--wrap' }) or args) == 0
+-- `tutti pane <verb> --direction <direction> --from $TUTTI_PANE <extra>`; true
+-- when it succeeded. Outside a pane there is no tutti pane to act from.
+local function from_here(verb, direction, extra)
+  local pane = vim.env.TUTTI_PANE
+  return pane ~= nil and M.run(vim.list_extend({ 'pane', verb, '--direction', direction, '--from', pane }, extra)) == 0
 end
 
+-- Focuses the tutti pane beyond this one; true when focus moved.
+function M.focus(direction, wrap)
+  return from_here('focus', direction, wrap and { '--wrap' } or {})
+end
+
+-- Moves tutti's split border by `amount` (a ratio; tutti's step when nil).
 function M.resize(direction, amount)
-  local args = { 'pane', 'resize', '--direction', direction, '--from', vim.env.TUTTI_PANE }
-  return M.run(amount and vim.list_extend(args, { '--amount', tostring(amount) }) or args) == 0
+  return from_here('resize', direction, amount and { '--amount', tostring(amount) } or {})
 end
 
 -- Moves to the Neovim window in `direction`, or past Neovim's edge to the

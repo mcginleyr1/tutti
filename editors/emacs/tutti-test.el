@@ -112,10 +112,20 @@ ANSWERS gives the control files for a call by its number, as in
                      "[pane][focus][--direction][down][--from][7]"))))
   (delete-other-windows))
 
-(ert-deftest tutti-windmove-never-signals ()
+(ert-deftest tutti-windmove-never-signals-in-a-pane ()
   (delete-other-windows)
-  (let ((tutti-program "/nonexistent/tutti"))
+  (let ((tutti-program "/nonexistent/tutti")
+        (process-environment (cons "TUTTI_PANE=7" process-environment)))
     (tutti-windmove-left)))
+
+(ert-deftest tutti-windmove-outside-a-pane-is-windmove ()
+  (delete-other-windows)
+  (should (equal (tutti-test--calls
+                  nil
+                  (lambda ()
+                    (setenv "TUTTI_PANE")
+                    (should-error (tutti-windmove-left) :type 'user-error)))
+                 nil)))
 
 (ert-deftest tutti-agents-lists-the-latest-snapshot-and-focuses ()
   (should (equal (tutti-test--calls

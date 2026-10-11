@@ -84,14 +84,14 @@ Does nothing outside a terminal frame in a tutti pane."
 (defun tutti--windmove (direction)
   "Select the window in DIRECTION, or past the frame's edge, tutti's pane.
 The edge is wherever windmove refuses: no window there, or only the
-inactive minibuffer."
-  (condition-case nil
+inactive minibuffer.  Outside a tutti pane, windmove's refusal stands."
+  (condition-case refusal
       (windmove-do-window-select direction)
     (error
-     (ignore-errors
-       (call-process tutti-program nil nil nil "pane" "focus"
-                     "--direction" (symbol-name direction)
-                     "--from" (or (getenv "TUTTI_PANE") ""))))))
+     (let ((pane (or (getenv "TUTTI_PANE") (signal (car refusal) (cdr refusal)))))
+       (ignore-errors
+         (call-process tutti-program nil nil nil "pane" "focus"
+                       "--direction" (symbol-name direction) "--from" pane))))))
 
 ;;;###autoload
 (defun tutti-windmove-left ()
