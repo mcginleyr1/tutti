@@ -1,9 +1,10 @@
-//! The agent integrations tutti installs: Claude Code's hooks, the opencode
-//! plugin, and the tutti skill. `Integration::plan` inspects one's target file
-//! and works out what installing would change, with no side effects — cheap
-//! enough to run whenever a status is wanted — and `apply` carries a plan out.
-//! No stdin or stdout here: the CLI's `--install` flows (and any TUI surface)
-//! wrap their own confirmation around it.
+//! The integrations tutti installs: Claude Code's hooks, the opencode plugin,
+//! the tutti skill, and the shell integration's line in the user's rc file.
+//! `Integration::plan` inspects one's target file and works out what
+//! installing would change, with no side effects — cheap enough to run
+//! whenever a status is wanted — and `apply` carries a plan out. No stdin or
+//! stdout here: the CLI's `--install` flows (and any TUI surface) wrap their
+//! own confirmation around it.
 
 use std::path::{Path, PathBuf};
 
@@ -25,6 +26,47 @@ pub enum Integration {
     OpencodePlugin,
     /// The tutti skill, for Claude Code.
     Skill,
+    /// The line loading `tutti shell-init` in the rc file of the user's
+    /// `$SHELL`.
+    ShellInit,
+}
+
+/// A shell `tutti shell-init` speaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Shell {
+    Zsh,
+    Bash,
+    Fish,
+}
+
+impl Shell {
+    /// The snippet `tutti shell-init` prints: inside a tutti pane it reports
+    /// the working directory (OSC 7) and marks each prompt and command (OSC
+    /// 133); elsewhere it does nothing. Sourcing it twice changes nothing.
+    pub fn snippet(self) -> &'static str {
+        match self {
+            Shell::Zsh => include_str!("shell/tutti.zsh"),
+            Shell::Bash => include_str!("shell/tutti.bash"),
+            Shell::Fish => include_str!("shell/tutti.fish"),
+        }
+    }
+
+    /// The line an rc file loads the snippet with: only inside a tutti pane,
+    /// so no other shell runs `tutti`, and only while tutti is installed.
+    /// Its `if` leaves `$?` at 0 outside tutti.
+    pub fn rc_line(self) -> &'static str {
+        match self {
+            Shell::Zsh => {
+                r#"if [ -n "$TUTTI_PANE" ] && command -v tutti >/dev/null; then eval "$(tutti shell-init zsh)"; fi"#
+            }
+            Shell::Bash => {
+                r#"if [ -n "$TUTTI_PANE" ] && command -v tutti >/dev/null; then eval "$(tutti shell-init bash)"; fi"#
+            }
+            Shell::Fish => {
+                "if set -q TUTTI_PANE; and command -q tutti; tutti shell-init fish | source; end"
+            }
+        }
+    }
 }
 
 /// The directories install targets resolve against: parameters, not
@@ -38,11 +80,16 @@ pub struct Dirs {
     /// Install into this project instead of the user's config. A relative
     /// path resolves against the cwd — an empty one is the cwd itself.
     pub project: Option<PathBuf>,
+    /// `$SHELL`, whose rc file the shell integration goes in.
+    pub shell: Option<PathBuf>,
+    /// `$ZDOTDIR`, where zsh reads `.zshrc` from instead of `$HOME`.
+    pub zdotdir: Option<PathBuf>,
 }
 
 impl Dirs {
-    /// The user's directories from the environment — `$HOME` and
-    /// `$XDG_CONFIG_HOME`, each ignored when empty — and no project.
+    /// The user's directories from the environment — `$HOME`,
+    /// `$XDG_CONFIG_HOME`, `$SHELL` and `$ZDOTDIR`, each ignored when empty —
+    /// and no project.
     pub fn from_env() -> Dirs {
         let var = |name| {
             std::env::var_os(name)
@@ -53,7 +100,22 @@ impl Dirs {
             home: var("HOME"),
             xdg_config_home: var("XDG_CONFIG_HOME"),
             project: None,
+            shell: var("SHELL"),
+            zdotdir: var("ZDOTDIR"),
         }
+    }
+
+    /// The shell `$SHELL` names, as `tutti shell-init` speaks it.
+    fn shell(&self) -> Result<Shell> {
+        let shell = self.shell.as_deref().context("SHELL is not set")?;
+        let name = shell.file_name().and_then(|name| name.to_str());
+        name.and_then(|name| clap::ValueEnum::from_str(name, false).ok())
+            .with_context(|| {
+                format!(
+                    "tutti shell-init speaks zsh, bash and fish, not {}",
+                    shell.display()
+                )
+            })
     }
 }
 
@@ -126,6 +188,7 @@ impl Integration {
             Integration::Skill => {
                 whole_file_status(found.as_deref(), SKILL, is_tutti_skill, "skill")
             }
+            Integration::ShellInit => rc_line_status(found.as_deref(), dirs.shell()?.rc_line()),
         };
         Ok(Plan {
             path,
@@ -151,6 +214,21 @@ impl Integration {
             },
             (Integration::Skill, Some(project)) => project.join(".claude/skills/tutti/SKILL.md"),
             (Integration::Skill, None) => home()?.join(".claude/skills/tutti/SKILL.md"),
+            (Integration::ShellInit, Some(_)) => {
+                bail!("shell integration goes in your own shell's rc file, not a project's")
+            }
+            // The rc file an interactive, non-login shell — a pane's — reads.
+            (Integration::ShellInit, None) => match dirs.shell()? {
+                Shell::Zsh => match &dirs.zdotdir {
+                    Some(zdotdir) => zdotdir.join(".zshrc"),
+                    None => home()?.join(".zshrc"),
+                },
+                Shell::Bash => home()?.join(".bashrc"),
+                Shell::Fish => match &dirs.xdg_config_home {
+                    Some(config) => config.join("fish/config.fish"),
+                    None => home()?.join(".config/fish/config.fish"),
+                },
+            },
         })
     }
 }
@@ -247,6 +325,26 @@ fn whole_file_status(
         }
         Some(_) => Status::Foreign,
     }
+}
+
+/// A shell's rc file, the user's own: `line` appended to whatever it holds,
+/// unless a `tutti shell-init` line is there already — tutti's, or one the
+/// user wrote.
+fn rc_line_status(found: Option<&str>, line: &str) -> Status {
+    let found = found.unwrap_or_default();
+    if found.contains("tutti shell-init") {
+        return Status::Installed;
+    }
+    let newline = if found.is_empty() || found.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    Status::Missing(Change {
+        contents: format!("{found}{newline}{line}\n"),
+        summary: "appending the line that loads tutti's shell integration".into(),
+        preview: format!("--- appended ---\n{line}\n"),
+    })
 }
 
 /// Whether a SKILL.md is tutti's: its frontmatter names it `tutti`.
@@ -516,6 +614,94 @@ mod tests {
         };
         assert!(apply(&installed).is_err(), "nothing to install");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn shell_user(home: &Path, shell: &str) -> Dirs {
+        Dirs {
+            shell: Some(shell.into()),
+            ..user(home)
+        }
+    }
+
+    #[test]
+    fn the_shell_integration_targets_the_rc_file_of_the_users_shell() {
+        let home = temp_home();
+        let path = |dirs: &Dirs| Integration::ShellInit.plan(dirs).unwrap().path;
+        assert_eq!(path(&shell_user(&home, "/bin/zsh")), home.join(".zshrc"));
+        let zdotdir = Dirs {
+            zdotdir: Some(home.join("zsh")),
+            ..shell_user(&home, "/bin/zsh")
+        };
+        assert_eq!(path(&zdotdir), home.join("zsh/.zshrc"));
+        assert_eq!(
+            path(&shell_user(&home, "/opt/homebrew/bin/bash")),
+            home.join(".bashrc")
+        );
+        assert_eq!(
+            path(&shell_user(&home, "/usr/local/bin/fish")),
+            home.join(".config/fish/config.fish")
+        );
+        let xdg = Dirs {
+            xdg_config_home: Some(home.join("xdg")),
+            ..shell_user(&home, "fish")
+        };
+        assert_eq!(path(&xdg), home.join("xdg/fish/config.fish"));
+
+        let err = |dirs: &Dirs| Integration::ShellInit.plan(dirs).unwrap_err().to_string();
+        assert_eq!(err(&user(&home)), "SHELL is not set");
+        assert!(err(&shell_user(&home, "/bin/tcsh")).contains("not /bin/tcsh"));
+        let project = Dirs {
+            project: Some(home.join("repo")),
+            ..shell_user(&home, "/bin/zsh")
+        };
+        assert!(err(&project).contains("not a project's"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_shell_line_is_appended_once_keeping_the_rc_file() {
+        let home = temp_home();
+        let dirs = shell_user(&home, "/opt/homebrew/bin/bash");
+        let bashrc = home.join(".bashrc");
+        let line = Shell::Bash.rc_line();
+
+        let plan = Integration::ShellInit.plan(&dirs).unwrap();
+        assert!(
+            matches!(&plan.status, Status::Missing(change) if change.contents == format!("{line}\n"))
+        );
+        write(&bashrc, "alias ll='ls -l'");
+        let plan = Integration::ShellInit.plan(&dirs).unwrap();
+        assert_eq!(
+            apply(&plan).unwrap(),
+            Some(home.join(".bashrc.bak")),
+            "the old rc file is kept"
+        );
+        assert_eq!(text(&bashrc), format!("alias ll='ls -l'\n{line}\n"));
+        assert_eq!(
+            Integration::ShellInit.plan(&dirs).unwrap().status,
+            Status::Installed
+        );
+
+        // A line of the user's own counts too.
+        write(&bashrc, "eval \"$(tutti shell-init bash)\"\n");
+        assert_eq!(
+            Integration::ShellInit.plan(&dirs).unwrap().status,
+            Status::Installed
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Every snippet does nothing outside a tutti pane and nothing twice.
+    #[test]
+    fn each_snippet_is_guarded_by_the_pane_and_against_a_second_load() {
+        for shell in [Shell::Zsh, Shell::Bash, Shell::Fish] {
+            let guard = shell.snippet().lines().find(|l| l.starts_with("if "));
+            assert!(
+                guard.is_some_and(|g| g.contains("TUTTI_PANE") && g.contains("__tutti_shell")),
+                "{shell:?}: {guard:?}"
+            );
+            assert!(shell.rc_line().contains("TUTTI_PANE"), "{shell:?}");
+        }
     }
 
     /// The shipped skill is a Claude Code skill tutti recognises as its own:

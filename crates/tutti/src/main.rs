@@ -14,7 +14,7 @@ use tutti_core::{
 use tutti::client::{self, Client, StopOutcome};
 use tutti::config::{Approvals, Config, RESIZE_DELTA};
 use tutti::hooks;
-use tutti::integrations::{self, Dirs, Integration, Status};
+use tutti::integrations::{self, Dirs, Integration, Shell, Status};
 use tutti::issues;
 use tutti::render;
 
@@ -167,6 +167,15 @@ enum Command {
         /// Skip the confirmation prompt.
         #[arg(long, requires = "install")]
         yes: bool,
+    },
+    /// Print the shell integration: inside a tutti pane it reports the
+    /// working directory, so a split starts there, and marks each command,
+    /// for `pane read --last-output`. Load it from your rc file with `eval
+    /// "$(tutti shell-init zsh)"` (fish: `tutti shell-init fish | source`), or
+    /// let the setup panel (prefix `i`) add that line.
+    ShellInit {
+        #[arg(value_enum)]
+        shell: Shell,
     },
 }
 
@@ -414,6 +423,10 @@ enum PaneAction {
         /// then the screen, and the next cursor on stderr. Start from 0.
         #[arg(long)]
         since: Option<u64>,
+        /// Print the output of the last command the pane's shell finished,
+        /// and its exit code on stderr. Needs `tutti shell-init` in the shell.
+        #[arg(long, conflicts_with_all = ["since", "fingerprint"])]
+        last_output: bool,
     },
     /// Answer the pane's held approval — a Claude permission request waiting
     /// on tutti under `approvals = "hold"`: allow the tool call, or `--deny`
@@ -646,6 +659,11 @@ fn run(cli: Cli) -> Result<i32> {
         }) => install_integration(Integration::Skill, project, yes),
         Some(Command::Skill { raw, .. }) => {
             emit_skill(raw);
+            Ok(0)
+        }
+        // Nothing on stderr: an rc file evals this on every shell start.
+        Some(Command::ShellInit { shell }) => {
+            print!("{}", shell.snippet());
             Ok(0)
         }
         Some(command) => {
@@ -1000,11 +1018,13 @@ fn to_request(command: Command) -> Result<Request> {
                 unwrapped,
                 fingerprint: false,
                 since,
+                last_output,
             } => Request::PaneRead {
                 pane: PaneId(pane),
                 lines,
                 unwrapped,
                 since,
+                last_output,
             },
             PaneAction::Approve {
                 pane,
@@ -1070,7 +1090,8 @@ fn to_request(command: Command) -> Result<Request> {
         | Command::Watch
         | Command::AgentEvent { .. }
         | Command::Hooks { .. }
-        | Command::Skill { .. } => bail!("not a protocol request"),
+        | Command::Skill { .. }
+        | Command::ShellInit { .. } => bail!("not a protocol request"),
     }
 }
 
@@ -1588,6 +1609,7 @@ fn install_integration(integration: Integration, project: bool, yes: bool) -> Re
         Integration::ClaudeHooks => ("hooks", "", "in"),
         Integration::OpencodePlugin => ("plugin", "the ", "at"),
         Integration::Skill => ("skill", "the ", "at"),
+        Integration::ShellInit => ("shell integration", "", "in"),
     };
     let change = match &plan.status {
         Status::Missing(change) | Status::Outdated(change) => change,
@@ -1761,6 +1783,23 @@ fn emit(response: Response, json: bool) -> i32 {
                 eprintln!("note: rows past the cursor had already left the pane's scrollback");
             }
             eprintln!("next cursor: {cursor}");
+            0
+        }
+        // The exit code goes to stderr so stdout stays the command's output.
+        Response::LastOutput {
+            lines,
+            exit,
+            truncated,
+        } => {
+            for line in lines {
+                println!("{line}");
+            }
+            if truncated {
+                eprintln!("note: its first rows had already left the pane's scrollback");
+            }
+            if let Some(exit) = exit {
+                eprintln!("exit: {exit}");
+            }
             0
         }
         Response::Fingerprint { fingerprint } => {
@@ -2395,6 +2434,7 @@ mod tests {
                 lines: Some(40),
                 unwrapped: true,
                 since: None,
+                last_output: false,
             }
         );
         assert_eq!(
@@ -2404,6 +2444,7 @@ mod tests {
                 lines: None,
                 unwrapped: false,
                 since: None,
+                last_output: false,
             }
         );
         assert_eq!(
@@ -2434,6 +2475,7 @@ mod tests {
                 lines: Some(40),
                 unwrapped: true,
                 since: Some(177),
+                last_output: false,
             }
         );
         assert!(
@@ -2448,6 +2490,27 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn pane_read_last_output_combines_with_unwrapped_but_not_since_or_fingerprint() {
+        assert_eq!(
+            request_of(&["tutti", "pane", "read", "5", "--last-output", "--unwrapped"]),
+            Request::PaneRead {
+                pane: PaneId(5),
+                lines: None,
+                unwrapped: true,
+                since: None,
+                last_output: true,
+            }
+        );
+        for other in [["--since", "0"].as_slice(), &["--fingerprint"]] {
+            let args = ["tutti", "pane", "read", "5", "--last-output"];
+            assert!(
+                Cli::try_parse_from(args.iter().chain(other)).is_err(),
+                "{other:?}"
+            );
+        }
     }
 
     #[test]

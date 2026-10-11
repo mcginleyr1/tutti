@@ -886,6 +886,7 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             lines,
             unwrapped,
             since,
+            last_output,
         } => {
             // Bound first: a read can format the whole 10k-row ring, and the
             // session lock must not be held across it.
@@ -895,6 +896,25 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
                     message: format!("no pane {pane}"),
                 };
             };
+            if last_output {
+                return match (since, pty.last_output(lines, unwrapped)) {
+                    (Some(_), _) => Response::Error {
+                        message: "a read takes since or last_output, not both".into(),
+                    },
+                    (None, Ok(Some(out))) => Response::LastOutput {
+                        lines: out.lines,
+                        exit: out.exit,
+                        truncated: out.truncated,
+                    },
+                    (None, Ok(None)) => Response::Error {
+                        message: format!(
+                            "no finished command in pane {pane} (needs shell integration: tutti \
+                             shell-init)"
+                        ),
+                    },
+                    (None, Err(err)) => error(err),
+                };
+            }
             match (pty.tail(since.unwrap_or(0), lines, unwrapped), since) {
                 (Ok(tail), None) => Response::Content { lines: tail.lines },
                 (Ok(tail), Some(_)) => Response::Tail {

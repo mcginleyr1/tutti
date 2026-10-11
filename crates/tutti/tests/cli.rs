@@ -1227,6 +1227,27 @@ fn project_add_prints_the_new_project() {
 }
 
 /// `tutti skill` prints the skill (`--raw` without the stderr notes), and
+/// `shell-init <shell>` prints the snippet alone and says nothing on stderr:
+/// an rc file evals it on every shell start, inside tutti or not.
+#[test]
+fn shell_init_prints_only_the_snippet() {
+    use tutti::integrations::Shell;
+    for (name, shell) in [
+        ("zsh", Shell::Zsh),
+        ("bash", Shell::Bash),
+        ("fish", Shell::Fish),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_tutti"))
+            .args(["shell-init", name])
+            .env_remove("TUTTI_SESSION")
+            .env_remove("TUTTI_PANE")
+            .output()
+            .unwrap();
+        assert!(out.status.success() && out.stderr.is_empty(), "{name}");
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), shell.snippet());
+    }
+}
+
 /// `skill --install --yes` writes it under `$HOME` — idempotently, replacing
 /// an older tutti skill behind a `.bak`, never a skill that is not tutti's.
 #[test]
@@ -1375,6 +1396,7 @@ fn pane_read_prints_plain_lines() {
                     lines: Some(2),
                     unwrapped: false,
                     since: None,
+                    last_output: false,
                 }
             );
         },
@@ -1402,6 +1424,7 @@ fn pane_read_since_prints_lines_then_the_cursor_on_stderr() {
                     lines: None,
                     unwrapped: false,
                     since: Some(40),
+                    last_output: false,
                 }
             );
         },
@@ -1419,6 +1442,43 @@ fn pane_read_since_prints_lines_then_the_cursor_on_stderr() {
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("next cursor: 52"), "stderr was: {stderr}");
+    assert!(
+        stderr.contains("left the pane's scrollback"),
+        "stderr was: {stderr}"
+    );
+}
+
+/// `pane read --last-output` keeps stdout the command's output alone: the
+/// exit code, and the note when rows were lost, go to stderr, and the CLI
+/// exits 0 whatever the command's code.
+#[test]
+fn pane_read_last_output_prints_lines_then_the_exit_code_on_stderr() {
+    let output = run_scenario(
+        "lastout",
+        &["pane", "read", "3", "--last-output", "--unwrapped"],
+        |req| {
+            assert_eq!(
+                *req,
+                Request::PaneRead {
+                    pane: PaneId(3),
+                    lines: None,
+                    unwrapped: true,
+                    since: None,
+                    last_output: true,
+                }
+            );
+        },
+        Response::LastOutput {
+            lines: vec!["a".into(), "b".into()],
+            exit: Some(2),
+            truncated: true,
+        },
+    );
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "a\nb\n");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.ends_with("exit: 2\n"), "stderr was: {stderr}");
     assert!(
         stderr.contains("left the pane's scrollback"),
         "stderr was: {stderr}"

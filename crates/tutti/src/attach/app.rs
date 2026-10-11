@@ -76,10 +76,11 @@ const NOTES_WIDTH: u16 = 100;
 
 /// The setup panel's rows, top to bottom: each integration tutti installs and
 /// the name it goes by there.
-const SETUP: [(Integration, &str); 3] = [
+const SETUP: [(Integration, &str); 4] = [
     (Integration::ClaudeHooks, "Claude Code hooks"),
     (Integration::OpencodePlugin, "opencode plugin"),
     (Integration::Skill, "tutti skill"),
+    (Integration::ShellInit, "shell integration"),
 ];
 
 /// The braille working-spinner frames and their advance interval, shared by
@@ -4984,6 +4985,7 @@ fn placeholder_info(pane: PaneId) -> PaneInfo {
         conversation: None,
         sandbox_name: None,
         user_vars: Default::default(),
+        cwd: None,
     }
 }
 
@@ -9713,6 +9715,7 @@ mod tests {
         let mut app = App::with_config(config);
         app.setup_dirs = Dirs {
             home: Some(home.clone()),
+            shell: Some("/bin/zsh".into()),
             ..Dirs::default()
         };
         let mut view = view_one_pane();
@@ -9727,9 +9730,10 @@ mod tests {
         app.setup_plans[row].as_ref().unwrap().status.clone()
     }
 
+    /// The target of every row that could be planned.
     fn setup_paths(app: &App) -> Vec<PathBuf> {
         app.setup_rows()
-            .map(|(_, plan)| plan.as_ref().unwrap().path.clone())
+            .filter_map(|(_, plan)| Some(plan.as_ref().ok()?.path.clone()))
             .collect()
     }
 
@@ -9741,7 +9745,12 @@ mod tests {
             let labels: Vec<&str> = app.setup_rows().map(|(label, _)| label).collect();
             assert_eq!(
                 labels,
-                ["Claude Code hooks", "opencode plugin", "tutti skill"]
+                [
+                    "Claude Code hooks",
+                    "opencode plugin",
+                    "tutti skill",
+                    "shell integration"
+                ]
             );
             assert_eq!(
                 setup_paths(&app),
@@ -9749,10 +9758,11 @@ mod tests {
                     home.join(".claude/settings.json"),
                     home.join(".config/opencode/plugins/tutti.js"),
                     home.join(".claude/skills/tutti/SKILL.md"),
+                    home.join(".zshrc"),
                 ],
                 "the user scope plans against the home"
             );
-            assert!((0..3).all(|row| matches!(setup_status(&app, row), Status::Missing(_))));
+            assert!((0..4).all(|row| matches!(setup_status(&app, row), Status::Missing(_))));
 
             let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
             assert_eq!(app.on_key(esc), Vec::new());
@@ -9890,6 +9900,45 @@ mod tests {
         assert!(
             matches!(setup_status(&app, 2), Status::Missing(_)),
             "the project install left the home alone"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    /// The shell row appends its one line to the `$SHELL`'s rc file behind a
+    /// backup, keeping what the file held, and then reads as installed; a
+    /// project has no rc file, so the row is unavailable there.
+    #[test]
+    fn the_shell_row_appends_its_line_to_the_rc_file_once() {
+        let (mut app, home, project) = setup_fixture(Config::default());
+        let zshrc = home.join(".zshrc");
+        std::fs::write(&zshrc, "export EDITOR=vi").unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.on_key(ctrl('b'));
+        app.on_key(plain('i'));
+        for _ in 0..3 {
+            app.on_key(plain('j'));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.setup_confirming(), "enter asks first");
+        app.on_key(plain('y'));
+        let line = integrations::Shell::Zsh.rc_line();
+        assert_eq!(
+            std::fs::read_to_string(&zshrc).unwrap(),
+            format!("export EDITOR=vi\n{line}\n")
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join(".zshrc.bak")).unwrap(),
+            "export EDITOR=vi"
+        );
+        assert_eq!(setup_status(&app, 3), Status::Installed);
+
+        app.on_key(plain('s'));
+        assert!(
+            app.setup_rows().nth(3).is_some_and(|(_, plan)| plan
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("not a project's"))),
+            "a project has no rc file"
         );
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&project);

@@ -191,6 +191,12 @@ pub enum Request {
         /// `Response::Tail`. `None` reads everything as `Response::Content`.
         #[serde(default)]
         since: Option<u64>,
+        /// Read the last command the pane's shell finished instead — its
+        /// output between the shell integration's OSC 133 `C` and `D` marks —
+        /// answered with `Response::LastOutput`; an Error when no command has
+        /// finished under shell integration. Never with `since`.
+        #[serde(default)]
+        last_output: bool,
     },
     /// Resize a pane's pty and grid to the attached client's rendered size.
     /// What clients older than `ViewSizes` send; it still applies directly.
@@ -542,6 +548,11 @@ pub struct PaneInfo {
     /// the daemon: a restored pane starts with none. Empty from older servers.
     #[serde(default)]
     pub user_vars: BTreeMap<String, String>,
+    /// The working directory the pane's shell last reported (OSC 7, which
+    /// `tutti shell-init` emits on every prompt) — a split from the pane
+    /// starts there. `None` before a report and from older servers.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 /// The tracker issue a pane was deployed on: the configured source it came
@@ -752,6 +763,16 @@ pub enum Response {
     Tail {
         lines: Vec<String>,
         cursor: u64,
+        truncated: bool,
+    },
+    /// A `PaneRead { last_output: true }` reply: the output rows of the last
+    /// command the pane's shell finished, trailing blank rows trimmed, and
+    /// the exit code its `D` mark carried. A command still running leaves
+    /// the one before it. `truncated`: its first rows had already left the
+    /// scrollback ring.
+    LastOutput {
+        lines: Vec<String>,
+        exit: Option<i32>,
         truncated: bool,
     },
     /// A `PaneFingerprint` reply: the pane's prompt fingerprint, 16 hex digits.
@@ -1064,12 +1085,21 @@ mod tests {
             lines: Some(50),
             unwrapped: true,
             since: None,
+            last_output: false,
         });
         roundtrip(&Request::PaneRead {
             pane: PaneId(2),
             lines: None,
             unwrapped: false,
             since: Some(10_177),
+            last_output: false,
+        });
+        roundtrip(&Request::PaneRead {
+            pane: PaneId(2),
+            lines: None,
+            unwrapped: true,
+            since: None,
+            last_output: true,
         });
         roundtrip(&Request::PaneResize {
             pane: PaneId(2),
@@ -1424,6 +1454,7 @@ mod tests {
                     conversation: None,
                     sandbox_name: None,
                     user_vars: BTreeMap::from([("TUTTI_KEYS".into(), "pane".into())]),
+                    cwd: None,
                 }],
             }],
         }]
@@ -1474,6 +1505,7 @@ mod tests {
                 conversation: Some("0b9e6c1e-3d2a-4f5b-9c8d-7e6f5a4b3c2d".into()),
                 sandbox_name: Some("tutti-p1-18f2a9c0de".into()),
                 user_vars: BTreeMap::from([("TUTTI_EDITOR".into(), "nvim /tmp/nvim.sock".into())]),
+                cwd: Some("/src/app/a dir".into()),
             }],
         });
         roundtrip(&Response::Panes {
@@ -1492,6 +1524,7 @@ mod tests {
                 conversation: None,
                 sandbox_name: None,
                 user_vars: BTreeMap::new(),
+                cwd: None,
             }],
         });
         for pane in [Some(PaneId(3)), None] {
@@ -1544,6 +1577,16 @@ mod tests {
         roundtrip(&Response::Tail {
             lines: Vec::new(),
             cursor: 0,
+            truncated: true,
+        });
+        roundtrip(&Response::LastOutput {
+            lines: vec!["a".into(), "b".into()],
+            exit: Some(0),
+            truncated: false,
+        });
+        roundtrip(&Response::LastOutput {
+            lines: Vec::new(),
+            exit: None,
             truncated: true,
         });
         roundtrip(&Response::Fingerprint {
@@ -1826,6 +1869,7 @@ mod tests {
         assert_eq!(pane.conversation, None, "and before `conversation`, none");
         assert_eq!(pane.sandbox_name, None, "and before `sandbox_name`, none");
         assert!(pane.user_vars.is_empty(), "and before `user_vars`, none");
+        assert_eq!(pane.cwd, None, "and before `cwd`, no report");
         assert_eq!(pane.approval, None, "and before `approval`, nothing held");
         // A watcher's pane from before `user_vars` existed has none.
         let watched: WatchPane = serde_json::from_str(concat!(
@@ -1917,7 +1961,8 @@ mod tests {
                 expect: None,
             }
         );
-        // `pane_read` from before `since` existed reads everything, as Content.
+        // `pane_read` from before `since` and `last_output` existed reads
+        // everything, as Content.
         let read: Request =
             serde_json::from_str(r#"{"type":"pane_read","pane":2,"lines":null,"unwrapped":false}"#)
                 .unwrap();
@@ -1928,6 +1973,7 @@ mod tests {
                 lines: None,
                 unwrapped: false,
                 since: None,
+                last_output: false,
             }
         );
         // `attach` from before `terminal` existed names no terminal.

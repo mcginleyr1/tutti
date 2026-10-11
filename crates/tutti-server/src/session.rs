@@ -409,14 +409,28 @@ impl Session {
         Ok(id)
     }
 
-    /// Split `pane`'s cell in its tab, spawning a login shell in the new half.
+    /// Split `pane`'s cell in its tab, spawning a login shell in the new half
+    /// — in the directory `pane`'s shell last reported (OSC 7) when that lies
+    /// inside its workspace's directory (compared canonically), else in the
+    /// workspace's directory.
     pub fn pane_split(&mut self, pane: PaneId, direction: Direction) -> Result<PaneId> {
-        let tab = self
+        let slot = self
             .panes
             .get(&pane)
-            .with_context(|| format!("no pane {pane}"))?
-            .tab;
-        let dir = self.tab_workspace_dir(tab)?;
+            .with_context(|| format!("no pane {pane}"))?;
+        let tab = slot.tab;
+        let workspace = self.tab_workspace_dir(tab)?;
+        let canon = |p: &Path| std::fs::canonicalize(p).ok();
+        let dir = slot
+            .pty
+            .cwd()
+            .map(PathBuf::from)
+            .filter(|cwd| {
+                canon(cwd)
+                    .zip(canon(&workspace))
+                    .is_some_and(|(cwd, ws)| cwd.starts_with(ws))
+            })
+            .unwrap_or(workspace);
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let mut spec = PtySpec::new(&shell);
         spec.cwd = Some(dir);
@@ -1521,6 +1535,7 @@ impl Session {
                     conversation: None,
                     sandbox_name: None,
                     user_vars: BTreeMap::new(),
+                    cwd: None,
                 },
                 pty,
                 tab,
@@ -1600,11 +1615,13 @@ fn stop_subagent(subs: &mut [SubagentInfo], id: &str) -> bool {
     false
 }
 
-/// A pane's wire metadata. One with no detected agent that is self-reporting
-/// presents its label as the agent, which is all every agent surface keys on.
+/// A pane's wire metadata, with the cwd its shell last reported. One with no
+/// detected agent that is self-reporting presents its label as the agent,
+/// which is all every agent surface keys on.
 fn pane_info(slot: &PaneSlot) -> PaneInfo {
     let mut info = PaneInfo {
         checkpoints: slot.turns.entries().to_vec(),
+        cwd: slot.pty.cwd(),
         ..slot.meta.clone()
     };
     if info.agent.is_none() {

@@ -165,6 +165,7 @@ async fn read_until(conn: &mut Conn, pane: PaneId, needle: &str) -> bool {
                     lines: None,
                     unwrapped: false,
                     since: None,
+                    last_output: false,
                 })
                 .await;
             if let Response::Content { lines } = response
@@ -848,6 +849,122 @@ async fn pane_read_since_tails_scrolled_output() {
     server.stop().await;
 }
 
+/// `pane read --last-output` answers the rows between a command's OSC 133
+/// `C` and `D` marks and the exit code `D` carried; a pane whose shell never
+/// marked one is refused, naming shell integration.
+#[tokio::test]
+async fn pane_read_last_output_answers_the_marked_command() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let marked = run_marker(
+        &mut conn,
+        r"printf 'prompt\n\033]133;C\033\\a\nb\n\033]133;D;3\007done'; sleep 30",
+    )
+    .await;
+    let plain = run_marker(&mut conn, "printf unmarked; sleep 30").await;
+    assert!(read_until(&mut conn, marked, "done").await);
+    assert!(read_until(&mut conn, plain, "unmarked").await);
+
+    let read = |pane, since| Request::PaneRead {
+        pane,
+        lines: None,
+        unwrapped: false,
+        since,
+        last_output: true,
+    };
+    assert_eq!(
+        conn.request(read(marked, None)).await,
+        Response::LastOutput {
+            lines: vec!["a".into(), "b".into()],
+            exit: Some(3),
+            truncated: false,
+        }
+    );
+    assert_eq!(
+        error_message(conn.request(read(plain, None)).await),
+        format!("no finished command in pane {plain} (needs shell integration: tutti shell-init)")
+    );
+    assert!(error_message(conn.request(read(marked, Some(0))).await).contains("not both"));
+
+    server.stop().await;
+}
+
+/// A split starts in the directory its source pane's shell last reported
+/// (OSC 7, listed as the pane's `cwd`) when that lies inside the workspace;
+/// a report outside it, or of a directory that is gone, starts the split in
+/// the workspace's own directory.
+#[tokio::test]
+async fn a_split_starts_where_its_source_panes_shell_is() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let root = fresh_dir("split-cwd");
+    let inside = root.join("sub");
+    std::fs::create_dir_all(&inside).unwrap();
+    workspace_id(
+        conn.request(Request::WorkspaceNew { dir: root.clone() })
+            .await,
+    );
+    let source = pane_id(
+        conn.request(Request::PaneRun {
+            tab: None,
+            cmd: vec!["/bin/sh".into()],
+            ephemeral: false,
+            sandbox: None,
+        })
+        .await,
+    );
+
+    for (reported, starts) in [
+        (inside.clone(), &inside),
+        (std::env::temp_dir(), &root),
+        (root.join("gone"), &root),
+    ] {
+        let reported = reported.display().to_string();
+        printf_osc(&mut conn, source, &format!("7;file://host{reported}")).await;
+        assert!(
+            wait_pane(&mut conn, source, |p| p.cwd.as_deref() == Some(&reported)).await,
+            "the report of {reported} never listed"
+        );
+        let split = pane_id(
+            conn.request(Request::PaneSplit {
+                pane: source,
+                direction: Direction::Vertical,
+            })
+            .await,
+        );
+        // Ask the split's own shell, whatever `$SHELL` is, where it started.
+        let out = root.join(format!("pwd-{split}"));
+        let sent = conn
+            .request(Request::PaneSend {
+                pane: split,
+                text: Some(format!("pwd -P > '{}'\n", out.display())),
+                keys: None,
+                expect: None,
+            })
+            .await;
+        assert_eq!(sent, Response::Ok);
+        let started = timeout(DEADLINE, async {
+            loop {
+                match std::fs::read_to_string(&out) {
+                    Ok(pwd) if pwd.ends_with('\n') => return pwd.trim_end().to_string(),
+                    _ => sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .expect("the split's shell never answered");
+        let want = std::fs::canonicalize(starts).unwrap();
+        assert_eq!(
+            started,
+            want.display().to_string(),
+            "after reporting {reported}"
+        );
+    }
+
+    server.stop().await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// One `pane read --since`, as `(lines, cursor, truncated)`.
 async fn read_since(conn: &mut Conn, pane: PaneId, since: u64) -> (Vec<String>, u64, bool) {
     match conn
@@ -856,6 +973,7 @@ async fn read_since(conn: &mut Conn, pane: PaneId, since: u64) -> (Vec<String>, 
             lines: None,
             unwrapped: false,
             since: Some(since),
+            last_output: false,
         })
         .await
     {

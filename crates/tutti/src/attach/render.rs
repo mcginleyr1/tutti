@@ -2347,6 +2347,7 @@ fn placeholder_title(pane: PaneId) -> PaneInfo {
         conversation: None,
         sandbox_name: None,
         user_vars: Default::default(),
+        cwd: None,
     }
 }
 
@@ -3081,6 +3082,7 @@ mod tests {
             conversation: None,
             sandbox_name: None,
             user_vars: Default::default(),
+            cwd: None,
         };
         assert_eq!(title_text(&info), "claude · blocked");
     }
@@ -3102,6 +3104,7 @@ mod tests {
             conversation: None,
             sandbox_name: None,
             user_vars: Default::default(),
+            cwd: None,
         };
         assert_eq!(title_text(&info), "claude · ⠋ working");
     }
@@ -3138,6 +3141,7 @@ mod tests {
             conversation: None,
             sandbox_name: None,
             user_vars: Default::default(),
+            cwd: None,
         };
         assert_eq!(title_text(&info), "zsh", "no `· unknown` suffix");
     }
@@ -3159,6 +3163,7 @@ mod tests {
             conversation: None,
             sandbox_name: None,
             user_vars: Default::default(),
+            cwd: None,
         };
         assert_eq!(
             title_text(&info),
@@ -4259,6 +4264,7 @@ mod tests {
         let mut app = app_with_pane(b"hi");
         app.setup_dirs = crate::integrations::Dirs {
             home: Some(home.clone()),
+            shell: Some("/bin/zsh".into()),
             ..Default::default()
         };
         app.on_key(ctrl('b'));
@@ -4291,6 +4297,7 @@ mod tests {
                 ".config/opencode/plugins/tutti.js",
             ),
             ("tutti skill", "installed", ".claude/skills/tutti/SKILL.md"),
+            ("shell integration", "not installed", ".zshrc"),
         ] {
             let row = row_containing(buf, label);
             let text = row_text(buf, row);
@@ -4787,6 +4794,7 @@ mod tests {
             conversation: None,
             sandbox_name: None,
             user_vars: Default::default(),
+            cwd: None,
         };
         let focused = pane_title_line(&info, true, ' ');
         assert_eq!(

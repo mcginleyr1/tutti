@@ -102,6 +102,29 @@ pub struct Tail {
     pub truncated: bool,
 }
 
+/// A `pane read --last-output` reply: the output of the last command the
+/// pane's shell finished.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastOutput {
+    /// Its rows, trailing blank rows trimmed.
+    pub lines: Vec<String>,
+    /// The exit code its OSC 133 `D` carried.
+    pub exit: Option<i32>,
+    /// Its first rows had already fallen out of the 10k ring.
+    pub truncated: bool,
+}
+
+/// A finished command, as its OSC 133 marks bound it: its output's absolute
+/// rows `[start, end)`, numbered as `--since` numbers them, then the cells
+/// before `end_col` on row `end`; and its exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Finished {
+    start: u64,
+    end: u64,
+    end_col: u16,
+    exit: Option<i32>,
+}
+
 /// A scrollback-free copy of a pane's live screen: what the broadcast tick
 /// diffs and keeps. Cloning the live screen drags its whole 10k-row ring
 /// along (~0.7 ms at 80×24, ~2.6 ms at 200×50, release); formatting just the
@@ -151,6 +174,13 @@ struct Term {
     scrolled: u64,
     /// How far into an escape sequence the bytes fed so far stand.
     seq: Seq,
+    /// The working directory the shell last reported (OSC 7).
+    cwd: Option<String>,
+    /// Where the running command's output began (OSC 133 `C`), as an
+    /// absolute row; taken by the `D` that finishes it.
+    output: Option<u64>,
+    /// The last command the shell finished (OSC 133 `D` after a `C`).
+    finished: Option<Finished>,
 }
 
 impl Term {
@@ -159,24 +189,27 @@ impl Term {
             parser: vt100::Parser::new(size.rows, size.cols, SCROLLBACK_LINES),
             scrolled: 0,
             seq: Seq::default(),
+            cwd: None,
+            output: None,
+            finished: None,
         }
     }
 
     /// Start over on a blank screen of the same size, after the parser
     /// panicked mid-read and left its state suspect. The count only moves
     /// forward — by one, for whatever the failed read pushed uncounted — so
-    /// every outstanding cursor reads as truncated instead of skipping rows
-    /// silently.
+    /// every outstanding cursor, and the last command's rows, read as
+    /// truncated instead of skipping rows silently.
     fn reset(&mut self) {
         let (rows, cols) = self.parser.screen().size();
-        *self = Self {
-            scrolled: self.scrolled + 1,
-            ..Self::new(PaneSize::new(rows, cols))
-        };
+        self.parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+        self.scrolled += 1;
+        self.seq = Seq::default();
     }
 
     /// Feed one read's bytes to the parser, counting the rows they push into
-    /// the primary screen's scrollback.
+    /// the primary screen's scrollback, and act on the shell's OSC 7 and 133
+    /// reports with the cursor where each fell.
     ///
     /// vt100 keeps no such count, but its scrollback offset can: `scroll_up`
     /// bumps a non-zero offset once per row it pushes, and the offset only
@@ -194,16 +227,72 @@ impl Term {
     /// too: any other byte pushes at most one row and a run is at most
     /// `RUN_MAX`, while a lone `S` pushes at most a screen height — so the
     /// count is exact for any pane shorter than the ring.
+    ///
+    /// An OSC string's terminator ends a run too, so the parser has consumed
+    /// every byte before the string — the count and the cursor exact — when
+    /// `osc` reads it.
     fn process(&mut self, bytes: &[u8]) {
         let mut start = 0;
         for (i, &b) in bytes.iter().enumerate() {
-            if self.seq.step(b) {
-                self.run(&bytes[start..i]);
-                self.run(&bytes[i..=i]);
-                start = i + 1;
+            match self.seq.step(b) {
+                Some(Hit::Alone) => {
+                    self.run(&bytes[start..i]);
+                    self.run(&bytes[i..=i]);
+                    start = i + 1;
+                }
+                Some(Hit::Osc(payload)) => {
+                    self.run(&bytes[start..=i]);
+                    start = i + 1;
+                    self.osc(&payload);
+                }
+                None => {}
             }
         }
         self.run(&bytes[start..]);
+    }
+
+    /// Act on an OSC string: OSC 7 reports the shell's working directory;
+    /// OSC 133 `C` marks where a command's output begins — the cursor's row
+    /// at column 0, else the next — and `D[;<exit>]` the cell where it
+    /// finished, rows numbered as `--since` numbers them. On the alternate
+    /// screen, which has no such numbers, a mark is ignored. A `D` with no
+    /// `C` before it (an empty command line) finishes nothing.
+    fn osc(&mut self, payload: &[u8]) {
+        let Some(text) = std::str::from_utf8(payload)
+            .ok()
+            .filter(|_| payload.len() <= OSC_CAP)
+        else {
+            return;
+        };
+        let screen = self.parser.screen();
+        let (row, col) = screen.cursor_position();
+        let row = self.scrolled + u64::from(row);
+        match text.split_once(';') {
+            Some(("7", url)) => {
+                if let Some(cwd) = parse_cwd(url) {
+                    self.cwd = Some(cwd);
+                }
+            }
+            Some(("133", mark)) if !screen.alternate_screen() => {
+                let mut fields = mark.split(';');
+                match fields.next() {
+                    Some("C") => self.output = Some(row + u64::from(col > 0)),
+                    Some("D") => {
+                        if let Some(start) = self.output.take() {
+                            let exit = fields.next().and_then(|code| code.parse().ok());
+                            self.finished = Some(Finished {
+                                start,
+                                end: row,
+                                end_col: col,
+                                exit,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Feed bytes that switch screens, if at all, only as a lone byte, adding
@@ -246,51 +335,12 @@ impl Term {
                  earlier daemon"
             );
         }
-        let screen = self.parser.screen_mut();
-        let alternate = screen.alternate_screen();
-        let (rows, cols) = screen.size();
-        let rows = usize::from(rows);
-        screen.set_scrollback(usize::MAX);
-        // The alternate grid keeps no ring: 0 while it is up.
-        let held = screen.scrollback();
-        let oldest = scrolled - held as u64;
+        let alternate = self.parser.screen().alternate_screen();
+        let (rows, cols) = self.parser.screen().size();
+        let (mut out, oldest) = self.rows(since, scrolled + u64::from(rows), cols);
         let committed = (scrolled - since.max(oldest)) as usize;
-
-        // Tile from the first wanted row to the foot of the screen with
-        // screen-height windows: `visible_rows` shows `rows` rows at a time,
-        // so step the offset and skip what an earlier window yielded.
-        let mut out: Vec<(String, bool)> = Vec::with_capacity(committed + rows);
-        let mut at = held - committed;
-        while at < held + rows {
-            let offset = held.saturating_sub(at);
-            screen.set_scrollback(offset);
-            let view = &*screen;
-            out.extend(
-                view.rows(0, cols)
-                    .zip(0..)
-                    .skip(at - (held - offset))
-                    .map(|(text, row)| (text, view.row_wrapped(row))),
-            );
-            at = held - offset + rows;
-        }
-        screen.set_scrollback(0);
-
         while out.len() > committed && out.last().is_some_and(|(text, _)| text.is_empty()) {
             out.pop();
-        }
-        let mut text: Vec<String> = Vec::with_capacity(out.len());
-        let mut continues = false;
-        for (row, wrapped) in out {
-            match text.last_mut() {
-                Some(line) if unwrapped && continues => line.push_str(&row),
-                _ => text.push(row),
-            }
-            continues = wrapped;
-        }
-        if let Some(n) = lines
-            && text.len() > n
-        {
-            text.drain(..text.len() - n);
         }
         // vt100 reads only the active grid, so while the alternate screen is
         // up the ring is out of reach and the cursor holds: nothing is pushed
@@ -302,17 +352,128 @@ impl Term {
             (scrolled, since < oldest)
         };
         Ok(Tail {
-            lines: text,
+            lines: fold(out, lines, unwrapped),
             cursor,
             truncated,
         })
     }
+
+    /// The last finished command's output; see `PtyPane::last_output`.
+    fn last_output(&mut self, lines: Option<usize>, unwrapped: bool) -> Result<Option<LastOutput>> {
+        let Some(Finished {
+            start,
+            end,
+            end_col,
+            exit,
+        }) = self.finished
+        else {
+            return Ok(None);
+        };
+        if self.parser.screen().alternate_screen() {
+            bail!(
+                "a full-screen program holds the pane's alternate screen: the last output is out \
+                 of reach until it exits"
+            );
+        }
+        let (mut out, oldest) = self.rows(start, end, self.parser.screen().size().1);
+        // The cells before `D` on its own row are output too; what follows
+        // there — the next prompt, zsh's `%` — is not.
+        if end_col > 0 {
+            out.extend(self.rows(start.max(end), end + 1, end_col).0);
+        }
+        while out.last().is_some_and(|(text, _)| text.is_empty()) {
+            out.pop();
+        }
+        Ok(Some(LastOutput {
+            lines: fold(out, lines, unwrapped),
+            exit,
+            truncated: start < oldest.min(end + u64::from(end_col > 0)),
+        }))
+    }
+
+    /// The rows with absolute index in `[from, to)` the active screen still
+    /// holds — its ring, then its grid — oldest first, their first `width`
+    /// columns each with its soft-wrap flag; and the oldest index the ring
+    /// holds. The alternate grid keeps no ring: only its grid, numbered on
+    /// from the count.
+    fn rows(&mut self, from: u64, to: u64, width: u16) -> (Vec<(String, bool)>, u64) {
+        let screen = self.parser.screen_mut();
+        let rows = usize::from(screen.size().0);
+        screen.set_scrollback(usize::MAX);
+        let held = screen.scrollback();
+        let oldest = self.scrolled - held as u64;
+        // Positions count from the oldest row held, on through the grid.
+        let first = (from.max(oldest) - oldest) as usize;
+        let end = (to.saturating_sub(oldest) as usize).min(held + rows);
+
+        // Tile from the first wanted row with screen-height windows:
+        // `visible_rows` shows `rows` rows at a time, so step the offset and
+        // skip what an earlier window yielded.
+        let mut out: Vec<(String, bool)> = Vec::with_capacity(end.saturating_sub(first));
+        let mut at = first;
+        while at < end {
+            let offset = held.saturating_sub(at);
+            screen.set_scrollback(offset);
+            let view = &*screen;
+            out.extend(
+                view.rows(0, width)
+                    .zip(0..)
+                    .skip(at - (held - offset))
+                    .map(|(text, row)| (text, view.row_wrapped(row))),
+            );
+            at = held - offset + rows;
+        }
+        screen.set_scrollback(0);
+        out.truncate(end.saturating_sub(first));
+        (out, oldest)
+    }
+}
+
+/// `Term::rows` rows as lines: with `unwrapped`, each soft-wrapped row joined
+/// with the one after it by vt100's own wrap flags; then only the newest
+/// `lines` kept.
+fn fold(rows: Vec<(String, bool)>, lines: Option<usize>, unwrapped: bool) -> Vec<String> {
+    let mut text: Vec<String> = Vec::with_capacity(rows.len());
+    let mut continues = false;
+    for (row, wrapped) in rows {
+        match text.last_mut() {
+            Some(line) if unwrapped && continues => line.push_str(&row),
+            _ => text.push(row),
+        }
+        continues = wrapped;
+    }
+    if let Some(n) = lines
+        && text.len() > n
+    {
+        text.drain(..text.len() - n);
+    }
+    text
+}
+
+/// The directory an OSC 7 `file://<host>/<path>` names: the path with its
+/// `%XX` escapes decoded, the host ignored. `None` unless it is absolute and
+/// decodes to UTF-8.
+fn parse_cwd(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("file://")?;
+    let mut bytes = rest[rest.find('/')?..].bytes();
+    let mut path = Vec::with_capacity(bytes.len());
+    while let Some(b) = bytes.next() {
+        path.push(match b {
+            b'%' => {
+                let mut digit = || char::from(bytes.next()?).to_digit(16);
+                (digit()? * 16 + digit()?) as u8
+            }
+            b => b,
+        });
+    }
+    String::from_utf8(path).ok()
 }
 
 /// Where the bytes fed so far stand within an escape sequence — as much of
 /// vte's state machine as `Term::process` needs to pick out the bytes it
-/// feeds alone. It persists across reads, as a sequence can straddle two.
-#[derive(Clone, Copy, Default)]
+/// feeds alone and the OSC strings it reads. It persists across reads, as a
+/// sequence can straddle two.
+#[derive(Default)]
 enum Seq {
     #[default]
     Ground,
@@ -320,25 +481,60 @@ enum Seq {
     Esc,
     /// Inside `ESC [`, before the final byte.
     Csi,
+    /// Inside `ESC ]`, holding the payload so far — one byte past `OSC_CAP`
+    /// at most, which marks it too long to read.
+    Osc(Vec<u8>),
+    /// Just after an `ESC` inside an OSC string, which ends the string: a
+    /// `\` completes its String Terminator.
+    OscEsc(Vec<u8>),
+}
+
+/// What a byte ends, for `Term::process`.
+enum Hit {
+    /// A sequence that can switch screens or push many rows: fed alone.
+    Alone,
+    /// An OSC string terminated by BEL or ST, with its payload.
+    Osc(Vec<u8>),
 }
 
 impl Seq {
-    /// Step over `b`: true when it ends a sequence that can switch screens or
-    /// push many rows — `CSI … h`/`l` (the alternate screen is `?47`/`?1049`),
-    /// `CSI … S` (scroll up), `ESC c` (full reset). Liberal on purpose: a
-    /// false hit only splits a run. As in vte, only `ESC` opens a sequence (a
-    /// raw C1 `CSI` byte is executed, not parsed), CAN/SUB abort one, and
-    /// other C0 controls execute inside one without ending it.
-    fn step(&mut self, b: u8) -> bool {
-        let (next, hit) = match (*self, b) {
-            (_, 0x1b) => (Seq::Esc, false),
-            (_, 0x18 | 0x1a) => (Seq::Ground, false),
-            (Seq::Esc, b'[') => (Seq::Csi, false),
-            (Seq::Esc, b'c') => (Seq::Ground, true),
-            (Seq::Esc | Seq::Csi, 0x00..=0x1f) => (*self, false),
-            (Seq::Csi, 0x40..=0x7e) => (Seq::Ground, matches!(b, b'h' | b'l' | b'S')),
-            (Seq::Csi, _) => (Seq::Csi, false),
-            (Seq::Ground | Seq::Esc, _) => (Seq::Ground, false),
+    /// Step over `b`, reporting what it ends: a sequence that can switch
+    /// screens or push many rows — `CSI … h`/`l` (the alternate screen is
+    /// `?47`/`?1049`), `CSI … S` (scroll up), `ESC c` (full reset) — or an
+    /// OSC string. Liberal on purpose: a false hit only splits a run. As in
+    /// vte, only `ESC` opens a sequence (a raw C1 `CSI` byte is executed, not
+    /// parsed), CAN/SUB abort one, other C0 controls execute inside one
+    /// without ending it (an OSC string ignores them), and an `ESC` that is
+    /// not the start of an ST ends an OSC string, which tutti then drops.
+    fn step(&mut self, b: u8) -> Option<Hit> {
+        let (next, hit) = match (std::mem::take(self), b) {
+            (Seq::Osc(payload), 0x07) | (Seq::OscEsc(payload), b'\\') => {
+                (Seq::Ground, Some(Hit::Osc(payload)))
+            }
+            (Seq::Osc(payload), 0x1b) => (Seq::OscEsc(payload), None),
+            (Seq::OscEsc(_), b) => {
+                *self = Seq::Esc;
+                return self.step(b);
+            }
+            (Seq::Osc(_), 0x18 | 0x1a) => (Seq::Ground, None),
+            (Seq::Osc(mut payload), b) => {
+                if b >= 0x20 && payload.len() <= OSC_CAP {
+                    payload.push(b);
+                }
+                (Seq::Osc(payload), None)
+            }
+            (_, 0x1b) => (Seq::Esc, None),
+            (_, 0x18 | 0x1a) => (Seq::Ground, None),
+            (Seq::Esc, b'[') => (Seq::Csi, None),
+            (Seq::Esc, b']') => (Seq::Osc(Vec::new()), None),
+            (Seq::Esc, b'c') => (Seq::Ground, Some(Hit::Alone)),
+            (seq @ (Seq::Esc | Seq::Csi), 0x00..=0x1f) => (seq, None),
+            (Seq::Csi, 0x40..=0x7e) => (
+                Seq::Ground,
+                matches!(b, b'h' | b'l' | b'S').then_some(Hit::Alone),
+            ),
+            (Seq::Csi, _) => (Seq::Csi, None),
+            (Seq::Ground | Seq::Esc, _) => (Seq::Ground, None),
         };
         *self = next;
         hit
@@ -557,6 +753,22 @@ impl PtyPane {
     /// pane, or an earlier daemon — is refused.
     pub fn tail(&self, since: u64, lines: Option<usize>, unwrapped: bool) -> Result<Tail> {
         lock(&self.term).tail(since, lines, unwrapped)
+    }
+
+    /// The output of the last command the pane's shell finished, between the
+    /// OSC 133 `C` and `D` marks `tutti shell-init` emits around it: the rows
+    /// the ring and screen still hold, trailing blank rows trimmed, `lines`
+    /// and `unwrapped` as for `tail`, and the exit code its `D` carried. A
+    /// command still running leaves the one before it. `None` when no command
+    /// has finished under shell integration; an error while the alternate
+    /// screen is up, as vt100 reads only the active grid.
+    pub fn last_output(&self, lines: Option<usize>, unwrapped: bool) -> Result<Option<LastOutput>> {
+        lock(&self.term).last_output(lines, unwrapped)
+    }
+
+    /// The working directory the pane's shell last reported (OSC 7).
+    pub fn cwd(&self) -> Option<String> {
+        lock(&self.term).cwd.clone()
     }
 
     /// The child's OS process id, if the platform reported one at spawn.
@@ -1765,6 +1977,177 @@ mod tests {
         let mut term = fed(5, 20, numbered(0, 10).as_bytes(), RUN_MAX);
         let err = term.tail(7, None, false).unwrap_err();
         assert!(err.to_string().contains("past this pane's 6"), "{err}");
+    }
+
+    #[test]
+    fn osc7_reports_the_cwd_decoded_and_skips_a_bad_report() {
+        let mut term = fed(5, 20, b"\x1b]7;file://host/Users/me/a%20dir\x07", RUN_MAX);
+        assert_eq!(term.cwd.as_deref(), Some("/Users/me/a dir"));
+        // ST-terminated, an empty host, raw and escaped UTF-8.
+        term.process("\x1b]7;file:///tmp/caf%C3%A9/é\x1b\\".as_bytes());
+        assert_eq!(term.cwd.as_deref(), Some("/tmp/café/é"));
+        // Not a file URL, no path, a broken escape, an escape that is not
+        // UTF-8: each skipped, the last good report kept.
+        for bad in [
+            "http://host/x",
+            "/bare/path",
+            "file://host",
+            "file://host/a%2",
+            "file://host/a%zz",
+            "file://host/a%+f",
+            "file://host/a%ff",
+        ] {
+            term.process(format!("\x1b]7;{bad}\x07").as_bytes());
+            assert_eq!(term.cwd.as_deref(), Some("/tmp/café/é"), "{bad}");
+        }
+        assert_eq!(term.scrolled, 0, "an OSC draws nothing");
+    }
+
+    /// A shell's turn as `tutti shell-init` marks it: the prompt, `cmd`
+    /// typed, then `output` between `C` and `D;<exit>`.
+    fn turn(cmd: &str, output: &str, exit: i32) -> String {
+        format!(
+            "\x1b]133;A\x07$ \x1b]133;B\x07{cmd}\r\n\x1b]133;C\x07{output}\x1b]133;D;{exit}\x07"
+        )
+    }
+
+    /// `last_output` as (lines, exit, truncated), `None` with no command.
+    fn last(term: &mut Term, unwrapped: bool) -> Option<(Vec<String>, Option<i32>, bool)> {
+        let out = term.last_output(None, unwrapped).unwrap()?;
+        Some((out.lines, out.exit, out.truncated))
+    }
+
+    /// Output that scrolls past the top of a five-row screen, wraps, and has
+    /// a full-screen program in the middle comes back exactly, however the
+    /// stream is cut into reads — a mark split across two included.
+    #[test]
+    fn last_output_reads_between_the_marks_across_a_read_boundary_anywhere() {
+        let output = format!(
+            "{}\x1b[?1049hfull screen\x1b[?1049lABCDEFGHIJKLMNO\r\n{}",
+            numbered(0, 4),
+            numbered(4, 4)
+        );
+        let stream = format!("{}\x1b]133;A\x07$ ", turn("run", &output, 3));
+        let mut want = rows_of(0..4);
+        want.extend(["ABCDEFGHIJ".into(), "KLMNO".into()]);
+        want.extend(rows_of(4..8));
+        let mut joined = rows_of(0..4);
+        joined.push("ABCDEFGHIJKLMNO".into());
+        joined.extend(rows_of(4..8));
+
+        let mut term = fed(5, 10, stream.as_bytes(), RUN_MAX);
+        assert_eq!(last(&mut term, false), Some((want.clone(), Some(3), false)));
+        assert_eq!(last(&mut term, true), Some((joined, Some(3), false)));
+        for cut in 0..=stream.len() {
+            let mut term = Term::new(PaneSize::new(5, 10));
+            term.process(&stream.as_bytes()[..cut]);
+            assert_eq!(term.parser.screen().scrollback(), 0, "the offset leaked");
+            term.process(&stream.as_bytes()[cut..]);
+            assert_eq!(
+                last(&mut term, false),
+                Some((want.clone(), Some(3), false)),
+                "reads split at byte {cut}"
+            );
+        }
+        for chunk in [1, 2, 3, 5, 64] {
+            let mut term = fed(5, 10, stream.as_bytes(), chunk);
+            assert_eq!(
+                last(&mut term, false),
+                Some((want.clone(), Some(3), false)),
+                "{chunk}-byte reads"
+            );
+        }
+    }
+
+    #[test]
+    fn last_output_is_the_previous_command_while_one_runs() {
+        let mut term = fed(10, 20, b"$ ", RUN_MAX);
+        assert_eq!(last(&mut term, false), None, "nothing finished yet");
+        term.process(turn("echo one", "one\r\n", 0).as_bytes());
+        let one = Some((vec!["one".to_string()], Some(0), false));
+        assert_eq!(last(&mut term, false), one);
+        // An empty command line: a prompt's `D` with no `C` before it.
+        term.process(b"\x1b]133;A\x07$ \x1b]133;D;1\x07\x1b]133;A\x07$ ");
+        assert_eq!(last(&mut term, false), one);
+        // A command still running leaves the one before it.
+        term.process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep\r\n\x1b]133;C\x07partial\r\n");
+        assert_eq!(last(&mut term, false), one);
+        term.process(b"\x1b]133;D;130\x07");
+        assert_eq!(
+            last(&mut term, false),
+            Some((vec!["partial".to_string()], Some(130), false))
+        );
+        // A `D` naming no exit code finishes with none.
+        term.process(turn("true", "", 0).replace("D;0", "D").as_bytes());
+        assert_eq!(last(&mut term, false), Some((Vec::new(), None, false)));
+    }
+
+    /// Output ending mid-row shares that row with what the shell draws next
+    /// — bash's prompt, zsh's `%` — which is not output.
+    #[test]
+    fn last_output_stops_at_the_cell_its_d_fell_on() {
+        let mut term = fed(5, 20, turn("printf", "a\r\nb", 0).as_bytes(), RUN_MAX);
+        term.process(b"%   \r\n\x1b]133;A\x07$ ");
+        assert_eq!(
+            last(&mut term, false),
+            Some((vec!["a".to_string(), "b".to_string()], Some(0), false))
+        );
+        term.process(turn("printf", "c", 1).as_bytes());
+        term.process(b"\x1b]133;A\x07$ ");
+        assert_eq!(
+            last(&mut term, false),
+            Some((vec!["c".to_string()], Some(1), false)),
+            "the prompt on the same row is cut off"
+        );
+        // A row filled to its last column keeps every cell.
+        term.process(turn("printf", "0123456789ABCDEFGHIJ", 0).as_bytes());
+        assert_eq!(
+            last(&mut term, false),
+            Some((vec!["0123456789ABCDEFGHIJ".to_string()], Some(0), false))
+        );
+    }
+
+    #[test]
+    fn last_output_reports_rows_that_left_the_ring() {
+        let stream = turn("seq", &numbered(0, 10_100), 0);
+        let mut term = fed(24, 80, stream.as_bytes(), 8192);
+        let (lines, exit, truncated) = last(&mut term, false).unwrap();
+        assert!(truncated);
+        assert_eq!(exit, Some(0));
+        assert_eq!(lines.last().map(String::as_str), Some("L10099"));
+        assert_eq!(
+            lines.len(),
+            10_000 + 23,
+            "the ring and the screen above the cursor"
+        );
+    }
+
+    /// The alternate grid has no rows numbered as the primary's: a mark
+    /// there is ignored, and while it is up the last output cannot be read.
+    #[test]
+    fn last_output_stays_on_the_primary_screen() {
+        let mut term = fed(5, 20, turn("ls", "x\r\n", 0).as_bytes(), RUN_MAX);
+        term.process(b"\x1b]133;A\x07$ \x1b]133;B\x07tmux\r\n\x1b]133;C\x07\x1b[?1049h");
+        term.process(turn("inner", "y\r\n", 7).as_bytes());
+        let err = term.last_output(None, false).unwrap_err();
+        assert!(err.to_string().contains("alternate screen"), "{err}");
+        term.process(b"\x1b[?1049l\x1b]133;D;0\x07");
+        assert_eq!(last(&mut term, false), Some((Vec::new(), Some(0), false)));
+    }
+
+    /// An `ESC` that does not start a String Terminator ends the OSC string
+    /// unread, and every byte after it is parsed as usual.
+    #[test]
+    fn an_osc_cut_short_by_an_escape_reports_nothing() {
+        let term = fed(
+            5,
+            20,
+            b"\x1b]7;file:///gone\x1b[1mbold\x1b]133;C\x1bc",
+            RUN_MAX,
+        );
+        assert_eq!(term.cwd, None);
+        assert_eq!(term.output, None);
+        assert_eq!(term.parser.screen().contents(), "", "the reset still ran");
     }
 
     #[test]
