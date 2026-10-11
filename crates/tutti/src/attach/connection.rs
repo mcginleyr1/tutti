@@ -1,62 +1,158 @@
-//! The attach socket: a background thread decodes inbound frames onto a
+//! The attach connection: a background thread decodes inbound frames onto a
 //! channel while the event loop writes frames from the foreground. Keeping the
 //! read side on its own thread lets the loop block on terminal input without
-//! stalling pane updates.
+//! stalling pane updates. The far end is the daemon's socket, or — for
+//! `tutti --host` — an `ssh … tutti proxy` child carrying the same frames,
+//! whose host replies the reader hands to the calls waiting on them.
 
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
+use std::process::{Child, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
-use tutti_core::{Frame, Request, Response, Tagged, socket_path};
+use anyhow::{Context, Result, anyhow, bail};
+use tutti_core::{Frame, Request, Response, Tagged};
 
 use crate::client;
+use crate::host::{self, HOST_REV, Remote, Startup, Waiting};
 
 /// The wire rev from which a daemon knows a view (`Attach.view`).
 const VIEW_REV: u32 = 16;
 
+/// The most of ssh's stderr kept to explain a connection that ended.
+const STDERR_TAIL: usize = 4096;
+
 pub struct Connection {
-    stream: UnixStream,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     rx: Receiver<Frame>,
     reader: Option<JoinHandle<()>>,
+    waiting: Waiting,
+    end: End,
     /// Frames read off `rx` ahead of `drain`, which hands them on first.
     early: Vec<Frame>,
     /// A `tutti attach --view`: `send` passes on only what navigates.
     pub view: bool,
 }
 
+enum End {
+    Socket(UnixStream),
+    Ssh {
+        child: Child,
+        destination: String,
+        stderr: Arc<Mutex<Vec<u8>>>,
+    },
+}
+
 impl Connection {
     /// Connect to the session's daemon (auto-starting it, but for a `view`),
     /// spawning a reader thread that decodes inbound frames onto a channel.
     pub fn open(session: &str, view: bool) -> Result<Self> {
-        let stream = if view {
-            UnixStream::connect(socket_path(session)).with_context(|| {
-                format!("no tutti-server answers for session '{session}': nothing to view")
-            })?
-        } else {
-            client::open(session)?
-        };
-        Self::new(stream, view)
+        Self::new(client::open_attach(session, view)?, view)
     }
 
-    /// The connection over `stream`, with its reader thread.
+    /// The connection over the daemon's socket `stream`, with its reader
+    /// thread.
     fn new(stream: UnixStream, view: bool) -> Result<Self> {
-        let reader_stream = stream.try_clone().context("clone attach socket")?;
+        let reader = stream.try_clone().context("clone attach socket")?;
+        let writer = stream.try_clone().context("clone attach socket")?;
+        let (conn, _) = Self::spawn(
+            Box::new(reader),
+            Box::new(writer),
+            End::Socket(stream),
+            view,
+        )?;
+        Ok(conn)
+    }
+
+    /// Reach the daemon of `session` (the far side's default when `None`) on
+    /// `destination` through `ssh destination tutti proxy` — which, for a
+    /// `view`, starts no daemon there — and wait for the proxy's hello: until
+    /// then the terminal is still the user's, for ssh to ask its questions on.
+    /// A connection that ends first is an error saying why — never a fall
+    /// back to a local daemon.
+    pub fn open_remote(
+        destination: &str,
+        session: Option<&str>,
+        view: bool,
+    ) -> Result<(Self, Startup)> {
+        let mut argv = vec!["tutti".to_string()];
+        if let Some(session) = session {
+            argv.extend(["-s".into(), session.into()]);
+        }
+        argv.push("proxy".into());
+        if view {
+            argv.push("--view".into());
+        }
+        let mut child = client::ssh(destination, &argv, false)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("running ssh")?;
+        let input = child.stdout.take().expect("piped stdout");
+        let output = child.stdin.take().expect("piped stdin");
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let mut said = child.stderr.take().expect("piped stderr");
+        let keep = Arc::clone(&stderr);
+        thread::spawn(move || {
+            let mut chunk = [0u8; 1024];
+            while let Ok(n @ 1..) = said.read(&mut chunk) {
+                let mut kept = keep.lock().unwrap_or_else(PoisonError::into_inner);
+                kept.extend_from_slice(&chunk[..n]);
+                let over = kept.len().saturating_sub(STDERR_TAIL);
+                kept.drain(..over);
+            }
+        });
+        let end = End::Ssh {
+            child,
+            destination: destination.into(),
+            stderr,
+        };
+        let (mut conn, hello) = Self::spawn(Box::new(input), Box::new(output), end, view)?;
+        match hello.recv() {
+            Ok((rev, startup)) if rev == HOST_REV => Ok((conn, startup)),
+            Ok((rev, _)) => bail!(
+                "the tutti on {destination} speaks host revision {rev}, this one {HOST_REV}: install the same build on both"
+            ),
+            Err(_) => Err(conn
+                .ended()
+                .unwrap_or_else(|| anyhow!("ssh {destination} closed"))),
+        }
+    }
+
+    fn spawn(
+        input: Box<dyn Read + Send>,
+        output: Box<dyn Write + Send>,
+        end: End,
+        view: bool,
+    ) -> Result<(Self, Receiver<(u32, Startup)>)> {
         let (tx, rx) = mpsc::channel();
+        let (hello_tx, hello_rx) = mpsc::channel();
+        let waiting = Waiting::default();
+        let routes = Arc::clone(&waiting);
         let reader = thread::Builder::new()
             .name("tutti-attach-reader".into())
-            .spawn(move || read_loop(reader_stream, &tx))
+            .spawn(move || read_loop(input, &tx, &routes, &hello_tx))
             .context("spawn attach reader thread")?;
-        Ok(Self {
-            stream,
+        let conn = Self {
+            writer: Arc::new(Mutex::new(output)),
             rx,
             reader: Some(reader),
+            waiting,
+            end,
             early: Vec::new(),
             view,
-        })
+        };
+        Ok((conn, hello_rx))
+    }
+
+    /// Questions about the far end's machine, answered by its proxy.
+    pub fn remote(&self) -> Remote {
+        Remote::new(Arc::clone(&self.writer), Arc::clone(&self.waiting))
     }
 
     /// A view's attach just sent, refused by the daemon's `Attached` reply
@@ -113,10 +209,11 @@ impl Connection {
         if self.view && !navigates(frame) {
             return Ok(());
         }
-        self.stream
+        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        writer
             .write_all(&frame.encode())
             .context("write attach frame")?;
-        self.stream.flush().context("flush attach frame")
+        writer.flush().context("flush attach frame")
     }
 
     /// Every frame the reader has decoded since the last call. `Err` means the
@@ -137,11 +234,53 @@ impl Connection {
             }
         }
     }
+
+    /// Why an ssh connection ended, once it has: ssh's exit when it failed,
+    /// and what it — or the tutti it ran — printed. `None` for a clean end
+    /// (the far daemon stopped) and for a local socket.
+    pub fn ended(&mut self) -> Option<anyhow::Error> {
+        let End::Ssh {
+            child,
+            destination,
+            stderr,
+        } = &mut self.end
+        else {
+            return None;
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+                _ => break None,
+            }
+        };
+        let said = String::from_utf8_lossy(&stderr.lock().unwrap_or_else(PoisonError::into_inner))
+            .trim()
+            .to_string();
+        if status.is_some_and(|s| s.success()) && said.is_empty() {
+            return None;
+        }
+        let how = status.map_or_else(|| "did not exit".into(), |s| s.to_string());
+        Some(anyhow!(
+            format!("ssh {destination}: {how}\n{said}")
+                .trim_end()
+                .to_string()
+        ))
+    }
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        let _ = self.stream.shutdown(Shutdown::Both);
+        match &mut self.end {
+            End::Socket(stream) => {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            End::Ssh { child, .. } => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
@@ -169,26 +308,42 @@ fn navigates(frame: &Frame) -> bool {
     })
 }
 
-fn read_loop(mut stream: UnixStream, tx: &mpsc::Sender<Frame>) {
+fn read_loop(
+    mut input: Box<dyn Read + Send>,
+    tx: &mpsc::Sender<Frame>,
+    waiting: &Waiting,
+    hello: &mpsc::Sender<(u32, Startup)>,
+) {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
         match Frame::decode(&buf) {
             Ok(Some((frame, consumed))) => {
                 buf.drain(..consumed);
-                if tx.send(frame).is_err() {
-                    return;
+                match frame {
+                    Frame::Host(json) => host::route(&json, waiting, hello),
+                    frame => {
+                        if tx.send(frame).is_err() {
+                            break;
+                        }
+                    }
                 }
                 continue;
             }
             Ok(None) => {}
-            Err(_) => return,
+            Err(_) => break,
         }
-        match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => return,
+        match input.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
         }
     }
+    // Nothing will answer the calls still out: fail them now, not at their
+    // timeouts.
+    waiting
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
 }
 
 #[cfg(test)]

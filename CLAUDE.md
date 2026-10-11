@@ -212,6 +212,13 @@ cargo fmt --all --check
   running program — an nvim server socket, a claim on the keys — that a
   restore does not bring back. A restored pane starts with none; never write
   them into the layout save.
+- **The TUI never reads its own machine** for anything the daemon's machine
+  owns — a path, `$HOME`, `$SHELL`, `PATH`, a `.jj`, a session store, an
+  install, the config's projects/sandboxes/issues: it asks `App::host`
+  (`host.rs`), answered in-process for a local attach and by `tutti proxy`
+  under `--host`. A direct `std::env`/`std::fs` read in `attach/` is right
+  locally and silently wrong remotely. A new question is a new `Query`,
+  answered in `Local::answer`, with `HOST_REV` bumped.
 
 ## Product vocabulary and rules
 

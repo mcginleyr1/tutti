@@ -3951,7 +3951,7 @@ mod tests {
         let mut app = app_with_pane(b"hi");
         // An empty PATH: however many agents this machine has installed, none
         // pushes the shell and command rows past the panel's foot.
-        app.launcher_path = None;
+        app.set_local(|local| local.path = None);
         app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
         app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
         assert_eq!(app.mode, Mode::Launcher);
@@ -4467,11 +4467,13 @@ mod tests {
             std::fs::write(path, text).unwrap();
         }
         let mut app = app_with_pane(b"hi");
-        app.setup_dirs = crate::integrations::Dirs {
-            home: Some(home.clone()),
-            shell: Some("/bin/zsh".into()),
-            ..Default::default()
-        };
+        app.set_local(|local| {
+            local.dirs = crate::integrations::Dirs {
+                home: Some(home.clone()),
+                shell: Some("/bin/zsh".into()),
+                ..Default::default()
+            }
+        });
         app.on_key(ctrl('b'));
         app.on_key(plain('i'));
         assert_eq!(app.mode, Mode::Integrations);

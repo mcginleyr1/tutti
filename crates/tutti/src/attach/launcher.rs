@@ -1,10 +1,10 @@
-//! The agent launcher's model: the selectable "what should run here?" rows,
-//! each agent's availability probed on a PATH passed in
-//! (`AgentSpec::installed`). No rendering and no app state, so the row
-//! construction, the availability check, and the selection arithmetic are
-//! unit-tested in isolation.
+//! The agent launcher's model: the selectable "what should run here?" rows.
+//! No rendering, no app state and no machine probes — which agents are
+//! installed, and the argv each runs as there, is the daemon's machine's to
+//! say (`host::Launcher`) — so the row construction and the selection
+//! arithmetic are unit-tested in isolation.
 
-use std::ffi::OsStr;
+use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use tutti_agents::{Registry, ResumeSession};
@@ -27,7 +27,7 @@ pub enum LaunchKind {
 
 /// One row in the launcher overlay: its two-tone label, what it runs, and
 /// whether it can be selected — every fixed row can; an agent row only when its
-/// binary was found on PATH.
+/// binary was found on the daemon's machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LauncherRow {
     pub name: String,
@@ -43,13 +43,19 @@ impl LauncherRow {
     }
 }
 
-/// Build the launcher rows: the **installed** agents first (registry order,
-/// bold name, the product name as the dim role), then the two fixed rows —
-/// the login shell and the free-form command entry — then the rest of the
-/// catalog dim and unselectable at the foot, each showing its project link so
-/// the picker doubles as "what else is out there". Resume rows are inserted
-/// between the fixed rows and the catalog by the caller.
-pub fn build_rows(registry: &Registry, path: Option<&OsStr>) -> Vec<LauncherRow> {
+/// Build the launcher rows: the agents `installed` names first (registry
+/// order, bold name, the product name as the dim role), each running the argv
+/// its machine found it as, then the two fixed rows — the login `shell` and
+/// the free-form command entry — then the rest of the catalog dim and
+/// unselectable at the foot, each showing its project link so the picker
+/// doubles as "what else is out there". Resume rows are inserted between the
+/// fixed rows and the catalog by the caller.
+pub fn build_rows(
+    registry: &Registry,
+    installed: &BTreeMap<String, Vec<String>>,
+    shell: &str,
+) -> Vec<LauncherRow> {
+    let argv = |spec: &tutti_agents::AgentSpec| installed.get(&spec.kind.to_string()).cloned();
     let agent_row = |spec: &tutti_agents::AgentSpec, available: bool| {
         let role = if available {
             spec.display.clone()
@@ -59,11 +65,11 @@ pub fn build_rows(registry: &Registry, path: Option<&OsStr>) -> Vec<LauncherRow>
         LauncherRow {
             name: spec.kind.to_string(),
             role,
-            kind: LaunchKind::Agent(spec.argv(path)),
+            kind: LaunchKind::Agent(argv(spec).unwrap_or_else(|| spec.argv(None))),
             available,
         }
     };
-    let installed = |spec: &&tutti_agents::AgentSpec| spec.installed(path).is_some();
+    let installed = |spec: &&tutti_agents::AgentSpec| argv(spec).is_some();
 
     let mut rows: Vec<LauncherRow> = registry
         .specs()
@@ -73,7 +79,7 @@ pub fn build_rows(registry: &Registry, path: Option<&OsStr>) -> Vec<LauncherRow>
         .collect();
     rows.push(LauncherRow {
         name: "shell".into(),
-        role: login_shell(),
+        role: shell.into(),
         kind: LaunchKind::Shell,
         available: true,
     });
@@ -202,12 +208,6 @@ pub fn truncate(text: &str, max: usize) -> String {
     cut
 }
 
-/// The user's login shell, `$SHELL` or `/bin/sh`. Shared with the app so the
-/// shell row and the shell fallback exec the same program.
-pub fn login_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
-}
-
 /// The first selectable row's index, or 0 when none is (there is always at
 /// least the shell row, so this only falls back for an empty list).
 pub fn first_selectable(rows: &[LauncherRow]) -> usize {
@@ -243,21 +243,6 @@ pub fn prev_selectable(rows: &[LauncherRow], from: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
-
-    fn temp_dir_unique() -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("tutti-launcher-{}-{n}", std::process::id()))
-    }
-
-    fn make_executable(path: &Path) {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(path, perms).unwrap();
-    }
 
     fn agent_row(name: &str, available: bool) -> LauncherRow {
         LauncherRow {
@@ -268,27 +253,41 @@ mod tests {
         }
     }
 
+    /// What a host's launcher answer names installed: each kind with its argv.
+    fn installed(argvs: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
+        argvs
+            .iter()
+            .map(|(kind, argv)| {
+                (
+                    kind.to_string(),
+                    argv.iter().map(|a| a.to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn build_rows_lists_agents_then_shell_and_command_with_availability() {
-        let dir = temp_dir_unique();
-        std::fs::create_dir_all(&dir).unwrap();
-        // Only `claude` is on the fake PATH; `codex` stays unavailable.
-        let bin = dir.join("claude");
-        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
-        make_executable(&bin);
-        let path = std::ffi::OsString::from(&dir);
-
-        let rows = build_rows(&Registry::default(), Some(path.as_os_str()));
+        // Only `claude` is installed; `codex` stays unavailable.
+        let rows = build_rows(
+            &Registry::default(),
+            &installed(&[("claude", &["claude"])]),
+            "/bin/zsh",
+        );
         // Installed agents lead, the fixed rows follow, and the rest of the
         // catalog sits dim at the foot with its project links.
         assert_eq!(rows[0].name, "claude");
-        assert!(rows[0].available, "claude is on the fake PATH");
+        assert!(rows[0].available, "claude is installed");
         assert_eq!(
             rows[0].role, "Claude Code",
             "an installed row shows the product name"
         );
         assert_eq!(rows[0].kind, LaunchKind::Agent(vec!["claude".into()]));
         assert!(matches!(rows[1].kind, LaunchKind::Shell));
+        assert_eq!(
+            rows[1].role, "/bin/zsh",
+            "the shell row names the host's shell"
+        );
         assert!(matches!(rows[2].kind, LaunchKind::Command));
         assert!(
             rows[1].available && rows[2].available,
@@ -305,7 +304,7 @@ mod tests {
             "every catalog agent gets a row"
         );
         let codex = rows[3..].iter().find(|r| r.name == "codex").unwrap();
-        assert!(!codex.available, "codex is absent from the fake PATH");
+        assert!(!codex.available, "codex is not installed");
         assert_eq!(
             codex.role, "Codex CLI · github.com/openai/codex",
             "an uninstalled row links to the project, scheme stripped"
@@ -314,8 +313,6 @@ mod tests {
             rows[3..].iter().all(|r| !r.available),
             "everything after the fixed rows is the uninstalled catalog"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -342,25 +339,26 @@ mod tests {
         assert_eq!(rows[rows.len() - 1].kind, LaunchKind::Command);
     }
 
+    /// An installed row runs the argv its machine found it as — Cursor by the
+    /// `agent` path checked there — and an uninstalled one the spec's own,
+    /// launch args included.
     #[test]
-    fn a_spec_with_launch_args_runs_its_subcommand() {
-        let dir = temp_dir_unique();
-        std::fs::create_dir_all(&dir).unwrap();
-        let bin = dir.join("ori");
-        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
-        make_executable(&bin);
-        let path = std::ffi::OsString::from(&dir);
-
-        let rows = build_rows(&Registry::default(), Some(path.as_os_str()));
-        assert_eq!(rows[0].name, "ori");
-        assert_eq!(rows[0].role, "Ori");
+    fn an_agent_row_runs_the_argv_its_machine_found() {
+        let cursor = "/home/u/.local/bin/agent";
+        let rows = build_rows(
+            &Registry::default(),
+            &installed(&[("cursor", &[cursor])]),
+            "/bin/sh",
+        );
+        assert_eq!(rows[0].name, "cursor");
+        assert_eq!(rows[0].kind, LaunchKind::Agent(vec![cursor.into()]));
+        let ori = rows.iter().find(|r| r.name == "ori").unwrap();
+        assert!(!ori.available);
         assert_eq!(
-            rows[0].kind,
+            ori.kind,
             LaunchKind::Agent(vec!["ori".into(), "code".into()]),
             "bare `ori` only prints its help; the row opens its agent"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Armed to deploy, the picker keeps only the agents that take a first

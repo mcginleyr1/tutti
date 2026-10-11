@@ -5,6 +5,8 @@
 //! row arithmetic mapping a click to an entry. No rendering, no state, so the
 //! tree order, sort rules, and hit-testing are unit-tested in isolation.
 
+use std::path::Path;
+
 use tutti_core::{
     AgentKind, AgentState, PaneId, PaneInfo, PendingApproval, SubagentInfo, TabId, WorkspaceId,
     WorkspaceView,
@@ -285,7 +287,11 @@ impl Sidebar {
 /// project — first a row per held approval, in the order they came, whatever
 /// the pane's state, then blocked — subagents stripped so each row stays two
 /// rows tall.
-pub fn build(workspaces: &[WorkspaceView], active_tab: Option<TabId>) -> Sidebar {
+pub fn build(
+    workspaces: &[WorkspaceView],
+    active_tab: Option<TabId>,
+    home: Option<&Path>,
+) -> Sidebar {
     let present: std::collections::HashSet<_> = workspaces.iter().map(|w| w.id).collect();
     // A workspace nests only when its parent is actually present; a child whose
     // origin was killed renders as a top-level project.
@@ -330,10 +336,7 @@ pub fn build(workspaces: &[WorkspaceView], active_tab: Option<TabId>) -> Sidebar
         Some(SidebarEntry::Workspace(WorkspaceRow {
             id: w.id,
             name: w.name.clone(),
-            subtitle: w
-                .branch
-                .clone()
-                .or_else(|| shorten_home(&w.dir, std::env::var_os("HOME").map(Into::into))),
+            subtitle: w.branch.clone().or_else(|| shorten_home(&w.dir, home)),
             changes: w.changes.clone(),
             stale: w.stale,
             active: owns,
@@ -463,8 +466,9 @@ fn state_rank(state: AgentState) -> u8 {
     }
 }
 
-/// `~`-shorten `dir` for the subtitle line; `None` for an empty path.
-fn shorten_home(dir: &std::path::Path, home: Option<std::path::PathBuf>) -> Option<String> {
+/// `~`-shorten `dir` against the daemon machine's `home` for the subtitle
+/// line; `None` for an empty path.
+fn shorten_home(dir: &Path, home: Option<&Path>) -> Option<String> {
     if dir.as_os_str().is_empty() {
         return None;
     }
@@ -540,7 +544,7 @@ mod tests {
 
     #[test]
     fn build_interleaves_each_workspace_with_its_agents_then_waiting() {
-        let sidebar = build(&two_workspace_view(), Some(TabId(2)));
+        let sidebar = build(&two_workspace_view(), Some(TabId(2)), None);
         // api, its claude, web, its codex + claude (pane order), then the
         // waiting section: pane 4 (blocked) ahead of pane 3 (done).
         assert_eq!(sidebar.tree_count, 5);
@@ -565,7 +569,7 @@ mod tests {
     fn tree_agents_keep_pane_order_not_attention_order() {
         // web's blocked agent (pane 4) follows its done agent (pane 3) in the
         // tree — a state change must never reshuffle rows under the cursor.
-        let sidebar = build(&two_workspace_view(), Some(TabId(2)));
+        let sidebar = build(&two_workspace_view(), Some(TabId(2)), None);
         let panes: Vec<u64> = sidebar.entries[3..5]
             .iter()
             .map(|e| match e {
@@ -578,7 +582,7 @@ mod tests {
 
     #[test]
     fn tree_agents_carry_guides_and_depth() {
-        let sidebar = build(&two_workspace_view(), Some(TabId(2)));
+        let sidebar = build(&two_workspace_view(), Some(TabId(2)), None);
         let SidebarEntry::Agent(api_agent) = &sidebar.entries[1] else {
             panic!("expected api's agent row");
         };
@@ -596,7 +600,7 @@ mod tests {
 
     #[test]
     fn waiting_gathers_blocked_then_done_across_projects() {
-        let sidebar = build(&two_workspace_view(), Some(TabId(2)));
+        let sidebar = build(&two_workspace_view(), Some(TabId(2)), None);
         let waiting: Vec<(u64, Option<char>, u8)> = sidebar.entries[sidebar.tree_count..]
             .iter()
             .map(|e| match e {
@@ -629,7 +633,7 @@ mod tests {
         // pane 4, blocked, holds one that came between them.
         view[0].tabs[0].panes[0].approvals = vec![held(7, "touch a.txt"), held(9, "touch c.txt")];
         view[1].tabs[0].panes[1].approvals = vec![held(8, "touch b.txt")];
-        let sidebar = build(&view, Some(TabId(2)));
+        let sidebar = build(&view, Some(TabId(2)), None);
         let waiting: Vec<(u64, Option<u64>)> = sidebar.entries[sidebar.tree_count..]
             .iter()
             .map(|e| match e {
@@ -650,7 +654,7 @@ mod tests {
 
     #[test]
     fn idents_distinguish_the_tree_row_from_its_waiting_copy() {
-        let sidebar = build(&two_workspace_view(), Some(TabId(2)));
+        let sidebar = build(&two_workspace_view(), Some(TabId(2)), None);
         assert_eq!(
             sidebar.ident_at(0),
             Some(EntryIdent::Workspace(WorkspaceId(1)))
@@ -673,7 +677,7 @@ mod tests {
     fn waiting_rows_carry_the_project_name_and_no_subagents() {
         let mut view = view_with_subagents();
         view[0].tabs[0].panes[0].state = AgentState::Blocked; // subagent carrier
-        let sidebar = build(&view, Some(TabId(1)));
+        let sidebar = build(&view, Some(TabId(1)), None);
         let SidebarEntry::Agent(a) = &sidebar.entries[sidebar.tree_count] else {
             panic!("expected a waiting row");
         };
@@ -687,7 +691,7 @@ mod tests {
 
     #[test]
     fn build_marks_the_active_workspace_and_jump_targets() {
-        let sidebar = build(&two_workspace_view(), Some(TabId(2)));
+        let sidebar = build(&two_workspace_view(), Some(TabId(2)), None);
         let SidebarEntry::Workspace(api) = &sidebar.entries[0] else {
             panic!("expected workspace row");
         };
@@ -719,7 +723,7 @@ mod tests {
         let mut view = two_workspace_view();
         view[0].changes = Some("2 files +5 −0".into());
         view[0].stale = true;
-        let sidebar = build(&view, Some(TabId(2)));
+        let sidebar = build(&view, Some(TabId(2)), None);
         let SidebarEntry::Workspace(api) = &sidebar.entries[0] else {
             panic!("expected workspace row");
         };
@@ -737,7 +741,7 @@ mod tests {
         let mut view = two_workspace_view();
         // Make `web` (id 2) a jj-workspace child of `api` (id 1).
         view[1].parent = Some(WorkspaceId(1));
-        let sidebar = build(&view, Some(TabId(2)));
+        let sidebar = build(&view, Some(TabId(2)), None);
         // api, api's agent, child web, then web's agents one level deeper.
         assert_eq!(sidebar.tree_count, 5);
         let SidebarEntry::Workspace(web) = &sidebar.entries[2] else {
@@ -794,7 +798,7 @@ mod tests {
         ];
         view[1].parent = Some(WorkspaceId(1));
         view[2].parent = Some(WorkspaceId(1));
-        let sidebar = build(&view, Some(TabId(1)));
+        let sidebar = build(&view, Some(TabId(1)), None);
         assert_eq!(sidebar.tree_count, 3);
         let guides: Vec<Option<char>> = sidebar.entries[..3]
             .iter()
@@ -825,7 +829,7 @@ mod tests {
             )],
         )];
         view[0].parent = Some(WorkspaceId(99)); // origin not present in the view
-        let sidebar = build(&view, Some(TabId(2)));
+        let sidebar = build(&view, Some(TabId(2)), None);
         let SidebarEntry::Workspace(web) = &sidebar.entries[0] else {
             panic!("expected a workspace row");
         };
@@ -837,8 +841,7 @@ mod tests {
 
     #[test]
     fn shorten_home_prefers_tilde_and_skips_empty_dirs() {
-        use std::path::{Path, PathBuf};
-        let home = || Some(PathBuf::from("/Users/me"));
+        let home = || Some(Path::new("/Users/me"));
         assert_eq!(
             shorten_home(Path::new("/Users/me/develop/x"), home()),
             Some("~/develop/x".into())
@@ -856,7 +859,7 @@ mod tests {
 
     #[test]
     fn agent_rows_carry_tab_and_pane_jump_targets() {
-        let sidebar = build(&two_workspace_view(), Some(TabId(2)));
+        let sidebar = build(&two_workspace_view(), Some(TabId(2)), None);
         let SidebarEntry::Agent(blocked) = &sidebar.entries[4] else {
             panic!("expected agent row");
         };
@@ -871,7 +874,7 @@ mod tests {
         let pane = &mut view[1].tabs[0].panes[1];
         assert_eq!(pane.state, AgentState::Blocked);
         pane.sandbox = Some("gke".into());
-        let sidebar = build(&view, Some(TabId(2)));
+        let sidebar = build(&view, Some(TabId(2)), None);
         let kinds: Vec<&str> = sidebar
             .entries
             .iter()
@@ -889,7 +892,7 @@ mod tests {
 
     #[test]
     fn entry_at_row_maps_clicks_past_the_frame_headers() {
-        let sidebar = build(&two_workspace_view(), Some(TabId(2)));
+        let sidebar = build(&two_workspace_view(), Some(TabId(2)), None);
         // Row 0 is the projects header (the top border) — a section toggle, not
         // an entry.
         assert_eq!(sidebar.entry_at_row(0), None);
@@ -916,7 +919,7 @@ mod tests {
 
     #[test]
     fn collapsing_projects_shifts_the_waiting_divider_up() {
-        let mut sidebar = build(&two_workspace_view(), Some(TabId(2)));
+        let mut sidebar = build(&two_workspace_view(), Some(TabId(2)), None);
         sidebar.projects_collapsed = true;
         assert_eq!(sidebar.entry_at_row(1), None, "tree rows are hidden");
         // No tree body, no spacer — the divider sits right below the header.
@@ -930,7 +933,7 @@ mod tests {
 
     #[test]
     fn collapsing_waiting_hides_the_queue_rows() {
-        let mut sidebar = build(&two_workspace_view(), Some(TabId(2)));
+        let mut sidebar = build(&two_workspace_view(), Some(TabId(2)), None);
         sidebar.waiting_collapsed = true;
         assert_eq!(sidebar.entry_at_row(1), Some(0), "tree rows still map");
         assert_eq!(sidebar.header_at_row(12), Some(Section::Waiting));
@@ -941,7 +944,7 @@ mod tests {
 
     #[test]
     fn build_carries_subagents_onto_the_tree_row() {
-        let sidebar = build(&view_with_subagents(), Some(TabId(1)));
+        let sidebar = build(&view_with_subagents(), Some(TabId(1)), None);
         let SidebarEntry::Agent(a) = &sidebar.entries[1] else {
             panic!("expected the first agent row");
         };
@@ -953,7 +956,7 @@ mod tests {
 
     #[test]
     fn entry_at_row_skips_subagent_rows_and_shifts_the_next_agent_down() {
-        let sidebar = build(&view_with_subagents(), Some(TabId(1)));
+        let sidebar = build(&view_with_subagents(), Some(TabId(1)), None);
         // One workspace: projects header row 0, workspace rows 1-2; agent entry
         // 1 (with two subagents) occupies rows 3-4 as its head.
         assert_eq!(sidebar.entry_at_row(1), Some(0), "the workspace row");

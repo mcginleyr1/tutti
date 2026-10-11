@@ -5,9 +5,10 @@ multiple terminal agents (Claude Code, Codex, Cursor CLI, OpenCode, etc.) in per
 panes, understands each agent's state (blocked / working / done / idle), and exposes a
 CLI + socket API so both humans and agents can drive it.
 
-**Out of scope for now (deliberate):** remote/SSH/mobile clients (remote
-*agents* are in: Phase 4 item 10 launches them into Kubernetes sandboxes, with
-the pty still local), and a plugin system (we'll design a better one later — do not build extension points
+**Out of scope for now (deliberate):** mobile clients (remote *agents* are in:
+Phase 4 item 10 launches them into Kubernetes sandboxes, with the pty still
+local; remote *clients* over ssh landed 2026-11-08 — Phase 2 item 1), and a
+plugin system (we'll design a better one later — do not build extension points
 speculatively, but keep module boundaries clean so a plugin layer can be added
 without a rewrite). Theming was on this list until 2026-09-01: the default still
 inherits the terminal's palette live, and `theme = "dark" | "light"` are opt-in
@@ -190,7 +191,19 @@ Goal: attachable ratatui client with real pane rendering and tmux-grade ergonomi
    any path; a pane nobody shows keeps its size, and an old client's
    `PaneResize` still applies. ✅ Attach refuses to nest a session inside one of
    its own panes, and `-s` defaults to the pane's own `TUTTI_SESSION` inside
-   tutti.
+   tutti. ✅ Remote attach: `tutti --host <ssh destination>` attaches through
+   `ssh … tutti proxy`, which carries the frames to the far daemon and answers
+   the TUI's questions about that machine over host frames (`0x06`,
+   `HOST_REV`, never seen by the daemon) — so directories, the launcher's
+   agents, shell and resume rows, the config's projects, sandboxes and issue
+   trackers, issue fetches, setup installs and the editor job are the far
+   machine's, while keys, theme and mouse stay the near one's. The TUI itself
+   no longer reads its own machine: every such question goes through `Host`,
+   answered in-process for a local attach. Any other command under `--host`
+   runs on the far side whole (`ssh -t` when interactive). A dropped or
+   refused connection is an error carrying ssh's stderr — never a local
+   daemon. Open: `Attach.terminal` names this machine's app, which a watcher
+   on the far side cannot raise; ages use this machine's clock.
 2. **Rendering**: draw each pane's vt100 grid into its ratatui area; cursor, colors,
    and attributes pass through — on the default `terminal` theme the terminal's
    palette is the theme; the opt-in `dark`/`light` themes re-ground only a pane's
@@ -986,6 +999,12 @@ In order; each lands its TUI path in the same wave as its verbs.
      `RegisterEventHotKey`), rtty's `global_hotkey`.
    Their source is tarp (unlicensed: read for ideas only, nothing copied;
    its GPL renderer repo, gpui-terminal, unread).
+13. ✅ **Remote attach** — `tutti --host` and `tutti proxy`; the TUI asks the
+   daemon's machine everything it used to read from its own (Phase 2 item 1).
+   The groundwork for a fleet orchestrator on a server that the TUI (and
+   rtty) attach to. Built 2026-10-11 and left unmerged; rebased onto main
+   and landed 2026-11-08, where the host also took the launcher's argv, a
+   deploy's prompt file and its write-back, and `--view` reached the proxy.
 
 **Open** — the headline items; each phase item above keeps its own list:
 - tracker write-back stops at the deploy: tutti never closes an issue
@@ -1175,6 +1194,11 @@ were. The checks:
   the inline history, a resync's rows and a second attach's in Neovim's
   `:terminal` and Emacs vterm/eat (run only with a tutti pane as the host:
   getsid and the tty there are those of a pane's shell).
+- `tutti --host` against a real sshd: driven end to end through a stand-in
+  `ssh` whose far side had its own HOME, config, SHELL and runtime dir (the
+  TUI in a pty: first run, completion, launcher, a setup install, an issue
+  fetch, detach, and the forwarded CLI), never over a real network; nor
+  `pane attach` (raw) through `ssh -t`.
 
 ## Phase 5 — Hardening & distribution
 

@@ -381,6 +381,38 @@ the focused pane whole, inside paste marks when the pane's program asked for
 them. A shell then runs none of a multi-line paste's lines until you press
 Enter.
 
+### Attaching from another machine
+
+`--host <destination>` uses the daemon on another machine over ssh — any
+destination ssh takes, `user@host` or a `Host` from `~/.ssh/config`:
+
+```sh
+tutti --host devbox              # attach: the TUI draws here, the panes run there
+tutti --host devbox pane list    # any other command runs there, as typed
+```
+
+Attaching runs `ssh devbox tutti proxy`, which carries the session to the far
+daemon (starting it if need be) and answers everything the TUI asks about that
+machine. So the directories you complete and add, the launcher's installed
+agents, login shell and resumable conversations, the config's startup
+projects, sandboxes and issue trackers, the issues panel's fetches, a deploy's
+write-back and the file a long first message goes through, the setup panel's
+installs and the changes panel's editor are all the far machine's — the one
+the panes run on. Keys, theme, mouse and icons come from this machine's
+config. Any other command runs on the far side whole: its paths, config,
+output and exit code are that machine's, with a terminal there when yours is
+one. `tutti --host devbox attach --view` watches without starting a daemon
+there, as a local view does.
+
+- Both machines need the same tutti build — the proxy's hello carries a
+  revision, and a mismatch is refused — with `tutti` on the far side's
+  non-interactive `PATH`, which is what `ssh devbox tutti --version` finds.
+- ssh asks its questions (a password, a new host key) before the TUI opens. A
+  connection that drops ends the TUI with ssh's own message; nothing ever
+  falls back to a daemon on this machine.
+- Each CLI call is its own ssh connection; `ControlMaster auto` with
+  `ControlPersist` in `~/.ssh/config` makes them quick.
+
 ### When something crashes
 
 The daemon is built to outlive its own bugs. A panic in a background pass —
@@ -481,7 +513,7 @@ the standing hint always on the right; a transient fires a one-line
 **notification band** just above it (accent for info, red for errors).
 
 **Run launcher** (`Ctrl+B r`): a floating ` run in <project> ` panel that answers
-"what should start here?" — the agents **installed on this machine** first
+"what should start here?" — the agents **installed on the daemon's machine** first
 (`claude`, `crush`, …), then `shell` and `command…`, then the rest of tutti's
 agent catalog dim and unselectable at the foot, each row naming the product and
 its project link (`gemini   Gemini CLI · github.com/google-gemini/gemini-cli`)
@@ -1893,7 +1925,7 @@ comes from the command, not from detection. Known limits: without the `--tty`
 hooks, state comes from the screen. Turns and checkpoints stay local and say
 nothing about the sandbox's work, so sandbox panes record none; pull the work
 back for its diff. Resume rows are hidden in a sandbox launcher because those
-conversations live on this machine. An exited sandbox pane's `r` reopens the
+conversations live on the daemon's machine. An exited sandbox pane's `r` reopens the
 launcher on the same sandbox.
 
 ## Orchestrating agents
@@ -2080,6 +2112,13 @@ and exits 1 — and exits 0 when the daemon goes away. To jump from such a tool 
 a pane, run `tutti -s <session> pane focus <id>`: the attached TUI switches to
 that pane's workspace and tab.
 
+Both work across machines: `tutti --host <h> watch` streams a far session's
+snapshots over ssh (tutti hands its process over to ssh, so stopping it stops
+ssh), and `tutti --host <h> pane focus <id>` jumps every TUI attached to that
+session — one attached from your Mac with `--host` too, whose
+`attached_terminal` is your Mac's terminal app, so a menu-bar app there can
+bring it to the front.
+
 ## CLI surface
 
 Every TUI action is also a CLI verb over the daemon socket — if it isn't
@@ -2160,6 +2199,11 @@ attach`) refuses to attach a session from inside one of its own panes, which
 would nest the session inside itself; pass `-s <other-session>` to attach a
 different one.
 
+Every verb also takes `--host <ssh destination>`: attach draws here from the
+daemon there, and any other verb runs there whole — see [Attaching from another
+machine](#attaching-from-another-machine). Without `-s` the far side picks its
+own default.
+
 ## Workspace layout
 
 ```
@@ -2205,3 +2249,5 @@ tutti is alpha; PLAN.md tracks what is open.
   TUI takes it on and `tutti pane focus` exits 0, even where rtty's own edge
   then stops it. An editor that does something of its own when tutti
   reports no move does not do it there.
+- **Across `--host`, ages use this machine's clock** against the daemon's
+  timestamps, so a skewed clock skews the "2h ago" labels.

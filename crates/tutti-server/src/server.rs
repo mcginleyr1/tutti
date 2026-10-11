@@ -930,7 +930,9 @@ fn handle_frame(
             let _ = pane_input(hub, pane, &bytes, None);
             ControlFlow::Continue(())
         }
-        Frame::PaneSnapshot(_) | Frame::PaneDelta(_) | Frame::PaneRaw { .. } => {
+        // Host frames end at the client's `tutti proxy`; one that reaches here
+        // has no one to answer it.
+        Frame::PaneSnapshot(_) | Frame::PaneDelta(_) | Frame::PaneRaw { .. } | Frame::Host(_) => {
             ControlFlow::Continue(())
         }
     }

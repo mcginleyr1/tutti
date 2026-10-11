@@ -2,9 +2,11 @@
 //! GitHub through the user's own `gh`, Linear's GraphQL API through `curl`
 //! with a personal API key from the environment, or any tracker through a
 //! command printing JSON — and deploying one launches an agent on it with the
-//! issue as its prompt. Every tracker call runs client-side, in the project's
-//! directory with the user's environment: the daemon never talks to a
-//! tracker. A source that opts in hears back from a deploy (`write_back`).
+//! issue as its prompt. Every tracker call runs in a tutti client process on
+//! the daemon's machine — the TUI's own, or the `tutti proxy` a remote attach
+//! runs — in the project's directory with that user's environment: the daemon
+//! never talks to a tracker. A source that opts in hears back from a deploy
+//! (`write_back`).
 
 use std::fs::{DirBuilder, OpenOptions};
 use std::io::Write;
@@ -39,7 +41,7 @@ const GH_FIELDS: &str = "number,title,body,url,labels";
 
 /// One configured tracker: where its issues come from, the prompt an agent
 /// deployed on one gets, and whether a deploy comments on it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Source {
     /// What the issues panel and `--source` call it, `[A-Za-z0-9_-]+`.
     pub name: String,
@@ -67,7 +69,7 @@ impl Source {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Kind {
     /// GitHub through `gh`: `repo` (`owner/name`), else the one the project's
     /// git remote names, narrowed by a `gh` `search`. A deploy assigns the
@@ -97,7 +99,7 @@ pub enum Kind {
 }
 
 /// One issue as its source lists it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Issue {
     /// The configured source it came from.
     pub source: String,

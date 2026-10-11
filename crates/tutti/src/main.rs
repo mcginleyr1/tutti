@@ -1,5 +1,6 @@
 use std::collections::HashSet;
-use std::io::Read;
+use std::ffi::OsString;
+use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -15,6 +16,7 @@ use tutti::client::{self, Client, StopOutcome};
 use tutti::config::{Approvals, Config, RESIZE_DELTA};
 use tutti::editor;
 use tutti::hooks;
+use tutti::host::{self, Startup};
 use tutti::integrations::{self, Dirs, Integration, Shell, Status};
 use tutti::issues;
 use tutti::render;
@@ -22,10 +24,16 @@ use tutti::render;
 #[derive(Parser)]
 #[command(name = "tutti", version, about = "Terminal-native agent multiplexer")]
 struct Cli {
-    /// Session name (one daemon + socket per session). Inside a tutti pane it
-    /// defaults to that pane's own session.
-    #[arg(short, long, global = true, default_value_t = session_from(std::env::var("TUTTI_SESSION").ok()))]
-    session: String,
+    /// Session name (one daemon + socket per session) [default: inside a tutti
+    /// pane, that pane's own session; elsewhere `tutti`]
+    #[arg(short, long, global = true)]
+    session: Option<String>,
+    /// Use the daemon on this ssh destination (`user@host`, or a Host from
+    /// ~/.ssh/config): `attach` draws here through `tutti proxy` there, so
+    /// everything about that machine comes from it; any other command runs
+    /// there whole. Needs the same tutti on that machine's PATH.
+    #[arg(long, global = true, value_name = "DESTINATION")]
+    host: Option<String>,
     /// Print raw JSON responses instead of formatted output.
     #[arg(long, global = true)]
     json: bool,
@@ -69,6 +77,15 @@ enum Command {
         /// Watch only, for a second screen or a pair: tutti's navigation and
         /// detach work, but nothing reaches a pane — no keys, no size vote,
         /// no change to the session. Never starts a daemon.
+        #[arg(long)]
+        view: bool,
+    },
+    /// Carry an attach connection between stdin/stdout and this machine's
+    /// daemon, answering the TUI's questions about this machine on the way:
+    /// what `tutti --host` runs over ssh.
+    #[command(hide = true)]
+    Proxy {
+        /// For an `attach --view`: start no daemon and mount nothing.
         #[arg(long)]
         view: bool,
     },
@@ -636,7 +653,12 @@ const TIMED_OUT: i32 = 124;
 const AGENT_EVENT_DEADLINE: Duration = Duration::from_secs(2);
 
 fn main() {
-    match run(Cli::parse()) {
+    let cli = Cli::parse();
+    let result = match cli.host.clone() {
+        Some(destination) => run_on(&destination, cli),
+        None => run(cli),
+    };
+    match result {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             eprintln!("error: {e:#}");
@@ -645,24 +667,85 @@ fn main() {
     }
 }
 
-fn run(cli: Cli) -> Result<i32> {
+/// `--host`: attach draws here through the far side's `tutti proxy`; any
+/// other command runs there whole, as typed — its paths, config and installs
+/// are that machine's. That ssh replaces this process, so its exit code and
+/// the signals sent to it (a supervisor stopping a `watch`) are ssh's own.
+/// Never a local daemon.
+fn run_on(destination: &str, cli: Cli) -> Result<i32> {
     match cli.command {
-        Some(Command::Server { action }) => run_server(action, &cli.session, cli.json),
-        // Bare `tutti` and `tutti attach` both attach, mounting startup projects.
         None => {
-            attach_session(&cli.session, false)?;
+            tutti::attach::run_remote(destination, cli.session.as_deref(), Config::load()?, false)?;
             Ok(0)
         }
         Some(Command::Attach { view }) => {
-            attach_session(&cli.session, view)?;
+            tutti::attach::run_remote(destination, cli.session.as_deref(), Config::load()?, view)?;
             Ok(0)
         }
-        Some(Command::AgentEvent { agent }) => run_agent_event(&cli.session, agent),
+        Some(_) => {
+            let argv: Vec<String> = std::iter::once("tutti".into())
+                .chain(
+                    without_host(std::env::args_os().skip(1))
+                        .iter()
+                        .map(|arg| arg.to_string_lossy().into_owned()),
+                )
+                .collect();
+            let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+            let error =
+                std::os::unix::process::CommandExt::exec(&mut client::ssh(destination, &argv, tty));
+            Err(error).context("running ssh")
+        }
+    }
+}
+
+/// The command line without `--host` and its value — what runs on the far
+/// side. Everything after a `--` is the command's own and passes untouched.
+fn without_host(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    let mut args = args.into_iter();
+    let mut kept = Vec::new();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            kept.push(arg);
+            kept.extend(args);
+            break;
+        }
+        if arg == "--host" {
+            args.next();
+        } else if !arg.to_string_lossy().starts_with("--host=") {
+            kept.push(arg);
+        }
+    }
+    kept
+}
+
+fn run(cli: Cli) -> Result<i32> {
+    let session = cli
+        .session
+        .clone()
+        .unwrap_or_else(|| session_from(std::env::var("TUTTI_SESSION").ok()));
+    match cli.command {
+        Some(Command::Server { action }) => run_server(action, &session, cli.json),
+        // Bare `tutti` and `tutti attach` both attach, mounting startup projects.
+        None => {
+            attach_session(&session, false)?;
+            Ok(0)
+        }
+        Some(Command::Attach { view }) => {
+            attach_session(&session, view)?;
+            Ok(0)
+        }
+        Some(Command::Proxy { view }) => {
+            let (config, startup) = prepare_attach(&session, view)?;
+            let daemon = client::open_attach(&session, view)?;
+            host::proxy(daemon, host::Local::from_env(config), startup)?;
+            Ok(0)
+        }
+        Some(Command::AgentEvent { agent }) => run_agent_event(&session, agent),
         Some(Command::Ask {
             pane,
             message,
             timeout,
-        }) => run_ask(&cli.session, cli.json, PaneId(pane), message, timeout),
+        }) => run_ask(&session, cli.json, PaneId(pane), message, timeout),
         Some(Command::Pane {
             action:
                 PaneAction::Wait {
@@ -671,7 +754,7 @@ fn run(cli: Cli) -> Result<i32> {
                     next,
                     timeout,
                 },
-        }) => run_wait(&cli.session, cli.json, &panes, &until, next, timeout),
+        }) => run_wait(&session, cli.json, &panes, &until, next, timeout),
         Some(Command::Pane {
             action:
                 PaneAction::Attach {
@@ -681,19 +764,13 @@ fn run(cli: Cli) -> Result<i32> {
                 },
         }) => {
             // Its own pane would echo its output back into itself forever.
-            let own = std::env::var("TUTTI_SESSION").is_ok_and(|s| s == cli.session)
+            let own = std::env::var("TUTTI_SESSION").is_ok_and(|s| s == session)
                 && std::env::var("TUTTI_PANE").is_ok_and(|p| p == pane.to_string());
             if own {
                 bail!("pane {pane} is the pane this runs in");
             }
             let history = if inline { history } else { 0 };
-            tutti::attach::raw::run(
-                &cli.session,
-                PaneId(pane),
-                &Config::load()?,
-                inline,
-                history,
-            )
+            tutti::attach::raw::run(&session, PaneId(pane), &Config::load()?, inline, history)
         }
         Some(Command::Sandbox {
             action: SandboxAction::Run { profile, name, cmd },
@@ -711,9 +788,9 @@ fn run(cli: Cli) -> Result<i32> {
             });
             tutti::sandbox::run(Config::load()?.sandbox(&profile)?, &name, &cmd)
         }
-        Some(Command::Issue { action }) => run_issue(action, &cli.session, cli.json),
-        Some(Command::Edit { target, workspace }) => run_edit(&cli.session, &target, workspace),
-        Some(Command::Watch) => run_watch(&cli.session),
+        Some(Command::Issue { action }) => run_issue(action, &session, cli.json),
+        Some(Command::Edit { target, workspace }) => run_edit(&session, &target, workspace),
+        Some(Command::Watch) => run_watch(&session),
         Some(Command::Hooks {
             agent,
             raw,
@@ -777,9 +854,9 @@ fn run(cli: Cli) -> Result<i32> {
             | Request::PaneResizeToward { from, .. } = &mut request
                 && from.is_none()
             {
-                *from = caller_pane(&cli.session);
+                *from = caller_pane(&session);
             }
-            let mut client = Client::connect_or_start(&cli.session)?;
+            let mut client = Client::connect_or_start(&session)?;
             let response = client.request(&request)?;
             Ok(if project {
                 emit_project(response, cli.json)
@@ -809,19 +886,26 @@ fn session_from(pane_session: Option<String>) -> String {
         .unwrap_or_else(|| "tutti".into())
 }
 
-/// Load config, mount any configured startup projects (idempotently), and
-/// attach. An empty session with no configured projects attaches straight into
-/// the first-run prompt (prefilled with the cwd) rather than assuming it —
-/// `first_run` carries that prefill. A project that fails to start yields a
-/// `notice` surfaced after attach; the rest still mount. Inside one of the
-/// session's own panes it refuses before loading or starting anything. A
-/// `view` changes nothing, and so mounts nothing and starts no daemon.
+/// Mount the configured startup projects and attach. Inside one of the
+/// session's own panes it refuses before loading or starting anything.
 fn attach_session(session: &str, view: bool) -> Result<()> {
     let pane_session = std::env::var_os("TUTTI_PANE").and(std::env::var("TUTTI_SESSION").ok());
     refuse_nested_attach(session, pane_session.as_deref())?;
+    let (config, startup) = prepare_attach(session, view)?;
+    tutti::attach::run(session, config, startup, view)
+}
+
+/// What attaching does first, on the daemon's machine — locally, or in the
+/// `tutti proxy` a remote attach runs: load the config and mount its startup
+/// projects (idempotently). An empty session with no configured projects
+/// arms the first-run prompt (prefilled with the cwd) rather than assuming
+/// it. A project that fails to start yields a notice surfaced after attach;
+/// the rest still mount. A `view` changes nothing, and so mounts nothing and
+/// starts no daemon.
+fn prepare_attach(session: &str, view: bool) -> Result<(Config, Startup)> {
     let config = Config::load()?;
     if view {
-        return tutti::attach::run(session, config, None, None, true);
+        return Ok((config, Startup::default()));
     }
     // Absolutize project dirs client-side so the daemon (which has its own cwd)
     // records the real directory and its git-branch probe hits.
@@ -844,8 +928,7 @@ fn attach_session(session: &str, view: bool) -> Result<()> {
         .transpose()
         .context("resolve current directory")?;
     let notice = (!notices.is_empty()).then(|| notices.join("; "));
-
-    tutti::attach::run(session, config, first_run, notice, false)
+    Ok((config, Startup { first_run, notice }))
 }
 
 /// Refuse to attach `session` from inside one of its own panes —
@@ -1192,6 +1275,7 @@ fn to_request(command: Command) -> Result<Request> {
         }),
         Command::Server { .. }
         | Command::Attach { .. }
+        | Command::Proxy { .. }
         | Command::Sandbox {
             action: SandboxAction::Run { .. },
         }
@@ -2192,14 +2276,17 @@ mod tests {
     fn global_flags_default_and_override() {
         let cli = Cli::try_parse_from(["tutti", "pane", "list"]).unwrap();
         assert_eq!(
-            cli.session,
-            session_from(std::env::var("TUTTI_SESSION").ok())
+            cli.session, None,
+            "resolved in run: the pane's own, else tutti"
         );
-        assert!(!cli.json);
+        assert_eq!((cli.json, cli.host), (false, None));
 
         let cli = Cli::try_parse_from(["tutti", "-s", "work", "--json", "pane", "list"]).unwrap();
-        assert_eq!(cli.session, "work");
+        assert_eq!(cli.session.as_deref(), Some("work"));
         assert!(cli.json);
+
+        let cli = Cli::try_parse_from(["tutti", "pane", "list", "--host", "box"]).unwrap();
+        assert_eq!(cli.host.as_deref(), Some("box"), "--host is global");
     }
 
     #[test]
@@ -2229,7 +2316,7 @@ mod tests {
         // No subcommand parses (routed to the bootstrap-attach path in `run`).
         let cli = Cli::try_parse_from(["tutti"]).unwrap();
         assert!(cli.command.is_none());
-        assert_eq!(cli.session, "tutti");
+        assert_eq!(cli.session, None);
 
         // A subcommand still parses alongside the now-optional default.
         let cli = Cli::try_parse_from(["tutti", "pane", "list"]).unwrap();
@@ -3312,7 +3399,25 @@ mod tests {
         assert!(attach(&["--history", "5"]).is_err(), "only inline");
         let cli = Cli::try_parse_from(["tutti", "watch", "-s", "work"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Watch)));
-        assert_eq!(cli.session, "work");
+        assert_eq!(cli.session.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn the_far_side_runs_the_command_line_without_host() {
+        let args = |line: &[&str]| line.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            without_host(args(&["--host", "box", "-s", "work", "pane", "list"])),
+            args(&["-s", "work", "pane", "list"])
+        );
+        assert_eq!(
+            without_host(args(&["pane", "list", "--host=box", "--json"])),
+            args(&["pane", "list", "--json"])
+        );
+        assert_eq!(
+            without_host(args(&["run", "--host", "box", "--", "ssh", "--host", "x"])),
+            args(&["run", "--", "ssh", "--host", "x"]),
+            "a command's own --host after -- is its own"
+        );
     }
 
     #[test]

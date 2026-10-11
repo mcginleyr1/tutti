@@ -19,6 +19,10 @@ pub enum Frame {
         pane: PaneId,
         bytes: Vec<u8>,
     },
+    /// One JSON object between a client and the `tutti proxy` on the daemon's
+    /// machine — questions about that machine (its directories, config,
+    /// installed agents), never seen by the daemon.
+    Host(Vec<u8>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +60,7 @@ const KIND_SNAPSHOT: u8 = 0x02;
 const KIND_DELTA: u8 = 0x03;
 const KIND_INPUT: u8 = 0x04;
 const KIND_RAW: u8 = 0x05;
+const KIND_HOST: u8 = 0x06;
 
 const PANE_HEADER: usize = 8 + 2 + 2 + 4;
 
@@ -63,6 +68,7 @@ impl Frame {
     pub fn encode(&self) -> Vec<u8> {
         let (kind, payload_len) = match self {
             Frame::Control(json) => (KIND_CONTROL, json.len()),
+            Frame::Host(json) => (KIND_HOST, json.len()),
             Frame::PaneSnapshot(d) => (KIND_SNAPSHOT, PANE_HEADER + d.bytes.len()),
             Frame::PaneDelta(d) => (KIND_DELTA, PANE_HEADER + d.bytes.len()),
             Frame::Input { bytes, .. } => (KIND_INPUT, 8 + bytes.len()),
@@ -76,7 +82,7 @@ impl Frame {
         out.extend_from_slice(&(1 + payload_len as u32).to_le_bytes());
         out.push(kind);
         match self {
-            Frame::Control(json) => out.extend_from_slice(json),
+            Frame::Control(json) | Frame::Host(json) => out.extend_from_slice(json),
             Frame::PaneSnapshot(d) | Frame::PaneDelta(d) => {
                 out.extend_from_slice(&d.pane.0.to_le_bytes());
                 out.extend_from_slice(&d.rows.to_le_bytes());
@@ -112,6 +118,7 @@ impl Frame {
         let payload = &body[1..];
         let frame = match body[0] {
             KIND_CONTROL => Frame::Control(payload.to_vec()),
+            KIND_HOST => Frame::Host(payload.to_vec()),
             KIND_SNAPSHOT => Frame::PaneSnapshot(decode_pane_data(payload)?),
             KIND_DELTA => Frame::PaneDelta(decode_pane_data(payload)?),
             KIND_INPUT | KIND_RAW => {
@@ -159,6 +166,7 @@ mod tests {
     #[test]
     fn roundtrips_all_kinds() {
         roundtrip(Frame::Control(br#"{"type":"pane_list"}"#.to_vec()));
+        roundtrip(Frame::Host(br#"{"type":"call","id":1}"#.to_vec()));
         roundtrip(Frame::PaneSnapshot(PaneData {
             pane: PaneId(7),
             rows: 24,

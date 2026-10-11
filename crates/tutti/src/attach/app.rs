@@ -37,7 +37,8 @@ use crate::config::{
     SidebarVisibility,
 };
 use crate::editor;
-use crate::integrations::{self, Dirs, Integration, Plan, Status};
+use crate::host::{Host, Info, Local};
+use crate::integrations::{Integration, Plan, Status};
 use crate::issues::{self, Issue};
 
 /// The sidebar's fixed column width, and the minimum total width below which it
@@ -63,9 +64,6 @@ const STATUS_TTL: Duration = Duration::from_secs(4);
 const MOUSE_SCROLL_STEP: usize = 3;
 /// How long the prefix can sit unanswered before the which-key popup appears.
 const WHICHKEY_DELAY: Duration = Duration::from_millis(500);
-
-/// Up to this many directory completions surface under the add-project prompt.
-const MAX_COMPLETIONS: usize = 8;
 
 /// The peek overlay's narrowest width, so its hint row (answer keys, esc, how
 /// to jump in: 62 columns padded) fits between the borders over a narrow pane.
@@ -362,25 +360,19 @@ pub struct App {
     /// armed from the issues panel: the agent rows run on that prompt, and
     /// the pick deploys rather than runs.
     launcher_issue: Option<(Issue, String)>,
-    /// The root the resume harvest reads the agent tools' session stores under
-    /// — the real home directory, pointed at a fixture tree in tests.
-    resume_home: Option<PathBuf>,
-    /// The `PATH` the launcher finds installed agents on — the real one,
-    /// emptied in tests so their rows never depend on this machine.
-    pub(crate) launcher_path: Option<std::ffi::OsString>,
-    /// Where a deploy writes a first message too long to ride an argument
-    /// well (`issues::deploy_argv`): `None` for the session's own
-    /// (`tutti_core::prompts_dir`), a scratch directory in tests.
-    prompts_dir: Option<PathBuf>,
-    /// Where the setup panel installs for the user — the real `$HOME` and
-    /// `$XDG_CONFIG_HOME`, pointed at a fixture tree in tests.
-    pub(crate) setup_dirs: Dirs,
+    /// The daemon's machine: every directory, agent, conversation and install
+    /// the TUI asks about lives there — in this process, or across ssh.
+    pub(crate) host: Host,
+    /// Its home directory, which paths shown here shorten to `~`.
+    home: Option<PathBuf>,
+    /// Its login shell, which the launcher's shell and command rows run.
+    shell: String,
     /// The project the setup panel installs into, as its name and directory,
     /// while `s` has switched it there; `None` installs for the user.
     setup_project: Option<(String, PathBuf)>,
     /// The setup panel's plans, one per `SETUP` row: made on opening, on a
     /// scope switch, and after every install, so a row shows the disk.
-    setup_plans: Vec<anyhow::Result<Plan>>,
+    setup_plans: Vec<Result<Plan, String>>,
     /// The highlighted setup row.
     setup_selected: usize,
     /// Whether the setup panel is asking to install the highlighted row.
@@ -535,7 +527,19 @@ impl App {
         Self::with_config(Config::default())
     }
 
+    /// An app whose daemon runs on this machine.
     pub fn with_config(config: Config) -> Self {
+        let host = Host::Local(std::sync::Arc::new(Local::from_env(config.clone())));
+        let info = host.info().expect("this machine describes itself");
+        Self::with_host(config, host, info)
+    }
+
+    /// An app asking `host` about the daemon's machine, which `info` describes:
+    /// its sandboxes and issue trackers replace `config`'s, which keeps the
+    /// rest — keys, theme, mouse — from the machine the TUI draws on.
+    pub fn with_host(mut config: Config, host: Host, info: Info) -> Self {
+        config.sandboxes = info.sandboxes;
+        config.issues = info.issues;
         Self {
             session: String::new(),
             workspaces: Vec::new(),
@@ -574,10 +578,9 @@ impl App {
             launcher_dir: None,
             launcher_sandbox: None,
             launcher_issue: None,
-            resume_home: std::env::var_os("HOME").map(PathBuf::from),
-            launcher_path: std::env::var_os("PATH"),
-            prompts_dir: None,
-            setup_dirs: Dirs::from_env(),
+            host,
+            home: info.home,
+            shell: info.shell,
             setup_project: None,
             setup_plans: Vec::new(),
             setup_selected: 0,
@@ -638,6 +641,29 @@ impl App {
     /// The active configuration, for the renderer (hint, which-key, help).
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Where questions about the daemon's machine go, for the event loop's
+    /// threads.
+    pub fn host(&self) -> &Host {
+        &self.host
+    }
+
+    /// The daemon machine's home directory, which shown paths shorten to `~`.
+    pub fn home(&self) -> Option<&Path> {
+        self.home.as_deref()
+    }
+
+    /// Point this machine's host at fixture directories.
+    #[cfg(test)]
+    pub(crate) fn set_local(&mut self, change: impl FnOnce(&mut Local)) {
+        let Host::Local(local) = &self.host else {
+            panic!("not a local host");
+        };
+        let mut local = Local::clone(local);
+        change(&mut local);
+        self.home = local.dirs.home.clone();
+        self.host = Host::Local(std::sync::Arc::new(local));
     }
 
     /// The saved layout on offer, for the renderer's restore modal.
@@ -866,7 +892,8 @@ impl App {
                     state.damaged = true;
                 }
             }
-            WireFrame::Input { .. } | WireFrame::PaneRaw { .. } => {}
+            // Host replies go to their callers before frames reach here.
+            WireFrame::Input { .. } | WireFrame::PaneRaw { .. } | WireFrame::Host(_) => {}
         }
         Vec::new()
     }
@@ -1233,7 +1260,7 @@ impl App {
                     if let FollowUp::Deploy(_, Some(file)) | FollowUp::Deployed(Some(file)) =
                         follow_up
                     {
-                        let _ = std::fs::remove_file(file);
+                        let _ = self.host.forget_prompt(&file);
                     }
                 }
                 self.set_status(format!("error: {message}"));
@@ -1752,7 +1779,7 @@ impl App {
     /// queue — for the renderer, hit-testing, and navigation. Carries the
     /// client's collapse state so the frame headers and row math agree.
     pub fn sidebar(&self) -> Sidebar {
-        let mut sidebar = sidebar::build(&self.workspaces, self.active_tab);
+        let mut sidebar = sidebar::build(&self.workspaces, self.active_tab, self.home.as_deref());
         sidebar.projects_collapsed = self.collapsed_projects;
         sidebar.waiting_collapsed = self.collapsed_waiting;
         sidebar
@@ -2479,9 +2506,16 @@ impl App {
         let Some(dir) = self.workspace_dir_of_tab(tab) else {
             return Vec::new();
         };
-        if !is_jj_workspace(&dir) {
-            self.set_status(format!("not a jj workspace: {}", dir.display()));
-            return Vec::new();
+        match self.host.is_jj(&dir) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.set_status(format!("not a jj workspace: {}", dir.display()));
+                return Vec::new();
+            }
+            Err(e) => {
+                self.set_status(format!("error: {e:#}"));
+                return Vec::new();
+            }
         }
         self.mode = Mode::Terminal;
         self.status = None;
@@ -2727,7 +2761,7 @@ impl App {
         };
         let branch = info.sandbox_name.as_deref().map(tutti_core::sandbox_branch);
         Some(WriteBack {
-            source: source.clone(),
+            source: source.name.clone(),
             id: issue.id.clone(),
             comment: issues::deployed_comment(
                 &info.title,
@@ -3036,9 +3070,8 @@ impl App {
     /// to type — the directory-completion panel fills in the rest.
     fn open_project_prompt(&mut self) {
         self.mode = Mode::SidebarPrompt;
-        let home = std::env::var_os("HOME").map(PathBuf::from);
         let dirs: Vec<PathBuf> = self.workspaces.iter().map(|w| w.dir.clone()).collect();
-        self.sidebar_prompt = prompt_prefill(&dirs, home.as_deref());
+        self.sidebar_prompt = prompt_prefill(&dirs, self.home.as_deref());
         self.prompt_selected = 0;
         self.status = None;
         self.refresh_completions();
@@ -3059,13 +3092,11 @@ impl App {
         self.refresh_completions();
     }
 
-    /// Recompute the directory completions for the current input against the live
-    /// environment. Kept off the render path: every edit calls this, and the
-    /// renderer only reads the cached result.
+    /// Recompute the directory completions for the current input on the
+    /// daemon's machine. Kept off the render path: every edit calls this, and
+    /// the renderer only reads the cached result.
     fn refresh_completions(&mut self) {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        self.prompt_completions = complete_dirs(&self.sidebar_prompt, home.as_deref(), &cwd);
+        self.prompt_completions = self.host.complete_dirs(&self.sidebar_prompt);
         if self.prompt_selected >= self.prompt_completions.len() {
             self.prompt_selected = 0;
         }
@@ -3091,15 +3122,29 @@ impl App {
             self.mode = Mode::Terminal;
             return Vec::new();
         }
-        let mut dir = expand_dir(&input);
-        if !dir.is_dir() {
+        let expanded = self.host.expand_dir(&input).and_then(|(dir, exists)| {
+            if exists {
+                return Ok(Some(dir));
+            }
             if self.prompt_completions.get(self.prompt_selected).is_none() {
+                return Ok(None);
+            }
+            self.complete_selection();
+            self.host
+                .expand_dir(self.sidebar_prompt.trim())
+                .map(|(dir, _)| Some(dir))
+        });
+        let dir = match expanded {
+            Ok(Some(dir)) => dir,
+            Ok(None) => {
                 self.set_status(format!("no such directory: {input}"));
                 return Vec::new();
             }
-            self.complete_selection();
-            dir = expand_dir(self.sidebar_prompt.trim());
-        }
+            Err(e) => {
+                self.set_status(format!("error: {e:#}"));
+                return Vec::new();
+            }
+        };
         self.clear_prompt();
         self.status = None;
         self.adopt_active_view = true;
@@ -3153,7 +3198,7 @@ impl App {
             .map(|w| w.dir.clone());
         self.new_workspace_name = name.clone();
         self.sidebar_prompt = dir
-            .map(|dir| sibling_dest_prefill(&dir, &name))
+            .and_then(|dir| self.host.sibling_dest(&dir, &name).ok())
             .unwrap_or_default();
         self.prompt_selected = 0;
         self.mode = Mode::SidebarWorkspaceDest;
@@ -3221,9 +3266,18 @@ impl App {
         let Some(id) = self.fork_target else {
             return Vec::new();
         };
-        let name = std::mem::take(&mut self.new_workspace_name);
         let input = self.sidebar_prompt.trim().to_string();
-        let dest = (!input.is_empty()).then(|| expand_dest(&input));
+        let dest = match (!input.is_empty())
+            .then(|| self.host.expand_dest(&input))
+            .transpose()
+        {
+            Ok(dest) => dest,
+            Err(e) => {
+                self.set_status(format!("error: {e:#}"));
+                return Vec::new();
+            }
+        };
+        let name = std::mem::take(&mut self.new_workspace_name);
         self.clear_prompt();
         self.mode = Mode::Sidebar;
         self.status = None;
@@ -3278,6 +3332,7 @@ impl App {
     /// `dir` is its directory — when known, conversations harvested from the
     /// agent tools' own session stores append as resume rows at the foot.
     fn open_launcher(&mut self, after_add: bool, target: Option<String>, dir: Option<&Path>) {
+        self.status = None;
         self.launcher_dir = dir.map(Path::to_path_buf);
         self.launcher_sandbox = None;
         self.rebuild_launcher();
@@ -3288,31 +3343,38 @@ impl App {
         self.launcher_target = target;
         self.mode = Mode::Launcher;
         self.prefix_since = None;
-        self.status = None;
     }
 
-    /// Build the rows for where the launcher runs its pick. Locally: the
-    /// agents found on PATH, with resume rows for the directory. In a sandbox:
-    /// the whole catalog, since what an image carries can't be probed from
-    /// here, and no resume rows — those conversations live on this machine.
-    /// Armed with an issue, only the agents, each on the issue's prompt.
+    /// Build the rows for where the launcher runs its pick. On the daemon's
+    /// machine: the agents found on its PATH, with resume rows for the
+    /// directory. In a sandbox: the whole catalog, since what an image carries
+    /// can't be probed from here, and no resume rows — those conversations
+    /// live on the daemon's machine. Armed with an issue, only the agents,
+    /// each on the issue's prompt. A machine that cannot say offers its shell
+    /// and the command row alone.
     fn rebuild_launcher(&mut self) {
         let registry = Registry::default();
         let rows = match self.launcher_sandbox {
             Some(_) => launcher::sandbox_rows(&registry),
             None => {
-                let mut rows = launcher::build_rows(&registry, self.launcher_path.as_deref());
-                if let (Some(dir), Some(home)) = (&self.launcher_dir, self.resume_home.as_deref()) {
-                    let stores = tutti_agents::Stores::from_env(home);
-                    let sessions = tutti_agents::resume_sessions(dir, &stores, 3);
-                    let resume =
-                        launcher::resume_rows(&sessions, &rows, std::time::SystemTime::now());
-                    // Resume rows sit between the fixed rows and the dim
-                    // uninstalled catalog, so the actionable part of the picker
-                    // stays together.
-                    let at = launcher::catalog_start(&rows);
-                    rows.splice(at..at, resume);
-                }
+                let found = self
+                    .host
+                    .launcher(self.launcher_dir.as_deref())
+                    .unwrap_or_else(|e| {
+                        self.set_status(format!("error: {e:#}"));
+                        crate::host::Launcher {
+                            installed: Default::default(),
+                            resume: Vec::new(),
+                        }
+                    });
+                let mut rows = launcher::build_rows(&registry, &found.installed, &self.shell);
+                let resume =
+                    launcher::resume_rows(&found.resume, &rows, std::time::SystemTime::now());
+                // Resume rows sit between the fixed rows and the dim
+                // uninstalled catalog, so the actionable part of the picker
+                // stays together.
+                let at = launcher::catalog_start(&rows);
+                rows.splice(at..at, resume);
                 rows
             }
         };
@@ -3447,7 +3509,7 @@ impl App {
     fn launcher_shell(&self) -> String {
         match self.launcher_sandbox {
             Some(_) => "sh".into(),
-            None => launcher::login_shell(),
+            None => self.shell.clone(),
         }
     }
 
@@ -3500,17 +3562,11 @@ impl App {
     ) -> Vec<WireFrame> {
         let sandbox = self.launcher_profile().map(String::from);
         self.close_launcher();
-        let registry = Registry::default();
-        let (Some(project), Some(spec)) = (self.issues_project, registry.spec(&agent.into()))
-        else {
+        let Some(project) = self.issues_project else {
             return Vec::new();
         };
-        let files = sandbox.is_none().then(|| {
-            self.prompts_dir
-                .clone()
-                .unwrap_or_else(|| tutti_core::prompts_dir(&self.session))
-        });
-        let (cmd, written) = match issues::deploy_argv(spec, argv, prompt, files.as_deref()) {
+        let session = sandbox.is_none().then_some(self.session.as_str());
+        let (cmd, written) = match self.host.deploy_argv(agent, argv, prompt, session) {
             Ok(deploy) => deploy,
             Err(e) => {
                 self.set_status(format!("{e:#}"));
@@ -3600,11 +3656,12 @@ impl App {
     /// Plan every setup row for the current scope. A plan reads one file and
     /// writes nothing, so this runs whenever a row may have changed.
     fn replan_setup(&mut self) {
-        let dirs = Dirs {
-            project: self.setup_project.as_ref().map(|(_, dir)| dir.clone()),
-            ..self.setup_dirs.clone()
-        };
-        self.setup_plans = SETUP.iter().map(|(i, _)| i.plan(&dirs)).collect();
+        let project = self.setup_project.as_ref().map(|(_, dir)| dir.clone());
+        let integrations = SETUP.iter().map(|(i, _)| *i).collect();
+        self.setup_plans = self
+            .host
+            .setup_plans(integrations, project)
+            .unwrap_or_else(|e| vec![Err(format!("{e:#}")); SETUP.len()]);
     }
 
     /// Keys in the setup panel: `j`/`k` (or the arrows) move, `s` switches
@@ -3674,7 +3731,7 @@ impl App {
         let label = SETUP[self.setup_selected].1;
         if let Ok(plan) = &self.setup_plans[self.setup_selected] {
             let path = plan.path.display();
-            let message = match integrations::apply(plan) {
+            let message = match self.host.setup_apply(plan) {
                 Ok(None) => format!("{label} installed into {path}"),
                 Ok(Some(backup)) => format!(
                     "{label} installed into {path} · backed up the old one to {}",
@@ -3689,7 +3746,7 @@ impl App {
 
     /// The setup panel's rows — each integration's name and plan — for the
     /// renderer.
-    pub fn setup_rows(&self) -> impl Iterator<Item = (&'static str, &anyhow::Result<Plan>)> {
+    pub fn setup_rows(&self) -> impl Iterator<Item = (&'static str, &Result<Plan, String>)> {
         SETUP.iter().map(|(_, label)| *label).zip(&self.setup_plans)
     }
 
@@ -3724,7 +3781,7 @@ impl App {
         };
         self.issues_generation += 1;
         self.issues = vec![None; self.config.issues.len()];
-        self.issues_jj = is_jj_workspace(&dir);
+        self.issues_jj = self.host.is_jj(&dir).unwrap_or(false);
         self.issues_fetch = (!self.issues.is_empty()).then_some((self.issues_generation, dir));
         self.issues_project = Some(id);
         self.issues_query.clear();
@@ -5208,16 +5265,11 @@ pub struct EditorJob {
 }
 
 impl EditorJob {
-    /// Open the file in the editor — blocking, so the event loop runs it on a
-    /// thread. The workspace may sit below the repo root the panel's paths
-    /// start from: the nearest directory up holding `.jj`.
-    pub fn open(&self) -> Result<(), String> {
-        let root = self
-            .dir
-            .ancestors()
-            .find(|d| d.join(".jj").exists())
-            .unwrap_or(&self.dir);
-        editor::open(&self.editor, &root.join(&self.file), None, None).map_err(|e| format!("{e:#}"))
+    /// Open the file in the editor, on the daemon's machine — blocking, so
+    /// the event loop runs it on a thread.
+    pub fn open(&self, host: &Host) -> Result<(), String> {
+        host.edit(&self.editor, &self.dir, &self.file)
+            .map_err(|e| format!("{e:#}"))
     }
 }
 
@@ -5226,16 +5278,17 @@ impl EditorJob {
 /// project directory the tracker is asked from, as a fetch is.
 #[derive(Debug, PartialEq)]
 pub struct WriteBack {
-    source: issues::Source,
+    source: String,
     pub id: String,
     comment: String,
     dir: PathBuf,
 }
 
 impl WriteBack {
-    /// Write it back — blocking, so the event loop runs it on a thread.
-    pub fn run(&self) -> Result<(), String> {
-        issues::write_back(&self.source, &self.id, &self.comment, &self.dir)
+    /// Write it back from the daemon's machine, whose tracker logins it is —
+    /// blocking, so the event loop runs it on a thread.
+    pub fn run(&self, host: &Host) -> Result<(), String> {
+        host.write_back(&self.source, &self.id, &self.comment, &self.dir)
             .map_err(|e| format!("{e:#}"))
     }
 }
@@ -5376,20 +5429,6 @@ fn run_pane(cmd: Vec<String>, sandbox: Option<String>) -> WireFrame {
     })
 }
 
-/// Whether `dir` or an ancestor holds a `.jj` directory. A local mirror of the
-/// server's jj probe so the sidebar diff key fails fast without a round-trip;
-/// jj is the required VCS for workspace diffs.
-fn is_jj_workspace(dir: &Path) -> bool {
-    let mut cur = Some(dir);
-    while let Some(d) = cur {
-        if d.join(".jj").exists() {
-            return true;
-        }
-        cur = d.parent();
-    }
-    false
-}
-
 /// The ephemeral-pane command paging a workspace's diff against trunk
 /// (`DIFF_RANGE`), optionally scoped to one repo-root-relative `path`. stderr
 /// folds into the pager so a jj failure (a stale workspace, say) is read, not
@@ -5521,116 +5560,6 @@ fn base64(input: &[u8]) -> String {
         });
     }
     out
-}
-
-/// Resolve a prompt-entered directory against the live environment: `~`
-/// expands to `$HOME`, relative paths against the client's cwd. The result is
-/// canonicalized to an absolute path so the daemon (which has its own cwd)
-/// records the real directory — without this, `.`-relative inputs land against
-/// the daemon's cwd and its git-branch probe misses.
-fn expand_dir(input: &str) -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let resolved = resolve_dir(input, home.as_deref(), &cwd);
-    std::fs::canonicalize(&resolved).unwrap_or(resolved)
-}
-
-/// Resolve a guided-create destination: expand `~`/relative like `expand_dir`,
-/// then canonicalize the *parent* while keeping the (not-yet-existing) leaf, so
-/// the daemon receives an absolute path whose parent is real. A missing parent is
-/// left as-is for the server to reject.
-fn expand_dest(input: &str) -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let resolved = resolve_dir(input, home.as_deref(), &cwd);
-    match (resolved.parent(), resolved.file_name()) {
-        (Some(parent), Some(leaf)) => std::fs::canonicalize(parent)
-            .unwrap_or_else(|_| parent.to_path_buf())
-            .join(leaf),
-        _ => resolved,
-    }
-}
-
-/// The `where:` prefill for guided create: the sibling default
-/// `<repo-parent>/<repo>-<name>`, home-shortened for display so the daemon still
-/// canonicalizes the parent on submit. Falls back to a sibling of `dir` itself
-/// when `dir` is not under a `.jj` repo (the server rejects a non-jj source).
-fn sibling_dest_prefill(dir: &Path, name: &str) -> String {
-    let root = jj_root(dir).unwrap_or_else(|| dir.to_path_buf());
-    let base = root
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let sibling = root
-        .parent()
-        .unwrap_or(&root)
-        .join(format!("{base}-{name}"));
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    if let Some(home) = &home
-        && let Ok(rest) = sibling.strip_prefix(home)
-    {
-        return format!("~/{}", rest.display());
-    }
-    sibling.display().to_string()
-}
-
-/// The `.jj` repo root at or above `dir` — the client's mirror of the server's
-/// `workspace_root`, so the guided-create prefill can name a sibling of the repo
-/// without a round-trip.
-fn jj_root(dir: &Path) -> Option<PathBuf> {
-    let mut cur = Some(dir);
-    while let Some(d) = cur {
-        if d.join(".jj").exists() {
-            return Some(d.to_path_buf());
-        }
-        cur = d.parent();
-    }
-    None
-}
-
-/// Pure directory resolution: `~`/`~/rest` against `home`, relative paths
-/// against `cwd`, absolute paths untouched.
-fn resolve_dir(input: &str, home: Option<&Path>, cwd: &Path) -> PathBuf {
-    if let Some(home) = home {
-        if input == "~" {
-            return home.to_path_buf();
-        }
-        if let Some(rest) = input.strip_prefix("~/") {
-            return home.join(rest);
-        }
-    }
-    let path = Path::new(input);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    }
-}
-
-/// Directory completions for the add-project prompt: the sub-directories of the
-/// input's parent whose names begin with its final path component (an empty
-/// component lists every sub-directory). Directories only, dot-dirs hidden
-/// unless the component itself starts with `.`, alphabetical, capped at
-/// `MAX_COMPLETIONS`. An unreadable parent yields nothing, so a half-typed path
-/// never flashes an error. Tilde/relative resolution matches `resolve_dir`.
-fn complete_dirs(input: &str, home: Option<&Path>, cwd: &Path) -> Vec<String> {
-    let (dir_part, comp) = match input.rfind('/') {
-        Some(i) => (&input[..=i], &input[i + 1..]),
-        None => ("", input),
-    };
-    let base = resolve_dir(dir_part, home, cwd);
-    let Ok(entries) = std::fs::read_dir(&base) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = entries
-        .flatten()
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
-        .filter(|name| name.starts_with(comp) && (comp.starts_with('.') || !name.starts_with('.')))
-        .collect();
-    names.sort();
-    names.truncate(MAX_COMPLETIONS);
-    names
 }
 
 /// The `n` add-project prompt's prefill: the workspaces' common parent
@@ -5766,6 +5695,7 @@ fn placeholder_info(pane: PaneId) -> PaneInfo {
 mod tests {
     use super::*;
     use crate::attach::fixtures::{agent, alt, ctrl, leaf, plain, shell, split, tab, workspace};
+    use crate::integrations::{self, Dirs};
     use ratatui::crossterm::event::KeyModifiers;
     use tutti_core::PaneData;
 
@@ -9877,30 +9807,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_dir_expands_home_and_relative_paths() {
-        let home = Path::new("/home/alice");
-        let cwd = Path::new("/work/proj");
-        assert_eq!(
-            resolve_dir("~", Some(home), cwd),
-            PathBuf::from("/home/alice")
-        );
-        assert_eq!(
-            resolve_dir("~/src/api", Some(home), cwd),
-            PathBuf::from("/home/alice/src/api")
-        );
-        assert_eq!(
-            resolve_dir("sub/dir", Some(home), cwd),
-            PathBuf::from("/work/proj/sub/dir")
-        );
-        assert_eq!(resolve_dir("/etc", Some(home), cwd), PathBuf::from("/etc"));
-        assert_eq!(
-            resolve_dir("~", None, cwd),
-            PathBuf::from("/work/proj/~"),
-            "without a home, ~ is treated as a relative path"
-        );
-    }
-
-    #[test]
     fn panes_offset_by_the_sidebar_and_mouse_hit_tests_past_it() {
         let mut app = App::new();
         attach_with(&mut app, view_two_workspaces());
@@ -11255,46 +11161,6 @@ mod tests {
     }
 
     #[test]
-    fn complete_dirs_lists_matching_subdirs_only() {
-        let root = temp_tree(&["alpha", "altair", "beta", ".hidden"]);
-        std::fs::write(root.join("apple.txt"), b"x").unwrap();
-        let home = Path::new("/no-home");
-        let cwd = Path::new("/no-cwd");
-
-        // A prefix matches directories only — the `apple.txt` file is excluded.
-        let got = complete_dirs(&format!("{}/al", root.display()), Some(home), cwd);
-        assert_eq!(got, vec!["alpha".to_string(), "altair".to_string()]);
-
-        // An empty component lists every visible sub-directory, alphabetical.
-        let got = complete_dirs(&format!("{}/", root.display()), Some(home), cwd);
-        assert_eq!(got, vec!["alpha", "altair", "beta"]);
-
-        // A `.`-leading component reveals the dot-directory it would otherwise hide.
-        let got = complete_dirs(&format!("{}/.", root.display()), Some(home), cwd);
-        assert_eq!(got, vec![".hidden"]);
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn complete_dirs_caps_at_eight_and_treats_unreadable_as_empty() {
-        let many: Vec<String> = (0..12).map(|i| format!("d{i:02}")).collect();
-        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
-        let root = temp_tree(&refs);
-
-        let got = complete_dirs(&format!("{}/", root.display()), None, Path::new("/"));
-        assert_eq!(got.len(), 8, "capped at eight matches");
-        assert_eq!(got[0], "d00", "the first eight, alphabetical");
-        assert_eq!(got[7], "d07");
-
-        // A parent that cannot be read yields nothing rather than an error.
-        let missing = format!("{}/nope/x", root.display());
-        assert!(complete_dirs(&missing, None, Path::new("/")).is_empty());
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn prompt_prefill_uses_the_common_parent_of_the_workspaces() {
         let home = Path::new("/Users/me");
         // Two projects under ~/develop → their common parent, home-shortened.
@@ -11449,11 +11315,13 @@ mod tests {
     fn setup_fixture(config: Config) -> (App, PathBuf, PathBuf) {
         let (home, project) = (fresh_dir(), fresh_dir());
         let mut app = App::with_config(config);
-        app.setup_dirs = Dirs {
-            home: Some(home.clone()),
-            shell: Some("/bin/zsh".into()),
-            ..Dirs::default()
-        };
+        app.set_local(|local| {
+            local.dirs = Dirs {
+                home: Some(home.clone()),
+                shell: Some("/bin/zsh".into()),
+                ..Dirs::default()
+            }
+        });
         let mut view = view_one_pane();
         view[0].dir = project.clone();
         attach_with(&mut app, view);
@@ -11714,10 +11582,13 @@ mod tests {
     #[test]
     fn s_with_no_project_open_stays_on_the_user_scope() {
         let mut app = App::new();
-        app.setup_dirs = Dirs {
-            home: Some(fresh_dir()),
-            ..Dirs::default()
-        };
+        let home = fresh_dir();
+        app.set_local(|local| {
+            local.dirs = Dirs {
+                home: Some(home.clone()),
+                ..Dirs::default()
+            }
+        });
         attach_with(&mut app, Vec::new());
         app.on_key(ctrl('b'));
         app.on_key(plain('i'));
@@ -11727,7 +11598,7 @@ mod tests {
             app.transient()
                 .is_some_and(|t| t.contains("no project open"))
         );
-        let _ = std::fs::remove_dir_all(app.setup_dirs.home.as_ref().unwrap());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -11777,7 +11648,7 @@ mod tests {
         );
 
         // Without a home to name, a user-scope row cannot be planned at all.
-        app.setup_dirs = Dirs::default();
+        app.set_local(|local| local.dirs = Dirs::default());
         app.on_key(plain('k'));
         app.on_key(plain('s'));
         app.on_key(plain('s'));
@@ -11882,7 +11753,7 @@ mod tests {
         std::fs::write(store.join("sess-1.jsonl"), format!("{line}\n")).unwrap();
 
         let mut app = App::new();
-        app.resume_home = Some(home.clone());
+        app.set_local(|local| local.dirs.home = Some(home.clone()));
         attach_with(&mut app, view_two_workspaces());
         focus_sidebar(&mut app);
         app.on_key(plain('n')); // new agent in the selected (first) workspace
@@ -11914,7 +11785,7 @@ mod tests {
         let mut app = App::new();
         attached(&mut app);
         // The shell row follows the installed agents: none on an empty PATH.
-        app.launcher_path = None;
+        app.set_local(|local| local.path = None);
         app.open_launcher(false, None, None);
         assert_eq!(app.launcher_rows()[0].kind, LaunchKind::Shell);
         let out = app.on_key(plain('1'));
@@ -12453,7 +12324,7 @@ mod tests {
             assert_eq!(
                 jobs,
                 [WriteBack {
-                    source: app.config.issues[0].clone(),
+                    source: app.config.issues[0].name.clone(),
                     id: "123".into(),
                     comment: "tutti deployed claude on this issue: workspace `gh-123` of project \
                               `api`, pane 9 of session `t`, pushing to branch `tutti/claude-9-x`."
@@ -12481,7 +12352,7 @@ mod tests {
     fn a_prompt_too_long_for_one_argument_deploys_through_a_file_never_a_sandbox() {
         let mut app = issues_panel(Path::new("/tmp/w"));
         let files = std::env::temp_dir().join(format!("tutti-app-{}.prompts", std::process::id()));
-        app.prompts_dir = Some(files.clone());
+        app.set_local(|local| local.prompts = Some(files.clone()));
         let mut long = gh_issue("7", "Long");
         long.body = "a".repeat(issues::MAX_ARG);
         app.issues_loaded(app.issues_generation, 0, Ok(vec![long]));
@@ -12544,7 +12415,7 @@ mod tests {
             (jj_project("refused"), true),
         ] {
             let mut app = issues_panel(&dir);
-            app.prompts_dir = Some(files.clone());
+            app.set_local(|local| local.prompts = Some(files.clone()));
             let mut long = gh_issue("7", "Long");
             long.body = "a".repeat(issues::FILE_PROMPT);
             app.issues_loaded(app.issues_generation, 0, Ok(vec![long]));

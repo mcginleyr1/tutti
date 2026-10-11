@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::hooks;
@@ -19,7 +20,7 @@ use crate::hooks;
 pub const SKILL: &str = include_str!("../../../skills/tutti/SKILL.md");
 
 /// An integration tutti installs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Integration {
     /// Claude Code hooks in settings.json, running `tutti agent-event claude`.
     ClaudeHooks,
@@ -132,7 +133,7 @@ impl Dirs {
 }
 
 /// What installing an integration would do, as `Integration::plan` found it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
     /// The file the integration lives in.
     pub path: PathBuf,
@@ -143,7 +144,7 @@ pub struct Plan {
 }
 
 /// Where an integration stands.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Status {
     /// Not installed: installing writes the file, or adds the hooks to it.
     Missing(Change),
@@ -159,7 +160,7 @@ pub enum Status {
 }
 
 /// What installing writes, and how to show it first.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Change {
     /// The whole new file.
     pub contents: String,

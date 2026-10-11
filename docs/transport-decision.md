@@ -216,6 +216,7 @@ Frame:
   len:     u32   // byte length of (kind + payload)
   kind:    u8    // 0x01 Control(JSON) | 0x02 PaneSnapshot | 0x03 PaneDelta | 0x04 Input
                  // | 0x05 PaneRaw (a raw pane stream, below)
+                 // | 0x06 Host(JSON) (client ↔ `tutti proxy`, never the daemon; below)
   payload: [u8; len-1]
 ```
 
@@ -564,3 +565,44 @@ Only the first of a run of command ends counts: zsh's integration marks one from
 and another from its precmd. Streams are told of the mouse and focus modes after the mark
 (the rest never reach them). The prompt start (A) would be too late: fish sets 2031 and
 modifyOtherKeys between its own A and the integration's.
+
+## Host frames: the daemon's machine (`tutti --host`)
+
+The daemon socket is a Unix socket, so a client on another machine reaches it through
+`ssh <destination> tutti proxy` (ssh `-T`: no terminal, an 8-bit-clean channel). The proxy
+connects to the session's daemon, auto-starting it, and carries frames between it and its
+stdin/stdout unchanged — the frame stream does not care what carries it.
+
+A client also needs answers only the daemon's machine has: which directories exist there,
+its home and shell, which agents are on its `PATH`, its resumable conversations, its
+config's sandboxes and issue trackers, and installs into its files. The daemon does not
+answer these. Its environment is whatever started it, the daemon never talks to a
+tracker, and the config lives with the CLI. They are answered by the `tutti` process on
+that machine instead: in the TUI's own process when it runs beside its daemon, by the
+proxy across ssh. Host frames (`kind = 0x06`) carry them, one JSON object each:
+
+```json
+{"type":"hello","rev":2,"startup":{"first_run":"/home/me","notice":null}}
+{"type":"call","id":3,"query":{"q":"complete_dirs","input":"~/src/a"}}
+{"type":"reply","id":3,"answer":{"Ok":{"dirs":["api","app"]}}}
+```
+
+- **Hello** is the proxy's first frame, sent once it holds a daemon connection: the
+  client waits for it before it takes the terminal (so ssh can still ask for a password),
+  refuses a `rev` other than its own `HOST_REV`, and takes `startup` — the first-run
+  prefill and a startup project's failure, worked out on that machine as a local attach
+  works them out.
+- **Call** / **Reply**: the client numbers its calls; the proxy answers each on a thread
+  of its own (an issue fetch can take a while), so replies may come out of order, and
+  the client hands each to the call waiting on its `id`. Every frame — the daemon's and
+  its own replies — goes to stdout whole under one lock, so a reply never lands inside a
+  pane frame. Queries: `info`, `complete_dirs`, `expand_dir`, `expand_dest`,
+  `sibling_dest`, `is_jj`, `launcher` (each installed agent with the argv it runs as
+  there), `issues`, `write_back`, `deploy_argv` (a long first message's file written in
+  that machine's prompt directory) and `forget_prompt`, `setup_plans`, `setup_apply`,
+  `edit` (`crates/tutti/src/host.rs`).
+- The daemon never sees a host frame; one that reaches it is ignored. Host frames change
+  nothing between client and daemon, so they move `HOST_REV`, not `WIRE_REV`.
+
+Any client — the TUI, a GUI front end like rtty — gets the same answers by running `tutti
+proxy` itself, locally or over ssh, and speaking these frames on its stdin/stdout.

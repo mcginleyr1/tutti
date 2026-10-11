@@ -27,7 +27,7 @@ const POLL: Duration = Duration::from_secs(1);
 const READY_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// One configured place to run agents.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Profile {
     pub name: String,
     /// The kubectl context; `None` uses the current one.
@@ -49,7 +49,7 @@ pub struct Profile {
 }
 
 /// What a profile provisions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Source {
     /// A `Sandbox` whose one container, `agent`, runs this image. Its
     /// entrypoint must keep running (clone the repo, then sleep) for the exec.

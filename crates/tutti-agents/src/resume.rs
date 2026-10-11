@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// One resumable conversation harvested from an agent tool's session store.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ResumeSession {
     /// The agent kind that owns the conversation (registry vocabulary).
     pub agent: String,

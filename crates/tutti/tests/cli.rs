@@ -2310,3 +2310,218 @@ fn error_response_exits_nonzero_on_stderr() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("no such pane"), "stderr was: {stderr}");
 }
+
+/// A stand-in `ssh` running `body`, first on a PATH that also finds the
+/// `tutti` under test: returns its directory (where it may leave files) and
+/// that PATH.
+fn fake_ssh(label: &str, body: &str) -> (PathBuf, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = unique_base(label);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ssh = dir.join("ssh");
+    std::fs::write(&ssh, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let tutti = std::path::Path::new(env!("CARGO_BIN_EXE_tutti"));
+    let path = format!(
+        "{}:{}:/usr/bin:/bin",
+        dir.display(),
+        tutti.parent().unwrap().display()
+    );
+    (dir, path)
+}
+
+/// `ssh -T -- <destination> <line>` that records its argv beside itself, then
+/// runs the line here as the far side would.
+const FORWARDING_SSH: &str = r#"printf '%s\n' "$@" > "$(dirname "$0")/argv"
+shift 3
+exec sh -c "$1""#;
+
+/// `--host` runs any command but attach on the far side whole: the line ssh
+/// gets is the command as typed minus `--host`, quoted for the far shell, and
+/// what that tutti prints and exits with is this one's.
+#[test]
+fn host_runs_a_command_on_the_far_side_whole() {
+    let (ssh, path) = fake_ssh("hostssh", FORWARDING_SSH);
+    let output = run_scenario_with(
+        "hostfwd",
+        &[
+            "--host", "box", "--json", "pane", "send", "3", "--text", "it's",
+        ],
+        &[("PATH", &path)],
+        "",
+        |req| {
+            assert_eq!(
+                *req,
+                Request::PaneSend {
+                    pane: PaneId(3),
+                    text: Some("it's".into()),
+                    keys: None,
+                    expect: None,
+                    between_turns: false,
+                    hooks: None,
+                }
+            );
+        },
+        Response::Ok,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(ssh.join("argv")).unwrap(),
+        "-T\n--\nbox\ntutti --json pane send 3 --text 'it'\\''s'\n",
+        "no terminal for a piped command, and no --host on the far side"
+    );
+    let _ = std::fs::remove_dir_all(&ssh);
+}
+
+/// What ssh exits with is what `--host` exits with; an attach that never
+/// reaches the far tutti says why instead of starting a local daemon.
+#[test]
+fn host_passes_ssh_failures_through_and_never_falls_back_to_a_local_daemon() {
+    let (ssh, path) = fake_ssh(
+        "hostfail",
+        "echo 'ssh: connect to host box port 22: Connection refused' >&2\nexit 255",
+    );
+    let runtime = unique_base("hostfailrt");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_tutti"))
+            .args(args)
+            .env("PATH", &path)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env_remove("TUTTI_SESSION")
+            .env_remove("TUTTI_PANE")
+            .output()
+            .unwrap()
+    };
+
+    let listed = run(&["--host", "box", "pane", "list"]);
+    assert_eq!(listed.status.code(), Some(255));
+
+    let attached = run(&["--host", "box"]);
+    assert_eq!(attached.status.code(), Some(1));
+    let stderr = String::from_utf8(attached.stderr).unwrap();
+    assert!(
+        stderr.contains("ssh box: exit status: 255") && stderr.contains("Connection refused"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        !runtime.join("tutti/tutti.sock").exists(),
+        "no daemon started here"
+    );
+    let _ = std::fs::remove_dir_all(&ssh);
+    let _ = std::fs::remove_dir_all(&runtime);
+}
+
+/// `tutti proxy` — the far end of `tutti --host` — mounts nothing on an
+/// empty session but arms the first run, says hello once it reaches the
+/// daemon, carries frames to and from it, and answers host calls itself from
+/// its own config: the daemon never sees them.
+#[test]
+fn proxy_carries_daemon_frames_and_answers_host_calls_itself() {
+    use tutti::host::{Answer, HOST_REV, HostFrame, Query};
+
+    let base = unique_base("proxy");
+    std::fs::create_dir_all(base.join("tutti")).unwrap();
+    let listener = UnixListener::bind(base.join("tutti/tutti.sock")).unwrap();
+    let config = config_dir("proxycfg", "[[sandboxes]]\nname = \"far\"\nimage = \"i\"\n");
+    let server = thread::spawn(move || {
+        let reply = |stream: &mut UnixStream, response: &Response| {
+            let frame = Frame::Control(serde_json::to_vec(response).unwrap());
+            stream.write_all(&frame.encode()).unwrap();
+        };
+        // Startup: what is mounted already.
+        let (mut startup, _) = listener.accept().unwrap();
+        assert_eq!(read_request(&mut startup), Request::WorkspaceList);
+        reply(&mut startup, &Response::Workspaces { workspaces: vec![] });
+        // The carried connection: only the daemon's own request arrives, and
+        // it stays up until the client hangs up.
+        let (mut carried, _) = listener.accept().unwrap();
+        assert_eq!(read_request(&mut carried), Request::PaneList);
+        reply(&mut carried, &Response::Panes { panes: vec![] });
+        let mut rest = Vec::new();
+        carried.read_to_end(&mut rest).unwrap();
+        assert!(
+            rest.is_empty(),
+            "nothing but its own request reached the daemon"
+        );
+    });
+
+    let mut proxy = Command::new(env!("CARGO_BIN_EXE_tutti"))
+        .arg("proxy")
+        .current_dir("/")
+        .env("XDG_RUNTIME_DIR", &base)
+        .env("XDG_CONFIG_HOME", &config)
+        .env_remove("TUTTI_SESSION")
+        .env_remove("TUTTI_PANE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = proxy.stdin.take().unwrap();
+    let mut stdout = proxy.stdout.take().unwrap();
+    let mut buf = Vec::new();
+    let mut next = || loop {
+        if let Some((frame, consumed)) = Frame::decode(&buf).unwrap() {
+            buf.drain(..consumed);
+            return frame;
+        }
+        let mut chunk = [0u8; 4096];
+        let n = stdout.read(&mut chunk).unwrap();
+        assert!(n > 0, "the proxy closed early");
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let host = |frame: Frame| match frame {
+        Frame::Host(json) => serde_json::from_slice::<HostFrame>(&json).unwrap(),
+        other => panic!("not a host frame: {other:?}"),
+    };
+
+    match host(next()) {
+        HostFrame::Hello { rev, startup } => {
+            assert_eq!(rev, HOST_REV);
+            assert_eq!(startup.first_run.as_deref(), Some("/"), "its own cwd");
+        }
+        other => panic!("{other:?}"),
+    }
+    let call = HostFrame::Call {
+        id: 7,
+        query: Query::Info,
+    };
+    stdin
+        .write_all(&Frame::Host(serde_json::to_vec(&call).unwrap()).encode())
+        .unwrap();
+    stdin
+        .write_all(&Frame::Control(serde_json::to_vec(&Request::PaneList).unwrap()).encode())
+        .unwrap();
+
+    let (mut answered, mut listed) = (false, false);
+    while !(answered && listed) {
+        match next() {
+            Frame::Control(json) => {
+                assert_eq!(
+                    serde_json::from_slice::<Response>(&json).unwrap(),
+                    Response::Panes { panes: vec![] }
+                );
+                listed = true;
+            }
+            frame => match host(frame) {
+                HostFrame::Reply {
+                    id: 7,
+                    answer: Ok(Answer::Info(info)),
+                } => {
+                    let names: Vec<&str> = info.sandboxes.iter().map(|p| p.name.as_str()).collect();
+                    assert_eq!(names, ["far"], "the proxy's own config");
+                    answered = true;
+                }
+                other => panic!("{other:?}"),
+            },
+        }
+    }
+    drop(stdin);
+    server.join().unwrap();
+    assert!(proxy.wait().unwrap().success());
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&config);
+}

@@ -139,6 +139,17 @@ pub fn open(session: &str) -> Result<UnixStream> {
     }
 }
 
+/// The socket an attach runs over: the daemon's, auto-started (`open`) — but
+/// for a `view`, which never starts one.
+pub fn open_attach(session: &str, view: bool) -> Result<UnixStream> {
+    if !view {
+        return open(session);
+    }
+    UnixStream::connect(socket_path(session)).with_context(|| {
+        format!("no tutti-server answers for session '{session}': nothing to view")
+    })
+}
+
 pub fn not_running(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
@@ -215,6 +226,31 @@ fn await_server(session: &str) -> Result<Client> {
     }
 }
 
+/// `ssh destination` running `argv` there: one shell-quoted line, since ssh
+/// hands its command to the far shell to split. `tty` asks for a terminal
+/// there (an interactive command); without one the channel is 8-bit clean.
+pub fn ssh(destination: &str, argv: &[String], tty: bool) -> Command {
+    let line: Vec<String> = argv.iter().map(|arg| shell_quote(arg)).collect();
+    let mut command = Command::new("ssh");
+    command
+        .arg(if tty { "-t" } else { "-T" })
+        .arg("--")
+        .arg(destination)
+        .arg(line.join(" "));
+    command
+}
+
+/// `arg` as one word to a POSIX shell: bare when it holds nothing the shell
+/// would act on, else single-quoted.
+pub fn shell_quote(arg: &str) -> String {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "-_./=:,@%+".contains(c);
+    if !arg.is_empty() && arg.chars().all(plain) {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', r"'\''"))
+    }
+}
+
 /// Locate the daemon binary: a sibling of the current executable, else `PATH`.
 fn server_exe() -> Result<PathBuf> {
     let current = std::env::current_exe().context("locating current executable")?;
@@ -263,5 +299,46 @@ mod tests {
             push: true,
         };
         assert!(deadline(&Request::PaneList).is_some_and(|d| d < deadline(&merge).unwrap()));
+    }
+
+    #[test]
+    fn the_far_shell_splits_each_word_back_out_whole() {
+        let argv = [
+            "tutti",
+            "pane",
+            "send",
+            "--text",
+            "it's $HOME; `x` | y",
+            "",
+            "--dir=/a b/c",
+        ]
+        .map(String::from);
+        let line: Vec<String> = argv.iter().map(|arg| shell_quote(arg)).collect();
+        assert_eq!(
+            line[..4],
+            ["tutti", "pane", "send", "--text"],
+            "plain words stay bare"
+        );
+        let echoed = Command::new("sh")
+            .args(["-c", &format!("printf '%s\\n' {}", line.join(" "))])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(echoed.stdout).unwrap(),
+            argv.map(|arg| arg + "\n").concat()
+        );
+    }
+
+    #[test]
+    fn ssh_gets_a_terminal_only_when_asked_and_never_an_option_for_a_host() {
+        let args = |tty| {
+            let command = ssh("-oProxyCommand=x", &["tutti".into(), "proxy".into()], tty);
+            command
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(args(false), ["-T", "--", "-oProxyCommand=x", "tutti proxy"]);
+        assert_eq!(args(true)[0], "-t");
     }
 }

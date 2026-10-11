@@ -43,28 +43,52 @@ use connection::Connection;
 use reader::{Asked, Decoder, Input};
 
 use crate::config::{Config, Theme};
+use crate::host::{Host, Local, Startup};
 
 const POLL: Duration = Duration::from_millis(16);
 
 /// Attach the interactive TUI to `session`, auto-starting the daemon. Restores
 /// the terminal on exit and on panic, returning once the user detaches or the
 /// server goes away. `config` supplies the prefix chord, direct bindings, and
-/// the master mouse switch. `first_run` (a prefill dir) arms the first-run
-/// new-project prompt on an empty session; `notice` posts a one-shot status
-/// line (e.g. a startup-project error) once attached. A `view` only watches:
-/// it sends the daemon nothing but navigation (`Connection::send`), so no
-/// key, size vote or colour of its terminal reaches a pane — the panes keep
-/// the sizes the other clients vote, or, with none, the size they have —
-/// and opens no file in a pane's editor. It attaches as a view, so its
-/// focus marks no agent seen and no note read.
-pub fn run(
-    session: &str,
+/// the master mouse switch, and — this being the daemon's machine — its
+/// sandboxes and issue trackers. `startup` arms the first-run prompt and
+/// posts a startup notice. A `view` only watches: it sends the daemon nothing
+/// but navigation (`Connection::send`), so no key, size vote or colour of its
+/// terminal reaches a pane — the panes keep the sizes the other clients vote,
+/// or, with none, the size they have — and opens no file in a pane's editor.
+/// It attaches as a view, so its focus marks no agent seen and no note read.
+pub fn run(session: &str, config: Config, startup: Startup, view: bool) -> Result<()> {
+    let mut conn = Connection::open(session, view)?;
+    let host = Host::Local(Arc::new(Local::from_env(config.clone())));
+    attach(&mut conn, host, config, startup).map(drop)
+}
+
+/// Attach to `session` (the far side's default when `None`) on the ssh
+/// `destination`, through `tutti proxy` there: the TUI draws here, with this
+/// machine's keys, theme and mouse, while everything about the daemon's
+/// machine — its config's sandboxes and trackers, its directories, agents and
+/// installs — comes from the proxy. A connection that drops says why.
+pub fn run_remote(
+    destination: &str,
+    session: Option<&str>,
     config: Config,
-    first_run: Option<String>,
-    notice: Option<String>,
     view: bool,
 ) -> Result<()> {
-    let mut conn = Connection::open(session, view)?;
+    let (mut conn, startup) = Connection::open_remote(destination, session, view)?;
+    let host = Host::Remote(conn.remote());
+    let closed = attach(&mut conn, host, config, startup)?;
+    match conn.ended() {
+        Some(why) if closed => Err(why),
+        _ => Ok(()),
+    }
+}
+
+/// `true` when the far end closed the connection, `false` on a detach.
+fn attach(conn: &mut Connection, host: Host, config: Config, startup: Startup) -> Result<bool> {
+    let info = host
+        .info()
+        .context("asking the daemon's machine for its config")?;
+    let view = conn.view;
     // macOS names the GUI app a process was launched under; watchers raise it.
     // In rtty, a move past tutti's edge goes on to rtty's panes — the daemon
     // hands this client a program's moves at every edge for that. Tagged, so
@@ -127,15 +151,8 @@ pub fn run(
         stop,
         resized,
     };
-    let result = event_loop(
-        &mut terminal,
-        &mut conn,
-        config,
-        first_run,
-        notice,
-        rtty,
-        tty,
-    );
+    let app = App::with_host(config, host, info);
+    let result = event_loop(&mut terminal, conn, app, startup, rtty, tty);
 
     leave();
     ratatui::restore();
@@ -245,20 +262,18 @@ fn suspend(terminal: &mut ratatui::Terminal<host::Host>, modes: Modes) -> Result
 fn event_loop(
     terminal: &mut ratatui::Terminal<host::Host>,
     conn: &mut Connection,
-    config: Config,
-    first_run: Option<String>,
-    notice: Option<String>,
+    mut app: App,
+    startup: Startup,
     rtty: Option<String>,
     mut tty: Tty,
-) -> Result<()> {
-    let mut captured = config.mouse;
-    let mut app = App::with_config(config);
+) -> Result<bool> {
+    let mut captured = app.config().mouse;
     app.in_rtty(rtty);
     app.view = conn.view;
-    if let Some(prefill) = first_run {
+    if let Some(prefill) = startup.first_run {
         app.start_first_run_prompt(prefill);
     }
-    if let Some(message) = notice {
+    if let Some(message) = startup.notice {
         app.note(message);
     }
     let mut dirty = true;
@@ -299,7 +314,7 @@ fn event_loop(
                     dirty = true;
                 }
             }
-            Err(_) => break, // server closed the connection
+            Err(_) => return Ok(true), // server closed the connection
         }
         while let Ok((generation, index, fetched)) = issues_rx.try_recv() {
             app.issues_loaded(generation, index, fetched);
@@ -383,7 +398,7 @@ fn event_loop(
                 }
             }
             // The terminal is gone.
-            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Disconnected) => return Ok(false),
         }
         let mut told = None;
         for input in inputs {
@@ -442,9 +457,11 @@ fn event_loop(
         // `gh` and `curl` must never stall the loop.
         if let Some((generation, dir, sources)) = app.take_issue_fetch() {
             for (index, source) in sources.into_iter().enumerate() {
-                let (tx, dir) = (issues_tx.clone(), dir.clone());
+                let (tx, dir, host) = (issues_tx.clone(), dir.clone(), app.host().clone());
                 std::thread::spawn(move || {
-                    let fetched = crate::issues::list(&source, &dir).map_err(|e| format!("{e:#}"));
+                    let fetched = host
+                        .issues(&source.name, &dir)
+                        .map_err(|e| format!("{e:#}"));
                     let _ = tx.send((generation, index, fetched));
                 });
             }
@@ -452,9 +469,9 @@ fn event_loop(
         // So does the editor's own CLI, which `e` in the changes panel runs —
         // but for a view, as it would open the file in a pane's editor.
         if let Some(job) = app.take_editor_job().filter(|_| !app.view) {
-            let tx = editor_tx.clone();
+            let (tx, host) = (editor_tx.clone(), app.host().clone());
             std::thread::spawn(move || {
-                let opened = job.open();
+                let opened = job.open(&host);
                 let _ = tx.send((job.pane, job.file, opened));
             });
         }
@@ -468,9 +485,9 @@ fn event_loop(
         }
         // And a deploy's `gh` or `curl` back to its tracker.
         for job in app.take_write_backs() {
-            let tx = written_tx.clone();
+            let (tx, host) = (written_tx.clone(), app.host().clone());
             std::thread::spawn(move || {
-                let written = job.run();
+                let written = job.run(&host);
                 let _ = tx.send((job.id, written));
             });
         }
@@ -503,10 +520,9 @@ fn event_loop(
         }
 
         if app.should_quit {
-            break;
+            return Ok(false);
         }
     }
-    Ok(())
 }
 
 /// Write raw bytes to the real terminal. Bells and OSC escapes are non-printing,
