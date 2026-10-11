@@ -159,7 +159,7 @@ fn event_loop(
                         dirty = true;
                     }
                     Event::Mouse(mouse) => {
-                        for frame in app.on_mouse(mouse.kind, mouse.column, mouse.row) {
+                        for frame in app.on_mouse_event(mouse) {
                             conn.send(&frame)?;
                         }
                         dirty = true;

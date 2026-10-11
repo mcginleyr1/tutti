@@ -77,6 +77,11 @@ In a tutti pane, the plugin always announces `TUTTI_EDITOR=nvim
 - `Alt+x` reaches Neovim unmapped while Neovim holds the keys. Kill the pane
   with the prefix and `x`.
 
+Neovim's mouse (`mouse=nvi` by default) works as in a terminal of its own:
+tutti hands a pane's clicks and drags to the program that asked for them, so
+a click places the cursor and a drag moves a split border or selects. Hold
+`Shift` for tutti's own select and copy instead.
+
 `:TuttiAgents` opens a `vim.ui.select` picker over the session's agents from
 `tutti watch`'s first snapshot. Each row shows the agent's state, title and
 workspace. Picking one runs `tutti pane focus <id>`, so the attached TUI jumps
@@ -158,6 +163,11 @@ whatever environment `tutti edit` runs in. Turn the mode on after
 Emacs asks the terminal for its colours at startup, and tutti answers with
 those of the terminal you attached from, so `background-mode` follows it,
 light or dark.
+
+For the mouse, turn on `(xterm-mouse-mode 1)` in your init file; `tutti-mode`
+leaves it to you. tutti then hands the pane's clicks and drags to Emacs, so a
+click moves point and selects windows. Hold `Shift` for tutti's own select
+and copy instead.
 
 `tutti-windmove-left`, `-right`, `-up` and `-down` move like `windmove`. Where
 windmove would refuse, at the frame's edge or toward an inactive minibuffer,

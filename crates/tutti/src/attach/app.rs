@@ -9,7 +9,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::Rect;
 use ratatui::text::Span;
 use tutti_core::{
@@ -258,6 +260,9 @@ pub struct App {
     boundaries: Vec<Boundary>,
     /// The border drag in progress; `None` while no border is held.
     border_drag: Option<BorderDrag>,
+    /// The pane a press went to (its program reports the mouse): its drag
+    /// and release go there too, wherever the pointer is.
+    mouse_grab: Option<PaneId>,
     status: Option<(String, Instant)>,
     /// The visible set last sent as `ViewSizes` — each shown pane at its
     /// rendered size — so a draw that moved nothing sends nothing.
@@ -484,6 +489,7 @@ impl App {
             rects: Vec::new(),
             boundaries: Vec::new(),
             border_drag: None,
+            mouse_grab: None,
             status: None,
             view_sent: Vec::new(),
             focus_sent: None,
@@ -3715,7 +3721,84 @@ impl App {
 
     // ---- mouse ----------------------------------------------------------
 
-    /// Handle a mouse event, returning frames to send to the server.
+    /// A mouse event from the terminal. Inside a pane whose program turned on
+    /// mouse reporting, a press, its drag and its release — and bare motion,
+    /// when the program asked for all of it — go to that program, a press
+    /// focusing the pane too, as tmux and WezTerm do; Shift held keeps the
+    /// mouse tutti's (select and copy). The wheel, border drags and the chrome
+    /// are tutti's: `on_mouse`.
+    pub fn on_mouse_event(&mut self, mouse: MouseEvent) -> Vec<WireFrame> {
+        if !mouse.modifiers.contains(KeyModifiers::SHIFT)
+            && let Some(frames) = self.forward_mouse(mouse)
+        {
+            return frames;
+        }
+        self.on_mouse(mouse.kind, mouse.column, mouse.row)
+    }
+
+    /// The frames handing `mouse` to the program it falls to, or `None` when
+    /// it is tutti's. A press over a pane's cells goes to a program reporting
+    /// presses, and holds the mouse for that pane: its drags and release go
+    /// there too, wherever the pointer is — reported when the program asked
+    /// for them, dropped when it did not.
+    fn forward_mouse(&mut self, mouse: MouseEvent) -> Option<Vec<WireFrame>> {
+        use vt100::MouseProtocolMode::{AnyMotion, ButtonMotion, None as Off, Press};
+        let (col, row) = (mouse.column, mouse.row);
+        let pane = match mouse.kind {
+            MouseEventKind::Down(_)
+                if matches!(self.mode, Mode::Terminal | Mode::Sidebar | Mode::DiffFiles)
+                    && self.boundary_at(col, row).is_none() =>
+            {
+                self.pane_cell_at(col, row)?.0
+            }
+            MouseEventKind::Moved if self.mode == Mode::Terminal => self.pane_cell_at(col, row)?.0,
+            MouseEventKind::Drag(_) | MouseEventKind::Up(_) => self.mouse_grab?,
+            _ => return None,
+        };
+        let (mode, encoding) = {
+            let state = self
+                .panes
+                .get(&pane)
+                .filter(|s| s.scroll.is_none() && s.info.exited.is_none())?;
+            let screen = state.parser.screen();
+            (
+                screen.mouse_protocol_mode(),
+                screen.mouse_protocol_encoding(),
+            )
+        };
+        let (button, release) = match mouse.kind {
+            MouseEventKind::Down(b) if mode != Off => (button_code(b), false),
+            MouseEventKind::Drag(b) if matches!(mode, ButtonMotion | AnyMotion) => {
+                (button_code(b) + 32, false)
+            }
+            MouseEventKind::Up(b) if !matches!(mode, Off | Press) => (button_code(b), true),
+            MouseEventKind::Moved if mode == AnyMotion => (3 + 32, false),
+            MouseEventKind::Drag(_) => return Some(Vec::new()),
+            MouseEventKind::Up(_) => {
+                self.mouse_grab = None;
+                return Some(Vec::new());
+            }
+            _ => return None,
+        };
+        let held = |m| u16::from(mouse.modifiers.contains(m));
+        let mods = held(KeyModifiers::ALT) * 8 + held(KeyModifiers::CONTROL) * 16;
+        let (r, c) = self.clamp_to_pane(pane, col, row)?;
+        let mut frames = Vec::new();
+        if matches!(mouse.kind, MouseEventKind::Down(_)) {
+            self.selection = None;
+            self.mouse_grab = Some(pane);
+            frames = self.mouse_focus(pane);
+        }
+        if release {
+            self.mouse_grab = None;
+        }
+        let bytes = input::encode_mouse(encoding, button + mods, release, c + 1, r + 1);
+        frames.push(WireFrame::Input { pane, bytes });
+        Some(frames)
+    }
+
+    /// Handle a mouse event as tutti's own — focus, select and copy, border
+    /// drags, the chrome, the wheel — returning frames to send to the server.
     pub fn on_mouse(&mut self, kind: MouseEventKind, col: u16, row: u16) -> Vec<WireFrame> {
         // The go-to overlay is modal over the whole screen: a click on an
         // entry jumps there and the wheel walks the highlight; nothing reaches
@@ -4224,20 +4307,14 @@ impl App {
     fn forwarded_wheel(&self, pane: PaneId, col: u16, row: u16, up: bool) -> Option<Vec<u8>> {
         let screen = self.panes.get(&pane)?.parser.screen();
         if screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None {
-            let rect = self
-                .rects
-                .iter()
-                .find(|(p, _)| *p == pane)
-                .map(|(_, r)| *r)?;
-            // 1-based cell within the pane interior (the rect includes the
-            // border row/column).
-            let x = col.saturating_sub(rect.x).max(1);
-            let y = row.saturating_sub(rect.y).max(1);
+            // The 1-based cell within the pane interior, below its title and
+            // frame rows.
+            let (r, c) = self.clamp_to_pane(pane, col, row)?;
             return Some(input::encode_wheel(
                 screen.mouse_protocol_encoding(),
                 up,
-                x,
-                y,
+                c + 1,
+                r + 1,
             ));
         }
         screen
@@ -4667,6 +4744,15 @@ fn center(r: Rect) -> (u16, u16) {
 /// least 1 so a pty is never asked for a zero dimension. A pane rect reserves
 /// its top row for the title line drawn above the frame, so height loses that
 /// row plus the two border rows.
+/// xterm's number for a mouse button.
+fn button_code(button: MouseButton) -> u16 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
+
 fn inner_size(rect: Rect) -> (u16, u16) {
     (
         rect.height.saturating_sub(3).max(1),
@@ -8856,9 +8942,10 @@ mod tests {
             out,
             vec![WireFrame::Input {
                 pane: PaneId(1),
-                bytes: b"\x1b[<64;5;3M".to_vec(),
+                bytes: b"\x1b[<64;5;2M".to_vec(),
             }],
-            "the program asked for mouse events, so it gets the wheel itself"
+            "the program asked for mouse events, so it gets the wheel itself, \
+             at the cell under the pointer: below the title and frame rows"
         );
         assert_eq!(app.mode, Mode::Terminal);
     }
@@ -9164,6 +9251,163 @@ mod tests {
         app.on_mouse(Up(MouseButton::Left), 60, 4);
         assert_eq!(app.take_terminal_out(), vec![osc52("hello world")]);
         assert_eq!(app.transient(), Some("copied 11 chars"));
+    }
+
+    // ---- the mouse to programs ----------------------------------------------
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16, modifiers: KeyModifiers) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers,
+        }
+    }
+
+    /// Side-by-side panes 1 | 2 (`border_fixture`), pane 2's program having
+    /// written `bytes`: pane 2's interior cell (r, c) sits at (51 + c, 4 + r).
+    fn reporting_fixture(bytes: &[u8]) -> App {
+        let mut app = border_fixture(Direction::Horizontal);
+        app.handle_frame(WireFrame::PaneSnapshot(PaneData {
+            pane: PaneId(2),
+            rows: 18,
+            cols: 48,
+            seq: 0,
+            bytes: bytes.to_vec(),
+        }));
+        app
+    }
+
+    fn to_two(bytes: &[u8]) -> Vec<WireFrame> {
+        vec![WireFrame::Input {
+            pane: PaneId(2),
+            bytes: bytes.to_vec(),
+        }]
+    }
+
+    /// A program with button-motion reporting (1002, SGR) gets a press —
+    /// which focuses its pane too — the drag and the release, at its own
+    /// 1-based cells, clamped to the pane once the pointer leaves it; tutti
+    /// selects and copies nothing.
+    #[test]
+    fn a_press_drag_and_release_go_to_a_program_reporting_them() {
+        use MouseEventKind::{Down, Drag, Up};
+        let none = KeyModifiers::NONE;
+        let mut app = reporting_fixture(b"\x1b[?1002h\x1b[?1006h");
+        assert_eq!(app.focused, Some(PaneId(1)));
+        let out = app.on_mouse_event(mouse(Down(MouseButton::Left), 55, 6, none));
+        assert_eq!(out, to_two(b"\x1b[<0;5;3M"));
+        assert_eq!(app.focused, Some(PaneId(2)), "the press focuses its pane");
+        let out = app.on_mouse_event(mouse(Drag(MouseButton::Left), 70, 7, none));
+        assert_eq!(out, to_two(b"\x1b[<32;20;4M"));
+        let out = app.on_mouse_event(mouse(Drag(MouseButton::Left), 99, 30, none));
+        assert_eq!(out, to_two(b"\x1b[<32;48;18M"), "clamped to the pane");
+        let out = app.on_mouse_event(mouse(Up(MouseButton::Left), 99, 30, none));
+        assert_eq!(out, to_two(b"\x1b[<0;48;18m"));
+        assert!(app.selection.is_none() && app.take_terminal_out().is_empty());
+        // Ctrl and Alt ride the button: a ctrl right-click.
+        let out = app.on_mouse_event(mouse(
+            Down(MouseButton::Right),
+            51,
+            4,
+            KeyModifiers::CONTROL,
+        ));
+        assert_eq!(out, to_two(b"\x1b[<18;1;1M"));
+    }
+
+    /// What a program did not ask for it does not get — and a press it took
+    /// keeps its drag and release from tutti: presses and releases (1000)
+    /// get no drags; presses alone (9) no release either.
+    #[test]
+    fn a_program_gets_only_the_reports_it_asked_for() {
+        use MouseEventKind::{Down, Drag, Moved, Up};
+        let none = KeyModifiers::NONE;
+        let mut app = reporting_fixture(b"\x1b[?1000h\x1b[?1006h");
+        app.on_mouse_event(mouse(Down(MouseButton::Left), 55, 6, none));
+        assert!(
+            app.on_mouse_event(mouse(Drag(MouseButton::Left), 70, 7, none))
+                .is_empty()
+        );
+        let out = app.on_mouse_event(mouse(Up(MouseButton::Left), 70, 7, none));
+        assert_eq!(out, to_two(b"\x1b[<0;20;4m"));
+        assert!(app.on_mouse_event(mouse(Moved, 60, 8, none)).is_empty());
+        assert!(app.selection.is_none() && app.take_terminal_out().is_empty());
+
+        let mut app = reporting_fixture(b"\x1b[?9h\x1b[?1006h");
+        let out = app.on_mouse_event(mouse(Down(MouseButton::Left), 55, 6, none));
+        assert_eq!(out, to_two(b"\x1b[<0;5;3M"));
+        assert!(
+            app.on_mouse_event(mouse(Up(MouseButton::Left), 55, 6, none))
+                .is_empty()
+        );
+        assert!(
+            app.mouse_grab.is_none(),
+            "the release ended the press all the same"
+        );
+
+        // Every motion (1003) goes, a button held or not.
+        let mut app = reporting_fixture(b"\x1b[?1003h\x1b[?1006h");
+        app.on_mouse_event(mouse(Down(MouseButton::Left), 51, 4, none));
+        app.on_mouse_event(mouse(Up(MouseButton::Left), 51, 4, none));
+        let out = app.on_mouse_event(mouse(Moved, 60, 8, none));
+        assert_eq!(out, to_two(b"\x1b[<35;10;5M"));
+    }
+
+    /// Without SGR the report is the legacy one: values offset by 32 into a
+    /// byte each, a release as button 3.
+    #[test]
+    fn a_legacy_reporting_program_gets_legacy_reports() {
+        use MouseEventKind::{Down, Up};
+        let none = KeyModifiers::NONE;
+        let mut app = reporting_fixture(b"\x1b[?1000h");
+        let out = app.on_mouse_event(mouse(Down(MouseButton::Left), 55, 6, none));
+        assert_eq!(out, to_two(&[0x1b, b'[', b'M', 32, 32 + 5, 32 + 3]));
+        let out = app.on_mouse_event(mouse(Up(MouseButton::Left), 55, 6, none));
+        assert_eq!(out, to_two(&[0x1b, b'[', b'M', 32 + 3, 32 + 5, 32 + 3]));
+    }
+
+    /// Shift keeps the mouse tutti's over a reporting program — select and
+    /// copy — and a pane whose program reports nothing selects as ever; a
+    /// border stays a border either way.
+    #[test]
+    fn shift_or_no_reporting_keeps_the_mouse_tuttis() {
+        use MouseEventKind::{Down, Drag, Up};
+        let shift = KeyModifiers::SHIFT;
+        let mut app = reporting_fixture(b"\x1b[?1002h\x1b[?1006hhello world");
+        for kind in [
+            Down(MouseButton::Left),
+            Drag(MouseButton::Left),
+            Up(MouseButton::Left),
+        ] {
+            let column = if matches!(kind, Down(_)) { 51 } else { 61 };
+            let out = app.on_mouse_event(mouse(kind, column, 4, shift));
+            assert!(out.iter().all(|f| !matches!(f, WireFrame::Input { .. })));
+        }
+        assert_eq!(app.take_terminal_out(), vec![osc52("hello world")]);
+
+        let none = KeyModifiers::NONE;
+        let mut app = reporting_fixture(b"hello world");
+        for kind in [
+            Down(MouseButton::Left),
+            Drag(MouseButton::Left),
+            Up(MouseButton::Left),
+        ] {
+            let column = if matches!(kind, Down(_)) { 51 } else { 61 };
+            let out = app.on_mouse_event(mouse(kind, column, 4, none));
+            assert!(out.iter().all(|f| !matches!(f, WireFrame::Input { .. })));
+        }
+        assert_eq!(app.take_terminal_out(), vec![osc52("hello world")]);
+
+        let mut app = reporting_fixture(b"\x1b[?1002h\x1b[?1006h");
+        assert!(
+            app.on_mouse_event(mouse(Down(MouseButton::Left), 50, 10, none))
+                .is_empty()
+        );
+        assert_eq!(
+            app.on_mouse_event(mouse(Drag(MouseButton::Left), 69, 10, none)),
+            vec![split_ratio(0.69)],
+            "pane 2's frame column is still the border's"
+        );
     }
 
     #[test]

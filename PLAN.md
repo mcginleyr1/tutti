@@ -543,6 +543,11 @@ In order; each lands its TUI path in the same wave as its verbs.
      an attached TUI shows focused, the TUI is handed the move
      (`Event::FocusEdge`) and goes on as its own Ctrl+h/l would (sidebar,
      changes panel, next tab); the CLI exits 0 (`Neighbor.relayed`).
+   - The mouse reaches a pane program that turned reporting on: presses,
+     releases and drags (and bare motion under 1003) inside the pane, in its
+     encoding at its own cells, a press focusing the pane too; Shift keeps
+     the mouse tutti's (select and copy); border drags, the chrome and the
+     wheel's routing stay tutti's.
    - `editors/nvim` (user vars through `nvim_ui_send`, `navigate` past
      Neovim's edge, a smart-splits.nvim 3.0.0 backend, `:TuttiAgents`) and
      `editors/emacs/tutti.el` (`tutti-mode`, `tutti-windmove-*`, a live
@@ -577,7 +582,6 @@ In order; each lands its TUI path in the same wave as its verbs.
      editor terminals keep native scrollback; detach under the kitty keyboard
      protocol; escape-time for an Alt prefix; a switching read's other bytes
      (queries, a bell) are lost to the redraw;
-   - clicks and drags never reach a pane program, only the wheel;
    - `cwd` in watch snapshots; `pane list` has no workspace and watch no
      approval, so the plugins read one from each;
    - fish's snippet unrun; bash before 4.4 has no `C` mark; Emacs 29 and

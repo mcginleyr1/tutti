@@ -413,7 +413,15 @@ wheel itself; a full-screen
 program without mouse reporting (Claude Code, less) gets arrow keys — the xterm
 "alternate scroll" convention — so it scrolls its own view; only a plain
 primary-screen pane (a shell) enters tutti's frozen scrollback browse
-(`q`/esc exits). Drag inside a pane to select its text; releasing copies the
+(`q`/esc exits). Clicks and drags inside a pane whose program asked for them
+(Neovim's `mouse` option, Emacs's `xterm-mouse-mode`, htop) go to that program
+as they would in a terminal of its own — presses, releases and drags, and bare
+motion when it asked for all of it, in its own encoding — so a click places
+Neovim's cursor and a drag moves its split borders; a click on another pane
+focuses it and reaches its program too. Hold `Shift` to select and copy
+there instead (tutti's selection, or your terminal's own where the terminal
+keeps `Shift` for itself). Elsewhere, drag inside a pane to select its text;
+releasing copies the
 selection to your system clipboard (an OSC 52 write your terminal fulfils) and
 flashes `copied N chars`, so selecting works even while tutti holds the mouse for
 scroll and focus — the selection also reaches the pane's scrollback while you
@@ -1586,6 +1594,4 @@ tutti is alpha; PLAN.md tracks what is open.
   a plain underline, drops underline colours and the cursor's shape (a bar in
   insert mode stays a block), and never sends focus events, so Neovim's
   `FocusGained`/`FocusLost` never fire; `tutti pane attach` passes the
-  underline styles and the cursor shape through to your terminal. Clicks and
-  drags in a pane stay tutti's (focus, select, copy): only
-  the wheel reaches an editor that asked for the mouse.
+  underline styles and the cursor shape through to your terminal.

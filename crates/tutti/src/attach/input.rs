@@ -85,17 +85,36 @@ fn csi_tilde(num: u32, param: u32) -> Vec<u8> {
     }
 }
 
-/// The wheel-tick bytes for a program that enabled mouse reporting. Buttons
-/// 64/65 are wheel-up/down; coordinates are 1-based cells within the pane.
-/// SGR spells everything out in decimal; the legacy encodings offset each
-/// value by 32 into one byte (UTF-8 mode encodes that byte as a codepoint).
+/// The wheel-tick bytes for a program that enabled mouse reporting: buttons
+/// 64/65 are wheel-up/down, as `encode_mouse` spells them.
 pub fn encode_wheel(encoding: vt100::MouseProtocolEncoding, up: bool, x: u16, y: u16) -> Vec<u8> {
-    let button: u16 = if up { 64 } else { 65 };
+    encode_mouse(encoding, if up { 64 } else { 65 }, false, x, y)
+}
+
+/// A mouse report for a program that enabled mouse reporting: `button` is
+/// xterm's code — 0/1/2 left/middle/right, plus 32 while it moves (3 + 32
+/// for motion with none held), 64/65 the wheel, plus 8 for Alt and 16 for
+/// Ctrl — and `release` ends a press. Coordinates are 1-based cells within
+/// the pane. SGR spells everything out in decimal and tells a release by its
+/// final `m`; the legacy encodings report a release as button 3 and offset
+/// each value by 32 into one byte (UTF-8 mode encodes that byte as a
+/// codepoint).
+pub fn encode_mouse(
+    encoding: vt100::MouseProtocolEncoding,
+    button: u16,
+    release: bool,
+    x: u16,
+    y: u16,
+) -> Vec<u8> {
+    let legacy = if release { button | 3 } else { button };
     match encoding {
-        vt100::MouseProtocolEncoding::Sgr => format!("\x1b[<{button};{x};{y}M").into_bytes(),
+        vt100::MouseProtocolEncoding::Sgr => {
+            let final_byte = if release { 'm' } else { 'M' };
+            format!("\x1b[<{button};{x};{y}{final_byte}").into_bytes()
+        }
         vt100::MouseProtocolEncoding::Utf8 => {
             let mut out = b"\x1b[M".to_vec();
-            for value in [button, x, y] {
+            for value in [legacy, x, y] {
                 let c = char::from_u32(u32::from(32 + value.min(2015))).unwrap_or(' ');
                 let mut buf = [0u8; 4];
                 out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
@@ -104,7 +123,7 @@ pub fn encode_wheel(encoding: vt100::MouseProtocolEncoding, up: bool, x: u16, y:
         }
         vt100::MouseProtocolEncoding::Default => {
             let mut out = b"\x1b[M".to_vec();
-            for value in [button, x, y] {
+            for value in [legacy, x, y] {
                 out.push((32 + value.min(223)) as u8);
             }
             out
@@ -283,6 +302,31 @@ mod tests {
                 b"!"
             ]
             .concat()
+        );
+    }
+
+    /// Presses, releases, drags and motion: SGR keeps the button on a
+    /// release and ends it `m`; the legacy encodings release as button 3,
+    /// the modifier bits kept.
+    #[test]
+    fn mouse_encodings() {
+        use vt100::MouseProtocolEncoding as E;
+        assert_eq!(encode_mouse(E::Sgr, 0, false, 5, 3), b"\x1b[<0;5;3M");
+        assert_eq!(encode_mouse(E::Sgr, 0, true, 5, 3), b"\x1b[<0;5;3m");
+        assert_eq!(encode_mouse(E::Sgr, 2 + 16, false, 1, 1), b"\x1b[<18;1;1M");
+        assert_eq!(encode_mouse(E::Sgr, 32, false, 6, 3), b"\x1b[<32;6;3M");
+        assert_eq!(encode_mouse(E::Sgr, 35, false, 7, 4), b"\x1b[<35;7;4M");
+        assert_eq!(
+            encode_mouse(E::Default, 0, false, 5, 3),
+            [0x1b, b'[', b'M', 32, 32 + 5, 32 + 3]
+        );
+        assert_eq!(
+            encode_mouse(E::Default, 2 + 8, true, 5, 3),
+            [0x1b, b'[', b'M', 32 + 3 + 8, 32 + 5, 32 + 3]
+        );
+        assert_eq!(
+            encode_mouse(E::Utf8, 32, false, 200, 1),
+            [b"\x1b[M@".as_slice(), "\u{e8}".as_bytes(), b"!"].concat()
         );
     }
 
