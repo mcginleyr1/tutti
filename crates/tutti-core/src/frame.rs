@@ -13,6 +13,12 @@ pub enum Frame {
         pane: PaneId,
         bytes: Vec<u8>,
     },
+    /// One pty read of a pane streamed raw (`Request::PaneAttach`), exactly as
+    /// the child wrote it.
+    PaneRaw {
+        pane: PaneId,
+        bytes: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +55,7 @@ const KIND_CONTROL: u8 = 0x01;
 const KIND_SNAPSHOT: u8 = 0x02;
 const KIND_DELTA: u8 = 0x03;
 const KIND_INPUT: u8 = 0x04;
+const KIND_RAW: u8 = 0x05;
 
 const PANE_HEADER: usize = 8 + 2 + 2 + 4;
 
@@ -59,6 +66,7 @@ impl Frame {
             Frame::PaneSnapshot(d) => (KIND_SNAPSHOT, PANE_HEADER + d.bytes.len()),
             Frame::PaneDelta(d) => (KIND_DELTA, PANE_HEADER + d.bytes.len()),
             Frame::Input { bytes, .. } => (KIND_INPUT, 8 + bytes.len()),
+            Frame::PaneRaw { bytes, .. } => (KIND_RAW, 8 + bytes.len()),
         };
         assert!(
             payload_len < MAX_FRAME_LEN,
@@ -76,7 +84,7 @@ impl Frame {
                 out.extend_from_slice(&d.seq.to_le_bytes());
                 out.extend_from_slice(&d.bytes);
             }
-            Frame::Input { pane, bytes } => {
+            Frame::Input { pane, bytes } | Frame::PaneRaw { pane, bytes } => {
                 out.extend_from_slice(&pane.0.to_le_bytes());
                 out.extend_from_slice(bytes);
             }
@@ -106,13 +114,16 @@ impl Frame {
             KIND_CONTROL => Frame::Control(payload.to_vec()),
             KIND_SNAPSHOT => Frame::PaneSnapshot(decode_pane_data(payload)?),
             KIND_DELTA => Frame::PaneDelta(decode_pane_data(payload)?),
-            KIND_INPUT => {
+            KIND_INPUT | KIND_RAW => {
                 if payload.len() < 8 {
                     return Err(FrameError::TruncatedPayload);
                 }
-                Frame::Input {
-                    pane: PaneId(u64::from_le_bytes(payload[..8].try_into().unwrap())),
-                    bytes: payload[8..].to_vec(),
+                let pane = PaneId(u64::from_le_bytes(payload[..8].try_into().unwrap()));
+                let bytes = payload[8..].to_vec();
+                if body[0] == KIND_INPUT {
+                    Frame::Input { pane, bytes }
+                } else {
+                    Frame::PaneRaw { pane, bytes }
                 }
             }
             kind => return Err(FrameError::UnknownKind(kind)),
@@ -166,6 +177,14 @@ mod tests {
             pane: PaneId(3),
             bytes: b"ls -la\r".to_vec(),
         });
+        roundtrip(Frame::PaneRaw {
+            pane: PaneId(3),
+            bytes: b"\x1b[?1049h\x00\xff partial \x1b[".to_vec(),
+        });
+        roundtrip(Frame::PaneRaw {
+            pane: PaneId(u64::MAX),
+            bytes: vec![],
+        });
     }
 
     #[test]
@@ -199,6 +218,8 @@ mod tests {
         assert_eq!(Frame::decode(&bad_kind), Err(FrameError::UnknownKind(0x7f)));
 
         let truncated = [8u32.to_le_bytes().as_slice(), &[KIND_SNAPSHOT], &[0; 7]].concat();
+        assert_eq!(Frame::decode(&truncated), Err(FrameError::TruncatedPayload));
+        let truncated = [8u32.to_le_bytes().as_slice(), &[KIND_RAW], &[0; 7]].concat();
         assert_eq!(Frame::decode(&truncated), Err(FrameError::TruncatedPayload));
 
         let huge = ((MAX_FRAME_LEN + 1) as u32).to_le_bytes();

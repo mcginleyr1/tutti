@@ -1,6 +1,7 @@
 //! The attachable TUI. `run` owns terminal setup/teardown and the event loop;
 //! the pieces it drives — connection, app state, input mapping, layout, and
-//! rendering — live in the submodules and are unit-tested there.
+//! rendering — live in the submodules and are unit-tested there. `raw` is the
+//! TUI-less view: one pane, streamed raw to the terminal's own emulator.
 
 mod app;
 mod connection;
@@ -8,6 +9,7 @@ mod input;
 mod launcher;
 mod layout;
 mod navigate;
+pub mod raw;
 mod render;
 mod sidebar;
 mod theme;

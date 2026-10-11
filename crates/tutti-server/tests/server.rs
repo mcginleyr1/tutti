@@ -1737,6 +1737,221 @@ async fn a_tab_switch_stops_a_client_voting_for_panes_it_left() {
     server.stop().await;
 }
 
+/// Feed `stream`'s pane frames to `terminal` — a snapshot reseeds it, a raw
+/// read goes in as is — until `done` holds for its screen, returning the
+/// raw bytes fed and the control frames passed on the way.
+async fn stream_until(
+    stream: &mut Conn,
+    terminal: &mut vt100::Parser,
+    done: impl Fn(&vt100::Screen) -> bool,
+) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let (mut raw, mut controls) = (Vec::new(), Vec::new());
+    timeout(DEADLINE, async {
+        while !done(terminal.screen()) {
+            match stream.read_frame().await {
+                Frame::PaneSnapshot(data) => {
+                    *terminal = vt100::Parser::new(data.rows, data.cols, 0);
+                    terminal.process(&data.bytes);
+                }
+                Frame::PaneRaw { bytes, .. } => {
+                    terminal.process(&bytes);
+                    raw.extend(bytes);
+                }
+                Frame::Control(json) => controls.push(json),
+                other => panic!("a pane stream got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the stream never got there");
+    (raw, controls)
+}
+
+fn pane_attach(pane: PaneId, rows: u16, cols: u16) -> Request {
+    Request::PaneAttach { pane, rows, cols }
+}
+
+/// A pane stream opens on a snapshot of the screen, then carries the pane's
+/// output raw and in order — a terminal fed both is level with the pane —
+/// and its `Input` frames type into the pane. One pane per connection, and
+/// only a pane that exists.
+#[tokio::test]
+async fn a_pane_stream_sends_a_snapshot_then_raw_output_in_order() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let pane = run_marker(&mut control, "printf 'before\\n'; exec cat").await;
+    assert!(read_until(&mut control, pane, "before").await);
+
+    let mut stream = server.connect().await;
+    stream.send(&pane_attach(pane, 24, 80)).await;
+    let Frame::PaneSnapshot(data) = stream.read_frame().await else {
+        panic!("the snapshot comes first");
+    };
+    assert_eq!((data.pane, data.rows, data.cols), (pane, 24, 80));
+    let mut terminal = vt100::Parser::new(24, 80, 0);
+    terminal.process(&data.bytes);
+    assert_eq!(terminal.screen().contents(), "before");
+
+    stream
+        .write_frame(&Frame::Input {
+            pane,
+            bytes: b"typed-here\r".to_vec(),
+        })
+        .await;
+    // The pty echoes the line, then `cat` prints it back.
+    let (raw, _) = stream_until(&mut stream, &mut terminal, |screen| {
+        screen.cursor_position() == (3, 0)
+    })
+    .await;
+    assert_eq!(raw, b"typed-here\r\ntyped-here\r\n");
+    let lines = match control
+        .request(Request::PaneRead {
+            pane,
+            lines: None,
+            unwrapped: false,
+            since: None,
+            last_output: false,
+        })
+        .await
+    {
+        Response::Content { lines } => lines,
+        other => panic!("expected Content, got {other:?}"),
+    };
+    assert_eq!(terminal.screen().contents(), lines.join("\n"));
+
+    stream.send(&pane_attach(pane, 24, 80)).await;
+    let refusal = error_message(stream.response().await);
+    assert!(refusal.contains("already streams"), "{refusal}");
+    let mut stray = server.connect().await;
+    stray.send(&pane_attach(PaneId(999), 24, 80)).await;
+    assert_eq!(error_message(stray.response().await), "no pane 999");
+
+    server.stop().await;
+}
+
+/// A pane stream votes in its pane's size like an attached client — at
+/// attach, then by `ViewSizes` — and the pane grows back once it leaves.
+#[tokio::test]
+async fn a_pane_stream_votes_in_its_panes_size_until_it_leaves() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let pane = run_marker(&mut control, "sleep 30").await;
+    let mut wide = server.connect().await;
+    attach(&mut wide).await;
+    view(&mut wide, &[(pane, 30, 100)]).await;
+    snapshot_at(&mut wide, pane, 30, 100).await;
+
+    let mut stream = server.connect().await;
+    stream.send(&pane_attach(pane, 20, 120)).await;
+    snapshot_at(&mut stream, pane, 20, 100).await;
+    snapshot_at(&mut wide, pane, 20, 100).await;
+    stream
+        .send(&Request::ViewSizes {
+            panes: vec![PaneDims {
+                pane,
+                rows: 12,
+                cols: 50,
+            }],
+        })
+        .await;
+    snapshot_at(&mut stream, pane, 12, 50).await;
+    snapshot_at(&mut wide, pane, 12, 50).await;
+    drop(stream);
+    snapshot_at(&mut wide, pane, 30, 100).await;
+
+    server.stop().await;
+}
+
+/// The child exiting ends its stream: the last output, then the exit code,
+/// then the daemon closes the connection.
+#[tokio::test]
+async fn a_pane_stream_ends_with_the_exit_after_the_last_output() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let pane = run_marker(&mut control, "read line; printf 'bye-%s' \"$line\"; exit 3").await;
+    let mut stream = server.connect().await;
+    stream.send(&pane_attach(pane, 24, 80)).await;
+    let mut terminal = vt100::Parser::new(24, 80, 0);
+    stream
+        .write_frame(&Frame::Input {
+            pane,
+            bytes: b"now\r".to_vec(),
+        })
+        .await;
+    let (raw, controls) = stream_until(&mut stream, &mut terminal, |screen| {
+        screen.contents().contains("bye-now")
+    })
+    .await;
+    assert!(controls.is_empty(), "nothing before the output");
+    assert!(raw.ends_with(b"bye-now"));
+    let exit = loop {
+        if let Frame::Control(json) = stream.read_frame().await {
+            break serde_json::from_slice::<Event>(&json).unwrap();
+        }
+    };
+    assert_eq!(exit, Event::PaneExited { pane, code: 3 });
+    let mut rest = [0u8; 64];
+    let read = timeout(DEADLINE, stream.stream.read(&mut rest)).await;
+    assert_eq!(read.expect("the stream stayed open").unwrap(), 0);
+
+    server.stop().await;
+}
+
+/// A stream that stops reading never stalls its pane or anyone else: once
+/// its queue backs up it is dropped — its vote with it — and, read at last,
+/// it holds its backlog, then the Error it was dropped with, then the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pane_stream_that_never_reads_is_dropped() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let pane = run_marker(&mut control, "exec /bin/sh").await;
+    let mut wide = server.connect().await;
+    attach(&mut wide).await;
+    view(&mut wide, &[(pane, 24, 80)]).await;
+    snapshot_at(&mut wide, pane, 24, 80).await;
+    let mut stuck = server.connect().await;
+    stuck.send(&pane_attach(pane, 10, 40)).await;
+    snapshot_at(&mut wide, pane, 10, 40).await;
+
+    // 16 MB of output: thousands of reads, far past the stream's 256-frame
+    // queue and the socket's few KiB.
+    let flood = "head -c 16000000 /dev/zero | tr '\\0' x; echo; echo flood-$((6*7))\r";
+    let sent = control
+        .request(Request::PaneSend {
+            pane,
+            text: Some(flood.into()),
+            keys: None,
+            expect: None,
+        })
+        .await;
+    assert_eq!(sent, Response::Ok);
+    snapshot_at(&mut wide, pane, 24, 80).await;
+    assert!(read_until(&mut control, pane, "flood-42").await);
+
+    let mut last = None;
+    timeout(DEADLINE, async {
+        loop {
+            while let Some((frame, used)) = Frame::decode(&stuck.buf).unwrap() {
+                stuck.buf.drain(..used);
+                if let Frame::Control(json) = frame {
+                    last = Some(json);
+                }
+            }
+            let mut chunk = [0u8; 65536];
+            match stuck.stream.read(&mut chunk).await.unwrap() {
+                0 => return,
+                n => stuck.buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+    })
+    .await
+    .expect("the dropped stream never closed");
+    let message = error_message(serde_json::from_slice(&last.unwrap()).unwrap());
+    assert!(message.contains("fell behind"), "{message}");
+
+    server.stop().await;
+}
+
 /// A request may carry a `req`, and its answer carries it back: a sync answer,
 /// one sent later from a spawned task, even the refusal of a request that does
 /// not parse. An untagged request's answer carries none, nor does an event.

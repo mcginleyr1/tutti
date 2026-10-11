@@ -1838,6 +1838,7 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "signal-hook",
  "terminal-colorsaurus",
  "tokio",
  "toml",

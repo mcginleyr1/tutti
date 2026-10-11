@@ -2,17 +2,18 @@
 //! connection is a request/response loop; a connection that sends `Attach` also
 //! joins the broadcast set and receives pane snapshots, coalesced deltas, and
 //! control events until it detaches or disconnects. One that sends `Watch` is
-//! pushed a whole-session snapshot whenever it changes, outside that set. A
-//! panic is contained where it happens — one frame's ends its connection, one
-//! background pass's ends that pass — so the daemon, and every pane with it,
-//! lives on.
+//! pushed a whole-session snapshot whenever it changes, outside that set, and
+//! one that sends `PaneAttach` is streamed one pane's raw output, for a real
+//! terminal to parse. A panic is contained where it happens — one frame's ends
+//! its connection, one background pass's ends that pass — so the daemon, and
+//! every pane with it, lives on.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::os::unix::fs::DirBuilderExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -36,7 +37,7 @@ use crate::herdr;
 use crate::jj;
 use crate::keys;
 use crate::persist::{self, SavedPane};
-use crate::pty::{PaneSize, PtyPane, Signal, StatusReport};
+use crate::pty::{Feed, PaneSize, PtyPane, Signal, StatusReport};
 use crate::session::{ReportOutcome, Restored, RunTarget, Session};
 
 /// Cadence of the render tick: coalesced pane deltas to attached clients, and
@@ -62,6 +63,10 @@ const SAVE_INTERVAL: Duration = Duration::from_secs(2);
 /// descriptors, is the likely one — before trying again: long enough not to
 /// spin on an error that persists, short enough to soon use a freed one.
 const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
+/// How long a pane stream waits, once its child has exited, for the reader to
+/// reach the pty's end — so the child's last output goes out before the exit
+/// does. A grandchild holding the pty open never lets it.
+const EXIT_GRACE: Duration = Duration::from_millis(250);
 
 /// One pane's news, broadcast to every `pane wait`.
 #[derive(Debug, Clone, Copy)]
@@ -133,11 +138,18 @@ pub struct Hub {
     session: Mutex<Session>,
     clients: Mutex<HashMap<u64, Client>>,
     watchers: Mutex<HashMap<u64, Watcher>>,
+    /// The pane streams (`PaneAttach`), by connection: the pane each streams
+    /// and the size it votes for it. Outside `clients` — a stream gets no
+    /// events, answers no approval, and is no watcher's attached terminal.
+    taps: Mutex<HashMap<u64, PaneDims>>,
     /// Last screen broadcast per pane — a scrollback-free `Mirror` parser,
     /// cheap to keep and diff — with its running delta sequence number and the
     /// pty output generation it was captured at.
     last: Mutex<HashMap<PaneId, (vt100::Parser, u32, u64)>>,
     next_client: AtomicU64,
+    /// Set as `serve` winds down: the panes its shutdown kills did not exit on
+    /// their own, so no pane stream is told they did — it loses its daemon.
+    stopping: AtomicBool,
     /// Session name, reported to attaching clients. Derived from the socket file.
     name: String,
     /// The agent registry driving detection and state classification.
@@ -187,6 +199,10 @@ impl Hub {
 
     fn watchers(&self) -> MutexGuard<'_, HashMap<u64, Watcher>> {
         lock(&self.watchers)
+    }
+
+    fn taps(&self) -> MutexGuard<'_, HashMap<u64, PaneDims>> {
+        lock(&self.taps)
     }
 
     fn last(&self) -> MutexGuard<'_, HashMap<PaneId, (vt100::Parser, u32, u64)>> {
@@ -258,8 +274,10 @@ pub async fn serve(
         session: Mutex::new(Session::new(size, name.clone())),
         clients: Mutex::new(HashMap::new()),
         watchers: Mutex::new(HashMap::new()),
+        taps: Mutex::new(HashMap::new()),
         last: Mutex::new(HashMap::new()),
         next_client: AtomicU64::new(0),
+        stopping: AtomicBool::new(false),
         name,
         registry: Registry::default(),
         vcs: Mutex::new(HashMap::new()),
@@ -394,6 +412,7 @@ pub async fn serve(
         let saved = hub.session().snapshot();
         persist::save(&persist::live_path(dir, &hub.name), saved.as_ref());
     }
+    hub.stopping.store(true, Ordering::SeqCst);
     hub.session().kill_all();
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(&pid_path);
@@ -438,6 +457,9 @@ async fn handle_conn(hub: Arc<Hub>, stream: tokio::net::UnixStream) -> Result<()
     let (hangup, hung_up) = oneshot::channel::<()>();
     let writer = tokio::spawn(writer_loop(write_half, rx, hung_up));
     let abort = writer.abort_handle();
+    // Handed to a pane stream's tap (`pane_attach`), whose end drops it.
+    let (kick, mut kicked) = oneshot::channel::<()>();
+    let mut kick = Some(kick);
 
     let mut buf = Vec::new();
     let mut wedged = false;
@@ -446,10 +468,15 @@ async fn handle_conn(hub: Arc<Hub>, stream: tokio::net::UnixStream) -> Result<()
     // writer task alive, defeats the ticker's nobody-attached shortcut, and
     // holds its vote in the sizes of the panes it viewed.
     let outcome = loop {
-        match read_frame(&mut read_half, &mut buf).await {
+        let read = tokio::select! {
+            read = read_frame(&mut read_half, &mut buf) => read,
+            // The pane stream ended: what is queued drains, then it closes.
+            _ = &mut kicked => break Ok(()),
+        };
+        match read {
             Ok(Some(frame)) => {
                 let handled = catch_unwind(AssertUnwindSafe(|| {
-                    handle_frame(&hub, cid, &tx, &abort, frame)
+                    handle_frame(&hub, cid, &tx, &abort, &mut kick, frame)
                 }));
                 match handled {
                     Ok(ControlFlow::Continue(())) => {}
@@ -524,6 +551,7 @@ fn handle_frame(
     cid: u64,
     tx: &mpsc::Sender<Vec<u8>>,
     writer: &tokio::task::AbortHandle,
+    kick: &mut Option<oneshot::Sender<()>>,
     frame: Frame,
 ) -> ControlFlow<()> {
     #[cfg(test)]
@@ -589,6 +617,9 @@ fn handle_frame(
                 send_reply(hub, cid, tx, reply.encode(&Response::Ok))
             }
             Ok(Request::ViewSizes { panes }) => view_sizes(hub, cid, &reply, panes),
+            Ok(Request::PaneAttach { pane, rows, cols }) => {
+                pane_attach(hub, cid, &reply, kick, PaneDims { pane, rows, cols })
+            }
             Ok(Request::Watch) => {
                 hub.watchers().insert(
                     cid,
@@ -667,7 +698,9 @@ fn handle_frame(
             let _ = pane_input(hub, pane, &bytes);
             ControlFlow::Continue(())
         }
-        Frame::PaneSnapshot(_) | Frame::PaneDelta(_) => ControlFlow::Continue(()),
+        Frame::PaneSnapshot(_) | Frame::PaneDelta(_) | Frame::PaneRaw { .. } => {
+            ControlFlow::Continue(())
+        }
     }
 }
 
@@ -685,22 +718,38 @@ fn send_reply(hub: &Hub, cid: u64, tx: &mpsc::Sender<Vec<u8>>, bytes: Vec<u8>) -
 }
 
 /// Drop client `cid` from the broadcast set — detached, gone, or wedged — and
-/// let the panes it viewed re-arbitrate their size without its vote. Returns
-/// the client, for a caller that must tear it down.
+/// let the panes it viewed re-arbitrate their size without its vote; a pane
+/// stream's too, untapping it. Returns the client, for a caller that must
+/// tear it down.
 fn drop_client(hub: &Hub, cid: u64) -> Option<Client> {
+    let tap = hub.taps().remove(&cid);
+    if let Some(PaneDims { pane, .. }) = tap {
+        let pty = hub.session().pty(pane);
+        if let Some(pty) = pty {
+            pty.untap(cid);
+        }
+        arbitrate(hub, [pane]);
+    }
     let client = hub.clients().remove(&cid)?;
     arbitrate(hub, client.view.iter().map(|d| d.pane));
     Some(client)
 }
 
 /// Record an attached client's visible set in place of its last, then size
-/// every pane either set names by the viewers it has now. A connection that
+/// every pane either set names by the viewers it has now. A pane stream's set
+/// is its one pane: a size for any other casts no vote. A connection that
 /// never attached has no set to keep.
 fn view_sizes(hub: &Hub, cid: u64, reply: &Reply, panes: Vec<PaneDims>) -> ControlFlow<()> {
     let old = hub
         .clients()
         .get_mut(&cid)
         .map(|client| std::mem::replace(&mut client.view, panes.clone()));
+    let old = old.or_else(|| {
+        let mut taps = hub.taps();
+        let vote = taps.get_mut(&cid)?;
+        let new = panes.iter().find(|d| d.pane == vote.pane).copied();
+        Some(vec![std::mem::replace(vote, new.unwrap_or(*vote))])
+    });
     let response = match old {
         Some(old) => {
             arbitrate(hub, old.iter().chain(&panes).map(|d| d.pane));
@@ -714,19 +763,21 @@ fn view_sizes(hub: &Hub, cid: u64, reply: &Reply, panes: Vec<PaneDims>) -> Contr
 }
 
 /// Size each of `panes` to the smallest rows and the smallest cols among the
-/// clients viewing it now — tmux's smallest client wins. A pane nobody views
-/// keeps its size. The votes are read under the clients lock, released before
-/// `resize_pane` takes the others.
+/// clients viewing it now, pane streams included — tmux's smallest client
+/// wins. A pane nobody views keeps its size. The votes are read under the
+/// clients and taps locks, released before `resize_pane` takes the others.
 fn arbitrate(hub: &Hub, panes: impl IntoIterator<Item = PaneId>) {
     let panes: HashSet<PaneId> = panes.into_iter().collect();
     let sizes: Vec<PaneDims> = {
         let clients = hub.clients();
+        let taps = hub.taps();
         panes
             .into_iter()
             .filter_map(|pane| {
                 clients
                     .values()
                     .flat_map(|client| &client.view)
+                    .chain(taps.values())
                     .filter(|dims| dims.pane == pane)
                     .copied()
                     .reduce(|a, b| PaneDims {
@@ -740,6 +791,91 @@ fn arbitrate(hub: &Hub, panes: impl IntoIterator<Item = PaneId>) {
     for PaneDims { pane, rows, cols } in sizes {
         let _ = resize_pane(hub, pane, rows, cols);
     }
+}
+
+/// `PaneAttach`: stream a pane raw to this connection through a tap
+/// (`PtyPane::tap`), voting `dims` for its size as an attached client's view
+/// does. The vote goes in first, so the snapshot comes at the size it
+/// settles. The tap owns `kick`, so its end — behind, untapped, or gone with
+/// its pane — ends the connection's read loop, which drains what is queued
+/// and closes. A tap is behind when its queue is all but full: the reader
+/// never waits on it, and the slot left carries the Error it ends with. The
+/// child exiting is told once its last output is queued — unless the daemon
+/// is stopping, which killed it.
+fn pane_attach(
+    hub: &Arc<Hub>,
+    cid: u64,
+    reply: &Reply,
+    kick: &mut Option<oneshot::Sender<()>>,
+    dims: PaneDims,
+) -> ControlFlow<()> {
+    let refuse = |message: String| {
+        send_reply(
+            hub,
+            cid,
+            &reply.tx,
+            reply.encode(&Response::Error { message }),
+        )
+    };
+    let pane = dims.pane;
+    let pty = hub.session().pty(pane);
+    let Some(pty) = pty else {
+        return refuse(format!("no pane {pane}"));
+    };
+    let Some(kick) = kick.take() else {
+        return refuse("this connection already streams a pane".into());
+    };
+    hub.taps().insert(cid, dims);
+    arbitrate(hub, [pane]);
+    let tx = reply.tx.clone();
+    let mut behind = reply.encode(&Response::Error {
+        message: format!("fell behind pane {pane}'s output"),
+    });
+    pty.tap(
+        cid,
+        Box::new(move |feed| {
+            // Named, so the tap owns `kick` and drops it with itself.
+            let _owned = &kick;
+            if tx.capacity() < 2 {
+                eprintln!("tutti: a stream of pane {pane} fell behind; dropping it");
+                let _ = tx.try_send(std::mem::take(&mut behind));
+                return false;
+            }
+            let frame = match feed {
+                Feed::Snapshot(size, bytes) => Frame::PaneSnapshot(PaneData {
+                    pane,
+                    rows: size.rows,
+                    cols: size.cols,
+                    seq: 0,
+                    bytes,
+                }),
+                Feed::Raw(bytes) => Frame::PaneRaw {
+                    pane,
+                    bytes: bytes.to_vec(),
+                },
+            };
+            tx.try_send(frame.encode()).is_ok()
+        }),
+    );
+    let (hub, tx) = (Arc::clone(hub), reply.tx.clone());
+    tokio::spawn(async move {
+        let exit = tokio::select! {
+            exit = pty.wait() => exit,
+            () = tx.closed() => return,
+        };
+        let mut output = pty.output_receiver();
+        let eof = async { while output.changed().await.is_ok() {} };
+        let _ = tokio::time::timeout(EXIT_GRACE, eof).await;
+        if hub.stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        let code = exit.code as i32;
+        let _ = tx
+            .send(encode_json(&Event::PaneExited { pane, code }))
+            .await;
+        pty.untap(cid);
+    });
+    ControlFlow::Continue(())
 }
 
 fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
@@ -990,6 +1126,7 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
         Request::Attach { .. }
         | Request::Detach
         | Request::ViewSizes { .. }
+        | Request::PaneAttach { .. }
         | Request::Watch
         | Request::PaneFocus { .. }
         | Request::PaneFocusToward { .. }
@@ -2710,6 +2847,7 @@ mod tests {
                 hub.last(),
                 hub.vcs(),
                 hub.approvals(),
+                hub.taps(),
             );
             panic!("injected: a frame panics holding every hub lock");
         }

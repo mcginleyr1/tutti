@@ -383,6 +383,23 @@ pub enum Request {
     /// focus, or a `Done` pane's seen state, so it sits beside an attached TUI
     /// without touching it.
     Watch,
+    /// Stream one pane raw to this connection, for a real terminal emulator
+    /// to show with its own parser: a `PaneSnapshot` of the screen as it
+    /// stands — written for a terminal, so with the primary screen under the
+    /// alternate one while that is up — then every pty read as a `PaneRaw`
+    /// frame, in order, nothing lost or repeated between the two. A resize
+    /// sends a fresh snapshot at the new size, in the same order. `rows` and
+    /// `cols` are this connection's vote in the pane's size, as an attached
+    /// client's `ViewSizes` is; a later `ViewSizes` naming the pane moves it.
+    /// `Input` frames type into the pane. The child exiting ends the stream
+    /// with `Event::PaneExited`, a connection that falls behind it with an
+    /// Error, and either way the daemon then closes it. Error for an unknown
+    /// pane, or on a connection already streaming one.
+    PaneAttach {
+        pane: PaneId,
+        rows: u16,
+        cols: u16,
+    },
 }
 
 /// A single agent-lifecycle signal mapped from a Claude Code hook event. Kept a
@@ -1258,6 +1275,11 @@ mod tests {
             terminal: Some("com.mitchellh.ghostty".into()),
         });
         roundtrip(&Request::Watch);
+        roundtrip(&Request::PaneAttach {
+            pane: PaneId(3),
+            rows: 24,
+            cols: 80,
+        });
     }
 
     fn sample_issue() -> IssueRef {
@@ -1733,6 +1755,16 @@ mod tests {
             })
             .unwrap(),
             r#"{"type":"pane_split","pane":1,"direction":"horizontal"}"#
+        );
+        // What an editor plugin speaking the socket itself would send.
+        assert_eq!(
+            serde_json::to_string(&Request::PaneAttach {
+                pane: PaneId(3),
+                rows: 24,
+                cols: 80,
+            })
+            .unwrap(),
+            r#"{"type":"pane_attach","pane":3,"rows":24,"cols":80}"#
         );
         assert_eq!(
             serde_json::to_string(&Event::StateChanged {

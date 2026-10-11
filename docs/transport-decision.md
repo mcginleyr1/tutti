@@ -200,6 +200,7 @@ Transport frame (little-endian):
 Frame:
   len:     u32   // byte length of (kind + payload)
   kind:    u8    // 0x01 Control(JSON) | 0x02 PaneSnapshot | 0x03 PaneDelta | 0x04 Input
+                 // | 0x05 PaneRaw (a raw pane stream, below)
   payload: [u8; len-1]
 ```
 
@@ -259,3 +260,80 @@ forwarded verbatim to the PTY (kept binary for the lowest-latency keystroke path
    snapshot of the scrolled region from the authoritative scrollback ring.
 8. **Detach:** client → `Frame{Control,{"t":"detach"}}`; server drops the client and
    keeps every PTY and parser alive.
+
+## Raw pane streams for real terminals (wire rev 10)
+
+Option C rests on one premise: the client "is not a real terminal" — the TUI draws a
+grid, so its fidelity ceiling is vt100's and server-side coalescing costs it nothing. A
+client that *is* a real terminal emulator showing one pane — `tutti pane attach` in any
+terminal, Ghostel inside Emacs, Neovim's `:terminal`, later the rtty GPUI app — flips
+that premise. Its own parser is better than vt100's model (OSC 8 links, OSC 52, kitty
+graphics and sixel, underline styles, its own reflow and scrollback), and feeding it
+vt100's re-encoding would cap it at vt100 and throw the rest away. For these clients
+Option A is the right answer, and its costs above do not apply:
+
+- **Double parse** costs nothing new: the emulator parses its input whatever it is fed,
+  and the server's parser exists anyway.
+- **Bandwidth** is one pane over a local socket — what the emulator would take from the
+  program directly — and the queue below bounds it.
+- **Attach** is the snapshot-then-raw-tail Option A already called "the honest
+  implementation".
+- **Scrollback** is the emulator's own: a pane on its primary screen scrolls into it.
+
+C stays right for the TUI, which multiplexes many panes into one grid, rides the frame
+rate, and fans one diff out to every client.
+
+**Wire.** `{"type":"pane_attach","pane":N,"rows":R,"cols":C}` opens the stream. The
+daemon answers with a `PaneSnapshot` (kind `0x02`, `seq` 0) of the screen at its size,
+then one `PaneRaw` frame per pty read — kind `0x05`, `[u64 pane_id][bytes]`, the bytes
+exactly as the child wrote them. A resize sends a fresh `PaneSnapshot` at the new size, in
+stream order: a terminal reflows its screen its own way, and the snapshot puts it level
+with the grid before the program's redraw lands. The client types with `Input` frames,
+moves its size vote with `ViewSizes` naming the pane, and detaches by closing the socket
+(or `detach`). The stream ends with `Event::PaneExited` once the child's last output is
+queued (up to 250 ms is spent letting the reader drain the pty first), or with an
+`Error` when the client falls behind; either way the daemon then closes the connection.
+A daemon that stops just closes it: its own shutdown killed the pane, which did not exit.
+A stream is not an attached client: it gets no events, answers no held approval, and is
+no watcher's attached terminal — but it votes in its pane's size like one (smallest
+viewer wins), and leaving re-arbitrates.
+
+**Ordering guarantee.** The reader thread parses each read under the pane's parser lock
+and, in the same hold, hands the bytes to every subscribed tap. `pane_attach` takes the
+snapshot and subscribes within one hold of that lock, so the snapshot covers exactly the
+reads before it and the stream exactly the reads after — none lost, none repeated. Both
+go out on the connection's single outbound queue, and the socket keeps the order. A
+resize's snapshot is taken in the same hold that resizes the grid.
+
+The snapshot is `state_formatted` — contents, cursor position and visibility, the current
+colours and attributes, and the input modes (keypad, cursor keys, bracketed paste, mouse
+mode and encoding) — plus what it leaves out: which screen is up. While the alternate
+screen is, the primary screen goes first, then `ESC[m ESC[?1049h`, then the alternate
+screen, so the terminal holds the pane's primary screen under it and the program's own
+`?1049l` brings both back to the same one. vt100 has no public handle on the hidden grid,
+so that primary is read off a clone of the screen switched back in a fresh parser (the
+ring comes along, ~1–3 ms) — only at an attach or resize while the alternate screen is
+up. What vt100 does not model, no snapshot can carry: the scroll region, origin mode,
+the DECSC saved cursor, focus reporting, kitty keyboard flags, cursor style, the title. A
+program that redraws on SIGWINCH repairs most of it, and an attach at a new size sends
+one.
+
+**Backpressure.** The reader never waits on a client. A tap `try_send`s into its
+connection's bounded queue (256 frames, each at most one 8 KiB read — 2 MiB). Once the
+queue is down to its last slot the stream is behind: that slot carries the `Error`, the
+tap is dropped and its size vote with it, and the connection closes after the queue
+drains. Nothing is buffered without bound, and nothing is dropped from a live stream — a
+gap in a raw stream would leave the terminal wrong for good.
+
+**The CLI's alternate screen.** `tutti pane attach` draws on the terminal's alternate
+screen and leaves it on exit, so the shell's own screen and scrollback come back as they
+were. That one alternate screen cannot also be the pane program's: passed through, a
+program's `?1049l` would land the stream on the shell's screen. So the CLI keeps a vt100
+mirror of the pane (fed every frame, checked after each `h`/`l` byte, where a screen
+switch ends), and a read that switches screens — or resets the terminal with `ESC c` — is
+replaced by a redraw from the mirror. Leaving vim brings back the pane's shell screen,
+drawn from the mirror; all other output goes through untouched. On exit it turns off what
+the pane may have turned on in the terminal (mouse reporting, focus events, bracketed
+paste, cursor keys and keypad, cursor style and visibility, colours) and pops the title
+it pushed. The cost: inside the CLI the pane has no native scrollback — the alternate
+screen keeps none.

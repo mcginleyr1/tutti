@@ -475,6 +475,12 @@ enum PaneAction {
         #[arg(long)]
         from: Option<u64>,
     },
+    /// Show one pane in this terminal, drawn by the terminal itself: its
+    /// output streamed raw, your keys typed into it. The prefix then `d`
+    /// detaches; the prefix twice sends one. Never starts a daemon.
+    Attach {
+        pane: u64,
+    },
     /// Block until each pane reaches a state (`done` unless `--until` says
     /// otherwise), printing each one's; exits 124 on `--timeout`.
     Wait {
@@ -606,6 +612,17 @@ fn run(cli: Cli) -> Result<i32> {
                     timeout,
                 },
         }) => run_wait(&cli.session, cli.json, &panes, &until, next, timeout),
+        Some(Command::Pane {
+            action: PaneAction::Attach { pane },
+        }) => {
+            // Its own pane would echo its output back into itself forever.
+            let own = std::env::var("TUTTI_SESSION").is_ok_and(|s| s == cli.session)
+                && std::env::var("TUTTI_PANE").is_ok_and(|p| p == pane.to_string());
+            if own {
+                bail!("pane {pane} is the pane this runs in");
+            }
+            tutti::attach::raw::run(&cli.session, PaneId(pane), Config::load()?.prefix)
+        }
         Some(Command::Sandbox {
             action: SandboxAction::Run { profile, name, cmd },
         }) => {
@@ -1062,6 +1079,7 @@ fn to_request(command: Command) -> Result<Request> {
                 delta: amount,
             },
             PaneAction::Wait { .. } => bail!("pane wait sends a request per pane"),
+            PaneAction::Attach { .. } => bail!("pane attach streams a pane"),
             PaneAction::Checkpoints { pane } => Request::PaneCheckpoints { pane: PaneId(pane) },
             PaneAction::CheckpointDiff { pane, n, stat } => Request::PaneCheckpointDiff {
                 pane: PaneId(pane),

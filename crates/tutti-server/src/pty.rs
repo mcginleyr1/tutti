@@ -164,6 +164,18 @@ impl Mirror {
     }
 }
 
+/// What a tap (`PtyPane::tap`) is handed, under the parser lock and in
+/// stream order: a snapshot of the screen to start from, at its size, then
+/// each read's bytes as the child wrote them — and after a resize, a fresh
+/// snapshot at the new size.
+pub enum Feed<'a> {
+    Snapshot(PaneSize, Vec<u8>),
+    Raw(&'a [u8]),
+}
+
+/// A subscriber to a pane's raw output. Returning false unsubscribes it.
+pub type Tap = Box<dyn FnMut(Feed<'_>) -> bool + Send>;
+
 /// A pane's terminal behind the parser lock: the vt100 parser and the count
 /// numbering the rows its primary screen commits to scrollback, kept
 /// together so a reader sees a grid and a count that agree.
@@ -181,6 +193,9 @@ struct Term {
     output: Option<u64>,
     /// The last command the shell finished (OSC 133 `D` after a `C`).
     finished: Option<Finished>,
+    /// The raw-output subscribers, by id: fed under this lock, so each sees
+    /// its snapshot and then every read once, in order.
+    taps: Vec<(u64, Tap)>,
 }
 
 impl Term {
@@ -192,6 +207,7 @@ impl Term {
             cwd: None,
             output: None,
             finished: None,
+            taps: Vec::new(),
         }
     }
 
@@ -199,12 +215,35 @@ impl Term {
     /// panicked mid-read and left its state suspect. The count only moves
     /// forward — by one, for whatever the failed read pushed uncounted — so
     /// every outstanding cursor, and the last command's rows, read as
-    /// truncated instead of skipping rows silently.
+    /// truncated instead of skipping rows silently. The taps stay: their
+    /// terminals parse the stream themselves.
     fn reset(&mut self) {
         let (rows, cols) = self.parser.screen().size();
         self.parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
         self.scrolled += 1;
         self.seq = Seq::default();
+    }
+
+    /// The screen as escape bytes for a real terminal. `state_formatted`
+    /// leaves out which screen is up, so while the alternate one is, the
+    /// primary goes first and `CSI ?1049h` switches over — with plain
+    /// colours, which it saves with the cursor — so the terminal holds the
+    /// pane's primary screen for the program's own switch back. The primary
+    /// is read off a clone switched back in a fresh parser — bytes fed to the
+    /// live one could land mid-sequence — so this one read copies the ring
+    /// (~1–3 ms, release), on an attach or a resize only.
+    fn snapshot(&self) -> Vec<u8> {
+        let screen = self.parser.screen();
+        if !screen.alternate_screen() {
+            return screen.state_formatted();
+        }
+        let mut primary = vt100::Parser::default();
+        *primary.screen_mut() = screen.clone();
+        primary.process(b"\x1b[?47l");
+        let mut out = primary.screen().contents_formatted();
+        out.extend_from_slice(b"\x1b[m\x1b[?1049h");
+        out.extend(screen.state_formatted());
+        out
     }
 
     /// Feed one read's bytes to the parser, counting the rows they push into
@@ -672,7 +711,9 @@ impl PtyPane {
 
     /// Resize both the kernel pty and the vt100 grid. A zero dimension is
     /// refused: `tail` tiles scrollback in screen-height windows and would
-    /// never advance.
+    /// never advance. Each tap is handed a fresh snapshot at the new size: a
+    /// terminal reflows its screen its own way, and this puts it level with
+    /// the grid again before the program's redraw lands.
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
         if rows == 0 || cols == 0 {
             bail!("pane size must be at least 1x1, got {rows}x{cols}");
@@ -685,9 +726,35 @@ impl PtyPane {
                 pixel_height: 0,
             })
             .context("resize pty failed")?;
-        lock(&self.term).parser.screen_mut().set_size(rows, cols);
-        *lock(&self.size) = PaneSize { rows, cols };
+        let size = PaneSize { rows, cols };
+        let mut term = lock(&self.term);
+        term.parser.screen_mut().set_size(rows, cols);
+        if !term.taps.is_empty() {
+            let snapshot = term.snapshot();
+            term.taps
+                .retain_mut(|(_, tap)| tap(Feed::Snapshot(size, snapshot.clone())));
+        }
+        drop(term);
+        *lock(&self.size) = size;
         Ok(())
+    }
+
+    /// Stream the pane's raw output to `tap`, as subscriber `id`. Under one
+    /// hold of the parser lock it is handed a snapshot of the screen as it
+    /// stands (`Term::snapshot`) and joins the reader, which hands it each
+    /// read in the same hold that parses it — so nothing is lost or repeated
+    /// between the two.
+    pub fn tap(&self, id: u64, mut tap: Tap) {
+        let mut term = lock(&self.term);
+        let (rows, cols) = term.parser.screen().size();
+        if tap(Feed::Snapshot(PaneSize::new(rows, cols), term.snapshot())) {
+            term.taps.push((id, tap));
+        }
+    }
+
+    /// Unsubscribe tap `id`, if it still is.
+    pub fn untap(&self, id: u64) {
+        lock(&self.term).taps.retain(|(tap, _)| *tap != id);
     }
 
     /// The size the pane was spawned at or last resized to.
@@ -923,6 +990,7 @@ fn read_loop(
                     eprintln!("tutti: a pane's terminal parser panicked; restarting it blank");
                     term.reset();
                 }
+                term.taps.retain_mut(|(_, tap)| tap(Feed::Raw(&buf[..n])));
                 output_tx.send_modify(|generation| *generation = generation.wrapping_add(1));
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -2320,6 +2388,95 @@ mod tests {
             catch_unwind(|| vt100::Parser::new(2, 1, 0).process(&mirror.snapshot)).is_ok(),
             "a client is sent the blank screen's snapshot, which replays"
         );
+    }
+
+    /// A terminal seeded with a tap's snapshot shows what the pane shows —
+    /// and under the alternate screen it holds the pane's primary, so the
+    /// program's own switch back lands both on the same screen.
+    #[test]
+    fn a_snapshot_seeds_a_terminal_with_both_screens() {
+        for screen in SCREENS {
+            let stream = format!("{}{screen}", numbered(0, 30));
+            let mut live = fed(24, 80, stream.as_bytes(), RUN_MAX);
+            let mut terminal = vt100::Parser::new(24, 80, 0);
+            terminal.process(&live.snapshot());
+            for next in ["", "\x1b[?1049l after"] {
+                live.process(next.as_bytes());
+                terminal.process(next.as_bytes());
+                let (seen, want) = (terminal.screen(), live.parser.screen());
+                let step = format!("{screen:?} then {next:?}");
+                assert_eq!(
+                    seen.contents_formatted(),
+                    want.contents_formatted(),
+                    "{step}"
+                );
+                assert_eq!(
+                    seen.input_mode_formatted(),
+                    want.input_mode_formatted(),
+                    "{step}"
+                );
+                assert_eq!(seen.alternate_screen(), want.alternate_screen(), "{step}");
+            }
+        }
+    }
+
+    /// A tap joined mid-stream is handed a snapshot, then every read after
+    /// it exactly once: the snapshot's numbers run on into the stream's with
+    /// none lost or repeated. A resize hands it a fresh snapshot at the new
+    /// size; untapped, it is dropped.
+    #[test]
+    fn a_tap_sees_a_snapshot_then_every_read_once() {
+        let spec = PtySpec {
+            args: vec!["-c".into(), "seq 1 300000".into()],
+            ..PtySpec::new("/bin/sh")
+        };
+        let pane = PtyPane::spawn(spec, PaneSize::new(24, 80)).unwrap();
+        wait_for(|| lock(&pane.term).scrolled > 1000, "no output");
+        let (tx, rx) = std::sync::mpsc::channel();
+        pane.tap(
+            7,
+            Box::new(move |feed| {
+                let fed = match feed {
+                    Feed::Snapshot(size, bytes) => (Some(size), bytes),
+                    Feed::Raw(bytes) => (None, bytes.to_vec()),
+                };
+                tx.send(fed).is_ok()
+            }),
+        );
+        wait_for(
+            || pane.output_receiver().has_changed().is_err(),
+            "the output never ended",
+        );
+
+        let (size, snapshot) = rx.recv().unwrap();
+        assert_eq!(size, Some(PaneSize::new(24, 80)));
+        let mut seeded = vt100::Parser::new(24, 80, 0);
+        seeded.process(&snapshot);
+        let mut text = seeded.screen().contents();
+        if seeded.screen().cursor_position().1 == 0 {
+            text.push('\n');
+        }
+        let mut reads = 0;
+        while let Ok((None, bytes)) = rx.try_recv() {
+            text.push_str(&String::from_utf8(bytes).unwrap().replace('\r', ""));
+            reads += 1;
+        }
+        let numbers: Vec<u64> = text.lines().map(|l| l.parse().unwrap()).collect();
+        assert!(reads > 0 && numbers.len() > 24, "joined after the output");
+        assert!(
+            numbers.windows(2).all(|w| w[1] == w[0] + 1),
+            "a read was lost or repeated"
+        );
+        assert_eq!(numbers.last(), Some(&300_000));
+
+        pane.resize(10, 40).unwrap();
+        let (size, snapshot) = rx.recv().unwrap();
+        assert_eq!(size, Some(PaneSize::new(10, 40)));
+        let mut seeded = vt100::Parser::new(10, 40, 0);
+        seeded.process(&snapshot);
+        assert_eq!(seeded.screen().contents(), pane.contents());
+        pane.untap(7);
+        assert!(rx.recv().is_err(), "an untapped tap is dropped");
     }
 
     /// Poll `done` for up to three seconds.

@@ -25,6 +25,7 @@ sysinfo = "0.39"
 toml = "1"
 terminal-colorsaurus = "1"
 base64 = "0.22"
+signal-hook = "0.3"
 tutti-core = { path = "crates/tutti-core" }
 tutti-server = { path = "crates/tutti-server" }
 tutti-agents = { path = "crates/tutti-agents" }

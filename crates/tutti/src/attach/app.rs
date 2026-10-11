@@ -689,7 +689,7 @@ impl App {
                     state.damaged = true;
                 }
             }
-            WireFrame::Input { .. } => {}
+            WireFrame::Input { .. } | WireFrame::PaneRaw { .. } => {}
         }
         Vec::new()
     }

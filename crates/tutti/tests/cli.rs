@@ -1383,6 +1383,31 @@ fn attach_refuses_to_nest_a_session_inside_its_own_pane() {
     assert!(!runtime.exists(), "nothing started");
 }
 
+/// `pane attach` refuses its own pane, whose output it would echo back into
+/// itself forever, and a stdin that is no terminal — exit 1, nothing started.
+#[test]
+fn pane_attach_refuses_its_own_pane_and_a_stdin_that_is_no_terminal() {
+    let runtime = unique_base("paneattach");
+    for (pane_env, want) in [
+        ("7", "error: pane 7 is the pane this runs in\n"),
+        ("3", "error: pane attach needs a terminal on stdin\n"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_tutti"))
+            .args(["-s", "work", "pane", "attach", "7"])
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_CONFIG_HOME", &runtime)
+            .env("TUTTI_PANE", pane_env)
+            .env("TUTTI_SESSION", "work")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{want}");
+        assert!(output.stdout.is_empty(), "{want}");
+        assert_eq!(String::from_utf8(output.stderr).unwrap(), want);
+    }
+    assert!(!runtime.exists(), "nothing started");
+}
+
 #[test]
 fn pane_read_prints_plain_lines() {
     let output = run_scenario(
