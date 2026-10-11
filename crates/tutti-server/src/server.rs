@@ -1239,7 +1239,10 @@ fn focus_pane(hub: &Arc<Hub>, cid: u64, pane: PaneId) -> Response {
 }
 
 /// Focus the pane `toward` of `from` as `focus_pane` does, and answer which it
-/// was — `None` at an edge, where nothing moves.
+/// was — `None` at an edge, where nothing moves here. At a left or right edge
+/// (no `wrap`), each attached client focused on `from` is handed the move
+/// (`FocusEdge`): an editor holding the direct keys then reaches the sidebar,
+/// the changes panel or the next tab, as the key itself would.
 fn focus_toward(
     hub: &Arc<Hub>,
     cid: u64,
@@ -1257,10 +1260,36 @@ fn focus_toward(
         Ok(pane) => pane,
         Err(err) => return error(err),
     };
+    let sideways = matches!(toward, Toward::Left | Toward::Right);
+    let relayed = pane.is_none() && sideways && !wrap && focus_edge(hub, from, toward);
     match pane.map(|pane| focus_pane(hub, cid, pane)) {
-        None | Some(Response::Ok) => Response::Neighbor { from, toward, pane },
+        None | Some(Response::Ok) => Response::Neighbor {
+            from,
+            toward,
+            pane,
+            relayed,
+        },
         Some(refusal) => refusal,
     }
+}
+
+/// Send `FocusEdge` to each attached client focused on `pane`; whether any
+/// was.
+fn focus_edge(hub: &Hub, pane: PaneId, toward: Toward) -> bool {
+    let bytes = encode_json(&Event::FocusEdge { pane, toward });
+    let mut doomed = Vec::new();
+    let mut sent = false;
+    {
+        let clients = hub.clients();
+        for (cid, client) in clients.iter().filter(|(_, c)| c.focused == Some(pane)) {
+            match client.tx.try_send(bytes.clone()) {
+                Ok(()) => sent = true,
+                Err(_) => doomed.push(*cid),
+            }
+        }
+    }
+    disconnect(hub, doomed);
+    sent
 }
 
 /// The pane a directional request starts from: `from`, else the attached

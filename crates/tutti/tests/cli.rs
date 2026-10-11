@@ -761,7 +761,8 @@ fn run_from_a_pane_names_its_caller_in_its_own_session_only() {
 }
 
 /// `pane focus --direction` from inside a pane starts from it and prints the
-/// bare id it moved to; at an edge it says `no pane <direction> of <id>` on
+/// bare id it moved to; at an edge the attached TUI took on it prints nothing
+/// and exits 0; at any other edge it says `no pane <direction> of <id>` on
 /// stderr and exits 1 — the contract smart-splits.nvim's backend reads.
 #[test]
 fn pane_focus_by_direction_prints_the_pane_or_exits_1_at_an_edge() {
@@ -784,10 +785,25 @@ fn pane_focus_by_direction_prints_the_pane_or_exits_1_at_an_edge() {
             from: PaneId(4),
             toward: Toward::Left,
             pane: Some(PaneId(2)),
+            relayed: false,
         },
     );
     assert!(output.status.success());
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "2\n");
+
+    let output = run_scenario(
+        "focusrelay",
+        &["pane", "focus", "--direction", "left", "--from", "3"],
+        |_| {},
+        Response::Neighbor {
+            from: PaneId(3),
+            toward: Toward::Left,
+            pane: None,
+            relayed: true,
+        },
+    );
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty() && output.stderr.is_empty());
 
     let output = run_scenario(
         "focusedge",
@@ -805,6 +821,7 @@ fn pane_focus_by_direction_prints_the_pane_or_exits_1_at_an_edge() {
             from: PaneId(3),
             toward: Toward::Up,
             pane: None,
+            relayed: false,
         },
     );
     assert_eq!(output.status.code(), Some(1));

@@ -15,7 +15,7 @@ use ratatui::text::Span;
 use tutti_core::{
     AgentKind, AgentState, ApprovalDecision, Checkpoint, DIFF_RANGE, Direction, Event, FileStat,
     Frame as WireFrame, Layout, NOTES_CAP, Note, NoteKind, PaneDims, PaneId, PaneInfo, Request,
-    Response, RestoreSummary, TabId, TabView, Tagged, WorkspaceId, WorkspaceView,
+    Response, RestoreSummary, TabId, TabView, Tagged, Toward, WorkspaceId, WorkspaceView,
     prompt_fingerprint, prompt_rows,
 };
 
@@ -712,7 +712,7 @@ impl App {
     fn handle_control(&mut self, json: &[u8]) -> Vec<WireFrame> {
         let mut frames = Vec::new();
         if let Ok(event) = serde_json::from_slice::<Event>(json) {
-            self.handle_event(event);
+            frames = self.handle_event(event);
         } else if let Ok(Tagged { req, body }) = serde_json::from_slice::<Tagged<Response>>(json) {
             frames = self.handle_response(req, body);
         }
@@ -738,7 +738,7 @@ impl App {
         frames
     }
 
-    fn handle_event(&mut self, event: Event) {
+    fn handle_event(&mut self, event: Event) -> Vec<WireFrame> {
         match event {
             Event::LayoutChanged { workspaces } => self.set_view(workspaces),
             Event::StateChanged { pane, from, to } => {
@@ -801,8 +801,22 @@ impl App {
                     self.focused = Some(pane);
                 }
             }
+            // The program holding the direct keys in the focused pane (an
+            // editor at its own edge) found no pane that way: the move goes
+            // on as the key itself would take it here.
+            Event::FocusEdge { pane, toward } => {
+                if self.mode == Mode::Terminal && self.focused == Some(pane) {
+                    return self.focus_or_tab(match toward {
+                        Toward::Left => FocusDir::Left,
+                        Toward::Right => FocusDir::Right,
+                        Toward::Up => FocusDir::Up,
+                        Toward::Down => FocusDir::Down,
+                    });
+                }
+            }
             Event::PaneOutput { .. } | Event::Snapshot { .. } => {}
         }
+        Vec::new()
     }
 
     /// Apply `patch` to `pane`'s entry in the workspace view — what the sidebar
@@ -5768,6 +5782,39 @@ mod tests {
         );
         assert_eq!(app.mode, Mode::Sidebar);
         assert_eq!(app.active_tab, Some(TabId(1)), "the tab is unchanged");
+    }
+
+    /// An editor holding the direct keys hands its edge back through the
+    /// daemon (`FocusEdge`), and the move goes on as the key itself would
+    /// take it — left into the sidebar, right on to the next tab — but only
+    /// for the pane shown focused, and only from the panes.
+    #[test]
+    fn a_focus_edge_goes_on_as_the_direct_key_would() {
+        let edge = |pane, toward| {
+            let event = Event::FocusEdge {
+                pane: PaneId(pane),
+                toward,
+            };
+            WireFrame::Control(serde_json::to_vec(&event).unwrap())
+        };
+        let mut app = App::new();
+        attach_with(&mut app, view_two_tabs());
+        app.sync_sizes(Rect::new(0, 0, 100, 24));
+        assert!(app.handle_frame(edge(9, Toward::Left)).is_empty());
+        assert_eq!(app.mode, Mode::Terminal, "another pane's edge");
+        assert!(app.handle_frame(edge(1, Toward::Up)).is_empty());
+        assert_eq!(app.mode, Mode::Terminal, "an upper edge goes nowhere");
+        assert!(app.handle_frame(edge(1, Toward::Left)).is_empty());
+        assert_eq!(app.mode, Mode::Sidebar);
+        assert!(app.handle_frame(edge(1, Toward::Right)).is_empty());
+        assert_eq!(app.mode, Mode::Sidebar, "a late edge leaves the sidebar be");
+        app.on_key(ctrl('l'));
+        assert_eq!(
+            app.handle_frame(edge(1, Toward::Right)),
+            vec![control(&Request::TabSelect { id: TabId(2) })],
+            "no changes panel: on to the next tab"
+        );
+        assert_eq!(app.active_tab, Some(TabId(2)));
     }
 
     #[test]

@@ -228,8 +228,11 @@ pub enum Request {
     },
     /// Focus the pane `toward` of `from` in its tab (`Layout::neighbor`, with
     /// `wrap`) as `PaneFocus` would, answered with `Response::Neighbor` —
-    /// whose `pane` is `None` at an edge, nothing focused. `from` defaults to
-    /// the attached client's focused pane; Error when there is none.
+    /// whose `pane` is `None` at an edge, nothing focused. At a left or right
+    /// edge without `wrap`, an attached client focused on `from` is handed
+    /// the move (`Event::FocusEdge`), as its own direct key would take it.
+    /// `from` defaults to the attached client's focused pane; Error when
+    /// there is none.
     PaneFocusToward {
         #[serde(default)]
         from: Option<PaneId>,
@@ -768,11 +771,14 @@ pub enum Response {
         id: PaneId,
     },
     /// A `PaneFocusToward` answered: the pane it started `from`, and the one
-    /// `toward` it now focused — `None` at an edge, where nothing moved.
+    /// `toward` it now focused — `None` at an edge, where nothing moved here.
+    /// `relayed`: at that edge an attached client was handed the move.
     Neighbor {
         from: PaneId,
         toward: Toward,
         pane: Option<PaneId>,
+        #[serde(default)]
+        relayed: bool,
     },
     /// A `View` answered: every workspace, its tabs, layouts and panes.
     View {
@@ -980,6 +986,14 @@ pub enum Event {
     /// switching workspace and tab. Never sent for a client's own focus.
     PaneFocused {
         pane: PaneId,
+    },
+    /// A `PaneFocusToward` found no pane `toward` (left or right) of `pane`,
+    /// the pane this client shows focused: the client takes the move on as
+    /// its own direct key would at that edge — into a panel, or on to the
+    /// next tab. Sent only to such a client.
+    FocusEdge {
+        pane: PaneId,
+        toward: Toward,
     },
     /// The whole session as a watcher (`Request::Watch`) sees it, replacing
     /// the previous snapshot: every pane flat, in sidebar order.
@@ -1630,11 +1644,12 @@ mod tests {
                 cwd: None,
             }],
         });
-        for pane in [Some(PaneId(3)), None] {
+        for (pane, relayed) in [(Some(PaneId(3)), false), (None, false), (None, true)] {
             roundtrip(&Response::Neighbor {
                 from: PaneId(2),
                 toward: Toward::Right,
                 pane,
+                relayed,
             });
         }
         roundtrip(&Response::View {
@@ -1778,6 +1793,10 @@ mod tests {
         });
         roundtrip(&Event::NotesChanged { notes: Vec::new() });
         roundtrip(&Event::PaneFocused { pane: PaneId(3) });
+        roundtrip(&Event::FocusEdge {
+            pane: PaneId(3),
+            toward: Toward::Left,
+        });
         roundtrip(&sample_snapshot());
         roundtrip(&Event::Snapshot {
             session: "tutti".into(),
@@ -2003,6 +2022,11 @@ mod tests {
                 wrap: false,
             }
         );
+        // Its answer from before `relayed` existed handed nothing on.
+        let edge: Response =
+            serde_json::from_str(r#"{"type":"neighbor","from":2,"toward":"left","pane":null}"#)
+                .unwrap();
+        assert!(matches!(edge, Response::Neighbor { relayed: false, .. }));
         // ...and before `checkpoints` existed, to no checkpoints.
         assert!(pane.checkpoints.is_empty());
         // A checkpoint from before `prompt` existed lists as its label.

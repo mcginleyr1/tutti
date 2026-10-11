@@ -442,8 +442,11 @@ enum PaneAction {
         message: Option<String>,
     },
     /// Mark a pane focused (records it active and clears its Done badge) —
-    /// or, with `--direction`, the pane beside one, printing its id. At an
-    /// edge that says `no pane <direction> of <id>` on stderr and exits 1.
+    /// or, with `--direction`, the pane beside one, printing its id. At a
+    /// left or right edge the attached TUI showing that pane takes the move on
+    /// as Ctrl+h/l would (sidebar, changes panel, next tab) and nothing
+    /// prints; at any other edge it says `no pane <direction> of <id>` on
+    /// stderr and exits 1.
     Focus {
         /// The pane to focus.
         #[arg(
@@ -1605,8 +1608,16 @@ fn emit_project(response: Response, json: bool) -> i32 {
 
 fn emit(response: Response, json: bool) -> i32 {
     let is_error = matches!(response, Response::Error { .. });
-    // A directional focus at an edge exits 1 with `--json` too.
-    let edge = matches!(response, Response::Neighbor { pane: None, .. });
+    // A directional focus at an edge no attached TUI took on exits 1 with
+    // `--json` too.
+    let edge = matches!(
+        response,
+        Response::Neighbor {
+            pane: None,
+            relayed: false,
+            ..
+        }
+    );
     if json {
         let text = serde_json::to_string(&response).expect("Response serializes");
         if is_error {
@@ -1662,10 +1673,17 @@ fn emit(response: Response, json: bool) -> i32 {
             println!("{pane}");
             0
         }
+        // The attached TUI took the move on: into a panel, or another tab.
+        Response::Neighbor {
+            pane: None,
+            relayed: true,
+            ..
+        } => 0,
         Response::Neighbor {
             from,
             toward,
             pane: None,
+            relayed: false,
         } => {
             eprintln!("no pane {toward} of {from}");
             1

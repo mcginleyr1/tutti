@@ -539,7 +539,10 @@ In order; each lands its TUI path in the same wave as its verbs.
      the pane, `Request::View`).
    - `pane focus|resize --direction`, from `--from`, else `$TUTTI_PANE`, else
      the attached TUI's focus, on `Layout::neighbor`: the TUI's rule on the
-     unit square, `--wrap` inside the tab.
+     unit square, `--wrap` inside the tab. At a left or right edge of the pane
+     an attached TUI shows focused, the TUI is handed the move
+     (`Event::FocusEdge`) and goes on as its own Ctrl+h/l would (sidebar,
+     changes panel, next tab); the CLI exits 0 (`Neighbor.relayed`).
    - `editors/nvim` (user vars through `nvim_ui_send`, `navigate` past
      Neovim's edge, a smart-splits.nvim 3.0.0 backend, `:TuttiAgents`) and
      `editors/emacs/tutti.el` (`tutti-mode`, `tutti-windmove-*`, a live
@@ -574,8 +577,6 @@ In order; each lands its TUI path in the same wave as its verbs.
      editor terminals keep native scrollback; detach under the kitty keyboard
      protocol; escape-time for an Alt prefix; a switching read's other bytes
      (queries, a bell) are lost to the redraw;
-   - an editor holding the keys loses the TUI's edge moves (sidebar, next tab):
-     `pane focus` at an edge could hand the move to the attached TUI;
    - clicks and drags never reach a pane program, only the wheel;
    - `cwd` in watch snapshots; `pane list` has no workspace and watch no
      approval, so the plugins read one from each;

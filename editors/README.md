@@ -35,9 +35,12 @@ Past the editor's edge, the plugins call the CLI, with `--from` set to the
 editor's own `$TUTTI_PANE`:
 
 - `tutti pane focus --direction <left|right|up|down> --from <pane> [--wrap]`
-  exits 0 and prints the new pane's id when focus moved. At an edge it exits
-  1 with `no pane <direction> of <pane>`. `--wrap` takes the farthest pane on
-  the other side instead. Focus stays within the pane's tab.
+  exits 0 and prints the new pane's id when focus moved. At a left or right
+  edge of the pane the attached TUI shows focused, the TUI goes on as its own
+  `Ctrl+h`/`Ctrl+l` would — into the sidebar or the changes panel, else to the
+  previous or next tab — and the command exits 0, printing nothing. At any
+  other edge it exits 1 with `no pane <direction> of <pane>`. `--wrap` takes
+  the farthest pane on the other side of the tab instead.
 - `tutti pane resize --direction <left|right|up|down> [--amount <ratio>]
   --from <pane>` moves the nearest split border that way, exactly as
   `Alt+h/j/k/l` do. The amount is a fraction of the split, 0.05 by default.

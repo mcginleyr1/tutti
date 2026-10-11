@@ -486,9 +486,13 @@ from the TUI.
 --direction …` give an editor's split navigation (smart-splits.nvim and the
 like) tutti's side of the move. Both start from `--from`, else the calling
 pane, else the attached TUI's focused pane. A focus prints the pane it moved
-to; at an edge it prints `no pane <direction> of <id>` on stderr and exits 1,
-unless `--wrap` goes round to the farthest pane on the other side, level with
-it. Focus stays inside the tab. A resize moves the nearest split border that
+to. At a left or right edge of the pane the attached TUI shows focused, the
+TUI takes the move on as `Ctrl+h`/`Ctrl+l` would — into the sidebar or the
+changes panel, else to the previous or next tab — and the command prints
+nothing and exits 0, so an editor's edge leads where tutti's own keys do. At
+any other edge it prints `no pane <direction> of <id>` on stderr and exits 1,
+unless `--wrap` goes round to the farthest pane on the other side of the tab,
+level with it. A resize moves the nearest split border that
 way by `--amount` of the split (0.05, the `Alt+h/j/k/l` step). See
 [Known limitations](#known-limitations) for what an editor in a pane does not
 get yet.
@@ -1494,7 +1498,7 @@ tutti run [--workspace <id> | --dir <path>] [--title <t>] [--sandbox <profile>] 
 tutti pane run [--tab <id>] [--ephemeral] [--sandbox <profile>] -- <cmd...>
 tutti pane split <pane> right|down
 tutti pane list | kill <pane> | focus <pane>   # focus: the attached TUI jumps to the pane
-tutti pane focus --direction left|right|up|down [--from <pane>] [--wrap]  # focus the pane beside one (default: this pane, else the TUI's) and print it; at an edge `no pane <dir> of <id>`, exit 1
+tutti pane focus --direction left|right|up|down [--from <pane>] [--wrap]  # focus the pane beside one (default: this pane, else the TUI's) and print it; at the TUI's focused pane's left/right edge the TUI moves on (sidebar, panel, tab), exit 0; else `no pane <dir> of <id>`, exit 1
 tutti pane resize --direction left|right|up|down [--amount <f>] [--from <pane>]  # move its split's border that way, as Alt+h/j/k/l (default step 0.05 of the split)
 tutti pane attach <pane>             # show one pane in this terminal, drawn by the terminal itself; prefix d detaches (never starts a daemon)
 tutti pane rename <pane> <title>
@@ -1584,7 +1588,4 @@ tutti is alpha; PLAN.md tracks what is open.
   `FocusGained`/`FocusLost` never fire; `tutti pane attach` passes the
   underline styles and the cursor shape through to your terminal. Clicks and
   drags in a pane stay tutti's (focus, select, copy): only
-  the wheel reaches an editor that asked for the mouse. While an editor holds
-  the direct keys, its edge is the tab's: `Ctrl+h` from the leftmost pane does
-  not step into the sidebar, nor `Ctrl+l` on to the next tab — the prefix
-  still does.
+  the wheel reaches an editor that asked for the mouse.

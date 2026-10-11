@@ -4215,7 +4215,12 @@ async fn directional_focus_and_resize_start_from_the_named_or_attached_pane() {
     };
     let right = pane_id(control.request(split).await);
     let focus = |from, toward, wrap| Request::PaneFocusToward { from, toward, wrap };
-    let moved = |from, toward, pane| Response::Neighbor { from, toward, pane };
+    let moved = |from, toward, pane| Response::Neighbor {
+        from,
+        toward,
+        pane,
+        relayed: false,
+    };
     assert!(
         matches!(
             control.request(focus(None, Toward::Right, false)).await,
@@ -4269,6 +4274,48 @@ async fn directional_focus_and_resize_start_from_the_named_or_attached_pane() {
     assert!(
         (ratio - 0.45).abs() < 1e-3,
         "left moves the border left: {ratio}"
+    );
+
+    // Once the viewer shows `right`, its right edge is the viewer's to take
+    // on — sideways only, and never instead of a wrap.
+    viewer.send(&Request::PaneFocus { pane: right }).await;
+    read_until_control(&mut viewer, |r: &Response| *r == Response::Ok).await;
+    assert_eq!(
+        control
+            .request(focus(Some(right), Toward::Right, false))
+            .await,
+        Response::Neighbor {
+            from: right,
+            toward: Toward::Right,
+            pane: None,
+            relayed: true,
+        }
+    );
+    read_until_control(&mut viewer, |e: &Event| {
+        *e == Event::FocusEdge {
+            pane: right,
+            toward: Toward::Right,
+        }
+    })
+    .await;
+    assert_eq!(
+        control.request(focus(Some(right), Toward::Up, false)).await,
+        moved(right, Toward::Up, None),
+        "an upper edge stays an edge"
+    );
+    assert_eq!(
+        control
+            .request(focus(Some(left), Toward::Left, false))
+            .await,
+        moved(left, Toward::Left, None),
+        "nobody shows `left` focused"
+    );
+    assert_eq!(
+        control
+            .request(focus(Some(right), Toward::Right, true))
+            .await,
+        moved(right, Toward::Right, Some(left)),
+        "a wrap still wraps"
     );
 
     server.stop().await;
