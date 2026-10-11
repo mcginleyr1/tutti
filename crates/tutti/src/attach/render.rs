@@ -4408,7 +4408,7 @@ mod tests {
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let footer = row_text(terminal.backend().buffer(), 19);
         assert!(
-            footer.contains("enter diff  d full diff  r restore turn  j/k move  esc back"),
+            footer.contains("enter diff  e edit  d full diff  r restore turn  j/k move  esc back"),
             "{footer:?}"
         );
     }

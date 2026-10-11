@@ -30,6 +30,7 @@ use crate::config::{
     self, Action, ChangesAction, Config, PrefixAction, RESIZE_DELTA, SidebarAction,
     SidebarVisibility,
 };
+use crate::editor;
 use crate::integrations::{self, Dirs, Integration, Plan, Status};
 use crate::issues::{self, Issue};
 
@@ -375,6 +376,9 @@ pub struct App {
     /// The fetch an opening panel asks of the event loop: its generation and
     /// the project directory the sources run in.
     issues_fetch: Option<(u64, PathBuf)>,
+    /// The file the changes panel's `e` asks the event loop to hand to an
+    /// editor pane.
+    editor_job: Option<EditorJob>,
     /// The project the panel lists for and deploys into, and whether it is
     /// a jj repo — so a deploy can give the issue its own workspace — probed
     /// once as the panel opens.
@@ -520,6 +524,7 @@ impl App {
             issues: Vec::new(),
             issues_generation: 0,
             issues_fetch: None,
+            editor_job: None,
             issues_project: None,
             issues_jj: false,
             issues_query: String::new(),
@@ -2110,8 +2115,9 @@ impl App {
     /// Keys while the changed-files panel is focused, dispatched through
     /// `config::CHANGES_TABLE` (which the help overlay and bottom-bar hint
     /// render): vim/less list motion over the files and then the turns,
-    /// `enter` opens the highlighted file's or turn's diff, `d` the whole diff,
-    /// `r` asks to restore the highlighted turn. The panel is the content's
+    /// `enter` opens the highlighted file's or turn's diff, `e` the file in the
+    /// workspace's editor pane, `d` the whole diff, `r` asks to restore the
+    /// highlighted turn. The panel is the content's
     /// right edge, and its edges behave like a pane's: `h`/`esc`/`q` and the
     /// focus-left binding step back into the pane area keeping its focus; `l`
     /// and the focus-right binding wrap on to the next tab.
@@ -2155,6 +2161,10 @@ impl App {
                     Some(turn) => self.open_turn_diff(&turn),
                     None => self.open_selected_file_diff(),
                 };
+            }
+            ChangesAction::Edit => {
+                self.open_in_editor();
+                return Vec::new();
             }
             ChangesAction::Restore => {
                 self.confirm_restore();
@@ -2229,6 +2239,73 @@ impl App {
             ephemeral: true,
             sandbox: None,
         })]
+    }
+
+    /// Hand the highlighted file to the active workspace's editor pane — the
+    /// one `tutti edit` picks, the focused pane's tab first — for the event
+    /// loop to open off its thread (`take_editor_job`). A turn row names no
+    /// one file.
+    fn open_in_editor(&mut self) {
+        let Some(file) = self
+            .changed_files()
+            .get(self.diff_selected)
+            .map(|f| f.path.clone())
+        else {
+            self.set_status("select a file to open".into());
+            return;
+        };
+        let Some((id, dir)) = self.active_workspace().map(|w| (w.id, w.dir.clone())) else {
+            return;
+        };
+        let found = editor::pane(&self.workspaces, self.focused, Some(id)).map(|(name, found)| {
+            let found = found.map(|(pane, editor)| (pane, editor.to_string()));
+            (name.to_string(), found)
+        });
+        match found {
+            Ok((_, Some((pane, editor)))) => {
+                self.editor_job = Some(EditorJob {
+                    pane,
+                    editor,
+                    dir,
+                    file,
+                })
+            }
+            Ok((name, None)) => self.set_status(format!("error: no editor pane in {name}")),
+            Err(err) => self.set_status(format!("error: {err:#}")),
+        }
+    }
+
+    /// The file `e` asked to hand to an editor pane, for the event loop to
+    /// open off its thread; the outcome comes back through `editor_opened`.
+    pub fn take_editor_job(&mut self) -> Option<EditorJob> {
+        self.editor_job.take()
+    }
+
+    /// Land an editor pane's answer for `file`: once it has the file, jump to
+    /// the pane as a sidebar jump does and say so; else the editor's own
+    /// complaint, in the error accent. A pane gone meanwhile is left be.
+    pub fn editor_opened(
+        &mut self,
+        pane: PaneId,
+        file: &str,
+        opened: Result<(), String>,
+    ) -> Vec<WireFrame> {
+        if let Err(err) = opened {
+            self.set_status(format!("error: {err}"));
+            return Vec::new();
+        }
+        let tab = self
+            .all_tabs()
+            .into_iter()
+            .find(|t| t.layout.as_ref().is_some_and(|l| l.contains(pane)))
+            .map(|t| t.id);
+        let title = self.panes.get(&pane).map(|s| s.info.title.clone());
+        let (Some(tab), Some(title)) = (tab, title) else {
+            return Vec::new();
+        };
+        let frames = self.jump_to(tab, Some(pane));
+        self.set_status(format!("opened {file} in {title}"));
+        frames
     }
 
     /// Open the restore confirm for the highlighted turn: `y` restores the
@@ -4515,6 +4592,31 @@ impl TabChip {
     pub fn width(&self) -> u16 {
         let dot = if self.badge.is_some() { 2 } else { 0 };
         self.label.chars().count() as u16 + dot
+    }
+}
+
+/// A file the changes panel hands to an editor pane (`App::take_editor_job`):
+/// the pane, its `TUTTI_EDITOR` value, the workspace's directory, and the
+/// file's repo-root-relative path as the panel lists it.
+#[derive(Debug, PartialEq)]
+pub struct EditorJob {
+    pub pane: PaneId,
+    editor: String,
+    dir: PathBuf,
+    pub file: String,
+}
+
+impl EditorJob {
+    /// Open the file in the editor — blocking, so the event loop runs it on a
+    /// thread. The workspace may sit below the repo root the panel's paths
+    /// start from: the nearest directory up holding `.jj`.
+    pub fn open(&self) -> Result<(), String> {
+        let root = self
+            .dir
+            .ancestors()
+            .find(|d| d.join(".jj").exists())
+            .unwrap_or(&self.dir);
+        editor::open(&self.editor, &root.join(&self.file), None, None).map_err(|e| format!("{e:#}"))
     }
 }
 
@@ -7012,6 +7114,83 @@ mod tests {
             app.mode,
             Mode::Terminal,
             "opening the diff leaves the panel"
+        );
+    }
+
+    /// `e` on a file row hands it to the active workspace's editor pane — the
+    /// focused pane's tab first — through the event loop, which jumps there
+    /// and says so once the editor has it. No editor pane, or an editor that
+    /// refuses, lands in the band's error accent.
+    #[test]
+    fn e_hands_the_highlighted_file_to_the_workspaces_editor_pane() {
+        assert_eq!(
+            config::panel_action(config::CHANGES_TABLE, plain('e')),
+            Some(ChangesAction::Edit)
+        );
+        let editor = |id, title: &str, value: &str| {
+            let mut info = crate::attach::fixtures::pane(id, title, None, AgentState::Idle);
+            info.user_vars.insert("TUTTI_EDITOR".into(), value.into());
+            info
+        };
+        let mut view = view_with_changes();
+        view[0].tabs = vec![
+            tab(
+                1,
+                "1",
+                true,
+                split(Direction::Horizontal, leaf(1), leaf(2)),
+                vec![shell(1), editor(2, "nvim", "nvim /tmp/n.sock")],
+            ),
+            tab(2, "2", false, leaf(3), vec![editor(3, "emacs", "emacs")]),
+        ];
+        let mut app = App::new();
+        attach_with(&mut app, view);
+        app.sync_sizes(Rect::new(0, 0, 140, 40));
+        let status = |app: &App| app.status.as_ref().map(|(text, _)| text.clone());
+        app.on_key(ctrl('b'));
+        app.on_key(plain('f'));
+        app.on_key(plain('j'));
+        assert!(
+            app.on_key(plain('e')).is_empty(),
+            "the editor runs off the loop"
+        );
+        assert_eq!(
+            app.take_editor_job(),
+            Some(EditorJob {
+                pane: PaneId(2),
+                editor: "nvim /tmp/n.sock".into(),
+                dir: PathBuf::from("/tmp/w"),
+                file: "crates/deep/dir/mod.rs".into(),
+            }),
+            "the focused pane's tab first"
+        );
+        assert_eq!(app.take_editor_job(), None, "a job is taken once");
+
+        let file = "crates/deep/dir/mod.rs";
+        assert_eq!(
+            app.editor_opened(PaneId(2), file, Ok(())),
+            vec![control(&Request::TabSelect { id: TabId(1) })]
+        );
+        assert_eq!((app.focused, app.mode), (Some(PaneId(2)), Mode::Terminal));
+        assert_eq!(
+            status(&app).as_deref(),
+            Some(&*format!("opened {file} in nvim"))
+        );
+        let refused = "nvim could not open /tmp/w/x: no server";
+        assert!(
+            app.editor_opened(PaneId(2), "x", Err(refused.into()))
+                .is_empty()
+        );
+        assert_eq!(status(&app), Some(format!("error: {refused}")));
+
+        layout_changed(&mut app, view_with_changes());
+        app.on_key(ctrl('b'));
+        app.on_key(plain('f'));
+        app.on_key(plain('e'));
+        assert_eq!(app.take_editor_job(), None);
+        assert_eq!(
+            status(&app).as_deref(),
+            Some("error: no editor pane in api")
         );
     }
 

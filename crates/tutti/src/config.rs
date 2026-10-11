@@ -255,6 +255,8 @@ pub enum ChangesAction {
     Bottom,
     /// Page the highlighted file's or turn's diff.
     Open,
+    /// Open the highlighted file in the workspace's editor pane.
+    Edit,
     /// Page the whole workspace's diff.
     FullDiff,
     /// Ask to restore the working copy to the highlighted turn.
@@ -301,11 +303,12 @@ pub const SIDEBAR_TABLE: &[PanelBinding<SidebarAction>] = &[
     hint(KeyCode::Esc, SidebarAction::Back, "back"),
 ];
 
-/// The changes panel's keys: the diff and restore verbs, vim/less list motion
-/// over the files and then the turns, and the edges a pane has — `h`/`q`/`esc`
-/// back into the panes, `l` on to the next tab.
+/// The changes panel's keys: the diff, editor and restore verbs, vim/less list
+/// motion over the files and then the turns, and the edges a pane has —
+/// `h`/`q`/`esc` back into the panes, `l` on to the next tab.
 pub const CHANGES_TABLE: &[PanelBinding<ChangesAction>] = &[
     hint(KeyCode::Enter, ChangesAction::Open, "diff"),
+    hint(KeyCode::Char('e'), ChangesAction::Edit, "edit"),
     hint(KeyCode::Char('d'), ChangesAction::FullDiff, "full diff"),
     hint(KeyCode::Char('r'), ChangesAction::Restore, "restore turn"),
     hint(KeyCode::Char('j'), ChangesAction::Down, "move"),

@@ -29,7 +29,7 @@ use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
 };
 use ratatui::crossterm::execute;
-use tutti_core::Request;
+use tutti_core::{PaneId, Request};
 
 use connection::Connection;
 
@@ -90,8 +90,10 @@ fn event_loop(
     let mut dirty = true;
     let mut whichkey = false;
     let mut spinner = app.spinner_frame();
-    // The issues panel's fetches report back from their threads.
+    // The issues panel's fetches report back from their threads, and so do
+    // the editors the changes panel hands files to.
     let (issues_tx, issues_rx) = std::sync::mpsc::channel();
+    let (editor_tx, editor_rx) = std::sync::mpsc::channel::<(PaneId, String, Result<(), String>)>();
 
     loop {
         match conn.drain() {
@@ -109,6 +111,12 @@ fn event_loop(
         }
         while let Ok((generation, index, fetched)) = issues_rx.try_recv() {
             app.issues_loaded(generation, index, fetched);
+            dirty = true;
+        }
+        while let Ok((pane, file, opened)) = editor_rx.try_recv() {
+            for frame in app.editor_opened(pane, &file, opened) {
+                let _ = conn.send(&frame);
+            }
             dirty = true;
         }
 
@@ -169,6 +177,14 @@ fn event_loop(
                     let _ = tx.send((generation, index, fetched));
                 });
             }
+        }
+        // So does the editor's own CLI, which `e` in the changes panel runs.
+        if let Some(job) = app.take_editor_job() {
+            let tx = editor_tx.clone();
+            std::thread::spawn(move || {
+                let opened = job.open();
+                let _ = tx.send((job.pane, job.file, opened));
+            });
         }
 
         // The mouse-toggle key releases/re-grabs capture so the terminal's own
