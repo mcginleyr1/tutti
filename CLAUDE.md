@@ -87,6 +87,33 @@ cargo fmt --check
 - **A TUI request whose reply drives a follow-up goes out through
   `App::follow`** (tagged with a `req`), never behind a bare flag — an
   unrelated refusal would cancel it (it did, to a merge's cleanup offer).
+- **Terminal-query answers go out through the pane's answer thread**
+  (`tutti-pty-answers`, pty.rs): the reader `try_send`s each read's answers
+  after releasing the parser lock, and nothing writes the pty from the reader
+  or under that lock. A raw-mode program that stops reading its input blocks a
+  pty write; a reader blocked there never drains the program's output, and the
+  pane deadlocks on something as plain as `cat`ting a file of `ESC[6n`.
+- **Taps are fed in the same parser-lock hold as `Term::process`, minus what
+  the daemon answered or owns** (`Term::taps`, `CSI_OWNED`, `OSC_QUERIES`; it
+  owns modes 2031 and modifyOtherKeys, which never reach a stream): a stream's
+  snapshot and its first raw read come from one hold, so nothing is lost or
+  repeated, and a resize hands taps a fresh snapshot in the hold that resizes.
+  An answered query that reached a raw stream would be answered again by the
+  client's terminal, into the pane; an unanswered one must reach it. A tap
+  runs on the reader thread under that lock: it never blocks, waits or takes
+  another lock — it `try_send`s.
+- **A prompt start (OSC 133;A) clears `TUTTI_KEYS` and `TUTTI_EDITOR`**
+  (`broadcast_tick`, server.rs): the only thing that hands the direct keys back
+  after an editor is `kill -9`'d. A new user var that claims something of the
+  pane belongs in that list.
+- **Every spawn stamps `COLORTERM=truecolor` in `spawn_into_tab`**
+  (session.rs), beside `TUTTI_PANE`/`TUTTI_SESSION`: Neovim's `termguicolors`
+  and Emacs's 24-bit colour read it, not `TERM`. A spawn that bypassed the
+  funnel would give its pane 256 colours.
+- **User vars are never persisted** (`PaneInfo.user_vars`): they describe a
+  running program — an nvim server socket, a claim on the keys — that a
+  restore does not bring back. A restored pane starts with none; never write
+  them into the layout save.
 
 ## Product vocabulary and rules
 
@@ -111,10 +138,11 @@ cargo fmt --check
 - All colour goes through `attach/theme.rs` (`theme::current()`, activated
   per draw): never write a `Color::…` literal in render code outside that file.
   Three palettes: `terminal` (default), `dark`, `light` — `theme = …` in config,
-  an explicit choice. The one detection is `theme::detect_terminal_background`
-  (OSC 11 via terminal-colorsaurus, once at attach, before crossterm owns
-  input): a light terminal selects with ANSI 7 instead of ANSI 8, because some
-  light schemes (Ghostty "Primary") map ANSI 8 to pure black.
+  an explicit choice. The one detection is `theme::host_colors` (OSC 10/11 via
+  terminal-colorsaurus, once at attach, before crossterm owns input — the
+  colours the daemon then answers panes' colour queries with): a light terminal
+  selects with ANSI 7 instead of ANSI 8, because some light schemes (Ghostty
+  "Primary") map ANSI 8 to pure black.
 - Dim by default; ONE accent marks the focused/active thing (focused pane frame
   and title, the focused panel's header and the rail down its edge, the `▎`
   gutter + name chip on a selected row); red/yellow/green on state dots, the working spinner, the

@@ -333,8 +333,11 @@ program's `?1049l` would land the stream on the shell's screen. So the CLI keeps
 mirror of the pane (fed every frame, checked after each `h`/`l` byte, where a screen
 switch ends), and a read that switches screens — or resets the terminal with `ESC c` — is
 replaced by a redraw from the mirror. Leaving vim brings back the pane's shell screen,
-drawn from the mirror; all other output goes through untouched. On exit it turns off what
-the pane may have turned on in the terminal (mouse reporting, focus events, bracketed
+drawn from the mirror; all other output goes through untouched. What else a switching
+read held goes with it: a program's startup queries usually share the read that enters
+its alternate screen (nvim 0.12's kitty keyboard query `CSI ? u` and its DECRQMs do), so
+they never reach the terminal and time out as they would under the TUI. On exit it turns
+off what the pane may have turned on in the terminal (mouse reporting, focus events, bracketed
 paste, cursor keys and keypad, cursor style and visibility, colours) and pops the title
 it pushed. The cost: inside the CLI the pane has no native scrollback — the alternate
 screen keeps none.

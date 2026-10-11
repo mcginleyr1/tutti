@@ -137,6 +137,17 @@ To follow a busy agent without rereading its whole history, keep the
 one. The live screen comes back every time, because it is not final until it
 scrolls.
 
+When the pane runs a shell with tutti's shell integration, read just the last
+finished command's output instead of the screen; its exit code comes on stderr
+as `exit: N`:
+
+```sh
+tutti pane read 8 --last-output
+```
+
+A pane without the integration answers "no finished command"; read its screen
+instead.
+
 ## Answer a blocked agent
 
 Answer through the guard, in this order:
@@ -187,6 +198,18 @@ tutti pane restore 7 3                # put the working copy back the way turn 3
 tutti checkpoints a jj workspace at the end of every agent turn. A restore is
 refused while the agent is mid-turn (`--force` overrides) and first saves the
 state it replaces as a new checkpoint, so it can be undone the same way.
+
+To show your user a spot in the code, open it in their editor pane, a Neovim
+or Emacs that advertises itself to tutti:
+
+```sh
+tutti edit src/lib.rs:42
+```
+
+It opens the file at that line and moves their focus to the editor, so do it
+only when you are asking them to look. With no editor pane in your workspace
+it exits 1 (`no editor pane in workspace …`); name the file and line in your
+reply instead.
 
 ## Merge and clean up
 

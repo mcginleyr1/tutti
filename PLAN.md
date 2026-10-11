@@ -501,7 +501,7 @@ Runnable now that items 1 and 3 have landed (`workspace add`, `run
 --workspace`, `pane wait --until done,blocked`, `workspace diff --stat`); open
 until it has been run for real against live agents.
 
-### Next waves (as of 2026-10-10)
+### Next waves (as of 2026-10-11)
 
 In order; each lands its TUI path in the same wave as its verbs.
 
@@ -530,6 +530,59 @@ In order; each lands its TUI path in the same wave as its verbs.
    and `tutti notes` (Phase 3 item 3).
 8. ✅ **Issue dispatch** — `[[issues]]` sources behind prefix `I` and `tutti
    issue list|deploy` (Phase 4 item 11).
+9. ✅ **Editor interop (wave 7)** — Neovim and Emacs in panes, wire rev 10:
+   - OSC 1337 user vars on `PaneInfo.user_vars`, in `pane list --json` and
+     `watch` (16 a pane, names `[A-Za-z0-9_]{1,64}`, values ≤ 1 KiB, empty
+     unsets, never persisted). `TUTTI_KEYS=pane` hands the direct chords to the
+     pane; `TUTTI_EDITOR` names where `tutti edit` and the changes panel's `e`
+     open a file, through the editor's own remote CLI (the daemon only names
+     the pane, `Request::View`).
+   - `pane focus|resize --direction`, from `--from`, else `$TUTTI_PANE`, else
+     the attached TUI's focus, on `Layout::neighbor`: the TUI's rule on the
+     unit square, `--wrap` inside the tab.
+   - `editors/nvim` (user vars through `nvim_ui_send`, `navigate` past
+     Neovim's edge, a smart-splits.nvim 3.0.0 backend, `:TuttiAgents`) and
+     `editors/emacs/tutti.el` (`tutti-mode`, `tutti-windmove-*`, a live
+     `tutti-agents` with guarded answers and held approvals).
+   - Shell integration: `tutti shell-init zsh|bash|fish` and a setup-panel
+     row; OSC 7 cwd (`PaneInfo.cwd`; a split starts there when it lies inside
+     the workspace); OSC 133 marks read at exact positions by the run-splitting
+     `Seq` scanner, for `pane read --last-output`; a prompt start clears the
+     editor vars, so a crashed editor hands the keys back.
+   - `tutti pane attach` (`PaneAttach`, `PaneRaw` frames): a snapshot, then
+     every pty read, taken under one hold of the parser lock; a resize resends
+     the snapshot; a stream that falls behind is dropped with an error; it
+     votes in the pane's size. The CLI draws on the alternate screen and
+     redraws a pane program's own screen switches from a vt100 mirror.
+   - The daemon answers DA1/DA2/DSR/CPR always (DA2 as xterm patch 277, the
+     version from which Emacs asks for colours), OSC 10/11/12 and `CSI ? 996
+     n` from the newest client colour report (`HostColors`), and owns mode
+     2031 (a light/dark change is told to the panes that set it) and
+     modifyOtherKeys (dropped: panes get legacy keys, and a `pane attach`
+     terminal keeps its prefix); answers go out through a per-pane thread,
+     and raw streams carry only what it did not answer. Every pane runs with
+     `COLORTERM=truecolor`.
+   Verified live with nvim 0.12.4 and Emacs 32 in zsh panes, under the TUI
+   and `pane attach` (the w7-finish acceptance, 76 checks), and `pane attach`
+   inside a tmux that honours modifyOtherKeys. Open:
+   - terminal fidelity, for the next wave's own engine: undercurl and
+     underline colour flattened, the cursor shape (DECSCUSR) dropped, no focus
+     events;
+   - the TUI's live light/dark: crossterm 0.29 swallows `CSI ? 997 n`, so it
+     reports colours at attach only;
+   - `pane attach --inline` (primary screen, switches passed through) so
+     editor terminals keep native scrollback; detach under the kitty keyboard
+     protocol; escape-time for an Alt prefix; a switching read's other bytes
+     (queries, a bell) are lost to the redraw;
+   - an editor holding the keys loses the TUI's edge moves (sidebar, next tab):
+     `pane focus` at an edge could hand the move to the attached TUI;
+   - clicks and drags never reach a pane program, only the wheel;
+   - `cwd` in watch snapshots; `pane list` has no workspace and watch no
+     approval, so the plugins read one from each;
+   - fish's snippet unrun; bash before 4.4 has no `C` mark; Emacs 29 and
+     Neovim before 0.12 unrun;
+   - XTVERSION, DECRQM beyond 2031 and kitty's `CSI ? u` go unanswered without
+     a raw stream.
 
 **Open** — the headline items; each phase item above keeps its own list:
 - the notification history is not persisted — a restarted daemon starts it
@@ -543,7 +596,9 @@ In order; each lands its TUI path in the same wave as its verbs.
   caller waiting: the daemon logs it, but the CLI has no client-side timeout;
 - under heavy parallel test load `openpty` occasionally fails a test's first
   spawn (`Unknown error: -6`); a rerun passes;
-- Codex and Gemini integrations need the tools installed and a live run.
+- Codex and Gemini integrations need the tools installed and a live run;
+- an editor in a pane misses vt100's gaps (undercurl, cursor shape, focus
+  events) until the next wave replaces vt100 with tutti's own engine.
 
 **Deliberately not done:** packaging and distribution (Phase 5) — the project
 is private, so install stays `cargo install --path` from a checkout.

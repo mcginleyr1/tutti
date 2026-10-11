@@ -28,7 +28,8 @@ printf '\033]1337;SetUserVar=TUTTI_KEYS=%s\007' "$(printf pane | base64)"
 
 Both plugins set their vars when the editor starts or resumes, and clear them
 when it suspends (`Ctrl-Z`) or exits, so the shell underneath gets tutti's keys
-back.
+back. An editor that crashes cannot; with tutti's shell integration
+(`tutti shell-init`) the shell's next prompt clears them instead.
 
 Past the editor's edge, the plugins call the CLI, with `--from` set to the
 editor's own `$TUTTI_PANE`:
@@ -150,6 +151,10 @@ whatever environment `tutti edit` runs in. Turn the mode on after
 `M-k`, `M-l` and `M-x` are Emacs's own keys again. The mode clears the vars on
 `suspend-hook` and `kill-emacs-hook`, and announces again on
 `suspend-resume-hook`.
+
+Emacs asks the terminal for its colours at startup, and tutti answers with
+those of the terminal you attached from, so `background-mode` follows it,
+light or dark.
 
 `tutti-windmove-left`, `-right`, `-up` and `-down` move like `windmove`. Where
 windmove would refuse, at the frame's edge or toward an inactive minibuffer,

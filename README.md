@@ -70,8 +70,15 @@ Optional finishing touches:
 - `tutti skill --install` gives the Claude Code agents in your panes the tutti
   skill, so they can start and coordinate sub-agents of their own — see
   [The tutti skill](#the-tutti-skill).
-- The hooks, the plugin and the skill also install from the TUI: `Ctrl+B i`
-  opens the setup panel (see [TUI keys](#tui-keys)).
+- `eval "$(tutti shell-init zsh)"` in your shell's rc file lets a split start
+  where you are and `tutti pane read --last-output` find the last command's
+  output — see [Shell integration](#shell-integration).
+- Neovim or Emacs in a pane: the plugins in `editors/` let the editor and tutti
+  share `Ctrl+h/j/k/l` and open files for `tutti edit` — see
+  [Editors in panes](#editors-in-panes).
+- The hooks, the plugin, the skill and the shell integration's rc line also
+  install from the TUI: `Ctrl+B i` opens the setup panel (see
+  [TUI keys](#tui-keys)).
 - Using a Nerd Font? Set `icons = "nerdfont"` in the config for crisper
   sidebar glyphs (see [Configuration](#configuration)).
 
@@ -178,6 +185,55 @@ tmux, and grows back when the smaller client detaches or switches away; a pane
 nobody shows keeps its size. A client whose window is bigger than a pane draws
 the pane from its top-left. `tutti watch` watchers never count.
 
+### One pane in a real terminal
+
+`tutti pane attach <pane>` shows one pane in the terminal you run it in, drawn
+by that terminal itself rather than the TUI: a snapshot first, then the pane's
+output streamed raw, and your keys typed into the pane. It is the view for
+editor terminals — Ghostel in Emacs, Neovim's `:terminal` — and for a pane you
+want at full fidelity. The prefix then `d` detaches; the prefix twice sends one
+prefix through; the prefix then any other key sends both. The pane is drawn on
+the terminal's alternate screen, and your shell's screen comes back on exit,
+the terminal's modes restored. A program in the pane that uses an alternate
+screen of its own (vim, less) is redrawn from a local copy of the pane on each
+switch, so leaving it brings back the pane's shell. The stream votes in the
+pane's size like an attached client and follows the window's size. It ends
+with `[pane N exited: CODE]` (exit 0) when the pane's program exits, and with
+an error (exit 1) when the daemon goes away or the terminal cannot keep up with
+the pane's output. It never starts a daemon, and refuses the pane it is run
+from.
+
+Two things the alternate screen costs: the pane has no native scrollback in
+that terminal, and a read that switches screens is replaced by the redraw, so
+whatever else that read held (a program's startup queries, a bell) is lost.
+
+### Terminal queries and colours
+
+A pane has no terminal of its own, so the daemon answers what programs ask
+theirs, on the pane's pty, attached or not: device attributes (DA1, and DA2 as
+xterm patch 277), status (DSR) and the cursor position (CPR). That is what lets
+Neovim suspend on `Ctrl-Z` (it waits on a DA1 answer first) and a TUI ask where
+its cursor is. Once a client has reported its terminal's colours, it also
+answers the foreground, background and cursor colour queries (OSC 10/11/12)
+and light/dark (`CSI ? 996 n`), so Neovim's `background` and Emacs's
+`background-mode` match what you see. Nothing reported, nothing is made up:
+programs keep their own defaults. Every pane also runs with
+`COLORTERM=truecolor`, so Neovim turns on `termguicolors` and Emacs `-nw` uses
+24-bit colour whatever terminal the daemon started from. A program's request
+for xterm's modifyOtherKeys (Neovim, vim and Emacs make one) is dropped: a
+pane gets legacy keys, under the TUI and `pane attach` alike.
+
+The TUI reports your terminal's colours when it attaches — on the `dark` and
+`light` themes, the theme's own pane ground and text, which panes are painted
+over. `tutti pane attach` reports them too, and also passes on your terminal's
+light/dark switches: the daemon owns mode 2031 for each pane, and tells a
+program that set it (Neovim does) of every change, as a terminal would. The TUI
+cannot: its input library would stall on the terminal's switch report, so it
+keeps its attach-time answer. Reattach after switching the OS theme, and the
+programs that set 2031 hear of the change then. A raw stream carries every
+query the daemon did not answer, so your terminal answers those and never one
+twice. The full table is in `docs/transport-decision.md`.
+
 ### When something crashes
 
 The daemon is built to outlive its own bugs. A panic in a background pass —
@@ -211,6 +267,13 @@ no longer receive those bytes (e.g. `Ctrl+l` no longer clears the shell). Rebind
 or disable any of them in the config (set an entry to `"none"` to hand the key
 back to the pane).
 
+A program can claim them back: while the focused pane carries the user var
+`TUTTI_KEYS=pane` (OSC 1337 `SetUserVar`, which tutti's Neovim and Emacs
+plugins set), the direct keys reach the pane as its own bytes. An editor then
+moves through its own splits first and calls `tutti pane focus --direction` at
+its edge (see [Editors in panes](#editors-in-panes)). The prefix is never handed
+over, and a pane whose program exited claims nothing.
+
 Everything else lives behind the prefix (`Ctrl+B` by default). The `default`
 preset:
 
@@ -224,7 +287,7 @@ preset:
 | `N` | notifications: the history of bells, desktop notifications, and agents that blocked or finished |
 | `r` | run an agent / shell / command here (opens the launcher) |
 | `I` | issues: list your trackers' issues and deploy one to an agent |
-| `i` | setup: install the Claude Code hooks, the opencode plugin, and the tutti skill — for you, or (`s`) into the active project |
+| `i` | setup: install the Claude Code hooks, the opencode plugin, the tutti skill, and the shell integration — for you, or (`s`) into the active project |
 | `o`, arrows | focus next pane / directional focus |
 | `z` | zoom focused pane |
 | `x` | kill pane (confirms) |
@@ -319,15 +382,18 @@ closes. The highlight sticks to its row while agents change state underneath
 it. The footer chip reads `GO TO`.
 
 **Setup panel** (`Ctrl+B i`): a floating ` setup · user ` panel listing what
-tutti installs — the Claude Code hooks, the opencode plugin, and the
-[tutti skill](#the-tutti-skill) — each with a status dot and word (installed,
+tutti installs — the Claude Code hooks, the opencode plugin, the
+[tutti skill](#the-tutti-skill), and the [shell integration](#shell-integration)'s
+line in your shell's rc file — each with a status dot and word (installed,
 needs update, not installed, not tutti's, unreadable) over its target file.
 `s` switches to the active project (` setup · project <name> `). `enter` on a
 row with something to install shows the change's summary and the head of the
 change, then asks `y/N`; `y` writes it — backing up a file it replaces, the
 same plan-and-apply the CLI's `--install` uses — and the row updates. A file
-that is not tutti's, or one it cannot read, is never written. The footer chip
-reads `SETUP`.
+that is not tutti's, or one it cannot read, is never written. The shell row
+appends its line to the rc file of your `$SHELL` once (a line already naming
+`tutti shell-init` counts as installed) and is yours alone: a project has none.
+The footer chip reads `SETUP`.
 
 Sidebar edge-nav: at a pane's **left edge**, `Ctrl+h` steps into the sidebar when
 it is visible (nvim-explorer muscle memory) instead of jumping straight to the
@@ -371,6 +437,91 @@ tinted pane ground, muted grey metadata rather than the DIM attribute, and
 accent/state/diff colours tuned to that ground — panes' default colours take
 the theme's ground too, so the whole screen reads as one surface. Pick the one
 matching your terminal; nothing is detected.
+
+## Editors in panes
+
+A Neovim or Emacs in a pane tells tutti it is there through iTerm2's user vars,
+`ESC ] 1337 ; SetUserVar=<NAME>=<base64 value> BEL`, which any program — a
+shell's `printf` included — can write. Names are `[A-Za-z0-9_]`, up to 64
+bytes; values are up to 1 KiB of UTF-8; a pane keeps 16, and an empty value
+unsets one. They live as long as the daemon (a restored pane starts with none),
+and `tutti --json pane list` and `tutti watch` show them as `user_vars`. tutti
+reads two:
+
+- `TUTTI_KEYS=pane`: the direct keys go to the pane (see [TUI keys](#tui-keys)).
+- `TUTTI_EDITOR`: `nvim <server address>` (its `v:servername`), or `emacs
+  [<server name or socket path>]` — best the absolute socket path, which an
+  emacsclient started from any environment finds. Files open in this pane.
+
+`editors/` holds the plugins that speak it; [editors/README.md](editors/README.md)
+has the lazy.nvim and `use-package` installs, the keymaps and the Lua API.
+
+- **Neovim** (`editors/nvim`, 0.10 or later) always announces `TUTTI_EDITOR`.
+  `require('tutti').setup({ keys = true })` also maps `Ctrl+h/j/k/l` to move
+  between Neovim's windows and on to tutti's panes past its edge, and
+  `Alt+h/j/k/l` to tutti's split resize, and only then claims the keys. A
+  smart-splits.nvim backend (`tutti.smart_splits`) does the same through
+  smart-splits' own mappings. `:TuttiAgents` picks an agent and focuses it.
+- **Emacs** (`editors/emacs/tutti.el`, 29.1 or later): `tutti-mode` claims the
+  keys, so `C-h`, `C-k`, `C-l`, `M-x` and the rest are Emacs's again, and
+  announces this Emacs — by its server's socket when `server-start` ran first.
+  `tutti-windmove-left`/`-right`/`-up`/`-down` cross from windows to panes;
+  `M-x tutti-agents` is a live agent list (`RET` focuses an agent, `p` answers a
+  blocked one with the guarded send, `y`/`n` answer a held approval).
+
+Both set their vars when the editor starts or resumes and clear them when it
+suspends (`Ctrl-Z`) or exits, so the shell beneath gets tutti's keys back. An
+editor that crashed cannot: with the [shell integration](#shell-integration)
+the shell's next prompt clears them instead, and the prefix always works.
+
+`tutti edit <path>[:<line>[:<col>]]` opens a file in the workspace's editor
+pane — the caller's own tab first, then layout order — through `nvim --server …
+--remote-expr` or `emacsclient -n`, and focuses that pane, so the attached TUI
+jumps there. It returns at once and is not a blocking `$EDITOR`. From outside a
+pane, pass `--workspace <id>`; with no editor pane it says `no editor pane in
+workspace <name>` and exits 1. The changes panel's `e` is the same hand-off
+from the TUI.
+
+`tutti pane focus --direction left|right|up|down` and `tutti pane resize
+--direction …` give an editor's split navigation (smart-splits.nvim and the
+like) tutti's side of the move. Both start from `--from`, else the calling
+pane, else the attached TUI's focused pane. A focus prints the pane it moved
+to; at an edge it prints `no pane <direction> of <id>` on stderr and exits 1,
+unless `--wrap` goes round to the farthest pane on the other side, level with
+it. Focus stays inside the tab. A resize moves the nearest split border that
+way by `--amount` of the split (0.05, the `Alt+h/j/k/l` step). See
+[Known limitations](#known-limitations) for what an editor in a pane does not
+get yet.
+
+## Shell integration
+
+Add one line to your shell's rc file, or let the setup panel (`Ctrl+B i`, row
+*shell integration*) append it for you, with a backup:
+
+```sh
+eval "$(tutti shell-init zsh)"   # ~/.zshrc (bash: ~/.bashrc, `shell-init bash`)
+tutti shell-init fish | source   # ~/.config/fish/config.fish
+```
+
+Inside a tutti pane the shell then reports its working directory (OSC 7) and
+marks each prompt and command (OSC 133); elsewhere it does nothing, and loading
+it twice changes nothing. With it:
+
+- a split (`%`, `"`, `tutti pane split`) starts in the directory you are in
+  when that lies inside the workspace, and in the workspace's directory
+  otherwise;
+- `tutti --json pane list` shows each pane's `cwd`;
+- `tutti pane read <pane> --last-output` prints the output of the last command
+  that finished, and `exit: N` on stderr. While a command runs you get the one
+  before it. It is exact to the cell: zsh's `%` marker and a prompt sharing the
+  row are not part of it. While a full-screen program holds the alternate
+  screen it is refused, and a pane without the integration says `no finished
+  command`;
+- each prompt clears the editor vars (`TUTTI_KEYS`, `TUTTI_EDITOR`), so an
+  editor that crashed without clearing them hands the keys back.
+
+bash needs 4.4 or newer for `--last-output` (`PS0`); macOS's `/bin/bash` 3.2
+reports only the directory. The fish snippet has not been run live yet.
 
 ## Configuration
 
@@ -717,9 +868,16 @@ its edge (the sidebar gets the same). It moves like vim (or `less`): `j`/`k`
 step, `g`/`G` jump to the first/last file, `Ctrl+D`/`Ctrl+U` move half the
 panel (arrows, `Home`/`End`, and `PageUp`/`PageDown` work too). `Enter` opens
 the highlighted **file's diff** against trunk in an ephemeral pager pane, `d`
-opens the **whole diff**; `h`/`esc` step back to the panes and `l`/`Ctrl+L`
-wrap on to the next tab, just as the pane's own right edge does. Clicking a
-row jumps straight to that file's diff. Like every diff surface, it answers
+opens the **whole diff**, and `e` opens the **file itself** in the workspace's
+editor pane — a Neovim or Emacs in one of its panes that advertises itself
+(see [Editors in panes](#editors-in-panes)), the focused pane's tab first — and
+jumps there; the band says `opened <file> in <pane>`, or why not (`no editor
+pane in <workspace>`, or the editor's own complaint). The editor's remote CLI
+runs off the TUI's loop, so a slow or dead editor never freezes the screen;
+`tutti edit` is the same hand-off for scripts. `h`/`esc` step back to the panes
+and `l`/`Ctrl+L` wrap on to the next tab, just as the pane's own right edge
+does. Clicking a row jumps straight to that file's diff. Like every diff
+surface, it answers
 "what has this workspace
 changed that hasn't landed on trunk" — the delta since the fork point from
 `main` (else `master`/`trunk`), so a workspace that fell behind an advanced
@@ -1281,13 +1439,14 @@ it against the CLI, so it cannot drift from the verbs it teaches.
 a menu-bar or notch app, a status line — as JSON lines on stdout, each flushed
 as it lands. Every line is a full snapshot of the session (replace, don't
 merge). The first comes at once, then one on each change to any pane's state,
-agent, title or exit, to the workspace/tab/pane structure, or to the attached
-TUI's focus or terminal; bursts coalesce.
+agent, title, exit or user vars, to the workspace/tab/pane structure, or to the
+attached TUI's focus or terminal; bursts coalesce.
 
 ```json
-{"type":"snapshot","session":"tutti","wire_rev":9,"attached_terminal":"com.mitchellh.ghostty",
+{"type":"snapshot","session":"tutti","wire_rev":10,"attached_terminal":"com.mitchellh.ghostty",
  "panes":[{"id":3,"workspace":"smartnotch","dir":"/Users/me/develop/smartnotch","tab":"main",
-           "title":"claude","agent":"claude","state":"working","source":"hook","exited":null,"focused":true}]}
+           "title":"claude","agent":"claude","state":"working","source":"hook","exited":null,"focused":true,
+           "user_vars":{}}]}
 ```
 
 - `id` is the pane id `tutti pane focus` takes; `workspace` and `dir` are its
@@ -1299,6 +1458,9 @@ TUI's focus or terminal; bursts coalesce.
   [Agent state sources](#agent-state-sources)).
 - `exited` is the exit code, `null` while running; `focused` marks the attached
   TUI's focused pane.
+- `user_vars` holds what the pane's programs set with OSC 1337 `SetUserVar`
+  (`TUTTI_KEYS`, `TUTTI_EDITOR`, …), name → value, `{}` when none (see
+  [Editors in panes](#editors-in-panes)).
 - `attached_terminal` is the terminal app the attached TUI runs in (macOS's
   `__CFBundleIdentifier`), `null` with nobody attached or off macOS;
   `wire_rev` is the daemon's protocol revision.
@@ -1332,10 +1494,14 @@ tutti run [--workspace <id> | --dir <path>] [--title <t>] [--sandbox <profile>] 
 tutti pane run [--tab <id>] [--ephemeral] [--sandbox <profile>] -- <cmd...>
 tutti pane split <pane> right|down
 tutti pane list | kill <pane> | focus <pane>   # focus: the attached TUI jumps to the pane
+tutti pane focus --direction left|right|up|down [--from <pane>] [--wrap]  # focus the pane beside one (default: this pane, else the TUI's) and print it; at an edge `no pane <dir> of <id>`, exit 1
+tutti pane resize --direction left|right|up|down [--amount <f>] [--from <pane>]  # move its split's border that way, as Alt+h/j/k/l (default step 0.05 of the split)
+tutti pane attach <pane>             # show one pane in this terminal, drawn by the terminal itself; prefix d detaches (never starts a daemon)
 tutti pane rename <pane> <title>
 tutti pane send <pane> --text <s> | --keys <s> [--expect <fp>]   # --expect: answer a blocked agent, refused if its prompt moved on
-tutti pane read <pane> [--lines N] [--unwrapped] [--since <cursor>] | --fingerprint
+tutti pane read <pane> [--lines N] [--unwrapped] [--since <cursor> | --last-output] | --fingerprint
                                      # --since: rows scrolled off since the cursor, then the screen; next cursor on stderr
+                                     # --last-output: the last finished command's output; `exit: N` on stderr (needs shell-init)
                                      # --fingerprint: the prompt fingerprint --expect takes
 tutti pane wait <pane>... [--until working|blocked|done|idle[,…]] [--next] [--timeout <secs>]  # block until each pane gets there; exit 124 on timeout
 tutti pane approve <pane> [--deny] [--message <s>]  # answer the pane's held approval (approvals = "hold")
@@ -1354,6 +1520,8 @@ tutti hooks claude --tty [--raw]     # print Claude hooks that report over OSC 7
 tutti skill [--raw]                  # print the tutti skill (a Claude Code SKILL.md)
 tutti skill --install [--project] [--yes]  # install it into ~/.claude/skills/tutti/ (or ./.claude/skills/tutti/)
 tutti agent-event claude|opencode    # forward an agent hook event (JSON on stdin) — used by the hooks/plugin
+tutti edit <path>[:<line>[:<col>]] [--workspace <id>]  # open in the workspace's editor pane (TUTTI_EDITOR) and focus it; returns at once
+tutti shell-init zsh|bash|fish       # print the shell integration (OSC 7 cwd + OSC 133 marks) for your rc file
 tutti watch                          # JSON-line snapshots of every pane's state, one per change (read-only; never starts a daemon)
 tutti [attach]                       # bare `tutti` attaches; a fresh session asks where to start
 ```
@@ -1400,3 +1568,23 @@ tutti is alpha; PLAN.md tracks what is open.
 - **A slow request whose handler panics never answers.** The daemon logs the
   panic and carries on, but the CLI waiting on that merge, diff or wait waits
   until you interrupt it.
+- **Light/dark switches reach panes only through `pane attach`.** The TUI
+  reports your terminal's colours when it attaches; reattach after switching
+  the OS theme.
+- **`pane attach` and the kitty keyboard protocol.** While a pane program has
+  turned on the kitty keyboard protocol, your terminal encodes the prefix in a
+  form `pane attach` does not watch for, so the prefix then `d` cannot detach;
+  closing the terminal can. (Neovim never turns it on in a pane: the daemon
+  answers the DA1 that closes its startup query before any terminal could
+  answer the query itself. The modifyOtherKeys it, vim and Emacs ask for
+  instead never reaches your terminal.)
+- **An editor in a pane misses some of a terminal.** The TUI draws undercurl as
+  a plain underline, drops underline colours and the cursor's shape (a bar in
+  insert mode stays a block), and never sends focus events, so Neovim's
+  `FocusGained`/`FocusLost` never fire; `tutti pane attach` passes the
+  underline styles and the cursor shape through to your terminal. Clicks and
+  drags in a pane stay tutti's (focus, select, copy): only
+  the wheel reaches an editor that asked for the mouse. While an editor holds
+  the direct keys, its edge is the tab's: `Ctrl+h` from the leftmost pane does
+  not step into the sidebar, nor `Ctrl+l` on to the next tab — the prefix
+  still does.
