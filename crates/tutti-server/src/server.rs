@@ -2390,7 +2390,9 @@ fn broadcast_tick(hub: &Arc<Hub>) {
     // but the history still records them. Status reports ride the same
     // queue, so a program's word lands within a tick, in stream order with
     // the notifications around it. User vars do too, and whatever they moved
-    // goes out as one fresh view per tick.
+    // goes out as one fresh view per tick. A shell drawing its prompt unsets
+    // the editor vars: an editor that crashed without unsetting them would
+    // otherwise keep the direct keys away from the shell beneath it.
     let mut vars_moved = false;
     for (pane, pty) in &panes {
         for signal in pty.take_notifications() {
@@ -2399,6 +2401,13 @@ fn broadcast_tick(hub: &Arc<Hub>) {
                 Signal::Status(report) => program_status(hub, *pane, report),
                 Signal::UserVar { name, value } => {
                     vars_moved |= hub.session().set_user_var(*pane, name, value);
+                }
+                Signal::Prompt => {
+                    for name in ["TUTTI_KEYS", "TUTTI_EDITOR"] {
+                        vars_moved |= hub
+                            .session()
+                            .set_user_var(*pane, name.into(), String::new());
+                    }
                 }
             }
         }

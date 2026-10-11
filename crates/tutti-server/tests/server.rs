@@ -3987,6 +3987,19 @@ async fn a_panes_user_vars_reach_its_listing_view_and_watchers() {
     );
     snapshot_until(&mut watcher, |_, panes| panes[0].user_vars.is_empty()).await;
 
+    // An editor that died holding the keys: the shell's next prompt frees
+    // them, and frees nothing else.
+    printf_osc(&mut control, pane, "1337;SetUserVar=TUTTI_KEYS=cGFuZQ==").await;
+    printf_osc(&mut control, pane, "1337;SetUserVar=OTHER=eA==").await;
+    assert!(wait_pane(&mut control, pane, |p| p.user_vars.len() == 2).await);
+    printf_osc(&mut control, pane, "133;A").await;
+    assert!(
+        wait_pane(&mut control, pane, |p| keys(p).is_none()
+            && p.user_vars.get("OTHER").map(String::as_str) == Some("x"))
+        .await,
+        "a prompt start unsets the editor vars only"
+    );
+
     server.stop().await;
 }
 

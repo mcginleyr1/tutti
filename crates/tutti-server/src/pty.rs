@@ -956,13 +956,15 @@ pub struct StatusReport {
 }
 
 /// What the scanner pulls from a raw pty stream: an attention signal, the
-/// program's word on its state, or one of its user vars (OSC 1337
-/// `SetUserVar`) — an empty `value` unsets it.
+/// program's word on its state, one of its user vars (OSC 1337
+/// `SetUserVar`) — an empty `value` unsets it — or a shell drawing its prompt
+/// (OSC 133;A), which says no editor holds the pane any more.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Signal {
     Notify(Notification),
     Status(StatusReport),
     UserVar { name: String, value: String },
+    Prompt,
 }
 
 /// Largest OSC payload buffered; a longer sequence is consumed but discarded so
@@ -1087,9 +1089,10 @@ impl NotifyScanner {
 
 /// Parse an OSC payload (the bytes between `ESC ]` and the terminator) for the
 /// commands tutti surfaces: notifications `9;<body>` and
-/// `777;notify;<title>;<body>`, status reports `9;4;…` and `7501;…`, and user
-/// vars `1337;SetUserVar=…`. Anything else yields `None` — ConEmu's other
-/// numbered `9;<n>[;…]` subcommands and iTerm2's other 1337 ones included.
+/// `777;notify;<title>;<body>`, status reports `9;4;…` and `7501;…`, user
+/// vars `1337;SetUserVar=…`, and a prompt start `133;A[;…]`. Anything else
+/// yields `None` — ConEmu's other numbered `9;<n>[;…]` subcommands, iTerm2's
+/// other 1337 ones and the other 133 marks included.
 fn parse_osc(buf: &[u8]) -> Option<Signal> {
     let text = std::str::from_utf8(buf).ok()?;
     let (cmd, rest) = text.split_once(';')?;
@@ -1119,6 +1122,7 @@ fn parse_osc(buf: &[u8]) -> Option<Signal> {
         }
         "7501" => parse_program_status(rest).map(Signal::Status),
         "1337" => parse_user_var(rest),
+        "133" => (rest.split(';').next() == Some("A")).then_some(Signal::Prompt),
         _ => None,
     }
 }
@@ -1551,6 +1555,20 @@ mod tests {
             "\x1b]1337;SetUserVar=K\x07".into(),
             "\x1b]1337;CurrentDir=/tmp\x07".into(),
             "\x1b]1337;SetMark\x07".into(),
+        ] {
+            assert!(signals(input.as_bytes()).is_empty(), "{input:?} was kept");
+        }
+    }
+
+    #[test]
+    fn a_prompt_start_is_a_signal_and_the_other_marks_are_not() {
+        assert_eq!(signals(b"\x1b]133;A\x07"), vec![Signal::Prompt]);
+        assert_eq!(signals(b"\x1b]133;A;k=i\x1b\\"), vec![Signal::Prompt]);
+        for input in [
+            "\x1b]133;B\x07",
+            "\x1b]133;C\x07",
+            "\x1b]133;D;0\x07",
+            "\x1b]133;AB\x07",
         ] {
             assert!(signals(input.as_bytes()).is_empty(), "{input:?} was kept");
         }
