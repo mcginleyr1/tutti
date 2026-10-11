@@ -13,9 +13,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
 use tutti_core::{
-    AgentHookEvent, AgentState, ApprovalDecision, Checkpoint, Direction, Event, Frame, IssueRef,
-    Layout, Note, NoteKind, PaneData, PaneDims, PaneId, PaneInfo, PendingApproval, Request,
-    Response, StateSource, SubagentInfo, Tagged, Toward, WatchPane, WorkspaceId,
+    AgentHookEvent, AgentState, ApprovalDecision, Checkpoint, Direction, Event, Frame, HostColors,
+    IssueRef, Layout, Note, NoteKind, PaneData, PaneDims, PaneId, PaneInfo, PendingApproval,
+    Request, Response, Rgb, StateSource, SubagentInfo, Tagged, Toward, WatchPane, WorkspaceId,
 };
 use tutti_server::{PaneSize, serve};
 
@@ -1897,6 +1897,123 @@ async fn a_pane_stream_ends_with_the_exit_after_the_last_output() {
     server.stop().await;
 }
 
+/// The daemon answers a pane's device and cursor queries itself — nothing
+/// else would: vt100 answers none and a TUI never sees them — a cursor
+/// report where the cursor stands. A pane stream never carries them, or its
+/// own terminal would answer them again.
+#[tokio::test]
+async fn a_panes_terminal_queries_are_answered_and_kept_from_its_streams() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let script = "stty -echo -icanon; echo ready; read -r go; \
+                  printf 'ab\\033[c\\033[>c\\033[5n\\033[6n'; head -c 29 | tr '\\033' E; sleep 30";
+    let pane = run_marker(&mut control, script).await;
+    assert!(read_until(&mut control, pane, "ready").await);
+    let mut stream = server.connect().await;
+    stream.send(&pane_attach(pane, 24, 80)).await;
+    stream
+        .write_frame(&Frame::Input {
+            pane,
+            bytes: b"go\r".to_vec(),
+        })
+        .await;
+    let answered = "abE[?62;22cE[>1;10;0cE[0nE[2;3R";
+    let mut terminal = vt100::Parser::new(24, 80, 0);
+    let (raw, _) = stream_until(&mut stream, &mut terminal, |screen| {
+        screen.contents().contains(answered)
+    })
+    .await;
+    assert!(String::from_utf8_lossy(&raw).contains(answered), "{raw:?}");
+    assert!(!raw.windows(2).any(|w| w == b"\x1b["), "{raw:?}");
+    assert!(read_until(&mut control, pane, answered).await);
+
+    server.stop().await;
+}
+
+/// Solarized Light — or, with `dark`, the same colours called dark.
+fn host_colors(dark: bool) -> Request {
+    let rgb = |r, g, b| Rgb { r, g, b };
+    Request::HostColors(HostColors {
+        fg: rgb(0x6565, 0x7b7b, 0x8383),
+        bg: rgb(0xfdfd, 0xf6f6, 0xe3e3),
+        cursor: None,
+        dark,
+    })
+}
+
+/// A colour query goes on to a pane's stream while no client has reported
+/// its terminal's colours — the daemon invents none — and once one has, the
+/// daemon answers it, closed as it was asked, and the stream never sees it.
+#[tokio::test]
+async fn a_colour_query_is_answered_once_a_client_reports_colours() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let script = "stty -echo -icanon; echo ready; read -r a; printf 'one\\033]11;?\\007'; \
+                  read -r b; printf 'two\\033]11;?\\033\\\\'; head -c 25 | tr '\\033' E; sleep 30";
+    let pane = run_marker(&mut control, script).await;
+    assert!(read_until(&mut control, pane, "ready").await);
+    let mut stream = server.connect().await;
+    stream.send(&pane_attach(pane, 24, 80)).await;
+    let go = Frame::Input {
+        pane,
+        bytes: b"go\r".to_vec(),
+    };
+    let mut terminal = vt100::Parser::new(24, 80, 0);
+    stream.write_frame(&go).await;
+    let (raw, _) = stream_until(&mut stream, &mut terminal, |s| s.contents().contains("one")).await;
+    assert!(
+        raw.ends_with(b"one\x1b]11;?\x07"),
+        "passed on unanswered: {raw:?}"
+    );
+
+    assert_eq!(control.request(host_colors(false)).await, Response::Ok);
+    stream.write_frame(&go).await;
+    let answer = "E]11;rgb:fdfd/f6f6/e3e3E\\";
+    let (raw, _) = stream_until(&mut stream, &mut terminal, |s| {
+        s.contents().contains(answer)
+    })
+    .await;
+    let raw = String::from_utf8_lossy(&raw);
+    assert!(raw.starts_with("two") && !raw.contains("]11;?"), "{raw:?}");
+
+    server.stop().await;
+}
+
+/// A pane that set mode 2031 hears each light/dark change — the first
+/// report counts as one — and a report that keeps it tells nothing; one
+/// that reset the mode hears none.
+#[tokio::test]
+async fn a_2031_pane_hears_of_a_light_dark_flip() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let script = |modes: &str| {
+        format!(
+            "stty -echo; printf '{modes}'; echo ready; IFS= read -r go; \
+             printf '[%s]' \"$go\" | tr '\\033' E; sleep 30"
+        )
+    };
+    let on = run_marker(&mut control, &script("\\033[?2031h")).await;
+    let off = run_marker(&mut control, &script("\\033[?2031h\\033[?2031l")).await;
+    assert!(read_until(&mut control, on, "ready").await);
+    assert!(read_until(&mut control, off, "ready").await);
+    for dark in [true, false, false] {
+        assert_eq!(control.request(host_colors(dark)).await, Response::Ok);
+    }
+    for pane in [on, off] {
+        let go = Request::PaneSend {
+            pane,
+            text: Some("go\r".into()),
+            keys: None,
+            expect: None,
+        };
+        assert_eq!(control.request(go).await, Response::Ok);
+    }
+    assert!(read_until(&mut control, on, "[E[?997;1nE[?997;2ngo]").await);
+    assert!(read_until(&mut control, off, "[go]").await);
+
+    server.stop().await;
+}
+
 /// A stream that stops reading never stalls its pane or anyone else: once
 /// its queue backs up it is dropped — its vote with it — and, read at last,
 /// it holds its backlog, then the Error it was dropped with, then the end.
@@ -1913,9 +2030,10 @@ async fn a_pane_stream_that_never_reads_is_dropped() {
     stuck.send(&pane_attach(pane, 10, 40)).await;
     snapshot_at(&mut wide, pane, 10, 40).await;
 
-    // 16 MB of output: thousands of reads, far past the stream's 256-frame
-    // queue and the socket's few KiB.
-    let flood = "head -c 16000000 /dev/zero | tr '\\0' x; echo; echo flood-$((6*7))\r";
+    // 6 MB of output: three times what the stream's 256-frame queue holds
+    // even at a full 8 KiB a read, and the socket's few KiB on top — and no
+    // more, so a loaded machine still drains it inside the deadline.
+    let flood = "head -c 6000000 /dev/zero | tr '\\0' x; echo; echo flood-$((6*7))\r";
     let sent = control
         .request(Request::PaneSend {
             pane,

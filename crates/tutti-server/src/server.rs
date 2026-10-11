@@ -1122,6 +1122,18 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             broadcast_event(hub, Event::NotesChanged { notes: Vec::new() });
             Response::Ok
         }
+        // The panes are bound under the session guard and told off it.
+        Request::HostColors(colors) => {
+            let ptys = {
+                let mut session = hub.session();
+                session.set_colors(colors);
+                session.panes_with_pty()
+            };
+            for (_, pty) in ptys {
+                pty.set_colors(colors);
+            }
+            Response::Ok
+        }
         // Handled in `handle_frame`; unreachable here.
         Request::Attach { .. }
         | Request::Detach

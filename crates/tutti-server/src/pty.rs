@@ -5,6 +5,7 @@
 use std::io::{Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -14,13 +15,17 @@ use base64::Engine;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::watch;
-use tutti_core::{AgentState, StateSource};
+use tutti_core::{AgentState, HostColors, Rgb, StateSource};
 
 const SCROLLBACK_LINES: usize = 10_000;
 /// The most bytes `Term::process` feeds between two readings of the scroll
 /// count. A byte pushes at most one row (a scroll-up excepted, and it is fed
 /// alone), so no run can push past what the 10k ring's offset counts.
 const RUN_MAX: usize = 8192;
+/// Writes waiting for a pane's answer thread: a read's answers, or a
+/// light/dark notice. A program that asks and never reads the answers stops
+/// getting them past this, rather than stalling its own output behind them.
+const ANSWER_QUEUE: usize = 64;
 
 /// What to run in a pane.
 #[derive(Debug, Clone)]
@@ -32,6 +37,9 @@ pub struct PtySpec {
     pub env: Vec<(String, String)>,
     /// Inherited environment variables dropped before `env` is layered on.
     pub env_remove: Vec<String>,
+    /// The host terminal's colours as of the spawn, so the program's first
+    /// colour query is answered (`PtyPane::set_colors` keeps them current).
+    pub colors: Option<HostColors>,
 }
 
 impl PtySpec {
@@ -42,6 +50,7 @@ impl PtySpec {
             cwd: None,
             env: Vec::new(),
             env_remove: Vec::new(),
+            colors: None,
         }
     }
 }
@@ -166,8 +175,10 @@ impl Mirror {
 
 /// What a tap (`PtyPane::tap`) is handed, under the parser lock and in
 /// stream order: a snapshot of the screen to start from, at its size, then
-/// each read's bytes as the child wrote them — and after a resize, a fresh
-/// snapshot at the new size.
+/// each read's bytes as the child wrote them, less the queries the daemon
+/// answers and the mode it owns (`Owned`, `OSC_QUERIES`) — a tap's own
+/// terminal would answer them again — and after a resize, a fresh snapshot
+/// at the new size.
 pub enum Feed<'a> {
     Snapshot(PaneSize, Vec<u8>),
     Raw(&'a [u8]),
@@ -193,13 +204,21 @@ struct Term {
     output: Option<u64>,
     /// The last command the shell finished (OSC 133 `D` after a `C`).
     finished: Option<Finished>,
+    /// The bytes of the sequence in hand since its `ESC`, while it could
+    /// still be one the daemon answers (`Seq::pending`): held from the taps
+    /// until it is answered and dropped, or turns out otherwise.
+    held: Vec<u8>,
+    /// The host terminal's colours, the newest report's.
+    colors: Option<HostColors>,
+    /// Whether the program asked to hear of light/dark changes (mode 2031).
+    theme_updates: bool,
     /// The raw-output subscribers, by id: fed under this lock, so each sees
     /// its snapshot and then every read once, in order.
     taps: Vec<(u64, Tap)>,
 }
 
 impl Term {
-    fn new(size: PaneSize) -> Self {
+    fn new(size: PaneSize, colors: Option<HostColors>) -> Self {
         Self {
             parser: vt100::Parser::new(size.rows, size.cols, SCROLLBACK_LINES),
             scrolled: 0,
@@ -207,6 +226,9 @@ impl Term {
             cwd: None,
             output: None,
             finished: None,
+            held: Vec::new(),
+            colors,
+            theme_updates: false,
             taps: Vec::new(),
         }
     }
@@ -222,6 +244,7 @@ impl Term {
         self.parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
         self.scrolled += 1;
         self.seq = Seq::default();
+        self.held.clear();
     }
 
     /// The screen as escape bytes for a real terminal. `state_formatted`
@@ -269,25 +292,89 @@ impl Term {
     ///
     /// An OSC string's terminator ends a run too, so the parser has consumed
     /// every byte before the string — the count and the cursor exact — when
-    /// `osc` reads it.
-    fn process(&mut self, bytes: &[u8]) {
+    /// `osc` reads it; and so does a CSI the daemon owns, so a cursor report
+    /// reads the cursor where the query found it.
+    ///
+    /// Returns what the taps get — `bytes` less the queries answered and the
+    /// mode owned, the start of one a read cut off held until the next
+    /// settles it — and the answers to write back to the pane, in order.
+    fn process(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let (mut raw, mut answers) = (Vec::with_capacity(bytes.len()), Vec::new());
         let mut start = 0;
         for (i, &b) in bytes.iter().enumerate() {
-            match self.seq.step(b) {
+            if matches!(self.seq, Seq::Ground) && b != 0x1b {
+                raw.push(b);
+                continue;
+            }
+            // An `ESC` opens a fresh sequence, so what is held was none of
+            // the daemon's — unless it may start the ST closing an OSC query.
+            // Held after an OSC's `ESC` that starts no ST, that `ESC` opened
+            // the fresh one.
+            match &self.seq {
+                Seq::OscEsc(_) if b != b'\\' => {
+                    raw.extend(self.held.drain(..self.held.len() - 1));
+                }
+                Seq::Osc(payload) if b == 0x1b && OSC_QUERIES.contains(&payload.as_slice()) => {}
+                _ if b == 0x1b => raw.append(&mut self.held),
+                _ => {}
+            }
+            self.held.push(b);
+            let answered = match self.seq.step(b) {
                 Some(Hit::Alone) => {
                     self.run(&bytes[start..i]);
                     self.run(&bytes[i..=i]);
                     start = i + 1;
+                    false
                 }
-                Some(Hit::Osc(payload)) => {
+                Some(Hit::Osc(payload, st)) => {
                     self.run(&bytes[start..=i]);
                     start = i + 1;
-                    self.osc(&payload);
+                    self.osc(&payload, st, &mut answers)
                 }
-                None => {}
+                Some(Hit::Owned(owned)) => {
+                    self.run(&bytes[start..=i]);
+                    start = i + 1;
+                    self.owned(owned, &mut answers)
+                }
+                None => false,
+            };
+            if answered {
+                self.held.clear();
+            } else if !self.seq.pending() {
+                raw.append(&mut self.held);
             }
         }
         self.run(&bytes[start..]);
+        (raw, answers)
+    }
+
+    /// Answer or apply a CSI the daemon owns, as the screen stands; false
+    /// when it cannot answer — light or dark, with no colours reported — and
+    /// the query goes on to the taps.
+    fn owned(&mut self, owned: Owned, answers: &mut Vec<u8>) -> bool {
+        match owned {
+            Owned::Primary => answers.extend_from_slice(b"\x1b[?62;22c"),
+            Owned::Secondary => answers.extend_from_slice(b"\x1b[>1;10;0c"),
+            Owned::Status => answers.extend_from_slice(b"\x1b[0n"),
+            Owned::Cursor => {
+                let screen = self.parser.screen();
+                let (row, col) = screen.cursor_position();
+                // Just past the last column, a wrap pending, the cursor
+                // still shows on it.
+                let col = col.min(screen.size().1 - 1);
+                answers.extend(format!("\x1b[{};{}R", row + 1, col + 1).into_bytes());
+            }
+            Owned::Theme => match self.colors {
+                Some(colors) => answers.extend(theme_report(colors.dark)),
+                None => return false,
+            },
+            Owned::ThemeUpdates(on) => self.theme_updates = on,
+            Owned::ThemeUpdatesMode => {
+                let mode = if self.theme_updates { 1 } else { 2 };
+                answers.extend(format!("\x1b[?2031;{mode}$y").into_bytes());
+            }
+        }
+        true
     }
 
     /// Act on an OSC string: OSC 7 reports the shell's working directory;
@@ -295,18 +382,36 @@ impl Term {
     /// at column 0, else the next — and `D[;<exit>]` the cell where it
     /// finished, rows numbered as `--since` numbers them. On the alternate
     /// screen, which has no such numbers, a mark is ignored. A `D` with no
-    /// `C` before it (an empty command line) finishes nothing.
-    fn osc(&mut self, payload: &[u8]) {
+    /// `C` before it (an empty command line) finishes nothing. OSC 10/11/12
+    /// `?` asks for a colour: answered from the host terminal's, closed as
+    /// the query was (`st`: ESC `\`, else BEL) — true — unless there is none
+    /// to give, and the query goes on to the taps.
+    fn osc(&mut self, payload: &[u8], st: bool, answers: &mut Vec<u8>) -> bool {
         let Some(text) = std::str::from_utf8(payload)
             .ok()
             .filter(|_| payload.len() <= OSC_CAP)
         else {
-            return;
+            return false;
         };
         let screen = self.parser.screen();
         let (row, col) = screen.cursor_position();
         let row = self.scrolled + u64::from(row);
         match text.split_once(';') {
+            Some((which @ ("10" | "11" | "12"), "?")) => {
+                let colors = self.colors;
+                let color = colors.and_then(|c| match which {
+                    "10" => Some(c.fg),
+                    "11" => Some(c.bg),
+                    _ => c.cursor,
+                });
+                let Some(Rgb { r, g, b }) = color else {
+                    return false;
+                };
+                let end = if st { "\x1b\\" } else { "\x07" };
+                answers
+                    .extend(format!("\x1b]{which};rgb:{r:04x}/{g:04x}/{b:04x}{end}").into_bytes());
+                return true;
+            }
             Some(("7", url)) => {
                 if let Some(cwd) = parse_cwd(url) {
                     self.cwd = Some(cwd);
@@ -332,6 +437,7 @@ impl Term {
             }
             _ => {}
         }
+        false
     }
 
     /// Feed bytes that switch screens, if at all, only as a lone byte, adding
@@ -510,16 +616,18 @@ fn parse_cwd(url: &str) -> Option<String> {
 
 /// Where the bytes fed so far stand within an escape sequence — as much of
 /// vte's state machine as `Term::process` needs to pick out the bytes it
-/// feeds alone and the OSC strings it reads. It persists across reads, as a
-/// sequence can straddle two.
+/// feeds alone, the OSC strings it reads and the CSIs the daemon owns. It
+/// persists across reads, as a sequence can straddle two.
 #[derive(Default)]
 enum Seq {
     #[default]
     Ground,
     /// Just after `ESC`.
     Esc,
-    /// Inside `ESC [`, before the final byte.
-    Csi,
+    /// Inside `ESC [`, before the final byte, holding the parameter and
+    /// intermediate bytes so far — one past `CSI_CAP` at most, which marks
+    /// it as none the daemon owns.
+    Csi(Vec<u8>),
     /// Inside `ESC ]`, holding the payload so far — one byte past `OSC_CAP`
     /// at most, which marks it too long to read.
     Osc(Vec<u8>),
@@ -532,24 +640,91 @@ enum Seq {
 enum Hit {
     /// A sequence that can switch screens or push many rows: fed alone.
     Alone,
-    /// An OSC string terminated by BEL or ST, with its payload.
-    Osc(Vec<u8>),
+    /// An OSC string terminated by BEL, or by ST (`true`), with its payload.
+    Osc(Vec<u8>, bool),
+    /// A CSI the daemon owns.
+    Owned(Owned),
+}
+
+/// A CSI the daemon answers or applies on a pane's behalf: a pane has no
+/// terminal of its own, so a program that waits on an answer — nvim's
+/// suspend and its startup probes, fish, a TUI asking where its cursor is —
+/// would otherwise hang or time out. Matched as `CSI_OWNED` spells each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Owned {
+    /// DA1, answered as a VT220 with ANSI colour: `CSI ? 62 ; 22 c`.
+    Primary,
+    /// DA2, answered as a VT220 at firmware 10 (`CSI > 1 ; 10 ; 0 c`): an
+    /// identity old enough that a program sniffing for xterm's version turns
+    /// nothing extra on.
+    Secondary,
+    /// DSR, answered "OK": `CSI 0 n`.
+    Status,
+    /// CPR, answered with the cursor's 1-based row and column: `CSI r ; c R`.
+    Cursor,
+    /// `CSI ? 996 n`, answered light or dark (`CSI ? 997 ; 1|2 n`, 1 dark) —
+    /// contour's color-palette-update extension.
+    Theme,
+    /// Mode 2031 set or reset: a light/dark change is told to the program.
+    ThemeUpdates(bool),
+    /// DECRQM for mode 2031, answered `CSI ? 2031 ; 1|2 $ y` (1 set).
+    ThemeUpdatesMode,
+}
+
+/// Each owned CSI by its parameter and intermediate bytes and final byte —
+/// exactly so: `CSI 00 c`, `CSI ? 6 n`, `CSI ? 1049 ; 2031 h` are not ones.
+/// C0 controls inside execute as vte executes them.
+const CSI_OWNED: [(&[u8], u8, Owned); 10] = [
+    (b"", b'c', Owned::Primary),
+    (b"0", b'c', Owned::Primary),
+    (b">", b'c', Owned::Secondary),
+    (b">0", b'c', Owned::Secondary),
+    (b"5", b'n', Owned::Status),
+    (b"6", b'n', Owned::Cursor),
+    (b"?996", b'n', Owned::Theme),
+    (b"?2031", b'h', Owned::ThemeUpdates(true)),
+    (b"?2031", b'l', Owned::ThemeUpdates(false)),
+    (b"?2031$", b'p', Owned::ThemeUpdatesMode),
+];
+
+/// More CSI parameter and intermediate bytes than any owned one has.
+const CSI_CAP: usize = 8;
+
+/// The colour queries answered from the host terminal's colours: OSC 10
+/// (foreground), 11 (background) and 12 (cursor), each `?`.
+const OSC_QUERIES: [&[u8]; 3] = [b"10;?", b"11;?", b"12;?"];
+
+/// What a mode-2031 terminal says of light (`false`) or dark.
+fn theme_report(dark: bool) -> Vec<u8> {
+    format!("\x1b[?997;{}n", if dark { 1 } else { 2 }).into_bytes()
 }
 
 impl Seq {
+    /// Whether the sequence in hand could still be one the daemon answers
+    /// or owns, so its bytes are held from the taps. An `ESC` in an OSC
+    /// could start its ST or a fresh sequence, so it holds too.
+    fn pending(&self) -> bool {
+        match self {
+            Seq::Ground => false,
+            Seq::Esc | Seq::OscEsc(_) => true,
+            Seq::Csi(params) => CSI_OWNED.iter().any(|(p, ..)| p.starts_with(params)),
+            Seq::Osc(payload) => OSC_QUERIES.iter().any(|q| q.starts_with(payload)),
+        }
+    }
+
     /// Step over `b`, reporting what it ends: a sequence that can switch
     /// screens or push many rows — `CSI … h`/`l` (the alternate screen is
-    /// `?47`/`?1049`), `CSI … S` (scroll up), `ESC c` (full reset) — or an
-    /// OSC string. Liberal on purpose: a false hit only splits a run. As in
-    /// vte, only `ESC` opens a sequence (a raw C1 `CSI` byte is executed, not
-    /// parsed), CAN/SUB abort one, other C0 controls execute inside one
-    /// without ending it (an OSC string ignores them), and an `ESC` that is
-    /// not the start of an ST ends an OSC string, which tutti then drops.
+    /// `?47`/`?1049`), `CSI … S` (scroll up), `ESC c` (full reset) — an OSC
+    /// string, or a CSI the daemon owns. Liberal on purpose: a false `Alone`
+    /// only splits a run. As in vte, only `ESC` opens a sequence (a raw C1
+    /// `CSI` byte is executed, not parsed), CAN/SUB abort one, other C0
+    /// controls execute inside one without ending it (an OSC string ignores
+    /// them), and an `ESC` that is not the start of an ST ends an OSC string,
+    /// which tutti then drops.
     fn step(&mut self, b: u8) -> Option<Hit> {
         let (next, hit) = match (std::mem::take(self), b) {
-            (Seq::Osc(payload), 0x07) | (Seq::OscEsc(payload), b'\\') => {
-                (Seq::Ground, Some(Hit::Osc(payload)))
-            }
+            (Seq::Osc(payload), 0x07) => (Seq::Ground, Some(Hit::Osc(payload, false))),
+            (Seq::OscEsc(payload), b'\\') => (Seq::Ground, Some(Hit::Osc(payload, true))),
             (Seq::Osc(payload), 0x1b) => (Seq::OscEsc(payload), None),
             (Seq::OscEsc(_), b) => {
                 *self = Seq::Esc;
@@ -564,15 +739,26 @@ impl Seq {
             }
             (_, 0x1b) => (Seq::Esc, None),
             (_, 0x18 | 0x1a) => (Seq::Ground, None),
-            (Seq::Esc, b'[') => (Seq::Csi, None),
+            (Seq::Esc, b'[') => (Seq::Csi(Vec::new()), None),
             (Seq::Esc, b']') => (Seq::Osc(Vec::new()), None),
             (Seq::Esc, b'c') => (Seq::Ground, Some(Hit::Alone)),
-            (seq @ (Seq::Esc | Seq::Csi), 0x00..=0x1f) => (seq, None),
-            (Seq::Csi, 0x40..=0x7e) => (
-                Seq::Ground,
-                matches!(b, b'h' | b'l' | b'S').then_some(Hit::Alone),
-            ),
-            (Seq::Csi, _) => (Seq::Csi, None),
+            (seq @ (Seq::Esc | Seq::Csi(_)), 0x00..=0x1f) => (seq, None),
+            (Seq::Csi(params), 0x40..=0x7e) => {
+                let owned = CSI_OWNED
+                    .iter()
+                    .find(|(p, end, _)| *p == params.as_slice() && *end == b);
+                let hit = match owned {
+                    Some(&(.., owned)) => Some(Hit::Owned(owned)),
+                    None => matches!(b, b'h' | b'l' | b'S').then_some(Hit::Alone),
+                };
+                (Seq::Ground, hit)
+            }
+            (Seq::Csi(mut params), b) => {
+                if params.len() <= CSI_CAP {
+                    params.push(b);
+                }
+                (Seq::Csi(params), None)
+            }
             (Seq::Ground | Seq::Esc, _) => (Seq::Ground, None),
         };
         *self = next;
@@ -583,7 +769,11 @@ impl Seq {
 /// A persistent pty running a single child process.
 pub struct PtyPane {
     master: Mutex<Box<dyn MasterPty + Send>>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    /// Shared with the answer thread, which writes back what the daemon says
+    /// on the pane's terminal's behalf.
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// The answer thread's queue, which the reader holds too.
+    answers: SyncSender<Vec<u8>>,
     term: Arc<Mutex<Term>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     /// The child's OS process id, the root of the process-tree walk that agent
@@ -650,22 +840,49 @@ impl PtyPane {
             .master
             .try_clone_reader()
             .context("failed to clone pty reader")?;
-        let writer = pair
-            .master
-            .take_writer()
-            .context("failed to take pty writer")?;
+        let writer = Arc::new(Mutex::new(
+            pair.master
+                .take_writer()
+                .context("failed to take pty writer")?,
+        ));
 
-        let term = Arc::new(Mutex::new(Term::new(size)));
+        let term = Arc::new(Mutex::new(Term::new(size, spec.colors)));
 
         let (output_tx, output_rx) = watch::channel(0u64);
         let (exit_tx, exit_rx) = watch::channel(None);
         let notifications = Arc::new(Mutex::new(Vec::new()));
 
+        // Answers go out on a thread of their own, off the parser lock: a
+        // program that asks and never reads them fills its input and blocks
+        // that thread, never the reader — which would leave its output
+        // undrained. The thread ends once the reader and the pane have both
+        // let go of its queue.
+        let (answers, answers_rx) = mpsc::sync_channel::<Vec<u8>>(ANSWER_QUEUE);
+        let answer_writer = Arc::clone(&writer);
+        std::thread::Builder::new()
+            .name("tutti-pty-answers".into())
+            .spawn(move || {
+                for answer in answers_rx {
+                    let mut writer = lock(&answer_writer);
+                    let _ = writer.write_all(&answer).and_then(|()| writer.flush());
+                }
+            })
+            .context("failed to spawn pty answer thread")?;
+
         let reader_term = Arc::clone(&term);
         let reader_notifications = Arc::clone(&notifications);
+        let reader_answers = answers.clone();
         let reader_thread = std::thread::Builder::new()
             .name("tutti-pty-reader".into())
-            .spawn(move || read_loop(reader, reader_term, output_tx, reader_notifications))
+            .spawn(move || {
+                read_loop(
+                    reader,
+                    reader_term,
+                    output_tx,
+                    reader_notifications,
+                    reader_answers,
+                )
+            })
             .context("failed to spawn pty reader thread")?;
 
         let wait_thread = std::thread::Builder::new()
@@ -688,7 +905,8 @@ impl PtyPane {
 
         Ok(Self {
             master: Mutex::new(pair.master),
-            writer: Mutex::new(writer),
+            writer,
+            answers,
             term,
             killer: Mutex::new(killer),
             pid,
@@ -699,6 +917,18 @@ impl PtyPane {
             reader_thread: Some(reader_thread),
             wait_thread: Some(wait_thread),
         })
+    }
+
+    /// Take the host terminal's colours for the pane's colour queries. A
+    /// change of light/dark — or the first report — is told to a program
+    /// that asked (mode 2031), as a terminal would: `CSI ? 997 ; 1|2 n`.
+    pub fn set_colors(&self, colors: HostColors) {
+        let mut term = lock(&self.term);
+        let changed = term.colors.is_none_or(|old| old.dark != colors.dark);
+        term.colors = Some(colors);
+        if changed && term.theme_updates {
+            let _ = self.answers.try_send(theme_report(colors.dark));
+        }
     }
 
     /// Forward raw keystrokes to the child.
@@ -960,6 +1190,7 @@ fn read_loop(
     term: Arc<Mutex<Term>>,
     output_tx: watch::Sender<u64>,
     notifications: Arc<Mutex<Vec<Signal>>>,
+    answers: SyncSender<Vec<u8>>,
 ) {
     let mut buf = [0u8; 8192];
     let mut scanner = NotifyScanner::default();
@@ -985,13 +1216,21 @@ fn read_loop(
                 // A vt100 panic (a wide character in a one-column pane is one)
                 // must neither end this thread nor poison the lock the render
                 // tick takes: caught inside the guard, the pane runs on from a
-                // blank screen.
-                if catch_unwind(AssertUnwindSafe(|| term.process(&buf[..n]))).is_err() {
+                // blank screen — its taps handed the read whole.
+                let processed = catch_unwind(AssertUnwindSafe(|| term.process(&buf[..n])));
+                let (raw, answer) = processed.unwrap_or_else(|_| {
                     eprintln!("tutti: a pane's terminal parser panicked; restarting it blank");
                     term.reset();
+                    (buf[..n].to_vec(), Vec::new())
+                });
+                if !raw.is_empty() {
+                    term.taps.retain_mut(|(_, tap)| tap(Feed::Raw(&raw)));
                 }
-                term.taps.retain_mut(|(_, tap)| tap(Feed::Raw(&buf[..n])));
                 output_tx.send_modify(|generation| *generation = generation.wrapping_add(1));
+                drop(term);
+                if !answer.is_empty() {
+                    let _ = answers.try_send(answer);
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
@@ -1866,7 +2105,7 @@ mod tests {
     /// reader thread would — checking after each that the scrollback offset
     /// never leaks out of a read.
     fn fed(rows: u16, cols: u16, bytes: &[u8], chunk: usize) -> Term {
-        let mut term = Term::new(PaneSize::new(rows, cols));
+        let mut term = Term::new(PaneSize::new(rows, cols), None);
         for read in bytes.chunks(chunk) {
             term.process(read);
             assert_eq!(term.parser.screen().scrollback(), 0, "the offset leaked");
@@ -1914,7 +2153,7 @@ mod tests {
         // scroll-up, 2.
         assert_eq!(fed(5, 10, stream.as_bytes(), RUN_MAX).scrolled, 19);
         for cut in 0..=stream.len() {
-            let mut term = Term::new(PaneSize::new(5, 10));
+            let mut term = Term::new(PaneSize::new(5, 10), None);
             term.process(&stream.as_bytes()[..cut]);
             term.process(&stream.as_bytes()[cut..]);
             assert_eq!(term.scrolled, 19, "reads split at byte {cut}");
@@ -1946,7 +2185,7 @@ mod tests {
 
     #[test]
     fn scroll_count_skips_the_alternate_screen_across_reads() {
-        let mut term = Term::new(PaneSize::new(5, 20));
+        let mut term = Term::new(PaneSize::new(5, 20), None);
         for read in [
             format!("{}\x1b[?1049h", numbered(0, 10)),
             numbered(100, 20),
@@ -1963,7 +2202,7 @@ mod tests {
     fn scroll_count_stays_exact_once_the_ring_is_full() {
         // 25k lines overflow the 10k ring long before the end; after every
         // 8 KiB read the count still names the newest row.
-        let mut term = Term::new(PaneSize::new(24, 80));
+        let mut term = Term::new(PaneSize::new(24, 80), None);
         for read in numbered(0, 25_000).as_bytes().chunks(8192) {
             term.process(read);
             assert_eq!(term.parser.screen().scrollback(), 0, "the offset leaked");
@@ -2125,7 +2364,7 @@ mod tests {
         assert_eq!(last(&mut term, false), Some((want.clone(), Some(3), false)));
         assert_eq!(last(&mut term, true), Some((joined, Some(3), false)));
         for cut in 0..=stream.len() {
-            let mut term = Term::new(PaneSize::new(5, 10));
+            let mut term = Term::new(PaneSize::new(5, 10), None);
             term.process(&stream.as_bytes()[..cut]);
             assert_eq!(term.parser.screen().scrollback(), 0, "the offset leaked");
             term.process(&stream.as_bytes()[cut..]);
@@ -2344,7 +2583,7 @@ mod tests {
     #[test]
     fn mirror_deltas_keep_a_client_level_with_the_live_screen() {
         let size = PaneSize::new(24, 80);
-        let mut live = Term::new(size);
+        let mut live = Term::new(size, None);
         live.process(numbered(0, 30).as_bytes());
         let mut prev = Mirror::new(size, live.parser.screen().state_formatted());
         let mut client = vt100::Parser::new(size.rows, size.cols, 0);
@@ -2373,7 +2612,7 @@ mod tests {
     fn a_mirror_vt100_cannot_replay_falls_back_to_a_blank_screen() {
         // A shrink leaves a wide character in a one-column row, and replaying
         // that panics vt100 — which must not take the render tick down.
-        let mut live = Term::new(PaneSize::new(2, 4));
+        let mut live = Term::new(PaneSize::new(2, 4), None);
         live.process("日本".as_bytes());
         live.parser.screen_mut().set_size(2, 1);
         let snapshot = live.parser.screen().state_formatted();
@@ -2388,6 +2627,115 @@ mod tests {
             catch_unwind(|| vt100::Parser::new(2, 1, 0).process(&mirror.snapshot)).is_ok(),
             "a client is sent the blank screen's snapshot, which replays"
         );
+    }
+
+    /// Solarized Light, its cursor too.
+    fn light() -> HostColors {
+        let rgb = |r, g, b| Rgb { r, g, b };
+        HostColors {
+            fg: rgb(0x6565, 0x7b7b, 0x8383),
+            bg: rgb(0xfdfd, 0xf6f6, 0xe3e3),
+            cursor: Some(rgb(0x5858, 0x6e6e, 0x7575)),
+            dark: false,
+        }
+    }
+
+    /// Feed `reads` to a fresh 3x20 `Term` holding `colors`, one at a time:
+    /// what the taps got and the answers, joined; the scroll count; and the
+    /// offset back at 0 after every read.
+    fn answered(colors: Option<HostColors>, reads: &[&[u8]]) -> (Vec<u8>, Vec<u8>, u64) {
+        let mut term = Term::new(PaneSize::new(3, 20), colors);
+        let (mut raw, mut answers) = (Vec::new(), Vec::new());
+        for read in reads {
+            let (r, a) = term.process(read);
+            assert_eq!(term.parser.screen().scrollback(), 0, "the offset leaked");
+            raw.extend(r);
+            answers.extend(a);
+        }
+        (raw, answers, term.scrolled)
+    }
+
+    /// Every CSI the daemon owns and every colour query, wherever reads cut
+    /// the stream: each answered once and in order — a cursor report where
+    /// the cursor stood, a row scrolled and all; mode 2031 tracked — and
+    /// dropped from what the taps get, which is everything else: near
+    /// misses, an OSC query an `ESC` cuts short, the `ESC` before another.
+    #[test]
+    fn owned_queries_are_answered_and_kept_from_the_taps_across_any_cut() {
+        let stream: &[u8] = b"ab\x1b[c\x1b[0cX\x1b[>c\x1b[>0c\r\nL1\r\nL2\r\nL3\x1b[5n\x1b[6n\
+            \x1b[?996n\x1b[?2031$p\x1b[?2031h\x1b[?2031$p\x1b[?2031l\
+            \x1b]10;?\x07\x1b]11;?\x1b\\\x1b]12;?\x07\
+            \x1b[?6n\x1b[1c\x1b[00c\x1b[=c\x1b[6;1n\x1b[?2031;1h\x1b[\x076n\
+            \x1b]11;?x\x07\x1b]110\x07\x1b]11;rgb:0/0/0\x07\x1b]0;t\x1b\\\
+            \x1b]11;?\x1b[c\x1b]1\x1b[5nend\x1b\x1b[6n";
+        let raw: &[u8] = b"abX\r\nL1\r\nL2\r\nL3\
+            \x1b[?6n\x1b[1c\x1b[00c\x1b[=c\x1b[6;1n\x1b[?2031;1h\
+            \x1b]11;?x\x07\x1b]110\x07\x1b]11;rgb:0/0/0\x07\x1b]0;t\x1b\\\
+            \x1b]11;?\x1b]1end\x1b";
+        let answers: &[u8] = b"\x1b[?62;22c\x1b[?62;22c\x1b[>1;10;0c\x1b[>1;10;0c\
+            \x1b[0n\x1b[3;3R\x1b[?997;2n\x1b[?2031;2$y\x1b[?2031;1$y\
+            \x1b]10;rgb:6565/7b7b/8383\x07\x1b]11;rgb:fdfd/f6f6/e3e3\x1b\\\
+            \x1b]12;rgb:5858/6e6e/7575\x07\x1b[3;3R\x1b[?62;22c\x1b[0n\x1b[3;6R";
+        let want = (raw.to_vec(), answers.to_vec(), 1);
+        for cut in 0..=stream.len() {
+            let got = answered(Some(light()), &[&stream[..cut], &stream[cut..]]);
+            assert_eq!(got, want, "cut at {cut}");
+        }
+        let bytes: Vec<&[u8]> = stream.chunks(1).collect();
+        assert_eq!(answered(Some(light()), &bytes), want, "a byte a read");
+    }
+
+    /// With no colours reported the daemon invents none: the colour queries
+    /// and the light/dark one go on to the taps unanswered. Without a cursor
+    /// colour, so does OSC 12 alone.
+    #[test]
+    fn colour_queries_without_a_report_go_on_to_the_taps() {
+        let queries: &[u8] = b"\x1b[?996n\x1b]10;?\x07\x1b]11;?\x1b\\\x1b]12;?\x07";
+        let stream = [queries, b"\x1b[c"].concat();
+        let (raw, answers, _) = answered(None, &[&stream]);
+        assert_eq!(
+            (raw.as_slice(), answers.as_slice()),
+            (queries, &b"\x1b[?62;22c"[..])
+        );
+        let blind = HostColors {
+            cursor: None,
+            ..light()
+        };
+        let (raw, answers, _) = answered(Some(blind), &[b"\x1b]12;?\x07\x1b]10;?\x07"]);
+        assert_eq!(raw, b"\x1b]12;?\x07");
+        assert_eq!(answers, b"\x1b]10;rgb:6565/7b7b/8383\x07");
+    }
+
+    /// A cursor report reads the screen the query lands on: a wrap pending
+    /// past the last column reports that column, and the alternate screen
+    /// its own cursor.
+    #[test]
+    fn a_cursor_report_reads_the_cursor_where_the_query_found_it() {
+        let mut term = Term::new(PaneSize::new(3, 10), None);
+        let mut answer = |bytes: &[u8]| term.process(bytes).1;
+        assert_eq!(answer(b"0123456789\x1b[6n"), b"\x1b[1;10R");
+        assert_eq!(answer(b"\x1b[?1049h\x1b[2;4H\x1b[6n"), b"\x1b[2;4R");
+        assert_eq!(answer(b"\x1b[?1049l\x1b[6n"), b"\x1b[1;10R");
+    }
+
+    /// A program that asks and never reads the answers never stalls its own
+    /// output behind them. Its input raw, a full input blocks the pty's
+    /// writer — the answer thread, which then falls behind until the rest go
+    /// unwritten — and the reader reads on.
+    #[test]
+    fn unread_answers_never_stall_the_output() {
+        let flood = "stty -icanon -echo; i=0; while [ $i -lt 5000 ]; do printf '\\033[6n'; \
+                     i=$((i+1)); done; echo flood-done; sleep 5";
+        let spec = PtySpec {
+            args: vec!["-c".into(), flood.into()],
+            ..PtySpec::new("/bin/sh")
+        };
+        let pane = PtyPane::spawn(spec, PaneSize::new(24, 80)).unwrap();
+        wait_for(
+            || pane.contents().contains("flood-done"),
+            "the output stalled behind its answers",
+        );
+        pane.kill().unwrap();
     }
 
     /// A terminal seeded with a tap's snapshot shows what the pane shows —

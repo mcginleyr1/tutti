@@ -286,7 +286,8 @@ rate, and fans one diff out to every client.
 **Wire.** `{"type":"pane_attach","pane":N,"rows":R,"cols":C}` opens the stream. The
 daemon answers with a `PaneSnapshot` (kind `0x02`, `seq` 0) of the screen at its size,
 then one `PaneRaw` frame per pty read — kind `0x05`, `[u64 pane_id][bytes]`, the bytes
-exactly as the child wrote them. A resize sends a fresh `PaneSnapshot` at the new size, in
+as the child wrote them but for what the daemon answers itself (below). A resize sends a
+fresh `PaneSnapshot` at the new size, in
 stream order: a terminal reflows its screen its own way, and the snapshot puts it level
 with the grid before the program's redraw lands. The client types with `Input` frames,
 moves its size vote with `ViewSizes` naming the pane, and detaches by closing the socket
@@ -337,3 +338,58 @@ the pane may have turned on in the terminal (mouse reporting, focus events, brac
 paste, cursor keys and keypad, cursor style and visibility, colours) and pops the title
 it pushed. The cost: inside the CLI the pane has no native scrollback — the alternate
 screen keeps none.
+
+## Terminal queries: the daemon answers what it can
+
+A pane has no terminal of its own: vt100 answers nothing, and a TUI client never sees the
+raw bytes. So a program that waits on an answer would hang or time out in tutti — nvim
+0.12's Ctrl-Z waits on a DA1 barrier, crossterm's `cursor::position()` on a CPR — and one
+that asks its background colour (nvim's startup OSC 11, fish) would guess. **The rule:
+the daemon answers what it can, on the pane's pty, and a raw stream carries only the
+queries it did not answer.** A stream's terminal would otherwise answer each one again,
+and its answer reach the pane as `Input`.
+
+| Asked | Bytes | Answered |
+|---|---|---|
+| DA1 | `CSI c`, `CSI 0 c` | `CSI ? 62 ; 22 c` — a VT220 with ANSI colour |
+| DA2 | `CSI > c`, `CSI > 0 c` | `CSI > 1 ; 10 ; 0 c` — a VT220 at firmware 10: old enough that a program sniffing for xterm's version turns nothing extra on |
+| DSR | `CSI 5 n` | `CSI 0 n` |
+| CPR | `CSI 6 n` | `CSI row ; col R`, 1-based, read once the parser has every byte before the query; a pending wrap reports the last column |
+| Colours | `OSC 10 ; ?`, `OSC 11 ; ?`, `OSC 12 ; ?` | `OSC 1x ; rgb:rrrr/gggg/bbbb`, closed as asked (BEL, or `ESC \`) — only once a client has reported its terminal's colours, and OSC 12 only with a cursor colour; else unanswered, and passed on |
+| Light/dark | `CSI ? 996 n` | `CSI ? 997 ; 1 n` (dark) or `; 2 n` (light) — only with colours reported |
+| Mode 2031 | `CSI ? 2031 h` / `l` | nothing: the daemon keeps the mode per pane, and never passes it on |
+| DECRQM 2031 | `CSI ? 2031 $ p` | `CSI ? 2031 ; 1 $ y` (set) or `; 2 $ y` (reset) |
+
+Each is matched exactly as spelled — parameter and intermediate bytes and final byte; C0
+controls inside execute as in vte — so `CSI 00 c`, `CSI ? 6 n` or `CSI ? 1049 ; 2031 h` go
+unanswered and on to the streams. They are picked out by the reader's own escape scanner
+(`Seq`), across read boundaries: the bytes of a sequence that could still be one are held
+from the streams until it completes — answered and dropped, or not and passed on. A
+query's last byte ends a parser run, as an OSC terminator does, so a cursor report reads
+the cursor where the query found it. The answers go to the pty from a per-pane thread, off
+the parser lock and through a bounded queue (64 writes): a program that asks and never
+reads its input fills it and stops getting answers, instead of stalling the reader — and
+with it its own output.
+
+**Colours.** `{"type":"host_colors","fg":{"r":…,"g":…,"b":…},"bg":{…},"cursor":{…}|null,
+"dark":bool}` reports the terminal a client shows panes on, 16 bits a channel. One store
+for the session, the newest report winning whoever sent it, kept across detaches: every
+pane answers from it, and a pane spawned later starts with it. The TUI reports at attach,
+before crossterm owns input — the terminal's own colours on the `terminal` theme
+(terminal-colorsaurus: OSC 10/11 with a DA1 barrier), the theme's own pane ground and
+text on `dark`/`light`, which panes are painted over. `tutti pane attach` reports the
+terminal's colours the same way before raw mode.
+
+**Light/dark changes (mode 2031,** contour's color-palette-update notifications**).** A
+report that changes light/dark — or the first one — is told to every pane whose program
+set `CSI ? 2031 h`, as `CSI ? 997 ; 1 n` (dark) or `; 2 n` (light); a report that keeps
+it tells nothing. The daemon owns the mode for its panes, so it answers DECRQM for it (nvim
+0.12 probes it before setting it) and never passes it on. `tutti pane attach` sets 2031 on
+its own terminal, keeps the `CSI ? 997 ; 1|2 n` reports that terminal sends out of what it
+types into the pane (split across reads once their `ESC [ ?` has come — no key types
+that; a lone `ESC` or `ESC [` ending a read is the key it looks like), and turns each into
+a fresh report: the colours asked again from its keyboard thread, which is then the only
+reader of the terminal, with the light/dark the terminal said. The TUI does not: crossterm
+0.29 reads `CSI ?` ending in anything but `u` or `c` as a sequence still arriving, so after
+a `CSI ? 997 ; 1 n` it would sit on every key typed until a `u` or `c` came. The TUI keeps
+its attach-time answer until it reattaches.

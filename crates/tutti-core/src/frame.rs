@@ -13,8 +13,8 @@ pub enum Frame {
         pane: PaneId,
         bytes: Vec<u8>,
     },
-    /// One pty read of a pane streamed raw (`Request::PaneAttach`), exactly as
-    /// the child wrote it.
+    /// One pty read of a pane streamed raw (`Request::PaneAttach`), as the
+    /// child wrote it but for the terminal queries the daemon answers itself.
     PaneRaw {
         pane: PaneId,
         bytes: Vec<u8>,

@@ -11,9 +11,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tutti_core::{
-    AgentHookEvent, AgentKind, AgentState, Direction, FileStat, IssueRef, Layout, Observation,
-    PaneId, PaneInfo, PendingApproval, StateEvent, StateSource, SubagentInfo, TabId, TabInfo,
-    TabView, Toward, WatchPane, WorkspaceId, WorkspaceInfo, WorkspaceView, prompt_fingerprint,
+    AgentHookEvent, AgentKind, AgentState, Direction, FileStat, HostColors, IssueRef, Layout,
+    Observation, PaneId, PaneInfo, PendingApproval, StateEvent, StateSource, SubagentInfo, TabId,
+    TabInfo, TabView, Toward, WatchPane, WorkspaceId, WorkspaceInfo, WorkspaceView,
+    prompt_fingerprint,
 };
 
 use crate::checkpoints::{Noted, Turns};
@@ -147,6 +148,9 @@ pub struct Session {
     /// herdr's reporting socket once it listens, exported to every pane
     /// spawned from then on with the rest of `HERDR_*`.
     herdr: Option<PathBuf>,
+    /// The host terminal's colours, the newest client report's: every pane
+    /// spawned from then on answers its colour queries with them.
+    colors: Option<HostColors>,
 }
 
 impl Session {
@@ -159,12 +163,19 @@ impl Session {
             ids: Ids::default(),
             name: name.into(),
             herdr: None,
+            colors: None,
         }
     }
 
     /// Point every pane spawned from now on at herdr's socket, `socket`.
     pub fn set_herdr_socket(&mut self, socket: PathBuf) {
         self.herdr = Some(socket);
+    }
+
+    /// Take a client's report of the host terminal's colours for every pane
+    /// spawned from now on; the live ones are the caller's to update.
+    pub fn set_colors(&mut self, colors: HostColors) {
+        self.colors = Some(colors);
     }
 
     pub fn workspace_new(&mut self, dir: PathBuf) -> WorkspaceId {
@@ -1505,6 +1516,7 @@ impl Session {
         if let (Some(socket), Some(workspace)) = (&self.herdr, self.workspace_of_tab(tab)) {
             spec.env.extend(herdr::env(socket, workspace, tab, id));
         }
+        spec.colors = self.colors;
         let pty = Arc::new(PtyPane::spawn(spec, self.size).context("spawn pty")?);
         let entry = self.tab_mut(tab).context("target tab vanished")?;
         entry.layout = Some(match (&entry.layout, split) {

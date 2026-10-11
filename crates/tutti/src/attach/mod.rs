@@ -18,7 +18,7 @@ mod theme;
 pub(crate) mod fixtures;
 
 pub use app::App;
-use app::tagged;
+use app::{control, tagged};
 
 use std::io;
 use std::time::Duration;
@@ -56,8 +56,14 @@ pub fn run(
     conn.send(&tagged(&Request::Attach { terminal }, 0))
         .context("send attach request")?;
 
-    if config.theme == crate::config::Theme::Terminal {
-        theme::detect_terminal_background();
+    // Asked before crossterm owns input. It stays the attach-time answer: the
+    // terminal's later light/dark reports (mode 2031, `CSI ? 997 ; 1|2 n`)
+    // are not asked for, as crossterm 0.29 takes `CSI ?` ending in anything
+    // but `u` or `c` for a sequence still arriving — it would sit on every
+    // key typed after one until a `u` or `c` came.
+    if let Some(colors) = theme::host_colors(config.theme) {
+        conn.send(&control(&Request::HostColors(colors)))
+            .context("send the terminal's colours")?;
     }
     let mut terminal = ratatui::init();
     if config.mouse {

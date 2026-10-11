@@ -387,7 +387,9 @@ pub enum Request {
     /// to show with its own parser: a `PaneSnapshot` of the screen as it
     /// stands — written for a terminal, so with the primary screen under the
     /// alternate one while that is up — then every pty read as a `PaneRaw`
-    /// frame, in order, nothing lost or repeated between the two. A resize
+    /// frame, in order, nothing lost or repeated between the two. The terminal
+    /// queries the daemon answers for every pane are cut out, so the client's
+    /// own terminal never answers them twice. A resize
     /// sends a fresh snapshot at the new size, in the same order. `rows` and
     /// `cols` are this connection's vote in the pane's size, as an attached
     /// client's `ViewSizes` is; a later `ViewSizes` naming the pane moves it.
@@ -400,6 +402,35 @@ pub enum Request {
         rows: u16,
         cols: u16,
     },
+    /// The colours of the terminal a client shows panes on, which the daemon
+    /// answers its panes' colour queries with — OSC 10/11/12 and mode 2031's
+    /// light/dark. One store for the session: the newest report replaces the
+    /// last, whoever sent it, and a change of light/dark is told to every pane
+    /// that asked (`CSI ? 2031 h`). Answered `Ok`.
+    HostColors(HostColors),
+}
+
+/// A client terminal's colours (`Request::HostColors`), 16 bits a channel as
+/// xterm reports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostColors {
+    pub fg: Rgb,
+    pub bg: Rgb,
+    /// The cursor's colour, when the client knows it; OSC 12 goes unanswered
+    /// without one.
+    #[serde(default)]
+    pub cursor: Option<Rgb>,
+    /// Whether the terminal is dark, as it says itself (mode 2031) or its
+    /// background's lightness does.
+    pub dark: bool,
+}
+
+/// A colour, 16 bits a channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rgb {
+    pub r: u16,
+    pub g: u16,
+    pub b: u16,
 }
 
 /// A single agent-lifecycle signal mapped from a Claude Code hook event. Kept a
@@ -1280,6 +1311,56 @@ mod tests {
             rows: 24,
             cols: 80,
         });
+        roundtrip(&Request::HostColors(sample_colors()));
+        roundtrip(&Request::HostColors(HostColors {
+            cursor: None,
+            ..sample_colors()
+        }));
+    }
+
+    /// Solarized Light, its cursor too.
+    fn sample_colors() -> HostColors {
+        HostColors {
+            fg: Rgb {
+                r: 0x6565,
+                g: 0x7b7b,
+                b: 0x8383,
+            },
+            bg: Rgb {
+                r: 0xfdfd,
+                g: 0xf6f6,
+                b: 0xe3e3,
+            },
+            cursor: Some(Rgb {
+                r: 0x5858,
+                g: 0x6e6e,
+                b: 0x7575,
+            }),
+            dark: false,
+        }
+    }
+
+    /// The colours ride beside the tag, each channel a number; a report
+    /// without a cursor names none.
+    #[test]
+    fn host_colors_ride_the_wire_flat() {
+        let json = serde_json::to_string(&Request::HostColors(sample_colors())).unwrap();
+        assert_eq!(
+            json,
+            concat!(
+                r#"{"type":"host_colors","fg":{"r":25957,"g":31611,"b":33667},"#,
+                r#""bg":{"r":65021,"g":63222,"b":58339},"cursor":{"r":22616,"g":28270,"b":30069},"#,
+                r#""dark":false}"#
+            )
+        );
+        let bare: Request = serde_json::from_str(
+            r#"{"type":"host_colors","fg":{"r":0,"g":0,"b":0},"bg":{"r":1,"g":2,"b":3},"dark":true}"#,
+        )
+        .unwrap();
+        let Request::HostColors(colors) = bare else {
+            panic!("{bare:?}");
+        };
+        assert_eq!((colors.cursor, colors.dark), (None, true));
     }
 
     fn sample_issue() -> IssueRef {

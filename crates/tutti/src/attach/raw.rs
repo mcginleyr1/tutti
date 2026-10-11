@@ -11,6 +11,11 @@
 //! the terminal (`ESC c`), is drawn from the mirror instead of passed through.
 //! A program leaving its alternate screen so brings back the pane's primary
 //! screen, not the shell's.
+//!
+//! The terminal's colours go to the daemon first, which answers the pane's
+//! colour queries with them; and the terminal is asked to tell of its
+//! light/dark changes (mode 2031), each of which goes to the daemon too, with
+//! the colours asked afresh — never to the pane.
 
 use std::io::{IsTerminal, Read, Write};
 use std::net::Shutdown;
@@ -23,20 +28,25 @@ use ratatui::crossterm::event::KeyEvent;
 use ratatui::crossterm::terminal;
 use signal_hook::consts::SIGWINCH;
 use signal_hook::iterator::Signals;
-use tutti_core::{Event, Frame, PaneDims, PaneId, Request, Response, socket_path};
+use tutti_core::{Event, Frame, HostColors, PaneDims, PaneId, Request, Response, socket_path};
 
 use super::input::encode_key;
+use super::theme::host_colors;
 use crate::client;
-use crate::config::Chord;
+use crate::config::{Chord, Theme};
 
-/// Push the window title and take the alternate screen.
-const ENTER: &[u8] = b"\x1b[22;0t\x1b[?1049h";
+/// Push the window title, take the alternate screen, and ask to hear of
+/// light/dark changes.
+const ENTER: &[u8] = b"\x1b[22;0t\x1b[?1049h\x1b[?2031h";
 /// Turn off what the pane may have turned on in this terminal — mouse
 /// reporting, focus events, bracketed paste, application cursor and keypad, a
-/// cursor style, a hidden cursor, colours — then leave the alternate screen
-/// and pop the title.
+/// cursor style, a hidden cursor, colours — and the light/dark reports, then
+/// leave the alternate screen and pop the title.
 const LEAVE: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\
-\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b>\x1b[0 q\x1b[?25h\x1b[m\x1b[?1049l\x1b[23;0t";
+\x1b[?1004l\x1b[?2004l\x1b[?2031l\x1b[?1l\x1b>\x1b[0 q\x1b[?25h\x1b[m\x1b[?1049l\x1b[23;0t";
+
+/// A mode-2031 terminal's light/dark reports, each with whether it says dark.
+const REPORTS: [(&[u8], bool); 2] = [(b"\x1b[?997;1n", true), (b"\x1b[?997;2n", false)];
 
 /// Show `pane` of `session` in this terminal until the prefix and `d` detach
 /// it, the pane exits (`[pane N exited: CODE]`), or the daemon goes away (an
@@ -54,20 +64,33 @@ pub fn run(session: &str, pane: PaneId, prefix: Chord) -> Result<i32> {
         }
         Err(e) => return Err(e).context("connecting to tutti-server"),
     };
+    if let Some(colors) = host_colors(Theme::Terminal) {
+        stream.write_all(&control(&Request::HostColors(colors)))?;
+    }
     let (cols, rows) = terminal::size().context("reading the terminal size")?;
     let attach = Request::PaneAttach { pane, rows, cols };
     stream.write_all(&control(&attach))?;
-    // A refusal — no such pane — lands before the terminal is touched.
+    // A refusal — no such pane — lands before the terminal is touched; the
+    // colours' `Ok` is passed over.
     let mut buf = Vec::new();
-    let first = read_frame(&mut stream, &mut buf)?.context("tutti-server closed the connection")?;
-    if let Frame::Control(json) = &first
-        && let Ok(Response::Error { message }) = serde_json::from_slice(json)
-    {
-        if message.starts_with("bad request") {
-            bail!("the daemon cannot stream a pane ({message}); restart it: `tutti server stop`");
+    let first = loop {
+        let frame =
+            read_frame(&mut stream, &mut buf)?.context("tutti-server closed the connection")?;
+        let reply = match &frame {
+            Frame::Control(json) => serde_json::from_slice(json).ok(),
+            _ => None,
+        };
+        match reply {
+            Some(Response::Ok) => continue,
+            Some(Response::Error { message }) if message.starts_with("bad request") => {
+                bail!(
+                    "the daemon cannot stream a pane ({message}); restart it: `tutti server stop`"
+                )
+            }
+            Some(Response::Error { message }) => bail!(message),
+            _ => break frame,
         }
-        bail!(message);
-    }
+    };
 
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
     let resizes = Signals::new([SIGWINCH]).context("watching for SIGWINCH")?;
@@ -152,15 +175,20 @@ fn redraw(mirror: &vt100::Parser) -> Vec<u8> {
     .concat()
 }
 
-/// The keys typed into the pane, watched for the prefix chord's bytes: the
+/// The keys typed into the pane, watched for the prefix chord's bytes — the
 /// prefix then `d` detaches, the prefix twice sends one, and the prefix then
-/// anything else sends both. A prefix split across reads still counts.
+/// anything else sends both — and for the terminal's light/dark reports
+/// (`REPORTS`), which are tutti's, never the pane's. Either still counts
+/// split across reads — a report once its `ESC [ ?` has come, which no key
+/// types: a lone `ESC` or `ESC [` ending a read is the key it looks like.
 struct Keys {
     prefix: Vec<u8>,
     /// How many of the prefix's bytes the input has matched so far.
     held: usize,
     /// A whole prefix came: the next key decides.
     armed: bool,
+    /// The bytes of a report begun so far.
+    report: Vec<u8>,
 }
 
 impl Keys {
@@ -169,38 +197,72 @@ impl Keys {
             prefix,
             held: 0,
             armed: false,
+            report: Vec::new(),
         }
     }
 
-    /// The bytes to send for one read of input, and whether it detached;
-    /// what follows a detach is dropped.
-    fn feed(&mut self, input: &[u8]) -> (Vec<u8>, bool) {
-        let mut out = Vec::new();
+    /// What one read of input comes to: the bytes to send, whether it
+    /// detached — what follows a detach is dropped — and what its last
+    /// light/dark report said (dark: `true`).
+    fn feed(&mut self, input: &[u8]) -> (Vec<u8>, bool, Option<bool>) {
+        let (mut out, mut dark) = (Vec::new(), None);
         for &b in input {
-            if self.armed && self.held == 0 && b == b'd' {
-                return (out, true);
-            }
-            if self.prefix[self.held] == b {
-                self.held += 1;
-                if self.held == self.prefix.len() {
-                    self.held = 0;
-                    if self.armed {
-                        out.extend_from_slice(&self.prefix);
-                    }
-                    self.armed = !self.armed;
+            if self.report.is_empty() && b != 0x1b {
+                if self.key(b, &mut out) {
+                    return (out, true, dark);
                 }
                 continue;
             }
-            if std::mem::take(&mut self.armed) {
-                out.extend_from_slice(&self.prefix);
-            }
-            out.extend_from_slice(&self.prefix[..self.held]);
-            self.held = usize::from(self.prefix[0] == b);
-            if self.held == 0 {
-                out.push(b);
+            self.report.push(b);
+            if let Some(&(_, said)) = REPORTS.iter().find(|(r, _)| *r == self.report) {
+                self.report.clear();
+                dark = Some(said);
+            } else if !REPORTS.iter().any(|(r, _)| r.starts_with(&self.report)) {
+                // No report: keys — but for an `ESC`, which may begin one.
+                let keys = self.report.len() - usize::from(b == 0x1b);
+                for k in self.report.drain(..keys).collect::<Vec<_>>() {
+                    if self.key(k, &mut out) {
+                        return (out, true, dark);
+                    }
+                }
             }
         }
-        (out, false)
+        if self.report.len() < 3 {
+            for k in std::mem::take(&mut self.report) {
+                if self.key(k, &mut out) {
+                    return (out, true, dark);
+                }
+            }
+        }
+        (out, false, dark)
+    }
+
+    /// Step the prefix watch over one key's byte, adding to `out` what goes
+    /// on to the pane; true on a detach.
+    fn key(&mut self, b: u8, out: &mut Vec<u8>) -> bool {
+        if self.armed && self.held == 0 && b == b'd' {
+            return true;
+        }
+        if self.prefix[self.held] == b {
+            self.held += 1;
+            if self.held == self.prefix.len() {
+                self.held = 0;
+                if self.armed {
+                    out.extend_from_slice(&self.prefix);
+                }
+                self.armed = !self.armed;
+            }
+            return false;
+        }
+        if std::mem::take(&mut self.armed) {
+            out.extend_from_slice(&self.prefix);
+        }
+        out.extend_from_slice(&self.prefix[..self.held]);
+        self.held = usize::from(self.prefix[0] == b);
+        if self.held == 0 {
+            out.push(b);
+        }
+        false
     }
 }
 
@@ -214,17 +276,30 @@ fn spawn_keys(
 ) {
     let (writer, detached) = (Arc::clone(writer), Arc::clone(detached));
     std::thread::spawn(move || {
-        let mut stdin = std::io::stdin().lock();
         let mut input = [0u8; 4096];
         loop {
-            let n = match stdin.read(&mut input) {
+            // Stdin is locked a read at a time: asking the colours locks it too.
+            let n = match std::io::stdin().read(&mut input) {
                 Ok(0) => return,
                 Ok(n) => n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => return,
             };
-            let (bytes, detach) = keys.feed(&input[..n]);
+            let (bytes, detach, dark) = keys.feed(&input[..n]);
+            // A light/dark change: the colours are asked afresh, for the
+            // daemon, from here — no other read of the terminal is under way,
+            // and the query holds stdout, so no pane output lands amid it.
+            let report = dark.and_then(|dark| {
+                host_colors(Theme::Terminal).map(|colors| HostColors { dark, ..colors })
+            });
             let mut stream = writer.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(colors) = report
+                && stream
+                    .write_all(&control(&Request::HostColors(colors)))
+                    .is_err()
+            {
+                return;
+            }
             if !bytes.is_empty()
                 && stream
                     .write_all(&Frame::Input { pane, bytes }.encode())
@@ -311,13 +386,50 @@ mod tests {
         let mut keys = Keys::new(prefix.to_vec());
         let mut sent = Vec::new();
         for read in reads {
-            let (bytes, detach) = keys.feed(read);
+            let (bytes, detach, _) = keys.feed(read);
             sent.extend(bytes);
             if detach {
                 return (sent, true);
             }
         }
         (sent, false)
+    }
+
+    /// The terminal's light/dark reports never reach the pane, wherever
+    /// reads cut them once their `ESC [ ?` has come; a near miss is keys, and
+    /// so is a lone `ESC` or `ESC [` ending a read — an arrow cut there
+    /// still arrives whole.
+    #[test]
+    fn light_dark_reports_are_kept_from_the_pane() {
+        let input = b"a\x1b[?997;2nb\x1b[?997;1n\x1b[?997;3n\x1b[Ac";
+        let feed = |reads: &[&[u8]]| {
+            let mut keys = Keys::new(vec![0x02]);
+            let (mut sent, mut said) = (Vec::new(), Vec::new());
+            for read in reads {
+                let (bytes, _, dark) = keys.feed(read);
+                sent.extend(bytes);
+                said.extend(dark);
+            }
+            (sent, said)
+        };
+        let keys = b"ab\x1b[?997;3n\x1b[Ac".to_vec();
+        assert_eq!(
+            feed(&[input]),
+            (keys.clone(), vec![true]),
+            "the read's last"
+        );
+        // Cut after a report's `ESC` or `ESC [`, it reads as keys.
+        for cut in (0..=input.len()).filter(|cut| ![2, 3, 12, 13].contains(cut)) {
+            let (sent, said) = feed(&[&input[..cut], &input[cut..]]);
+            assert_eq!(sent, keys, "cut at {cut}");
+            assert_eq!(said.last(), Some(&true), "cut at {cut}");
+            // One report a read: both are seen when the cut parts them.
+            assert_eq!(
+                said.len(),
+                1 + usize::from((10..20).contains(&cut)),
+                "cut at {cut}"
+            );
+        }
     }
 
     #[test]

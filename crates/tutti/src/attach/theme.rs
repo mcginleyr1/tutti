@@ -4,9 +4,10 @@
 //! flows through live and flips with it. `dark` and `light` are opt-in
 //! truecolor themes: a shaded chrome over a tinted pane ground, an explicit
 //! muted grey instead of DIM, and state/diff colours tuned to that ground. A
-//! theme is a fixed choice made in config. The one thing detected is whether
-//! the terminal's background is light, once at attach, and it only picks which
-//! ANSI colour the `terminal` theme's selection row uses.
+//! theme is a fixed choice made in config. The one thing detected is the
+//! terminal's own colours, once at attach: whether its background is light
+//! only picks which ANSI colour the `terminal` theme's selection row uses,
+//! and the daemon answers the panes' colour queries with them.
 //!
 //! The active palette is thread-local, set for the span of one `draw` by
 //! `activate`, so every styling helper reads it without threading a parameter
@@ -19,6 +20,7 @@ use std::time::Duration;
 
 use ratatui::style::{Color, Modifier, Style};
 use terminal_colorsaurus::{QueryOptions, ThemeMode};
+use tutti_core::{HostColors, Rgb};
 
 use crate::config::Theme;
 
@@ -111,18 +113,51 @@ pub static TERMINAL_LIGHT: Palette = Palette {
 
 static LIGHT_TERMINAL: AtomicBool = AtomicBool::new(false);
 
-/// Ask the terminal once, before the TUI takes over input, whether its
-/// background is light. The answer is fixed for the attach: a later light/dark
-/// flip keeps the selection colour picked here. Terminals that don't answer
-/// are treated as dark.
-pub fn detect_terminal_background() {
+/// The colours a pane shows on, which the daemon answers its colour queries
+/// with (`Request::HostColors`). On the `terminal` theme they are the
+/// terminal's own, asked once here before the TUI takes over input — which
+/// also picks the selection colour, fixed for the attach, a later light/dark
+/// flip keeping it. A terminal that doesn't answer gives `None` and is
+/// treated as dark. On `dark` and `light` they are the theme's own pane
+/// ground and text, which panes are painted over.
+pub fn host_colors(theme: Theme) -> Option<HostColors> {
+    if theme != Theme::Terminal {
+        let theme_palette = palette(theme);
+        let (Some(Color::Rgb(r, g, b)), Some(Color::Rgb(br, bg, bb))) =
+            (theme_palette.fg, theme_palette.pane_bg)
+        else {
+            return None;
+        };
+        let wide = |r: u8, g: u8, b: u8| Rgb {
+            r: u16::from(r) * 257,
+            g: u16::from(g) * 257,
+            b: u16::from(b) * 257,
+        };
+        return Some(HostColors {
+            fg: wide(r, g, b),
+            bg: wide(br, bg, bb),
+            cursor: None,
+            dark: theme == Theme::Dark,
+        });
+    }
     let mut options = QueryOptions::default();
     options.timeout = Duration::from_millis(300);
-    let light = matches!(
-        terminal_colorsaurus::theme_mode(options),
-        Ok(ThemeMode::Light)
-    );
-    LIGHT_TERMINAL.store(light, Ordering::Relaxed);
+    let detected = terminal_colorsaurus::color_palette(options).ok();
+    let dark = detected
+        .as_ref()
+        .is_none_or(|found| matches!(found.theme_mode(), ThemeMode::Dark));
+    LIGHT_TERMINAL.store(!dark, Ordering::Relaxed);
+    let rgb = |c: terminal_colorsaurus::Color| Rgb {
+        r: c.r,
+        g: c.g,
+        b: c.b,
+    };
+    detected.map(|found| HostColors {
+        fg: rgb(found.foreground),
+        bg: rgb(found.background),
+        cursor: None,
+        dark,
+    })
 }
 
 /// A graphite dark theme: chrome a step darker than the pane ground, soft blue
@@ -218,6 +253,41 @@ mod tests {
             },
             TERMINAL
         );
+    }
+
+    /// On a truecolor theme panes are painted over the theme's own ground,
+    /// so that is what their colour queries are answered with — the terminal
+    /// is never asked.
+    #[test]
+    fn a_truecolor_theme_reports_its_own_pane_ground() {
+        let light = host_colors(Theme::Light).unwrap();
+        assert_eq!(
+            light.bg,
+            Rgb {
+                r: 0xfafa,
+                g: 0xfafa,
+                b: 0xfbfb
+            }
+        );
+        assert_eq!(
+            light.fg,
+            Rgb {
+                r: 0x2b2b,
+                g: 0x3030,
+                b: 0x3b3b
+            }
+        );
+        assert!(!light.dark && light.cursor.is_none());
+        let dark = host_colors(Theme::Dark).unwrap();
+        assert_eq!(
+            dark.bg,
+            Rgb {
+                r: 0x1b1b,
+                g: 0x1e1e,
+                b: 0x2626
+            }
+        );
+        assert!(dark.dark);
     }
 
     #[test]
