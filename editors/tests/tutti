@@ -1,0 +1,12 @@
+#!/bin/sh
+# A stand-in tutti for the tests. Logs each call's argv to $TUTTI_STUB/log, one
+# line per call, every argument in brackets; then answers the Nth call from the
+# control files N.out (stdout), N.err (stderr), N.sleep (seconds) and N.exit
+# (the status, 0 when absent).
+printf '[%s]' "$@" >> "$TUTTI_STUB/log"
+echo >> "$TUTTI_STUB/log"
+n="$TUTTI_STUB/$(wc -l < "$TUTTI_STUB/log" | tr -d ' ')"
+cat "$n.out" 2>/dev/null
+cat "$n.err" >&2 2>/dev/null
+sleep "$(cat "$n.sleep" 2>/dev/null || echo 0)"
+exit "$(cat "$n.exit" 2>/dev/null || echo 0)"
