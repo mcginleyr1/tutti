@@ -580,8 +580,11 @@ In order; each lands its TUI path in the same wave as its verbs.
      reports colours at attach only;
    - `pane attach --inline` (primary screen, switches passed through) so
      editor terminals keep native scrollback; detach under the kitty keyboard
-     protocol; escape-time for an Alt prefix; a switching read's other bytes
-     (queries, a bell) are lost to the redraw;
+     protocol; escape-time for an Alt prefix;
+   - `pane attach` loses the rest of a read that switches screens to its
+     mirror redraw: a program's startup queries (nvim's kitty `CSI ? u`, its
+     DECRQMs) and a bell sharing that read never reach the terminal. Waits for
+     the engine swap;
    - `cwd` in watch snapshots; `pane list` has no workspace and watch no
      approval, so the plugins read one from each;
    - fish's snippet unrun; bash before 4.4 has no `C` mark; Emacs 29 and
