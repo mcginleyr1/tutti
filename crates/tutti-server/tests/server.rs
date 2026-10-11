@@ -2301,20 +2301,21 @@ async fn a_detached_daemon_logs_beside_its_socket() {
 
 /// Every spawned pane carries `TUTTI_PANE` (its id) and `TUTTI_SESSION` (the
 /// socket's session name) in its environment, so a Claude Code hook running
-/// inside it can address this daemon. The test server's socket is `s.sock`, so
-/// the session name is `s`.
+/// inside it can address this daemon, and `COLORTERM=truecolor`, so editors
+/// turn on 24-bit colour. The test server's socket is `s.sock`, so the
+/// session name is `s`.
 #[tokio::test]
 async fn spawned_pane_carries_tutti_env() {
     let server = TestServer::start();
     let mut conn = server.connect().await;
     let pane = run_marker(
         &mut conn,
-        "printf 'ENV %s %s\\n' \"$TUTTI_PANE\" \"$TUTTI_SESSION\"; sleep 30",
+        "printf 'ENV %s %s %s\\n' \"$TUTTI_PANE\" \"$TUTTI_SESSION\" \"$COLORTERM\"; sleep 30",
     )
     .await;
     assert!(
-        read_until(&mut conn, pane, &format!("ENV {pane} s")).await,
-        "the pane env should carry TUTTI_PANE=<id> and TUTTI_SESSION=<name>"
+        read_until(&mut conn, pane, &format!("ENV {pane} s truecolor")).await,
+        "the pane env should carry TUTTI_PANE=<id>, TUTTI_SESSION=<name> and COLORTERM=truecolor"
     );
     server.stop().await;
 }

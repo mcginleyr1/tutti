@@ -1508,6 +1508,10 @@ impl Session {
         let id = self.ids.pane();
         spec.env.push(("TUTTI_PANE".into(), id.0.to_string()));
         spec.env.push(("TUTTI_SESSION".into(), self.name.clone()));
+        // The pane renders RGB through to the client whatever terminal the
+        // daemon was started from, so say so: Neovim's termguicolors and
+        // Emacs -nw read this rather than guessing from TERM.
+        spec.env.push(("COLORTERM".into(), "truecolor".into()));
         // Its herdr reporters reach this daemon, never a herdr the daemon
         // itself was started inside.
         let inherited = std::env::vars_os().filter_map(|(key, _)| key.into_string().ok());
