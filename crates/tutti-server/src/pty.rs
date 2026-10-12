@@ -141,8 +141,9 @@ pub struct Look {
 /// stream order: a snapshot of the screen to start from, at its size, then
 /// each read's bytes as the child wrote them, less the queries the daemon
 /// answered and the sequences it owns (`verdict`) — a tap's own terminal
-/// would answer or take them again — and after a resize, a fresh snapshot
-/// at the new size.
+/// would answer or take them again — a switch of screens or a reset handed
+/// on its own between the bytes around it; and after a resize, a fresh
+/// snapshot at the new size.
 pub enum Feed<'a> {
     Snapshot(PaneSize, Vec<u8>),
     Raw(&'a [u8]),
@@ -157,6 +158,12 @@ struct Processed {
     /// The read for the taps: less what the daemon answered or owns, the
     /// start of a sequence it may yet answer held until the next read.
     raw: Vec<u8>,
+    /// Where `raw` is cut into the reads a tap is handed: around each
+    /// sequence that switches screens or resets the terminal (`switches`).
+    /// `pane attach` redraws a read that does from its mirror, and so loses
+    /// whatever else that read held — a bell, a cursor shape — unless the
+    /// switch comes alone.
+    cuts: Vec<usize>,
     /// The answers to write back to the pane, in order.
     answers: Vec<u8>,
     signals: Vec<Signal>,
@@ -340,11 +347,18 @@ impl Term {
             }
         };
         if !kept {
+            let alone = switches(&whole);
+            if alone {
+                out.cuts.push(out.raw.len());
+            }
             out.raw.extend_from_slice(if verdict == Verdict::Released {
                 &bytes[seq]
             } else {
                 &whole
             });
+            if alone {
+                out.cuts.push(out.raw.len());
+            }
         }
         if !then.is_empty() && matches!(whole.get(1), Some(b']' | b'P')) {
             self.string_kept = Some(kept);
@@ -649,6 +663,18 @@ fn verdict(seq: &[u8]) -> Verdict {
         }
         [0x1b, b'Z'] | [0x1b, b']' | b'P', ..] => Verdict::Ask,
         _ => Verdict::Pass,
+    }
+}
+
+/// Whether a sequence switches screens (`CSI ? 47|1047|1049 h|l`, any
+/// among others) or resets the terminal (`ESC c`).
+fn switches(seq: &[u8]) -> bool {
+    match seq {
+        [0x1b, b'c'] => true,
+        [0x1b, b'[', b'?', params @ .., b'h' | b'l'] => params
+            .split(|&b| b == b';')
+            .any(|mode| matches!(mode, b"47" | b"1047" | b"1049")),
+        _ => false,
     }
 }
 
@@ -1086,11 +1112,17 @@ fn read_loop(
                 let mut term = lock(&term);
                 let Processed {
                     raw,
+                    cuts,
                     answers: answer,
                     signals,
                 } = term.process(&buf[..n]);
-                if !raw.is_empty() {
-                    term.taps.retain_mut(|(_, tap)| tap(Feed::Raw(&raw)));
+                let mut from = 0;
+                for to in cuts.into_iter().chain([raw.len()]) {
+                    let piece = &raw[from..to];
+                    if !piece.is_empty() {
+                        term.taps.retain_mut(|(_, tap)| tap(Feed::Raw(piece)));
+                    }
+                    from = to;
                 }
                 if !signals.is_empty() {
                     let mut queue = lock(&notifications);
@@ -2424,6 +2456,56 @@ mod tests {
             assert_eq!(term.vt.modes().modify_other_keys, 0);
             let snapshot = String::from_utf8_lossy(&term.vt.snapshot()).into_owned();
             assert!(!snapshot.contains("\x1b[>"), "{snapshot:?}");
+        }
+    }
+
+    /// A switch of screens and a reset each reach the taps alone, however
+    /// reads cut the stream — `pane attach` redraws a read that switches, and
+    /// would lose the bell, the cursor shape or the text beside one.
+    #[test]
+    fn a_switch_of_screens_reaches_the_taps_alone() {
+        let stream: &[u8] = b"before\x07\x1b[?1049h\x1b[?2026$p\x07\x1b[6 qafter\
+            \x1b[?1049;1006l\x1b[?47hon\x1b[?47l\x1bcreset";
+        let switches: [&[u8]; 5] = [
+            b"\x1b[?1049h",
+            b"\x1b[?1049;1006l",
+            b"\x1b[?47h",
+            b"\x1b[?47l",
+            b"\x1bc",
+        ];
+        let raw = [
+            b"before\x07".as_slice(),
+            switches[0],
+            b"\x07\x1b[6 qafter",
+            switches[1],
+            switches[2],
+            b"on",
+            switches[3],
+            switches[4],
+            b"reset",
+        ]
+        .concat();
+        for cut in 0..=stream.len() {
+            let mut term = Term::new(PaneSize::new(5, 20), None);
+            let mut pieces: Vec<Vec<u8>> = Vec::new();
+            for read in [&stream[..cut], &stream[cut..]] {
+                let out = term.process(read);
+                let mut from = 0;
+                for to in out.cuts.iter().copied().chain([out.raw.len()]) {
+                    pieces.push(out.raw[from..to].to_vec());
+                    from = to;
+                }
+            }
+            assert_eq!(pieces.concat(), raw, "cut at {cut}");
+            for piece in &pieces {
+                for switch in switches {
+                    let holds = piece.windows(switch.len()).any(|bytes| bytes == switch);
+                    assert!(
+                        !holds || piece == switch,
+                        "cut at {cut}: {piece:?} switches with more"
+                    );
+                }
+            }
         }
     }
 

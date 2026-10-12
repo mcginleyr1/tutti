@@ -10,7 +10,8 @@
 //! the pane follows the stream, and a read that switches screens, or resets
 //! the terminal (`ESC c`), is drawn from the mirror instead of passed through.
 //! A program leaving its alternate screen so brings back the pane's primary
-//! screen, not the shell's.
+//! screen, not the shell's. The daemon sends each switch or reset in a frame
+//! of its own, so no other byte goes with the redraw.
 //!
 //! The terminal's colours go to the daemon first, which answers the pane's
 //! colour queries with them; and the terminal is asked to tell of its

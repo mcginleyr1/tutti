@@ -581,10 +581,11 @@ In order; each lands its TUI path in the same wave as its verbs.
    - `pane attach --inline` (primary screen, switches passed through) so
      editor terminals keep native scrollback; detach under the kitty keyboard
      protocol; escape-time for an Alt prefix;
-   - `pane attach` loses the rest of a read that switches screens to its
-     mirror redraw: a program's startup queries (nvim's kitty `CSI ? u`, its
-     DECRQMs) and a bell sharing that read never reach the terminal. Waits for
-     the engine swap;
+   - ✅ `pane attach` lost the rest of a read that switches screens to its
+     mirror redraw (a program's startup queries, a bell). Fixed with the
+     engine swap: the daemon answers those queries itself, and hands a
+     stream each switch of screens (or reset) in a frame of its own
+     (`a_screen_switching_read_loses_nothing_on_a_stream`);
    - `cwd` in watch snapshots; `pane list` has no workspace and watch no
      approval, so the plugins read one from each;
    - fish's snippet unrun; bash before 4.4 has no `C` mark; Emacs 29 and

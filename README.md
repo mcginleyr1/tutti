@@ -203,9 +203,11 @@ an error (exit 1) when the daemon goes away or the terminal cannot keep up with
 the pane's output. It never starts a daemon, and refuses the pane it is run
 from.
 
-Two things the alternate screen costs: the pane has no native scrollback in
-that terminal, and a read that switches screens is replaced by the redraw, so
-whatever else that read held (a program's startup queries, a bell) is lost.
+What the alternate screen costs: the pane has no native scrollback in that
+terminal. Nothing else is lost to the redraws: the daemon hands a stream each
+switch of screens on its own, so the bell or cursor shape beside one still
+reaches your terminal, and it answers the queries a program sends as it
+starts itself.
 
 ### Terminal queries and colours
 

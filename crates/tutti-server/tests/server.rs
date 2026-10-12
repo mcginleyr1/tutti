@@ -2014,6 +2014,60 @@ async fn a_2031_pane_hears_of_a_light_dark_flip() {
     server.stop().await;
 }
 
+/// A read that switches screens reaches a pane stream with the switch in a
+/// frame of its own, so `pane attach` — which redraws a switching frame from
+/// its mirror — loses nothing else the read held: a bell, a cursor shape.
+/// The queries a program sends as it switches (nvim's DECRQM and DECRQSS)
+/// are answered by the daemon and never reach the stream; kitty's keyboard
+/// query is dropped, and the DA1 after it says there is no such protocol.
+#[tokio::test]
+async fn a_screen_switching_read_loses_nothing_on_a_stream() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let script = "stty -echo -icanon; echo ready; read -r go; \
+                  printf 'before\\007\\033[?1049h\\033[?2026$p\\033P$qm\\033\\\\\\033[?u\\033[c\\007\\033[6 qafter'; \
+                  head -c 29 | tr '\\033' E; sleep 30";
+    let pane = run_marker(&mut control, script).await;
+    assert!(read_until(&mut control, pane, "ready").await);
+    let mut stream = server.connect().await;
+    stream.send(&pane_attach(pane, 24, 80)).await;
+    stream
+        .write_frame(&Frame::Input {
+            pane,
+            bytes: b"go\r".to_vec(),
+        })
+        .await;
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    timeout(DEADLINE, async {
+        while !frames.concat().windows(5).any(|bytes| bytes == b"after") {
+            if let Frame::PaneRaw { bytes, .. } = stream.read_frame().await {
+                frames.push(bytes);
+            }
+        }
+    })
+    .await
+    .expect("the stream never got there");
+    let switch = b"\x1b[?1049h".as_slice();
+    for frame in &frames {
+        let holds = |bytes: &[u8]| frame.windows(bytes.len()).any(|seen| seen == bytes);
+        assert!(!holds(switch) || frame == switch, "{frame:?}");
+        for query in [b"$p".as_slice(), b"$q", b"\x1b[?u", b"\x1b[c"] {
+            assert!(!holds(query), "{query:?} reached the stream: {frame:?}");
+        }
+    }
+    let after: Vec<u8> = frames
+        .iter()
+        .skip_while(|frame| frame.as_slice() != switch)
+        .skip(1)
+        .flatten()
+        .copied()
+        .collect();
+    assert_eq!(after, b"\x07\x1b[6 qafter", "{frames:?}");
+    assert!(read_until(&mut control, pane, "E[?2026;2$yEP1$r0mE\\E[?62;22c").await);
+
+    server.stop().await;
+}
+
 /// A stream that stops reading never stalls its pane or anyone else: once
 /// its queue backs up it is dropped — its vote with it — and, read at last,
 /// it holds its backlog, then the Error it was dropped with, then the end.
