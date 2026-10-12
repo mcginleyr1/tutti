@@ -22,10 +22,15 @@ use tokio::sync::watch;
 use tutti_core::{AgentState, HostColors, Rgb, StateSource};
 
 const SCROLLBACK_LINES: usize = 10_000;
-/// Writes waiting for a pane's answer thread: a read's answers, or a
-/// light/dark notice. A program that asks and never reads the answers stops
+/// Writes waiting for a pane's writer thread: a read's answers, a light/dark
+/// notice, input. A program that asks and never reads the answers stops
 /// getting them past this, rather than stalling its own output behind them.
-const ANSWER_QUEUE: usize = 64;
+const WRITE_QUEUE: usize = 64;
+
+/// One write to a pane's pty (`PtyPane::writes`): a read's answers or a
+/// light/dark notice, or input, whose sender waits on the second for how the
+/// write went.
+type PtyWrite = (Vec<u8>, Option<SyncSender<std::io::Result<()>>>);
 /// The longest sequence held from the terminal and the taps while it could
 /// still be one the daemon answers or owns; past it, it goes on to both.
 const HOLD_MAX: usize = 256;
@@ -774,11 +779,11 @@ fn switches(seq: &[u8]) -> bool {
 /// A persistent pty running a single child process.
 pub struct PtyPane {
     master: Mutex<Box<dyn MasterPty + Send>>,
-    /// Shared with the answer thread, which writes back what the daemon says
-    /// on the pane's terminal's behalf.
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    /// The answer thread's queue, which the reader holds too.
-    answers: SyncSender<Vec<u8>>,
+    /// The writer thread's queue, which the reader holds too: what the
+    /// daemon answers on the pane's terminal's behalf and the input typed
+    /// into it reach the pty in the order they were queued, as a terminal's
+    /// own reports and keys do.
+    writes: SyncSender<PtyWrite>,
     term: Arc<Mutex<Term>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     /// The child's OS process id, the root of the process-tree walk that agent
@@ -845,11 +850,10 @@ impl PtyPane {
             .master
             .try_clone_reader()
             .context("failed to clone pty reader")?;
-        let writer = Arc::new(Mutex::new(
-            pair.master
-                .take_writer()
-                .context("failed to take pty writer")?,
-        ));
+        let mut writer = pair
+            .master
+            .take_writer()
+            .context("failed to take pty writer")?;
 
         let term = Arc::new(Mutex::new(Term::new(size, spec.colors)));
 
@@ -857,26 +861,29 @@ impl PtyPane {
         let (exit_tx, exit_rx) = watch::channel(None);
         let notifications = Arc::new(Mutex::new(Vec::new()));
 
-        // Answers go out on a thread of their own, off the parser lock: a
-        // program that asks and never reads them fills its input and blocks
-        // that thread, never the reader — which would leave its output
+        // Everything written to the pty goes out on a thread of its own, in
+        // the order it was queued — answers and input alike, so a key never
+        // overtakes an answer queued before it — and off the parser lock: a
+        // program that asks and never reads its answers fills its input and
+        // blocks that thread, never the reader, which would leave its output
         // undrained. The thread ends once the reader and the pane have both
         // let go of its queue.
-        let (answers, answers_rx) = mpsc::sync_channel::<Vec<u8>>(ANSWER_QUEUE);
-        let answer_writer = Arc::clone(&writer);
+        let (writes, queued) = mpsc::sync_channel::<PtyWrite>(WRITE_QUEUE);
         std::thread::Builder::new()
-            .name("tutti-pty-answers".into())
+            .name("tutti-pty-writer".into())
             .spawn(move || {
-                for answer in answers_rx {
-                    let mut writer = lock(&answer_writer);
-                    let _ = writer.write_all(&answer).and_then(|()| writer.flush());
+                for (bytes, done) in queued {
+                    let wrote = writer.write_all(&bytes).and_then(|()| writer.flush());
+                    if let Some(done) = done {
+                        let _ = done.send(wrote);
+                    }
                 }
             })
-            .context("failed to spawn pty answer thread")?;
+            .context("failed to spawn pty writer thread")?;
 
         let reader_term = Arc::clone(&term);
         let reader_notifications = Arc::clone(&notifications);
-        let reader_answers = answers.clone();
+        let reader_answers = writes.clone();
         let reader_thread = std::thread::Builder::new()
             .name("tutti-pty-reader".into())
             .spawn(move || {
@@ -911,8 +918,7 @@ impl PtyPane {
 
         Ok(Self {
             master: Mutex::new(pair.master),
-            writer,
-            answers,
+            writes,
             term,
             killer: Mutex::new(killer),
             pid,
@@ -952,16 +958,22 @@ impl PtyPane {
             out.answers
         });
         if !answers.is_empty() {
-            let _ = self.answers.try_send(answers);
+            let _ = self.writes.try_send((answers, None));
         }
     }
 
-    /// Forward raw keystrokes to the child.
+    /// Forward raw keystrokes to the child, after whatever the daemon
+    /// answered on its terminal's behalf before them, and return once they
+    /// are written.
     pub fn write_input(&self, bytes: &[u8]) -> Result<()> {
-        let mut writer = lock(&self.writer);
-        writer.write_all(bytes).context("write to pty failed")?;
-        writer.flush().context("flush pty failed")?;
-        Ok(())
+        let (done, wrote) = mpsc::sync_channel(1);
+        self.writes
+            .send((bytes.to_vec(), Some(done)))
+            .context("the pane's writer is gone")?;
+        wrote
+            .recv()
+            .context("the pane's writer is gone")?
+            .context("write to pty failed")
     }
 
     /// Resize both the kernel pty and the terminal, which reflows its
@@ -1248,7 +1260,7 @@ fn read_loop(
     pid: Option<u32>,
     output_tx: watch::Sender<u64>,
     notifications: Arc<Mutex<Vec<Signal>>>,
-    answers: SyncSender<Vec<u8>>,
+    answers: SyncSender<PtyWrite>,
 ) {
     let mut buf = [0u8; 8192];
     loop {
@@ -1296,7 +1308,7 @@ fn read_loop(
                 output_tx.send_modify(|generation| *generation = generation.wrapping_add(1));
                 drop(term);
                 if !answer.is_empty() {
-                    let _ = answers.try_send(answer);
+                    let _ = answers.try_send((answer, None));
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -2802,8 +2814,8 @@ mod tests {
 
     /// A program that asks and never reads the answers never stalls its own
     /// output behind them. Its input raw, a full input blocks the pty's
-    /// writer — the answer thread, which then falls behind until the rest go
-    /// unwritten — and the reader reads on.
+    /// writer thread, which then falls behind until the rest go unwritten,
+    /// and the reader reads on.
     #[test]
     fn unread_answers_never_stall_the_output() {
         let flood = "stty -icanon -echo; i=0; while [ $i -lt 5000 ]; do printf '\\033[6n'; \
@@ -2936,12 +2948,11 @@ mod tests {
         let poisoner = Arc::clone(&pane);
         let _ = std::thread::spawn(move || {
             let _term = poisoner.term.lock();
-            let _writer = poisoner.writer.lock();
             let _notifications = poisoner.notifications.lock();
             panic!("poisoning the pane's locks");
         })
         .join();
-        assert!(pane.term.is_poisoned() && pane.writer.is_poisoned());
+        assert!(pane.term.is_poisoned() && pane.notifications.is_poisoned());
         pane.write_input(b"after-poison\n").unwrap();
         wait_for(
             || pane.snapshot().text().contains("after-poison"),

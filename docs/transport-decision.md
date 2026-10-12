@@ -423,7 +423,10 @@ as long as the read. The bytes of a sequence a read cut off are held from both u
 later read ends it — up to 256 bytes, past which, too long to be a query, it goes on. The
 answers go to the pty from a per-pane thread, off the parser lock and through a bounded
 queue (64 writes): a program that asks and never reads its input fills it and stops
-getting answers, instead of stalling the reader — and with it its own output.
+getting answers, instead of stalling the reader — and with it its own output. Input
+(`Input` frames, `pane_send`) goes through the same queue and waits for its write. So
+everything reaches the pty in the order it was queued, and a key never overtakes an
+answer or a light/dark report queued before it.
 
 **Colours.** `{"type":"host_colors","fg":{"r":…,"g":…,"b":…},"bg":{…},"cursor":{…}|null,
 "dark":bool}` reports the terminal a client shows panes on, 16 bits a channel. One store

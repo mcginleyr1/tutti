@@ -659,10 +659,11 @@ In order; each lands its TUI path in the same wave as its verbs.
      - **Why at D:** shells set their own prompt modes after D (zsh, bash,
        fish measured), and fish's 2031 comes before the integration's A.
      - **Acceptance:** 115/115.
+   - ✅ The 2031 server test's race is fixed. Everything written to a pane's
+     pty goes through one writer thread in queue order: answers, light/dark
+     notices and input alike. Before this, typed input took a second path and
+     could overtake a report queued before it.
    - Step 3, rtty itself.
-   Open: answers to a pane's own queries are written by the answer thread,
-   so keys typed through `pane send` can overtake a light/dark report the
-   daemon queued just before (the 2031 server test raced once under load).
 
 **Open** — the headline items; each phase item above keeps its own list:
 - the notification history is not persisted — a restarted daemon starts it
