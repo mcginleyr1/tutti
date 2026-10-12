@@ -5,14 +5,15 @@
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::{Alignment, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
-use rtty_vt::{Attrs, Color as VtColor, Row, Terminal, Underline};
+use rtty_vt::{Attrs, Color as VtColor, Row, Terminal};
 use tutti_core::{AgentState, Checkpoint, Note, NoteKind, PaneId, PaneInfo, SubagentInfo};
 
 use super::app::{App, IssueRow, Mode};
+use super::host;
 use super::launcher::LauncherRow;
 use super::navigate::{self, Marker};
 use super::sidebar::{AgentRow, SidebarEntry, WorkspaceRow};
@@ -144,6 +145,7 @@ fn clear(frame: &mut Frame, rect: Rect, bg: Option<Color>) {
 /// floating panel.
 pub fn draw(frame: &mut Frame, app: &App) {
     let _theme = theme::activate(app.config().theme);
+    host::clear_links();
     let area = frame.area();
     if area.height == 0 {
         return;
@@ -1231,7 +1233,11 @@ fn draw_screen(
             symbol.clear();
             row.push_grapheme(at, &mut symbol);
             buf_cell.set_symbol(&symbol);
-            let style = cell_style(row, at);
+            let mut style = cell_style(row, at);
+            if let Some(link) = row.hyperlink(at) {
+                let position = Position::new(area.x + col, area.y + y);
+                style = style.add_modifier(host::link(position, link));
+            }
             let selected = selection.is_some_and(|(s, e)| in_span(s, e, cols, r, col));
             buf_cell.set_style(if selected {
                 style.bg(select_bg())
@@ -1273,14 +1279,13 @@ pub fn cell_style(row: &Row, col: usize) -> Style {
         (Attrs::INVERSE, Modifier::REVERSED),
         (Attrs::HIDDEN, Modifier::HIDDEN),
         (Attrs::STRIKE, Modifier::CROSSED_OUT),
+        (Attrs::OVERLINE, host::OVERLINE),
     ]
     .into_iter()
     .filter(|&(attr, _)| attrs.contains(attr))
-    .fold(Modifier::empty(), |all, (_, modifier)| all | modifier);
-    let underline = match attrs.underline() {
-        Underline::None => Modifier::empty(),
-        _ => Modifier::UNDERLINED,
-    };
+    .fold(host::underline(attrs.underline()), |all, (_, modifier)| {
+        all | modifier
+    });
     let cell = &row.cells()[col];
     let fg = match cell.fg() {
         VtColor::Default => palette.fg.unwrap_or(Color::Reset),
@@ -1294,7 +1299,7 @@ pub fn cell_style(row: &Row, col: usize) -> Style {
         .fg(fg)
         .bg(bg)
         .underline_color(map_color(row.underline_color(col)))
-        .add_modifier(modifier | underline)
+        .add_modifier(modifier)
 }
 
 /// Map an rtty-vt colour to the equivalent ratatui colour.
@@ -2421,12 +2426,24 @@ mod tests {
                 | Modifier::ITALIC
         );
         assert_eq!(style.underline_color, Some(Color::Rgb(1, 2, 3)));
-        assert!(
-            first_style(b"\x1b[4:3mY")
-                .add_modifier
-                .contains(Modifier::UNDERLINED),
-            "a curly underline is an underline"
+        assert_eq!(
+            first_style(b"\x1b[4:3;53mY").add_modifier,
+            host::underline(rtty_vt::Underline::Curly) | host::OVERLINE,
+            "nvim's undercurl, for the host to draw"
         );
+    }
+
+    /// A linked cell carries its link's mark, and the frame knows its link.
+    #[test]
+    fn linked_cells_are_marked_for_the_host() {
+        let mut term = rtty_vt::Terminal::new(1, 6, 0);
+        term.advance(b"\x1b]8;;https://example.com\x1b\\ab\x1b]8;;\x1b\\c");
+        let area = Rect::new(0, 0, 6, 1);
+        let mut buf = Buffer::empty(area);
+        host::clear_links();
+        draw_screen(&mut buf, area, &term, 0, None);
+        let marked = |x: usize| buf.content[x].modifier.bits() >> 13 != 0;
+        assert!(marked(0) && marked(1) && !marked(2));
     }
 
     /// A cell shows its whole cluster, and the right half of a wide

@@ -5,6 +5,7 @@
 
 mod app;
 mod connection;
+mod host;
 mod input;
 mod launcher;
 mod layout;
@@ -24,7 +25,6 @@ use std::io;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
 };
@@ -65,11 +65,11 @@ pub fn run(
         conn.send(&control(&Request::HostColors(colors)))
             .context("send the terminal's colours")?;
     }
-    let mut terminal = ratatui::init();
+    let mut terminal = host::init().context("take the terminal")?;
+    install_panic_hook();
     if config.mouse {
         let _ = execute!(io::stdout(), EnableMouseCapture);
     }
-    install_panic_hook();
 
     let result = event_loop(&mut terminal, &mut conn, config, first_run, notice);
 
@@ -86,7 +86,7 @@ fn leave() {
 }
 
 fn event_loop(
-    terminal: &mut DefaultTerminal,
+    terminal: &mut ratatui::Terminal<host::Host>,
     conn: &mut Connection,
     config: Config,
     first_run: Option<String>,
@@ -244,11 +244,11 @@ fn emit_terminal(bytes: &[u8]) {
     let _ = out.flush();
 }
 
-/// Chain onto the hook `ratatui::init` installed — which leaves raw mode and
-/// the alternate screen before printing the panic — so any panic restores the
-/// terminal, mouse capture included. A pane frame that panics its parser is
-/// the exception: that panic is caught and the pane reseeded
-/// (`App::handle_frame`), so the TUI and its screen are left as they are.
+/// Restore the terminal — raw mode and the alternate screen left, mouse
+/// capture and the cursor's shape handed back — before any panic prints. A
+/// pane frame that panics its terminal is the exception: that panic is
+/// caught and the pane reseeded (`App::handle_frame`), so the TUI and its
+/// screen are left as they are.
 fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -258,6 +258,7 @@ fn install_panic_hook() {
         // Capture may have been toggled at runtime; releasing when it was never
         // grabbed is harmless, and so is the default cursor shape.
         leave();
+        ratatui::restore();
         previous(info);
     }));
 }
