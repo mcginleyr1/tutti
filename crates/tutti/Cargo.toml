@@ -12,7 +12,7 @@ anyhow.workspace = true
 tutti-core.workspace = true
 tutti-agents.workspace = true
 ratatui.workspace = true
-vt100.workspace = true
+rtty-vt.workspace = true
 terminal-colorsaurus.workspace = true
 signal-hook.workspace = true
 

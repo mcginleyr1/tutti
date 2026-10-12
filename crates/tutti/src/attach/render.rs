@@ -1,7 +1,7 @@
-//! Drawing the attach TUI into a ratatui frame: pane borders, the vt100 grid
-//! rendered cell-by-cell, the cursor, and the status bar. The vt100→ratatui
+//! Drawing the attach TUI into a ratatui frame: pane borders, each pane's
+//! rtty-vt grid rendered cell-by-cell, the cursor, and the status bar. The
 //! cell and colour mappings are pulled out as pure functions so they can be
-//! unit-tested against a real parser.
+//! unit-tested against a real terminal.
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -9,6 +9,7 @@ use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use rtty_vt::{Attrs, Color as VtColor, Row, Terminal, Underline};
 use tutti_core::{AgentState, Checkpoint, Note, NoteKind, PaneId, PaneInfo, SubagentInfo};
 
 use super::app::{App, IssueRow, Mode};
@@ -1180,16 +1181,15 @@ fn draw_pane(frame: &mut Frame, app: &App, pane: PaneId, rect: Rect, spinner: ch
     frame.render_widget(block, frame_rect);
 
     if let Some(state) = state {
-        let screen = state.parser.screen();
         draw_screen(
             frame.buffer_mut(),
             inner,
-            screen,
+            &state.term,
             0,
             app.selection_span(pane),
         );
-        if focused && state.scroll.is_none() && !screen.hide_cursor() {
-            let (row, col) = screen.cursor_position();
+        if focused && state.scroll.is_none() && state.term.modes().cursor_visible {
+            let (row, col) = state.term.cursor_position();
             if col < inner.width && row < inner.height {
                 frame.set_cursor_position((inner.x + col, inner.y + row));
             }
@@ -1197,54 +1197,47 @@ fn draw_pane(frame: &mut Frame, app: &App, pane: PaneId, rect: Rect, spinner: ch
     }
 }
 
-/// Blit a vt100 screen into `area`, one cell at a time, mapping colours and
+/// Blit a pane's screen into `area`, one cell at a time, mapping colours and
 /// attributes, starting from screen row `first_row` (0 for a pane; the prompt
-/// region's top for a peek). Wide-character continuation cells are cleared so a
-/// glyph is not drawn twice. `selection`, when set, is the inclusive `(start,
-/// end)` span of a live mouse selection in screen coordinates; cells inside it
-/// take the `select_bg()` highlight — an ANSI palette colour, so it repaints
-/// with the terminal's scheme like the sidebar selection.
+/// region's top for a peek). A cell shows its whole grapheme cluster; the
+/// right half of a wide character is cleared so its glyph is not drawn
+/// twice. `selection`, when set, is the inclusive `(start, end)` span of a
+/// live mouse selection in screen coordinates; cells inside it take the
+/// `select_bg()` highlight — an ANSI palette colour, so it repaints with the
+/// terminal's scheme like the sidebar selection.
 fn draw_screen(
     buf: &mut Buffer,
     area: Rect,
-    screen: &vt100::Screen,
+    term: &Terminal,
     first_row: u16,
     selection: Option<((u16, u16), (u16, u16))>,
 ) {
-    let (rows, cols) = screen.size();
+    let (rows, cols) = term.size();
     let height = area.height.min(rows.saturating_sub(first_row));
     let width = area.width.min(cols);
+    let mut symbol = String::new();
     for y in 0..height {
-        let row = first_row + y;
+        let r = first_row + y;
+        let row = term.screen_row(r);
         for col in 0..width {
             let Some(buf_cell) = buf.cell_mut((area.x + col, area.y + y)) else {
                 continue;
             };
-            let selected = selection.is_some_and(|(s, e)| in_span(s, e, cols, row, col));
-            match screen.cell(row, col) {
-                Some(cell) if cell.is_wide_continuation() => {
-                    buf_cell.set_symbol("");
-                }
-                Some(cell) => {
-                    if cell.has_contents() {
-                        buf_cell.set_symbol(cell.contents());
-                    } else {
-                        buf_cell.set_char(' ');
-                    }
-                    let style = cell_style(cell);
-                    buf_cell.set_style(if selected {
-                        style.bg(select_bg())
-                    } else {
-                        style
-                    });
-                }
-                None => {
-                    buf_cell.set_char(' ');
-                    if selected {
-                        buf_cell.set_style(Style::default().bg(select_bg()));
-                    }
-                }
+            let at = usize::from(col);
+            if row.cells()[at].is_spacer() {
+                buf_cell.set_symbol("");
+                continue;
             }
+            symbol.clear();
+            row.push_grapheme(at, &mut symbol);
+            buf_cell.set_symbol(&symbol);
+            let style = cell_style(row, at);
+            let selected = selection.is_some_and(|(s, e)| in_span(s, e, cols, r, col));
+            buf_cell.set_style(if selected {
+                style.bg(select_bg())
+            } else {
+                style
+            });
         }
     }
 }
@@ -1266,44 +1259,50 @@ fn in_span(start: (u16, u16), end: (u16, u16), cols: u16, row: u16, col: u16) ->
     col >= c0 && col <= c1
 }
 
-/// The ratatui style for a vt100 cell: explicit colours pass straight through;
-/// the default foreground/background take the theme's pane ground (nothing —
-/// the terminal's own — on the terminal theme).
-pub fn cell_style(cell: &vt100::Cell) -> Style {
+/// The ratatui style for the cell at `col` of `row`: explicit colours pass
+/// straight through; the default foreground/background take the theme's
+/// pane ground (nothing — the terminal's own — on the terminal theme).
+pub fn cell_style(row: &Row, col: usize) -> Style {
     let palette = theme::current();
-    let mut modifier = Modifier::empty();
-    if cell.bold() {
-        modifier |= Modifier::BOLD;
-    }
-    if cell.dim() {
-        modifier |= Modifier::DIM;
-    }
-    if cell.italic() {
-        modifier |= Modifier::ITALIC;
-    }
-    if cell.underline() {
-        modifier |= Modifier::UNDERLINED;
-    }
-    if cell.inverse() {
-        modifier |= Modifier::REVERSED;
-    }
-    let fg = match cell.fgcolor() {
-        vt100::Color::Default => palette.fg.unwrap_or(Color::Reset),
+    let attrs = row.cells()[col].attrs();
+    let modifier = [
+        (Attrs::BOLD, Modifier::BOLD),
+        (Attrs::DIM, Modifier::DIM),
+        (Attrs::ITALIC, Modifier::ITALIC),
+        (Attrs::BLINK, Modifier::SLOW_BLINK),
+        (Attrs::INVERSE, Modifier::REVERSED),
+        (Attrs::HIDDEN, Modifier::HIDDEN),
+        (Attrs::STRIKE, Modifier::CROSSED_OUT),
+    ]
+    .into_iter()
+    .filter(|&(attr, _)| attrs.contains(attr))
+    .fold(Modifier::empty(), |all, (_, modifier)| all | modifier);
+    let underline = match attrs.underline() {
+        Underline::None => Modifier::empty(),
+        _ => Modifier::UNDERLINED,
+    };
+    let cell = &row.cells()[col];
+    let fg = match cell.fg() {
+        VtColor::Default => palette.fg.unwrap_or(Color::Reset),
         colour => map_color(colour),
     };
-    let bg = match cell.bgcolor() {
-        vt100::Color::Default => palette.pane_bg.unwrap_or(Color::Reset),
+    let bg = match cell.bg() {
+        VtColor::Default => palette.pane_bg.unwrap_or(Color::Reset),
         colour => map_color(colour),
     };
-    Style::default().fg(fg).bg(bg).add_modifier(modifier)
+    Style::default()
+        .fg(fg)
+        .bg(bg)
+        .underline_color(map_color(row.underline_color(col)))
+        .add_modifier(modifier | underline)
 }
 
-/// Map a vt100 colour to the equivalent ratatui colour.
-pub fn map_color(color: vt100::Color) -> Color {
+/// Map an rtty-vt colour to the equivalent ratatui colour.
+pub fn map_color(color: VtColor) -> Color {
     match color {
-        vt100::Color::Default => Color::Reset,
-        vt100::Color::Idx(i) => Color::Indexed(i),
-        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+        VtColor::Default => Color::Reset,
+        VtColor::Named(i) | VtColor::Indexed(i) => Color::Indexed(i),
+        VtColor::Rgb(r, g, b) => Color::Rgb(r, g, b),
     }
 }
 
@@ -1853,7 +1852,7 @@ fn draw_peek(frame: &mut Frame, app: &App, area: Rect) {
     draw_screen(
         frame.buffer_mut(),
         body,
-        state.parser.screen(),
+        &state.term,
         rows.start as u16,
         None,
     );
@@ -2387,31 +2386,60 @@ mod tests {
     use tutti_core::{Frame as WireFrame, PaneData, Response};
 
     #[test]
-    fn maps_default_indexed_and_rgb_colors() {
-        assert_eq!(map_color(vt100::Color::Default), Color::Reset);
-        assert_eq!(map_color(vt100::Color::Idx(9)), Color::Indexed(9));
-        assert_eq!(map_color(vt100::Color::Rgb(1, 2, 3)), Color::Rgb(1, 2, 3));
+    fn maps_default_named_indexed_and_rgb_colors() {
+        assert_eq!(map_color(VtColor::Default), Color::Reset);
+        assert_eq!(map_color(VtColor::Named(9)), Color::Indexed(9));
+        assert_eq!(map_color(VtColor::Indexed(200)), Color::Indexed(200));
+        assert_eq!(map_color(VtColor::Rgb(1, 2, 3)), Color::Rgb(1, 2, 3));
+    }
+
+    /// The style of the first cell after `bytes`.
+    fn first_style(bytes: &[u8]) -> Style {
+        let mut term = rtty_vt::Terminal::new(1, 10, 0);
+        term.advance(bytes);
+        cell_style(term.screen_row(0), 0)
     }
 
     #[test]
-    fn cell_style_reads_bold_red_from_a_real_parser() {
-        let mut parser = vt100::Parser::new(1, 10, 0);
-        parser.process(b"\x1b[1;31mX");
-        let screen = parser.screen();
-        let cell = screen.cell(0, 0).unwrap();
-        let style = cell_style(cell);
+    fn cell_style_reads_bold_red_from_a_real_terminal() {
+        let style = first_style(b"\x1b[1;31mX");
         assert_eq!(style.fg, Some(Color::Indexed(1)));
         assert!(style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
-    fn cell_style_maps_underline_and_reverse() {
-        let mut parser = vt100::Parser::new(1, 10, 0);
-        parser.process(b"\x1b[4;7mY");
-        let screen = parser.screen();
-        let style = cell_style(screen.cell(0, 0).unwrap());
-        assert!(style.add_modifier.contains(Modifier::UNDERLINED));
-        assert!(style.add_modifier.contains(Modifier::REVERSED));
+    fn cell_style_maps_every_rendition_and_the_underline_colour() {
+        let style = first_style(b"\x1b[4;7;5;8;9;2;3;58:2::1:2:3mY");
+        assert_eq!(
+            style.add_modifier,
+            Modifier::UNDERLINED
+                | Modifier::REVERSED
+                | Modifier::SLOW_BLINK
+                | Modifier::HIDDEN
+                | Modifier::CROSSED_OUT
+                | Modifier::DIM
+                | Modifier::ITALIC
+        );
+        assert_eq!(style.underline_color, Some(Color::Rgb(1, 2, 3)));
+        assert!(
+            first_style(b"\x1b[4:3mY")
+                .add_modifier
+                .contains(Modifier::UNDERLINED),
+            "a curly underline is an underline"
+        );
+    }
+
+    /// A cell shows its whole cluster, and the right half of a wide
+    /// character nothing.
+    #[test]
+    fn a_screen_blits_clusters_whole() {
+        let mut term = rtty_vt::Terminal::new(1, 6, 0);
+        term.advance("e\u{301}日👍🏽".as_bytes());
+        let area = Rect::new(0, 0, 6, 1);
+        let mut buf = Buffer::empty(area);
+        draw_screen(&mut buf, area, &term, 0, None);
+        let symbols: Vec<&str> = buf.content.iter().map(|cell| cell.symbol()).collect();
+        assert_eq!(symbols, ["e\u{301}", "日", "", "👍🏽", "", " "]);
     }
 
     fn app_with_pane(text: &[u8]) -> App {

@@ -6,12 +6,17 @@
 //!
 //! The pane is drawn on the alternate screen, left on exit, so the shell's
 //! screen and scrollback come back as they were. A pane program's own
-//! alternate screen therefore cannot be this terminal's: a vt100 mirror of
+//! alternate screen therefore cannot be this terminal's: an rtty-vt mirror of
 //! the pane follows the stream, and a read that switches screens, or resets
 //! the terminal (`ESC c`), is drawn from the mirror instead of passed through.
 //! A program leaving its alternate screen so brings back the pane's primary
 //! screen, not the shell's. The daemon sends each switch or reset in a frame
 //! of its own, so no other byte goes with the redraw.
+//!
+//! This terminal's keys stay plain: the daemon keeps the pane's keyboard
+//! protocols (kitty's, modifyOtherKeys) out of the stream, and the mirror's
+//! redraws leave them out too — the prefix is watched for in plain bytes,
+//! and a detach could not be sure to turn them off.
 //!
 //! The terminal's colours go to the daemon first, which answers the pane's
 //! colour queries with them; and the terminal is asked to tell of its
@@ -27,6 +32,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, bail};
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::crossterm::terminal;
+use rtty_vt::Terminal;
 use signal_hook::consts::SIGWINCH;
 use signal_hook::iterator::Signals;
 use tutti_core::{Event, Frame, HostColors, PaneDims, PaneId, Request, Response, socket_path};
@@ -114,7 +120,7 @@ pub fn run(session: &str, pane: PaneId, prefix: Chord) -> Result<i32> {
 /// connection closes (`None`). A refusal on the way — the stream fell behind —
 /// is the error.
 fn show(first: Frame, stream: &mut UnixStream, buf: &mut Vec<u8>) -> Result<Option<i32>> {
-    let mut mirror = vt100::Parser::default();
+    let mut mirror = Terminal::new(24, 80, 0);
     let mut last = 0;
     let mut frame = Some(first);
     loop {
@@ -127,8 +133,9 @@ fn show(first: Frame, stream: &mut UnixStream, buf: &mut Vec<u8>) -> Result<Opti
         };
         match next {
             Frame::PaneSnapshot(data) => {
-                mirror = vt100::Parser::new(data.rows, data.cols, 0);
-                mirror.process(&data.bytes);
+                mirror = Terminal::new(data.rows, data.cols, 0);
+                mirror.advance(&data.bytes);
+                mirror.take_events();
                 emit(&redraw(&mirror))?;
             }
             Frame::PaneRaw { bytes, .. } if feed(&mut mirror, &mut last, &bytes) => {
@@ -153,27 +160,45 @@ fn show(first: Frame, stream: &mut UnixStream, buf: &mut Vec<u8>) -> Result<Opti
 /// A screen switch ends on `h` or `l`, so the mirror is checked after each —
 /// one read can switch there and back. `last` is the byte before this read,
 /// for an `ESC c` split across two.
-fn feed(mirror: &mut vt100::Parser, last: &mut u8, bytes: &[u8]) -> bool {
+fn feed(mirror: &mut Terminal, last: &mut u8, bytes: &[u8]) -> bool {
     let mut switched = false;
     for run in bytes.split_inclusive(|b| matches!(b, b'h' | b'l' | b'c')) {
-        let alternate = mirror.screen().alternate_screen();
-        mirror.process(run);
+        let alternate = mirror.modes().alt_screen;
+        mirror.advance(run);
         let before = run.len().checked_sub(2).map_or(*last, |i| run[i]);
-        switched |= alternate != mirror.screen().alternate_screen()
-            || (before == 0x1b && run.ends_with(b"c"));
+        switched |=
+            alternate != mirror.modes().alt_screen || (before == 0x1b && run.ends_with(b"c"));
         *last = run[run.len() - 1];
     }
+    mirror.take_events();
     switched
 }
 
 /// The mirror's screen, drawn whole on the alternate screen — taken again
-/// first, in case a reset the stream slipped past left it.
-fn redraw(mirror: &vt100::Parser) -> Vec<u8> {
-    [
-        b"\x1b[?1049h".as_slice(),
-        &mirror.screen().state_formatted(),
-    ]
-    .concat()
+/// first, in case a reset the stream slipped past left it, and cleared — with
+/// its cursor and modes, but for what is this terminal's own: its keyboard
+/// protocols, and the light/dark reports `ENTER` asked for.
+fn redraw(mirror: &Terminal) -> Vec<u8> {
+    let rows: Vec<u16> = (0..mirror.size().0).collect();
+    let redraw = String::from_utf8(mirror.redraw(&rows)).expect("rtty-vt writes UTF-8");
+    let mut out = String::from("\x1b[?1049h\x1b[0m\x1b[H\x1b[2J");
+    let mut rest = redraw.as_str();
+    while let Some(at) = rest.find("\x1b[") {
+        out.push_str(&rest[..at]);
+        let end = rest[at + 2..]
+            .find(|c| ('\x40'..='\x7e').contains(&c))
+            .map_or(rest.len(), |i| at + i + 3);
+        let seq = &rest[at..end];
+        let own = seq.starts_with("\x1b[=") && seq.ends_with('u')
+            || seq.starts_with("\x1b[>4;") && seq.ends_with('m')
+            || seq.starts_with("\x1b[?2031");
+        if !own {
+            out.push_str(seq);
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out.into_bytes()
 }
 
 /// The keys typed into the pane, watched for the prefix chord's bytes — the
@@ -495,16 +520,16 @@ mod tests {
 
     /// What this terminal shows after `writes`: the stream fed whole where
     /// `feed` passes a read, the mirror's redraw where it does not.
-    fn shown(mirror: &mut vt100::Parser, reads: &[&[u8]]) -> (vt100::Parser, Vec<bool>) {
-        let (rows, cols) = mirror.screen().size();
-        let mut terminal = vt100::Parser::new(rows, cols, 0);
-        terminal.process(&redraw(mirror));
+    fn shown(mirror: &mut Terminal, reads: &[&[u8]]) -> (Terminal, Vec<bool>) {
+        let (rows, cols) = mirror.size();
+        let mut terminal = Terminal::new(rows, cols, 0);
+        terminal.advance(&redraw(mirror));
         let mut last = 0;
         let switched = reads
             .iter()
             .map(|read| {
                 let switched = feed(mirror, &mut last, read);
-                terminal.process(&if switched {
+                terminal.advance(&if switched {
                     redraw(mirror)
                 } else {
                     read.to_vec()
@@ -515,13 +540,19 @@ mod tests {
         (terminal, switched)
     }
 
+    /// Every cell of the screen in view, and the cursor.
+    fn screen(term: &Terminal) -> (Vec<Vec<rtty_vt::Cell>>, (u16, u16)) {
+        let rows = (0..term.size().0).map(|r| term.screen_row(r).cells().to_vec());
+        (rows.collect(), term.cursor_position())
+    }
+
     /// A pane program's trip to its alternate screen never reaches this
     /// terminal's: each switch is drawn from the mirror, so leaving brings
     /// back the pane's own screen, and the terminal stays on its alternate.
     #[test]
     fn a_pane_programs_alternate_screen_is_drawn_from_the_mirror() {
-        let mut mirror = vt100::Parser::new(6, 20, 0);
-        mirror.process(b"$ ls\r\nfile\r\n$ ");
+        let mut mirror = Terminal::new(6, 20, 0);
+        mirror.advance(b"$ ls\r\nfile\r\n$ ");
         let (terminal, switched) = shown(
             &mut mirror,
             &[
@@ -531,21 +562,35 @@ mod tests {
             ],
         );
         assert_eq!(switched, [true, false, true]);
-        assert!(
-            terminal
-                .screen()
-                .contents()
-                .starts_with("$ ls\nfile\n$ vim\n$ done")
-        );
+        assert!(terminal.contents().starts_with("$ ls\nfile\n$ vim\n$ done"));
         assert_eq!(
-            terminal.screen().contents_formatted(),
-            mirror.screen().contents_formatted(),
+            screen(&terminal),
+            screen(&mirror),
             "the pane's primary screen came back, cursor and all"
         );
         assert!(
-            terminal.screen().alternate_screen() && !mirror.screen().alternate_screen(),
+            terminal.modes().alt_screen && !mirror.modes().alt_screen,
             "this terminal stays on its alternate screen"
         );
+    }
+
+    /// A redraw hands this terminal neither the pane's keyboard protocols
+    /// nor a word on its light/dark reports — whatever the mirror holds.
+    #[test]
+    fn a_redraw_keeps_this_terminals_own_modes() {
+        let mut mirror = Terminal::new(4, 20, 0);
+        mirror.advance(b"\x1b[>5u\x1b[>4;2m\x1b[?2031h\x1b[?1049h\x1b[>1uvim");
+        let (rows, cols) = mirror.size();
+        let bytes = redraw(&mirror);
+        let mut terminal = Terminal::new(rows, cols, 0);
+        terminal.advance(b"\x1b[?2031h");
+        terminal.advance(&bytes);
+        assert_eq!(terminal.kitty_keyboard(), 0);
+        assert_eq!(terminal.modes().modify_other_keys, 0);
+        assert!(terminal.modes().color_scheme_reports);
+        assert!(terminal.contents().starts_with("vim"));
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("\x1b[=") && !text.contains("\x1b[>4;") && !text.contains("2031"));
     }
 
     /// A read that goes there and back, a switch cut across two reads, and a
@@ -553,7 +598,7 @@ mod tests {
     /// `ESC` before other letters pass through.
     #[test]
     fn switches_and_resets_redraw_wherever_they_fall() {
-        let mut mirror = vt100::Parser::new(4, 20, 0);
+        let mut mirror = Terminal::new(4, 20, 0);
         let (terminal, switched) = shown(
             &mut mirror,
             &[
@@ -572,7 +617,7 @@ mod tests {
             switched,
             [false, true, false, true, true, true, false, true, false]
         );
-        assert_eq!(terminal.screen().contents(), "boldchl");
-        assert!(!mirror.screen().alternate_screen());
+        assert_eq!(terminal.contents(), "boldchl");
+        assert!(!mirror.modes().alt_screen);
     }
 }

@@ -1847,6 +1847,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ratatui",
+ "rtty-vt",
  "serde",
  "serde_json",
  "signal-hook",
@@ -1856,7 +1857,6 @@ dependencies = [
  "tutti-agents",
  "tutti-core",
  "tutti-server",
- "vt100",
 ]
 
 [[package]]

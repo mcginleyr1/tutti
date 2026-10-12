@@ -3,6 +3,7 @@
 //! the escape sequences can be unit-tested without a real terminal.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use rtty_vt::MouseEncoding;
 
 /// The bytes a terminal would send for `key`, or `None` when the key has no
 /// pty encoding (bare modifier presses, unmapped function keys).
@@ -87,7 +88,7 @@ fn csi_tilde(num: u32, param: u32) -> Vec<u8> {
 
 /// The wheel-tick bytes for a program that enabled mouse reporting: buttons
 /// 64/65 are wheel-up/down, as `encode_mouse` spells them.
-pub fn encode_wheel(encoding: vt100::MouseProtocolEncoding, up: bool, x: u16, y: u16) -> Vec<u8> {
+pub fn encode_wheel(encoding: MouseEncoding, up: bool, x: u16, y: u16) -> Vec<u8> {
     encode_mouse(encoding, if up { 64 } else { 65 }, false, x, y)
 }
 
@@ -96,11 +97,12 @@ pub fn encode_wheel(encoding: vt100::MouseProtocolEncoding, up: bool, x: u16, y:
 /// for motion with none held), 64/65 the wheel, plus 8 for Alt and 16 for
 /// Ctrl — and `release` ends a press. Coordinates are 1-based cells within
 /// the pane. SGR spells everything out in decimal and tells a release by its
-/// final `m`; the legacy encodings report a release as button 3 and offset
-/// each value by 32 into one byte (UTF-8 mode encodes that byte as a
-/// codepoint).
+/// final `m` (tutti knows no pixels, so SGR-pixels reports cells as SGR
+/// does); urxvt spells out the legacy values in decimal; the legacy encodings
+/// report a release as button 3 and offset each value by 32 into one byte
+/// (UTF-8 mode encodes that byte as a codepoint).
 pub fn encode_mouse(
-    encoding: vt100::MouseProtocolEncoding,
+    encoding: MouseEncoding,
     button: u16,
     release: bool,
     x: u16,
@@ -108,11 +110,12 @@ pub fn encode_mouse(
 ) -> Vec<u8> {
     let legacy = if release { button | 3 } else { button };
     match encoding {
-        vt100::MouseProtocolEncoding::Sgr => {
+        MouseEncoding::Sgr | MouseEncoding::SgrPixels => {
             let final_byte = if release { 'm' } else { 'M' };
             format!("\x1b[<{button};{x};{y}{final_byte}").into_bytes()
         }
-        vt100::MouseProtocolEncoding::Utf8 => {
+        MouseEncoding::Urxvt => format!("\x1b[{};{x};{y}M", 32 + legacy).into_bytes(),
+        MouseEncoding::Utf8 => {
             let mut out = b"\x1b[M".to_vec();
             for value in [legacy, x, y] {
                 let c = char::from_u32(u32::from(32 + value.min(2015))).unwrap_or(' ');
@@ -121,7 +124,7 @@ pub fn encode_mouse(
             }
             out
         }
-        vt100::MouseProtocolEncoding::Default => {
+        MouseEncoding::Default => {
             let mut out = b"\x1b[M".to_vec();
             for value in [legacy, x, y] {
                 out.push((32 + value.min(223)) as u8);
@@ -274,7 +277,7 @@ mod tests {
 
     #[test]
     fn wheel_encodings() {
-        use vt100::MouseProtocolEncoding as E;
+        use MouseEncoding as E;
         assert_eq!(
             encode_wheel(E::Sgr, true, 5, 3),
             b"\x1b[<64;5;3M".to_vec(),
@@ -310,7 +313,7 @@ mod tests {
     /// the modifier bits kept.
     #[test]
     fn mouse_encodings() {
-        use vt100::MouseProtocolEncoding as E;
+        use MouseEncoding as E;
         assert_eq!(encode_mouse(E::Sgr, 0, false, 5, 3), b"\x1b[<0;5;3M");
         assert_eq!(encode_mouse(E::Sgr, 0, true, 5, 3), b"\x1b[<0;5;3m");
         assert_eq!(encode_mouse(E::Sgr, 2 + 16, false, 1, 1), b"\x1b[<18;1;1M");
@@ -328,6 +331,9 @@ mod tests {
             encode_mouse(E::Utf8, 32, false, 200, 1),
             [b"\x1b[M@".as_slice(), "\u{e8}".as_bytes(), b"!"].concat()
         );
+        assert_eq!(encode_mouse(E::Urxvt, 0, false, 5, 300), b"\x1b[32;5;300M");
+        assert_eq!(encode_mouse(E::Urxvt, 2, true, 5, 3), b"\x1b[35;5;3M");
+        assert_eq!(encode_mouse(E::SgrPixels, 0, true, 5, 3), b"\x1b[<0;5;3m");
     }
 
     #[test]

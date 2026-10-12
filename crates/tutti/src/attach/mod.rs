@@ -73,9 +73,16 @@ pub fn run(
 
     let result = event_loop(&mut terminal, &mut conn, config, first_run, notice);
 
-    let _ = execute!(io::stdout(), DisableMouseCapture);
+    leave();
     ratatui::restore();
     result
+}
+
+/// Hand back what the TUI changed in the terminal beyond what
+/// `ratatui::restore` does: mouse capture and the cursor's shape.
+fn leave() {
+    let _ = execute!(io::stdout(), DisableMouseCapture);
+    emit_terminal(b"\x1b[0 q");
 }
 
 fn event_loop(
@@ -94,6 +101,7 @@ fn event_loop(
         app.note(message);
     }
     let mut dirty = true;
+    let mut cursor_shape = 0;
     let mut whichkey = false;
     let mut spinner = app.spinner_frame();
     // The issues panel's fetches report back from their threads, and so do
@@ -147,6 +155,10 @@ fn event_loop(
                 let _ = conn.send(&frame);
             }
             dirty = false;
+        }
+        if app.cursor_shape() != cursor_shape {
+            cursor_shape = app.cursor_shape();
+            emit_terminal(format!("\x1b[{cursor_shape} q").as_bytes());
         }
 
         if event::poll(POLL).context("poll terminal input")? {
@@ -244,8 +256,8 @@ fn install_panic_hook() {
             return;
         }
         // Capture may have been toggled at runtime; releasing when it was never
-        // grabbed is harmless.
-        let _ = execute!(io::stdout(), DisableMouseCapture);
+        // grabbed is harmless, and so is the default cursor shape.
+        leave();
         previous(info);
     }));
 }

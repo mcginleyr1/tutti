@@ -14,6 +14,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::layout::Rect;
 use ratatui::text::Span;
+use rtty_vt::Terminal;
 use tutti_core::{
     AgentKind, AgentState, ApprovalDecision, Checkpoint, DIFF_RANGE, Direction, Event, FileStat,
     Frame as WireFrame, Layout, NOTES_CAP, Note, NoteKind, PaneDims, PaneId, PaneInfo, Request,
@@ -55,7 +56,6 @@ const TURNS_SHOWN: usize = 5;
 /// beneath it. The content region begins below them.
 const HEADER_ROWS: u16 = 2;
 
-const SCROLLBACK: usize = 10_000;
 const STATUS_TTL: Duration = Duration::from_secs(4);
 const MOUSE_SCROLL_STEP: usize = 3;
 /// How long the prefix can sit unanswered before the which-key popup appears.
@@ -92,10 +92,10 @@ const SETUP: [(Integration, &str); 4] = [
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const SPINNER_TICK: Duration = Duration::from_millis(100);
 
-/// One pane's client-side mirror: a parser fed by snapshots/deltas plus the
+/// One pane's client-side mirror: a terminal fed by snapshots/deltas plus the
 /// metadata the status bar shows.
 pub struct PaneState {
-    pub parser: vt100::Parser,
+    pub term: Terminal,
     pub info: PaneInfo,
     pub damaged: bool,
     /// `Some(offset)` while the pane is frozen browsing its scrollback; deltas
@@ -105,14 +105,25 @@ pub struct PaneState {
 
 impl PaneState {
     fn seeded(rows: u16, cols: u16, bytes: &[u8], info: PaneInfo) -> Self {
-        let mut parser = vt100::Parser::new(rows, cols, SCROLLBACK);
-        parser.process(bytes);
-        Self {
-            parser,
+        let mut state = Self {
+            term: Terminal::new(rows, cols, 0),
             info,
             damaged: true,
             scroll: None,
+        };
+        state.feed(bytes);
+        state
+    }
+
+    /// Apply a snapshot or delta. Its events — the modes and title it sets —
+    /// are read off the terminal instead, so they are let go.
+    fn feed(&mut self, bytes: &[u8]) {
+        #[cfg(test)]
+        if bytes == tests::PANIC_FRAME {
+            panic!("injected: a frame that breaks its pane's terminal");
         }
+        self.term.advance(bytes);
+        self.term.take_events();
     }
 }
 
@@ -136,7 +147,7 @@ enum FollowUp {
 
 /// An in-progress or just-finished mouse text selection within one pane. `anchor`
 /// is where the drag began, `head` where it currently is — both 0-based `(row,
-/// col)` cells of the pane's visible vt100 grid (so it tracks scrollback). A
+/// col)` cells of the pane's visible grid (so it tracks scrollback). A
 /// selection is only meaningful inside the single pane it started in; `dragged`
 /// stays false for a plain click (head never left the anchor cell) so a focus
 /// click copies nothing.
@@ -641,6 +652,17 @@ impl App {
             .map(|pane| control(&Request::PaneFocus { pane }))
     }
 
+    /// The DECSCUSR parameter the terminal's cursor takes: the shape the
+    /// focused pane's program set (nvim's insert-mode bar), else the
+    /// terminal's own default, 0 — for a pane browsing its scrollback too.
+    pub fn cursor_shape(&self) -> u8 {
+        self.focused
+            .and_then(|pane| self.panes.get(&pane))
+            .filter(|s| s.scroll.is_none())
+            .and_then(|s| s.term.cursor_style())
+            .map_or(0, |style| style.decscusr())
+    }
+
     /// Whether a bell is pending (a non-focused pane just blocked or finished),
     /// clearing the flag.
     pub fn take_bell(&mut self) -> bool {
@@ -672,7 +694,7 @@ impl App {
 
     /// Apply one frame received from the server, mutating client state, and
     /// return what it calls for: a fresh snapshot of a pane whose frame broke
-    /// its parser, a deploy's next step.
+    /// its terminal, a deploy's next step.
     pub fn handle_frame(&mut self, frame: WireFrame) -> Vec<WireFrame> {
         match frame {
             WireFrame::Control(json) => return self.handle_control(&json),
@@ -693,7 +715,7 @@ impl App {
                 if let Some(state) = self.panes.get_mut(&data.pane)
                     && state.scroll.is_none()
                 {
-                    if fed(|| state.parser.process(&data.bytes)).is_none() {
+                    if fed(|| state.feed(&data.bytes)).is_none() {
                         let info = state.info.clone();
                         return self.reseed(data.pane, data.rows, data.cols, info);
                     }
@@ -705,13 +727,15 @@ impl App {
         Vec::new()
     }
 
-    /// Recover a pane whose frame panicked its parser: start it over blank and
-    /// have the server reseed it — a `PaneScroll` back to the live view does —
-    /// instead of letting vt100 take the TUI down.
+    /// Recover a pane whose frame panicked its terminal: start it over blank
+    /// and have the server reseed it — a `PaneScroll` back to the live view
+    /// does — instead of letting one pane take the TUI down.
     fn reseed(&mut self, pane: PaneId, rows: u16, cols: u16, info: PaneInfo) -> Vec<WireFrame> {
         self.panes
             .insert(pane, PaneState::seeded(rows, cols, b"", info));
-        self.set_status(format!("pane {pane}'s output broke its parser; reseeding"));
+        self.set_status(format!(
+            "pane {pane}'s output broke its terminal; reseeding"
+        ));
         vec![control(&Request::PaneScroll { pane, offset: 0 })]
     }
 
@@ -1912,7 +1936,7 @@ impl App {
             pane,
             text: Some(text),
             keys: None,
-            expect: Some(prompt_fingerprint(&screen_rows(state.parser.screen()))),
+            expect: Some(prompt_fingerprint(&screen_rows(&state.term))),
         })]
     }
 
@@ -1925,11 +1949,11 @@ impl App {
         let Mode::Peek(pane) = self.mode else {
             return None;
         };
-        let screen = self.panes.get(&pane)?.parser.screen();
-        let region = prompt_rows(&screen_rows(screen));
+        let term = &self.panes.get(&pane)?.term;
+        let region = prompt_rows(&screen_rows(term));
         // Two border rows and the hint row around the region.
         let height = (region.len().max(1) as u16 + 3).min(area.height);
-        let width = (screen.size().1 + 2).max(PEEK_MIN_WIDTH).min(area.width);
+        let width = (term.size().1 + 2).max(PEEK_MIN_WIDTH).min(area.width);
         let popup = Rect::new(
             area.x + (area.width - width) / 2,
             area.y + (area.height - height) / 2,
@@ -2013,7 +2037,7 @@ impl App {
         };
         let state = self.panes.get(&pane)?;
         let approval = state.info.approval.as_ref()?;
-        let width = (state.parser.screen().size().1 + 2)
+        let width = (state.term.size().1 + 2)
             .max(PEEK_MIN_WIDTH)
             .min(area.width);
         let summary: Vec<char> = approval.summary.chars().collect();
@@ -3742,7 +3766,7 @@ impl App {
     /// there too, wherever the pointer is — reported when the program asked
     /// for them, dropped when it did not.
     fn forward_mouse(&mut self, mouse: MouseEvent) -> Option<Vec<WireFrame>> {
-        use vt100::MouseProtocolMode::{AnyMotion, ButtonMotion, None as Off, Press};
+        use rtty_vt::MouseMode::{Drag, Motion, None as Off, X10};
         let (col, row) = (mouse.column, mouse.row);
         let pane = match mouse.kind {
             MouseEventKind::Down(_)
@@ -3760,19 +3784,16 @@ impl App {
                 .panes
                 .get(&pane)
                 .filter(|s| s.scroll.is_none() && s.info.exited.is_none())?;
-            let screen = state.parser.screen();
-            (
-                screen.mouse_protocol_mode(),
-                screen.mouse_protocol_encoding(),
-            )
+            let modes = state.term.modes();
+            (modes.mouse, modes.mouse_encoding)
         };
         let (button, release) = match mouse.kind {
             MouseEventKind::Down(b) if mode != Off => (button_code(b), false),
-            MouseEventKind::Drag(b) if matches!(mode, ButtonMotion | AnyMotion) => {
+            MouseEventKind::Drag(b) if matches!(mode, Drag | Motion) => {
                 (button_code(b) + 32, false)
             }
-            MouseEventKind::Up(b) if !matches!(mode, Off | Press) => (button_code(b), true),
-            MouseEventKind::Moved if mode == AnyMotion => (3 + 32, false),
+            MouseEventKind::Up(b) if !matches!(mode, Off | X10) => (button_code(b), true),
+            MouseEventKind::Moved if mode == Motion => (3 + 32, false),
             MouseEventKind::Drag(_) => return Some(Vec::new()),
             MouseEventKind::Up(_) => {
                 self.mouse_grab = None;
@@ -4002,8 +4023,8 @@ impl App {
         if !sel.dragged {
             return None;
         }
-        let screen = self.panes.get(&sel.pane)?.parser.screen();
-        let (rows, cols) = screen.size();
+        let term = &self.panes.get(&sel.pane)?.term;
+        let (rows, cols) = term.size();
         let (start, end) = ordered(sel.anchor, sel.head);
         let mut out = String::new();
         for r in start.0..=end.0.min(rows.saturating_sub(1)) {
@@ -4013,13 +4034,10 @@ impl App {
             } else {
                 cols.saturating_sub(1)
             };
+            let row = term.screen_row(r);
             let mut line = String::new();
-            for c in c0..=c1.min(cols.saturating_sub(1)) {
-                match screen.cell(r, c) {
-                    Some(cell) if cell.is_wide_continuation() => {}
-                    Some(cell) if cell.has_contents() => line.push_str(cell.contents()),
-                    _ => line.push(' '),
-                }
+            for c in usize::from(c0)..=usize::from(c1.min(cols.saturating_sub(1))) {
+                row.push_grapheme(c, &mut line);
             }
             out.push_str(line.trim_end_matches(' '));
             if r != end.0 {
@@ -4067,7 +4085,7 @@ impl App {
         let (grid_rows, grid_cols) = self
             .panes
             .get(&pane)
-            .map_or((rows, cols), |s| s.parser.screen().size());
+            .map_or((rows, cols), |s| s.term.size());
         (rows.min(grid_rows).max(1), cols.min(grid_cols).max(1))
     }
 
@@ -4305,21 +4323,16 @@ impl App {
     /// The bytes a wheel tick sends straight to `pane`'s child, or `None` for
     /// a primary-screen pane whose scrollback tutti browses itself.
     fn forwarded_wheel(&self, pane: PaneId, col: u16, row: u16, up: bool) -> Option<Vec<u8>> {
-        let screen = self.panes.get(&pane)?.parser.screen();
-        if screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None {
+        let modes = self.panes.get(&pane)?.term.modes();
+        if modes.mouse != rtty_vt::MouseMode::None {
             // The 1-based cell within the pane interior, below its title and
             // frame rows.
             let (r, c) = self.clamp_to_pane(pane, col, row)?;
-            return Some(input::encode_wheel(
-                screen.mouse_protocol_encoding(),
-                up,
-                c + 1,
-                r + 1,
-            ));
+            return Some(input::encode_wheel(modes.mouse_encoding, up, c + 1, r + 1));
         }
-        screen
-            .alternate_screen()
-            .then(|| input::encode_wheel_arrows(screen.application_cursor(), up, MOUSE_SCROLL_STEP))
+        modes
+            .alt_screen
+            .then(|| input::encode_wheel_arrows(modes.cursor_keys, up, MOUSE_SCROLL_STEP))
     }
 
     // ---- layout / sizing ------------------------------------------------
@@ -4414,7 +4427,7 @@ impl App {
 
     /// The focused pane's screen contents as text, for assertions.
     pub fn pane_text(&self, pane: PaneId) -> Option<String> {
-        self.panes.get(&pane).map(|s| s.parser.screen().contents())
+        self.panes.get(&pane).map(|s| s.term.contents())
     }
 
     // ---- internal actions ----------------------------------------------
@@ -4774,19 +4787,21 @@ pub(crate) fn tagged(request: &Request, req: u64) -> WireFrame {
 }
 
 thread_local! {
-    /// Set while `fed` feeds a pane frame to its parser, so the panic hook
-    /// leaves the terminal be for a panic that is about to be caught.
+    /// Set while `fed` feeds a pane frame to its terminal, so the panic hook
+    /// leaves the host terminal be for a panic that is about to be caught.
     static FEEDING: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Whether this thread is feeding a pane frame to its parser — for the panic
-/// hook: that panic is caught and the pane reseeded, so the TUI runs on.
+/// Whether this thread is feeding a pane frame to its terminal — for the
+/// panic hook: that panic is caught and the pane reseeded, so the TUI runs on.
 pub(crate) fn feeding() -> bool {
     FEEDING.get()
 }
 
-/// Feed a pane frame to its parser, catching a vt100 panic — a wide character
-/// in a one-column pane is one — as `None`: the parser it left is suspect.
+/// Feed a pane frame to its terminal, catching a panic as `None`: the
+/// terminal it left is suspect. A pane is the unit of failure here as in the
+/// daemon — rtty-vt is property-tested never to panic, and this keeps one
+/// that did to its pane.
 fn fed<T>(feed: impl FnOnce() -> T) -> Option<T> {
     FEEDING.set(true);
     let fed = catch_unwind(AssertUnwindSafe(feed)).ok();
@@ -5154,8 +5169,10 @@ fn prev_visible(sidebar: &Sidebar, from: usize) -> usize {
 
 /// A screen's visible rows as text, top to bottom — what the prompt fingerprint
 /// and its region are computed over, exactly as the server computes them.
-fn screen_rows(screen: &vt100::Screen) -> Vec<String> {
-    screen.rows(0, screen.size().1).collect()
+fn screen_rows(term: &Terminal) -> Vec<String> {
+    (0..term.size().0)
+        .map(|r| term.screen_row(r).text())
+        .collect()
 }
 
 fn tab_infos(w: &WorkspaceView) -> impl Iterator<Item = &PaneInfo> {
@@ -5164,7 +5181,7 @@ fn tab_infos(w: &WorkspaceView) -> impl Iterator<Item = &PaneInfo> {
 
 fn empty_pane_state(info: PaneInfo) -> PaneState {
     PaneState {
-        parser: vt100::Parser::new(24, 80, SCROLLBACK),
+        term: Terminal::new(24, 80, 0),
         info,
         damaged: true,
         scroll: None,
@@ -5239,7 +5256,9 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_seeds_parser_then_delta_updates_it() {
+    fn snapshot_seeds_the_terminal_then_delta_updates_it() {
+        let mut src = Terminal::new(24, 80, 0);
+        src.advance(b"hello");
         let mut app = App::new();
         attached(&mut app);
         app.handle_frame(WireFrame::PaneSnapshot(PaneData {
@@ -5247,16 +5266,15 @@ mod tests {
             rows: 24,
             cols: 80,
             seq: 0,
-            bytes: b"hello".to_vec(),
+            bytes: src.snapshot(),
         }));
         assert!(app.pane_text(PaneId(1)).unwrap().contains("hello"));
 
-        // A delta encoded by a vt100 parser transforms the client's screen.
-        let mut src = vt100::Parser::new(24, 80, 0);
-        src.process(b"hello");
-        let before = src.screen().clone();
-        src.process(b" world");
-        let delta = src.screen().contents_diff(&before);
+        // A delta is the daemon's redraw of its terminal's damage.
+        src.take_damage();
+        src.advance(b" world");
+        let damage = src.take_damage();
+        let delta = src.redraw(&damage);
         app.handle_frame(WireFrame::PaneDelta(PaneData {
             pane: PaneId(1),
             rows: 24,
@@ -5265,6 +5283,25 @@ mod tests {
             bytes: delta,
         }));
         assert!(app.pane_text(PaneId(1)).unwrap().contains("hello world"));
+    }
+
+    /// The terminal's cursor takes the shape the focused pane's program set,
+    /// and its default while that pane browses its scrollback.
+    #[test]
+    fn the_cursor_takes_the_focused_panes_shape() {
+        let mut app = App::new();
+        attached(&mut app);
+        assert_eq!(app.cursor_shape(), 0);
+        app.handle_frame(WireFrame::PaneSnapshot(PaneData {
+            pane: PaneId(1),
+            rows: 24,
+            cols: 80,
+            seq: 0,
+            bytes: b"\x1b[6 q".to_vec(),
+        }));
+        assert_eq!(app.cursor_shape(), 6, "a steady bar");
+        app.set_scroll(PaneId(1), Some(5));
+        assert_eq!(app.cursor_shape(), 0);
     }
 
     #[test]
@@ -5289,44 +5326,47 @@ mod tests {
         assert!(app.pane_text(PaneId(1)).unwrap().contains("frozen"));
     }
 
-    /// A frame that panics vt100 — a wide character in a one-column pane, which
-    /// the client's one-column clamp makes reachable — resets that pane blank
-    /// and asks the server to reseed it, instead of taking the TUI down.
+    /// What makes a pane's terminal panic, through the test hook in
+    /// `PaneState::feed`.
+    pub(super) const PANIC_FRAME: &[u8] = b"tutti\x01panic";
+
+    /// A frame that panics its pane's terminal resets that pane blank and
+    /// asks the server to reseed it, instead of taking the TUI down.
     #[test]
-    fn a_frame_that_panics_the_parser_reseeds_its_pane() {
+    fn a_frame_that_panics_the_terminal_reseeds_its_pane() {
         let mut app = App::new();
         attached(&mut app);
-        let frame = |rows, cols, bytes: &str| PaneData {
+        let frame = |rows, cols, bytes: &[u8]| PaneData {
             pane: PaneId(1),
             rows,
             cols,
             seq: 0,
-            bytes: bytes.as_bytes().to_vec(),
+            bytes: bytes.to_vec(),
         };
         let reseed = vec![control(&Request::PaneScroll {
             pane: PaneId(1),
             offset: 0,
         })];
         assert_eq!(
-            app.handle_frame(WireFrame::PaneSnapshot(frame(2, 1, "日本"))),
+            app.handle_frame(WireFrame::PaneSnapshot(frame(2, 1, PANIC_FRAME))),
             reseed
         );
-        assert_eq!(app.panes[&PaneId(1)].parser.screen().size(), (2, 1));
+        assert_eq!(app.panes[&PaneId(1)].term.size(), (2, 1));
         assert_eq!(app.pane_text(PaneId(1)).unwrap(), "", "reset blank");
         assert!(app.transient().is_some_and(|t| t.contains("reseeding")));
         // A delta can break a seeded pane the same way.
         assert!(
-            app.handle_frame(WireFrame::PaneSnapshot(frame(2, 1, "x")))
+            app.handle_frame(WireFrame::PaneSnapshot(frame(2, 1, b"x")))
                 .is_empty()
         );
         assert_eq!(
-            app.handle_frame(WireFrame::PaneDelta(frame(2, 1, "日"))),
+            app.handle_frame(WireFrame::PaneDelta(frame(2, 1, PANIC_FRAME))),
             reseed
         );
         assert!(!feeding(), "the panic hook is armed again");
         // The reseed lands like any snapshot.
         assert!(
-            app.handle_frame(WireFrame::PaneSnapshot(frame(2, 4, "ok")))
+            app.handle_frame(WireFrame::PaneSnapshot(frame(2, 4, b"ok")))
                 .is_empty()
         );
         assert!(app.pane_text(PaneId(1)).unwrap().contains("ok"));
@@ -6334,7 +6374,7 @@ mod tests {
     /// The guarded send the peek should emit for `text`, fingerprinted from
     /// pane 3's mirror as it stands.
     fn guarded_answer(app: &App, text: &str) -> WireFrame {
-        let rows = screen_rows(app.panes[&PaneId(3)].parser.screen());
+        let rows = screen_rows(&app.panes[&PaneId(3)].term);
         control(&Request::PaneSend {
             pane: PaneId(3),
             text: Some(text.into()),
@@ -6480,7 +6520,7 @@ mod tests {
     fn the_peek_popup_frames_exactly_the_fingerprinted_region() {
         let mut app = peek_fixture();
         app.on_key(plain('p'));
-        let rows = screen_rows(app.panes[&PaneId(3)].parser.screen());
+        let rows = screen_rows(&app.panes[&PaneId(3)].term);
         let region = prompt_rows(&rows);
         assert_eq!(region, 0..6, "the dialog, blank spacer row included");
 
@@ -8885,7 +8925,7 @@ mod tests {
 
     // ---- mouse wheel ----------------------------------------------------
 
-    /// Seed pane 1's parser with `bytes` so its declared modes (alt screen,
+    /// Seed pane 1's terminal with `bytes` so its declared modes (alt screen,
     /// mouse reporting) drive the wheel routing, and return its rect.
     fn wheel_fixture(app: &mut App, bytes: &[u8]) -> Rect {
         attached(app);
