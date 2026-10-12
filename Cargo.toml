@@ -19,7 +19,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 portable-pty = "0.9"
-rtty-vt = { git = "https://github.com/mcginleyr1/rtty", rev = "98baf25943a38099dfd2b9983d2370458fdbe6a9" }
+rtty-vt = { git = "https://github.com/mcginleyr1/rtty", rev = "115bcedebf5505af343db12ef488d378a829b9e5" }
 memchr = "2.7"
 vt100 = "0.16"
 anyhow = "1"
