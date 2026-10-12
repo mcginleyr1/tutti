@@ -2020,7 +2020,9 @@ async fn a_colour_query_is_answered_once_a_client_reports_colours() {
 
 /// A pane that set mode 2031 hears each light/dark change — the first
 /// report counts as one — and a report that keeps it tells nothing; one
-/// that reset the mode hears none.
+/// that reset the mode hears none, and nor does one whose shell marked the
+/// end of the command that set it (OSC 133;D), as after nvim was killed
+/// with SIGKILL: the report would reach the shell as typing.
 #[tokio::test]
 async fn a_2031_pane_hears_of_a_light_dark_flip() {
     let server = TestServer::start();
@@ -2033,12 +2035,14 @@ async fn a_2031_pane_hears_of_a_light_dark_flip() {
     };
     let on = run_marker(&mut control, &script("\\033[?2031h")).await;
     let off = run_marker(&mut control, &script("\\033[?2031h\\033[?2031l")).await;
-    assert!(read_until(&mut control, on, "ready").await);
-    assert!(read_until(&mut control, off, "ready").await);
+    let ended = run_marker(&mut control, &script("\\033[?2031h\\033]133;D;137\\007")).await;
+    for pane in [on, off, ended] {
+        assert!(read_until(&mut control, pane, "ready").await);
+    }
     for dark in [true, false, false] {
         assert_eq!(control.request(host_colors(dark)).await, Response::Ok);
     }
-    for pane in [on, off] {
+    for pane in [on, off, ended] {
         let go = Request::PaneSend {
             pane,
             text: Some("go\r".into()),
@@ -2049,6 +2053,7 @@ async fn a_2031_pane_hears_of_a_light_dark_flip() {
     }
     assert!(read_until(&mut control, on, "[E[?997;1nE[?997;2ngo]").await);
     assert!(read_until(&mut control, off, "[go]").await);
+    assert!(read_until(&mut control, ended, "[go]").await);
 
     server.stop().await;
 }

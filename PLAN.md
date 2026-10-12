@@ -648,6 +648,17 @@ In order; each lands its TUI path in the same wave as its verbs.
      inherit `RTTY_PANE`/`RTTY_SOCKET`. A link-only change of a cell always
      redraws (`CellDiffOption::AlwaysUpdate`). Acceptance 113/113, the
      harness playing rtty with a stub `rtty` on PATH.
+   - ✅ What a command left on goes off at its shell's command-end mark (OSC
+     133;D): mouse, focus, 2031, modifyOtherKeys and kitty's flags.
+     - **The failure it fixes:** an nvim killed with SIGKILL left 2031 on, and
+       each later nvim probed it as set and so never reset it. The next
+       light/dark flip reached zsh's line editor as typing, which ate the
+       harness's `nv`.
+     - **Key encodings:** the TUI had also typed Ctrl-C into that shell as
+       `CSI 99;5u`.
+     - **Why at D:** shells set their own prompt modes after D (zsh, bash,
+       fish measured), and fish's 2031 comes before the integration's A.
+     - **Acceptance:** 115/115.
    - Step 3, rtty itself.
    Open: answers to a pane's own queries are written by the answer thread,
    so keys typed through `pane send` can overtake a light/dark report the

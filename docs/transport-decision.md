@@ -447,3 +447,15 @@ reader of the terminal, with the light/dark the terminal said. The TUI does not:
 0.29 reads `CSI ?` ending in anything but `u` or `c` as a sequence still arriving, so after
 a `CSI ? 997 ; 1 n` it would sit on every key typed until a `u` or `c` came. The TUI keeps
 its attach-time answer until it reattaches.
+
+**What a command left on.** The daemon turns off what a command left on at its shell's
+command-end mark (OSC 133;D, from `tutti shell-init` or fish itself), at the mark's byte. That
+covers mouse reporting (every tracking mode and encoding), focus reports (1004), 2031,
+modifyOtherKeys and kitty's flags (every entry popped). A program killed with SIGKILL leaves
+them on, and nvim then probes 2031 as set and so never resets it again. The next flip would
+reach the shell as typing, and the TUI would type into the shell in kitty's encoding.
+
+Only the first of a run of command ends counts: zsh's integration marks one from PROMPT_SP
+and another from its precmd. Streams are told of the mouse and focus modes after the mark
+(the rest never reach them). The prompt start (A) would be too late: fish sets 2031 and
+modifyOtherKeys between its own A and the integration's.

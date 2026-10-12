@@ -132,6 +132,16 @@ cargo fmt --check
   of screens goes to a tap alone (`Processed::cuts`): `pane attach` redraws a
   frame that switches. A tap runs on the reader thread under that lock: it
   never blocks, waits or takes another lock — it `try_send`s.
+- **A command's end (OSC 133;D) turns off the modes the command left on**
+  (`LEFT_ON`, `Term::drain`, pty.rs):
+  - **What it covers:** mouse, focus, 2031 and the key encodings, applied at
+    the mark's byte and only at the first of a run of ends.
+  - **Don't move it to the prompt start (A).** fish sets 2031 and
+    modifyOtherKeys between its own A and the integration's A, so it would
+    lose them at every prompt.
+  - **Keep bracketed paste and DECCKM out.** Every shell sets bracketed paste
+    itself, and zsh and bash take both arrow encodings. Measured on zsh 5.9,
+    bash 3.2 and 5, and fish 4.9.
 - **A prompt start (OSC 133;A) clears `TUTTI_KEYS` and `TUTTI_EDITOR`**
   (`broadcast_tick`, server.rs): the only thing that hands the direct keys back
   after an editor is `kill -9`'d. A new user var that claims something of the

@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use rtty_vt::{ColorScheme, Event, MarkKind, ModeChange, Terminal};
+use rtty_vt::{ColorScheme, Event, MarkKind, ModeChange, MouseEncoding, MouseMode, Terminal};
 use tokio::sync::watch;
 use tutti_core::{AgentState, HostColors, Rgb, StateSource};
 
@@ -29,6 +29,18 @@ const ANSWER_QUEUE: usize = 64;
 /// The longest sequence held from the terminal and the taps while it could
 /// still be one the daemon answers or owns; past it, it goes on to both.
 const HOLD_MAX: usize = 256;
+/// What a program can leave on in its terminal that the shell after it
+/// never asked for: the reports the terminal writes into the pane unbidden —
+/// the mouse's (every tracking mode and encoding), focus (1004), light/dark
+/// (2031) — and the key encodings the TUI types into it by, xterm's
+/// modifyOtherKeys and kitty's flags (every entry popped). A program killed
+/// with SIGKILL turns none of them off; a shell drawing its prompt sets its
+/// own after the command's end (`Term::drain`). Bracketed paste stays: every
+/// shell sets it itself.
+const LEFT_ON: &[u8] =
+    b"\x1b[?9;1000;1002;1003;1004;1005;1006;1015;1016;2031l\x1b[>4;0m\x1b[<65535u";
+/// `LEFT_ON` less what never reaches a tap (`Verdict::Own`).
+const LEFT_ON_TAPS: &[u8] = b"\x1b[?9;1000;1002;1003;1004;1005;1006;1015;1016l";
 
 /// What to run in a pane.
 #[derive(Debug, Clone)]
@@ -194,6 +206,11 @@ struct Term {
     crashed: bool,
     /// When the program opened the synchronized update (2026) it has open.
     synced: Option<Instant>,
+    /// The last shell mark was a command's end (OSC 133;D).
+    ended: bool,
+    /// A command's end turned off what it left on (`LEFT_ON`): the taps are
+    /// told once the mark has ended, its ST included.
+    taps_owed: bool,
 }
 
 /// The longest the render tick holds a pane's frame for a synchronized
@@ -211,6 +228,8 @@ impl Term {
             taps: Vec::new(),
             crashed: false,
             synced: None,
+            ended: false,
+            taps_owed: false,
         };
         if let Some(colors) = colors {
             term.set_colors(colors);
@@ -395,6 +414,11 @@ impl Term {
                 out.cuts.push(out.raw.len());
             }
         }
+        // A shell's marks are OSCs, drained here; one an `ESC` ended goes
+        // on with its `\` first.
+        if then.is_empty() && std::mem::take(&mut self.taps_owed) {
+            out.raw.extend_from_slice(LEFT_ON_TAPS);
+        }
         if !then.is_empty() && matches!(whole.get(1), Some(b']' | b'P')) {
             self.string_kept = Some(kept);
         }
@@ -413,6 +437,28 @@ impl Term {
                 }
                 Event::Mode(ModeChange::SyncUpdate(open)) => {
                     self.synced = open.then(Instant::now);
+                }
+                // A shell marked the end of the command it ran: what that
+                // left on goes off, at the mark — the shell's next prompt
+                // sets its own after it (fish its 2031 and modifyOtherKeys).
+                // Only at the first of a run of ends: zsh's integration marks
+                // one from PROMPT_SP and one from precmd, and a hook between
+                // them belongs to the shell.
+                Event::Mark(mark) => {
+                    let ended = matches!(mark.kind, MarkKind::CommandEnd { .. });
+                    let modes = self.vt.modes();
+                    let on = modes.mouse != MouseMode::None
+                        || modes.mouse_encoding != MouseEncoding::Default
+                        || modes.focus_reports
+                        || modes.color_scheme_reports
+                        || modes.modify_other_keys != 0
+                        || self.vt.kitty_keyboard() != 0;
+                    if ended && !self.ended && on {
+                        self.vt.advance(LEFT_ON);
+                        self.taps_owed = true;
+                    }
+                    self.ended = ended;
+                    out.signals.extend(signal(Event::Mark(mark)));
                 }
                 event => out.signals.extend(signal(event)),
             }
@@ -2587,6 +2633,73 @@ mod tests {
                 "{snapshot:?}"
             );
         }
+    }
+
+    /// nvim killed with SIGKILL, as its shell's integration marks it: the
+    /// mouse, focus and light/dark reports and the key encodings it left on
+    /// go off at the command's end (OSC 133;D), however reads cut the
+    /// stream, so the shell neither hears a light/dark flip (a 997 report
+    /// zsh's line editor takes for typing) nor gets its keys in kitty's
+    /// encoding. Bracketed paste and the alternate screen stay. The taps
+    /// are told of the mouse and focus modes, after the mark.
+    #[test]
+    fn a_commands_end_turns_off_what_it_left_on() {
+        let left: &[u8] = b"\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2031h\x1b[?2004h\
+            \x1b[>4;2m\x1b[>1u";
+        let stream = [
+            b"\x1b]133;C\x07",
+            left,
+            b"\x1b]133;D;137\x1b\\\x1b]133;A\x07$ ",
+        ]
+        .concat();
+        let raw = [
+            b"\x1b]133;C\x07\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2004h\
+                \x1b]133;D;137\x1b\\",
+            LEFT_ON_TAPS,
+            b"\x1b]133;A\x07$ ",
+        ]
+        .concat();
+        for cut in 0..=stream.len() {
+            let mut term = Term::new(PaneSize::new(3, 20), None);
+            let (first, second) = (term.process(&stream[..cut]), term.process(&stream[cut..]));
+            assert_eq!([first.raw, second.raw].concat(), raw, "cut at {cut}");
+            let modes = term.vt.modes();
+            assert_eq!(
+                (modes.mouse, modes.mouse_encoding, modes.focus_reports),
+                (MouseMode::None, MouseEncoding::Default, false),
+                "cut at {cut}"
+            );
+            assert!(!modes.color_scheme_reports);
+            assert_eq!((modes.modify_other_keys, term.vt.kitty_keyboard()), (0, 0));
+            assert!(modes.bracketed_paste && modes.alt_screen);
+            term.set_colors(light());
+            let mut out = Processed::default();
+            term.drain(&mut out);
+            assert_eq!(out.answers, b"", "no light/dark report reaches the shell");
+        }
+    }
+
+    /// What a shell sets after a command's end stays: fish turns on 2031 and
+    /// modifyOtherKeys at each prompt, in the read that ends the command.
+    /// Only the first of a run of ends turns anything off — zsh's
+    /// integration marks one from PROMPT_SP and another from its precmd, and
+    /// what a hook between them turns on is the shell's — and an end with
+    /// nothing left on tells the taps nothing.
+    #[test]
+    fn only_a_commands_first_end_turns_anything_off() {
+        let mut term = Term::new(PaneSize::new(3, 20), None);
+        term.process(b"\x1b]133;C\x07\x1b[?1000h");
+        term.process(b"\x1b]133;D;0\x07\x1b]133;A\x07\x1b[?2031h\x1b[>4;1m> ");
+        let modes = term.vt.modes();
+        assert_eq!(modes.mouse, MouseMode::None);
+        assert!(modes.color_scheme_reports && modes.modify_other_keys == 1);
+
+        let mut term = Term::new(PaneSize::new(3, 20), None);
+        let quiet = b"\x1b]133;D;0\x07\x1b[?1004h\x1b]133;D;0\x07$ ";
+        assert_eq!(term.process(quiet).raw, quiet, "nothing was on");
+        assert!(term.vt.modes().focus_reports, "a hook's, between two ends");
+        term.process(b"\x1b]133;A\x07$ \x1b]133;C\x07\x1b]133;D;0\x07");
+        assert!(!term.vt.modes().focus_reports, "a command ran since");
     }
 
     /// A synchronized update holds the pane's frame until its program ends

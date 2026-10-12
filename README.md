@@ -626,9 +626,24 @@ it twice changes nothing. With it:
   command`;
 - each prompt clears the editor vars (`TUTTI_KEYS`, `TUTTI_EDITOR`), so an
   editor that crashed without clearing them hands the keys back.
+- the end of each command turns off what the command left on in its terminal
+  that the shell never asked for. That covers mouse reporting, focus reports
+  (1004), light/dark reports (2031) and the key encodings (modifyOtherKeys,
+  kitty's flags).
+  - **Why:** a program killed with SIGKILL (Neovim after a `kill -9`) leaves
+    them all on. The shell would then read the next light/dark report as
+    typing, and the TUI would type into it in kitty's encoding, so Ctrl-C
+    would no longer interrupt.
+  - **What stays:** whatever the shell sets for its own prompt comes after the
+    command's end. zsh, bash and fish set bracketed paste themselves, and fish
+    also sets 2031 and modifyOtherKeys.
+  - **The tty is not touched:** zsh keeps the raw mode a killed program leaves
+    the tty in, and `stty sane` restores it.
 
 bash needs 4.4 or newer for `--last-output` (`PS0`); macOS's `/bin/bash` 3.2
-reports only the directory. The fish snippet has not been run live yet.
+reports only the directory. The fish snippet has been run under fish 4.9.3,
+which marks prompts and commands itself too; `--last-output` under fish has not
+been checked.
 
 ## Configuration
 
