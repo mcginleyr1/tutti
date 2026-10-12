@@ -85,7 +85,10 @@ cargo fmt --check
 - **Panics cost one pass, never the daemon**: hub locks go through the
   poison-recovering accessors (`hub.session()`, `hub.clients()`, … — never
   `.lock().expect()`), and background passes run inside `guarded` (or as their
-  own task if async). In the TUI, any new `catch_unwind` must set `FEEDING` as
+  own task if async). A pane's engine is touched only through `PtyPane::with`
+  or the reader's own guard, which catch a panic inside the term lock and end
+  that pane (`crashed`) — a new path to `Term` that skips them would poison
+  the lock instead. In the TUI, any new `catch_unwind` must set `FEEDING` as
   `fed()` does, or the panic hook restores the terminal under a TUI that keeps
   running.
 - **A TUI request whose reply drives a follow-up goes out through

@@ -3,8 +3,10 @@
 //! child keeps running whether or not anything is reading the UI — this is
 //! the daemon's core.
 
+use std::any::Any;
 use std::borrow::Cow;
 use std::io::{Read, Write};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -187,6 +189,9 @@ struct Term {
     /// The raw-output subscribers, by id: fed under this lock, so each sees
     /// its snapshot and then every read once, in order.
     taps: Vec<(u64, Tap)>,
+    /// The engine panicked (`crash`): `vt` is a blank terminal telling of
+    /// it, and nothing the pane writes reaches it.
+    crashed: bool,
 }
 
 impl Term {
@@ -198,11 +203,28 @@ impl Term {
             released: false,
             string_kept: None,
             taps: Vec::new(),
+            crashed: false,
         };
         if let Some(colors) = colors {
             term.set_colors(colors);
         }
         term
+    }
+
+    /// Put a blank terminal of the same size in the place of an engine that
+    /// panicked with `message`, telling of the crash, and hand every tap
+    /// that screen to start from. Whatever the pane writes next is dropped.
+    fn crash(&mut self, message: &str) {
+        let (rows, cols) = self.vt.size();
+        self.vt = Terminal::new(rows, cols, 0);
+        self.vt
+            .advance(format!("\r\ntutti: this pane's terminal crashed: {message}\r\n").as_bytes());
+        (self.seq, self.released, self.string_kept, self.crashed) =
+            (Seq::Ground, false, None, true);
+        self.held.clear();
+        let (size, snapshot) = (PaneSize::new(rows, cols), self.vt.snapshot());
+        self.taps
+            .retain_mut(|(_, tap)| tap(Feed::Snapshot(size, snapshot.clone())));
     }
 
     /// Take the host terminal's colours, which the colour queries are
@@ -235,6 +257,16 @@ impl Term {
     /// other sequences go in runs as long as the read. A sequence a read cut
     /// off is held from both until a later read ends it.
     fn process(&mut self, bytes: &[u8]) -> Processed {
+        if self.crashed {
+            return Processed::default();
+        }
+        #[cfg(test)]
+        if bytes
+            .windows(tests::PANIC_READ.len())
+            .any(|bytes| bytes == tests::PANIC_READ)
+        {
+            panic!("injected: the engine panics on this read");
+        }
         let mut out = Processed {
             raw: Vec::with_capacity(bytes.len()),
             ..Processed::default()
@@ -384,6 +416,10 @@ impl Term {
 
     /// One broadcast tick's look; see `PtyPane::look`.
     fn look(&mut self, last: Option<(PaneSize, bool)>, snapshot: bool) -> Look {
+        #[cfg(test)]
+        if self.vt.title() == tests::PANIC_LOOK {
+            panic!("injected: the engine panics drawing the screen");
+        }
         let (rows, cols) = self.vt.size();
         let size = PaneSize::new(rows, cols);
         let alt_screen = self.vt.modes().alt_screen;
@@ -790,6 +826,7 @@ impl PtyPane {
                 read_loop(
                     reader,
                     reader_term,
+                    pid,
                     output_tx,
                     reader_notifications,
                     reader_answers,
@@ -831,16 +868,34 @@ impl PtyPane {
         })
     }
 
+    /// Run `f` on the pane's terminal, under its lock. The pane is the unit
+    /// of failure: a panic in its engine is caught inside the lock hold — so
+    /// the lock the hub, the reader and every caller take is never poisoned
+    /// — and ends this pane alone (`crashed`); `f` then runs on the blank
+    /// terminal that tells of the crash.
+    fn with<R>(&self, mut f: impl FnMut(&mut Term) -> R) -> R {
+        let mut term = lock(&self.term);
+        match catch_unwind(AssertUnwindSafe(|| f(&mut term))) {
+            Ok(out) => out,
+            Err(panic) => {
+                crashed(&mut term, &*panic, self.pid, &self.notifications);
+                f(&mut term)
+            }
+        }
+    }
+
     /// Take the host terminal's colours for the pane's colour queries. A
     /// change of light/dark — or the first report — is told to a program
     /// that asked (mode 2031), as a terminal would: `CSI ? 997 ; 1|2 n`.
     pub fn set_colors(&self, colors: HostColors) {
-        let mut term = lock(&self.term);
-        term.set_colors(colors);
-        let mut out = Processed::default();
-        term.drain(&mut out);
-        if !out.answers.is_empty() {
-            let _ = self.answers.try_send(out.answers);
+        let answers = self.with(|term| {
+            term.set_colors(colors);
+            let mut out = Processed::default();
+            term.drain(&mut out);
+            out.answers
+        });
+        if !answers.is_empty() {
+            let _ = self.answers.try_send(answers);
         }
     }
 
@@ -870,14 +925,14 @@ impl PtyPane {
             })
             .context("resize pty failed")?;
         let size = PaneSize { rows, cols };
-        let mut term = lock(&self.term);
-        term.vt.resize(rows, cols);
-        if !term.taps.is_empty() {
-            let snapshot = term.vt.snapshot();
-            term.taps
-                .retain_mut(|(_, tap)| tap(Feed::Snapshot(size, snapshot.clone())));
-        }
-        drop(term);
+        self.with(|term| {
+            term.vt.resize(rows, cols);
+            if !term.taps.is_empty() {
+                let snapshot = term.vt.snapshot();
+                term.taps
+                    .retain_mut(|(_, tap)| tap(Feed::Snapshot(size, snapshot.clone())));
+            }
+        });
         *lock(&self.size) = size;
         Ok(())
     }
@@ -886,15 +941,17 @@ impl PtyPane {
     /// hold of the parser lock it is handed a snapshot of the screen as it
     /// stands and joins the reader, which hands it each read in the same
     /// hold that parses it — so nothing is lost or repeated between the two.
-    pub fn tap(&self, id: u64, mut tap: Tap) {
-        let mut term = lock(&self.term);
-        let (rows, cols) = term.vt.size();
-        if tap(Feed::Snapshot(
-            PaneSize::new(rows, cols),
-            term.vt.snapshot(),
-        )) {
-            term.taps.push((id, tap));
-        }
+    pub fn tap(&self, id: u64, tap: Tap) {
+        let mut tap = Some(tap);
+        self.with(|term| {
+            let (rows, cols) = term.vt.size();
+            let snapshot = term.vt.snapshot();
+            if let Some(mut tap) = tap.take()
+                && tap(Feed::Snapshot(PaneSize::new(rows, cols), snapshot))
+            {
+                term.taps.push((id, tap));
+            }
+        });
     }
 
     /// Unsubscribe tap `id`, if it still is.
@@ -909,18 +966,19 @@ impl PtyPane {
 
     /// Current screen contents, cursor position, and size.
     pub fn snapshot(&self) -> Snapshot {
-        let term = lock(&self.term);
-        let (rows, cols) = term.vt.size();
-        let (cursor_row, cursor_col) = term.vt.cursor_position();
-        let lines = (0..rows).map(|r| term.vt.screen_row(r).text()).collect();
-        Snapshot {
-            rows,
-            cols,
-            cursor_row,
-            cursor_col,
-            lines,
-            generation: *self.output_rx.borrow(),
-        }
+        self.with(|term| {
+            let (rows, cols) = term.vt.size();
+            let (cursor_row, cursor_col) = term.vt.cursor_position();
+            let lines = (0..rows).map(|r| term.vt.screen_row(r).text()).collect();
+            Snapshot {
+                rows,
+                cols,
+                cursor_row,
+                cursor_col,
+                lines,
+                generation: *self.output_rx.borrow(),
+            }
+        })
     }
 
     /// The broadcast tick's look at the screen, the one consumer of its
@@ -928,22 +986,23 @@ impl PtyPane {
     /// bytes that bring a client holding it level, and with `snapshot` the
     /// bytes for a client holding none.
     pub fn look(&self, last: Option<(PaneSize, bool)>, snapshot: bool) -> Look {
-        lock(&self.term).look(last, snapshot)
+        self.with(|term| term.look(last, snapshot))
     }
 
     /// A client snapshot of the screen scrolled `offset` rows back into the
     /// scrollback, with its size: the rows from there drawn, no cursor.
     pub fn scrolled_snapshot(&self, offset: usize) -> (PaneSize, Vec<u8>) {
-        let term = lock(&self.term);
-        let (rows, cols) = term.vt.size();
-        let snapshot = term.vt.scrolled_snapshot(offset as u64);
-        (PaneSize::new(rows, cols), snapshot)
+        self.with(|term| {
+            let (rows, cols) = term.vt.size();
+            let snapshot = term.vt.scrolled_snapshot(offset as u64);
+            (PaneSize::new(rows, cols), snapshot)
+        })
     }
 
     /// The live screen's text, soft-wrapped rows joined: the classifier
     /// scans it.
     pub fn contents(&self) -> String {
-        lock(&self.term).vt.contents()
+        self.with(|term| term.vt.contents())
     }
 
     /// The rows committed to the primary scrollback from absolute index
@@ -958,7 +1017,7 @@ impl PtyPane {
     /// rows it keeps afresh: a cursor from before it may see a row again,
     /// never skip one.
     pub fn tail(&self, since: u64, lines: Option<usize>, unwrapped: bool) -> Result<Tail> {
-        lock(&self.term).tail(since, lines, unwrapped)
+        self.with(|term| term.tail(since, lines, unwrapped))
     }
 
     /// The output of the last command the pane's shell finished, between the
@@ -970,12 +1029,12 @@ impl PtyPane {
     /// under shell integration; an error while the alternate screen is up,
     /// which covers the primary's screen.
     pub fn last_output(&self, lines: Option<usize>, unwrapped: bool) -> Result<Option<LastOutput>> {
-        lock(&self.term).last_output(lines, unwrapped)
+        self.with(|term| term.last_output(lines, unwrapped))
     }
 
     /// The working directory the pane's shell last reported (OSC 7).
     pub fn cwd(&self) -> Option<String> {
-        lock(&self.term).vt.cwd().map(str::to_string)
+        self.with(|term| term.vt.cwd().map(str::to_string))
     }
 
     /// The child's OS process id, if the platform reported one at spawn.
@@ -1093,9 +1152,36 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// End the pane whose engine panicked with `panic`: the panic message to the
+/// daemon's log, the blank terminal that tells of it in the engine's place
+/// (`Term::crash`), a notification, and the child's process group killed —
+/// which closes the pty, ending the reader. Nothing else is touched.
+fn crashed(
+    term: &mut Term,
+    panic: &(dyn Any + Send),
+    pid: Option<u32>,
+    notifications: &Mutex<Vec<Signal>>,
+) {
+    let message = panic
+        .downcast_ref::<&str>()
+        .map(|message| message.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic with no message".into());
+    eprintln!("tutti: the terminal of a pane (pid {pid:?}) panicked: {message}; ending that pane");
+    term.crash(&message);
+    lock(notifications).push(Signal::Notify(Notification {
+        title: Some("pane crashed".into()),
+        body: Some(message),
+    }));
+    if let Some(pid) = pid {
+        signal_group(pid, SIGKILL);
+    }
+}
+
 fn read_loop(
     mut reader: Box<dyn Read + Send>,
     term: Arc<Mutex<Term>>,
+    pid: Option<u32>,
     output_tx: watch::Sender<u64>,
     notifications: Arc<Mutex<Vec<Signal>>>,
     answers: SyncSender<Vec<u8>>,
@@ -1108,22 +1194,33 @@ fn read_loop(
                 // Bumped under the parser lock, so a `snapshot` sees a grid and
                 // a generation that agree; the signals are queued in the same
                 // hold, so the tick that sees the screen they came with sees
-                // them too.
+                // them too. A panic handling the read is caught inside that
+                // hold, so it never poisons the lock, and ends this pane.
                 let mut term = lock(&term);
-                let Processed {
-                    raw,
-                    cuts,
-                    answers: answer,
-                    signals,
-                } = term.process(&buf[..n]);
-                let mut from = 0;
-                for to in cuts.into_iter().chain([raw.len()]) {
-                    let piece = &raw[from..to];
-                    if !piece.is_empty() {
-                        term.taps.retain_mut(|(_, tap)| tap(Feed::Raw(piece)));
+                let handled = catch_unwind(AssertUnwindSafe(|| {
+                    let Processed {
+                        raw,
+                        cuts,
+                        answers,
+                        signals,
+                    } = term.process(&buf[..n]);
+                    let mut from = 0;
+                    for to in cuts.into_iter().chain([raw.len()]) {
+                        let piece = &raw[from..to];
+                        if !piece.is_empty() {
+                            term.taps.retain_mut(|(_, tap)| tap(Feed::Raw(piece)));
+                        }
+                        from = to;
                     }
-                    from = to;
-                }
+                    (answers, signals)
+                }));
+                let (answer, signals) = match handled {
+                    Ok(handled) => handled,
+                    Err(panic) => {
+                        crashed(&mut term, &*panic, pid, &notifications);
+                        break;
+                    }
+                };
                 if !signals.is_empty() {
                     let mut queue = lock(&notifications);
                     queue.extend(signals);
@@ -1142,6 +1239,9 @@ fn read_loop(
             Err(_) => break,
         }
     }
+    // The last screen — a crash's, or the end of a pane its crash killed —
+    // goes out with the next tick.
+    output_tx.send_modify(|generation| *generation = generation.wrapping_add(1));
 }
 
 /// A desktop notification or bell surfaced from a pane's raw output. A bare
@@ -1294,6 +1394,12 @@ mod tests {
 
     /// The reader's buffer.
     const READ: usize = 8192;
+
+    /// What makes a pane's engine panic, through the test hooks: a read that
+    /// holds these bytes (`Term::process`), or drawing a screen with this
+    /// title (`Term::look`).
+    pub(super) const PANIC_READ: &[u8] = b"tutti\x01panic";
+    pub(super) const PANIC_LOOK: &str = "tutti-panic-look";
 
     fn signals(input: &[u8]) -> Vec<Signal> {
         Term::new(PaneSize::new(24, 80), None)
@@ -2707,5 +2813,67 @@ mod tests {
         assert!(client.screen().contents().contains("after-poison"));
         assert!(pane.take_notifications().is_empty());
         pane.kill().unwrap();
+    }
+
+    /// A pane is the unit of failure. Its engine panicking — on a read, or
+    /// drawing the screen for the tick — ends that pane alone: its child is
+    /// killed, its screen tells of the crash, a notification says so, and its
+    /// lock is never poisoned, so whoever takes it next gets an answer. The
+    /// pane beside it reads and draws on.
+    #[test]
+    fn a_panicking_engine_ends_its_pane_alone() {
+        let cat = || PtyPane::spawn(PtySpec::new("/bin/cat"), PaneSize::new(24, 80)).unwrap();
+        let (reading, drawing, beside) = (cat(), cat(), cat());
+        let crashed = |pane: &PtyPane| {
+            wait_for(
+                || pane.exit_status().is_some(),
+                "the crashed pane's child lives on",
+            );
+            assert!(!pane.term.is_poisoned());
+            assert!(
+                pane.contents().contains("terminal crashed: injected"),
+                "{:?}",
+                pane.contents()
+            );
+            let notes = pane.take_notifications();
+            assert!(
+                notes.iter().any(|signal| matches!(signal,
+                    Signal::Notify(note) if note.title.as_deref() == Some("pane crashed"))),
+                "{notes:?}"
+            );
+        };
+
+        reading.write_input(&[PANIC_READ, b"\n"].concat()).unwrap();
+        crashed(&reading);
+
+        drawing
+            .write_input(format!("\x1b]2;{PANIC_LOOK}\x07\n").as_bytes())
+            .unwrap();
+        wait_for(
+            || lock(&drawing.term).vt.title() == PANIC_LOOK,
+            "the title never landed",
+        );
+        let look = drawing.look(None, true);
+        let mut client = vt100::Parser::new(24, 80, 0);
+        client.process(&look.snapshot.unwrap());
+        assert!(
+            client
+                .screen()
+                .contents()
+                .contains("terminal crashed: injected")
+        );
+        crashed(&drawing);
+
+        beside.write_input(b"still-here\n").unwrap();
+        wait_for(
+            || beside.contents().contains("still-here"),
+            "the pane beside stopped",
+        );
+        let look = beside.look(None, true);
+        let mut client = vt100::Parser::new(24, 80, 0);
+        client.process(&look.snapshot.unwrap());
+        assert!(client.screen().contents().contains("still-here"));
+        assert!(beside.exit_status().is_none() && !beside.term.is_poisoned());
+        beside.kill().unwrap();
     }
 }

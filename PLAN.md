@@ -609,7 +609,8 @@ In order; each lands its TUI path in the same wave as its verbs.
    - ✅ Step 1, the daemon: each pane is an `rtty_vt::Terminal`. Gone: the
      scroll-count offset trick, the run-splitting `Seq`, the window tiling,
      `NotifyScanner`, `Mirror` and its replay, the hub's per-pane vt100
-     parsers and the reader's `catch_unwind`. Rows are the engine's absolute
+     parsers and the reader's restart-blank `catch_unwind`, for a pane fault
+     boundary that ends the pane (Phase 5). Rows are the engine's absolute
      numbers; events (bell, OSC 9/777, 9;4, 7501, 1337, 133) are its own,
      tutti keeping its 7501 decoding and caps; the render tick takes each
      pane's damage once (`look`); answers are the engine's `Event::Reply`,
@@ -680,8 +681,12 @@ is private, so install stays `cargo install --path` from a checkout.
   Until wave 8 a vt100 panic on a pane's reader thread restarted that pane's
   screen blank (the trigger found: a wide character printed into a one-column
   pane); the pane's engine is now rtty-vt, property-tested never to panic on
-  any bytes or resize (it writes that wide character as U+FFFD), so the guard
-  went with vt100. ✅ The hub's locks
+  any bytes or resize (it writes that wide character as U+FFFD). ✅ A pane is
+  the unit of failure: a panic in its engine, on its reader or under any lock
+  of its terminal (`PtyPane::with`), is caught inside the lock, so nothing is
+  poisoned, and ends that pane alone — its process group killed, its screen
+  telling of the crash, a `pane crashed` note, the message in the log.
+  ✅ The hub's locks
   recover from poisoning too; the render tick, VCS watch, classify and detect
   passes survive their panics (logged, the loop goes on); a panicking frame
   drops only its connection, which leaves through `drop_client` like any

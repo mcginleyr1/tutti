@@ -250,9 +250,11 @@ The daemon is built to outlive its own bugs. A panic in a background pass —
 the render tick, the classifier, detection, the VCS watch — is logged and the
 pass carries on; a panic while handling one connection's request drops only
 that connection; a lock a panic poisoned is recovered; a failed `accept` is
-retried. A pane's terminal engine is built never to panic, whatever a program
-writes — it is property-tested on arbitrary bytes and resizes; were it to,
-that pane's output would stop and every other pane run on. The client
+retried. A pane is the unit of failure. Its terminal engine is built never to
+panic, whatever a program writes — it is property-tested on arbitrary bytes
+and resizes — but were it to, that pane alone ends: its program is killed,
+its screen says the terminal crashed and why, a `pane crashed` note joins the
+history, the panic goes to the log, and every other pane runs on. The client
 survives its own parser's: a pane update its parser cannot apply
 resets the pane and asks the daemon for a fresh copy, and any other client
 panic restores your terminal on its way out.

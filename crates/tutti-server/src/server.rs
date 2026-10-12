@@ -2571,9 +2571,9 @@ fn refresh_all_changes(hub: &Arc<Hub>) {
 
 fn broadcast_tick(hub: &Arc<Hub>) {
     // Exited panes too: what a child wrote just before its exit — its last
-    // screen, its last notification — may land after the reaper marks it,
-    // and a corpse stays on screen. A quiescent corpse costs a generation
-    // check.
+    // screen, its last notification, a crashed engine's word — may land after
+    // the reaper marks it, and a corpse stays on screen. A quiescent corpse
+    // costs a generation check.
     let panes = hub.session().panes_with_pty();
 
     // Drain each pane's bells/notifications every tick so the queues stay
@@ -3108,6 +3108,123 @@ mod tests {
             _ => None,
         })
         .await;
+
+        let _ = stop.send(());
+        server.await.unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pane is the unit of failure. One pane's engine panicking on a read,
+    /// and another's drawing its screen for the render tick (the test hooks
+    /// in pty.rs), ends each alone: it exits, its screen tells of the crash,
+    /// and a note says so. The daemon serves on, and the pane beside them
+    /// still echoes and still reaches the attached client.
+    #[tokio::test]
+    async fn a_pane_whose_engine_panics_ends_alone() {
+        let dir = std::env::temp_dir().join(format!("tutti-unit-crash-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("crash.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (stop, stopped) = oneshot::channel::<()>();
+        let server = tokio::spawn(serve(
+            listener,
+            path.clone(),
+            PaneSize::new(24, 80),
+            None,
+            async {
+                let _ = stopped.await;
+            },
+        ));
+
+        let mut viewer = Peer::connect(&path).await;
+        let workspace = Request::WorkspaceNew {
+            dir: std::env::temp_dir(),
+        };
+        viewer.request(&workspace).await;
+        let mut panes = Vec::new();
+        // `tutti\001panic` and the `tutti-panic-look` title are the hooks'
+        // triggers (`PANIC_READ`, `PANIC_LOOK`).
+        for script in [
+            "read go; printf 'tutti\\001panic'; sleep 30",
+            "read go; printf '\\033]2;tutti-panic-look\\007drawn'; sleep 30",
+            "exec cat",
+        ] {
+            let run = Request::PaneRun {
+                tab: None,
+                cmd: vec!["/bin/sh".into(), "-c".into(), script.into()],
+                ephemeral: false,
+                sandbox: None,
+            };
+            let Response::PaneCreated { id } = viewer.request(&run).await else {
+                panic!("expected a pane");
+            };
+            panes.push(id);
+        }
+        let [reading, drawing, beside] = panes[..] else {
+            unreachable!()
+        };
+        viewer.request(&Request::Attach { terminal: None }).await;
+        let send = |pane, text: &str| Request::PaneSend {
+            pane,
+            text: Some(text.into()),
+            keys: None,
+            expect: None,
+        };
+        let read = |pane| Request::PaneRead {
+            pane,
+            lines: None,
+            unwrapped: false,
+            since: None,
+            last_output: false,
+        };
+
+        for pane in [reading, drawing] {
+            assert_eq!(viewer.request(&send(pane, "go\r")).await, Response::Ok);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let Response::Panes { panes } = viewer.request(&Request::PaneList).await else {
+                    panic!("expected the pane list");
+                };
+                if panes.iter().any(|p| p.id == pane && p.exited.is_some()) {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "pane {pane} never ended"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let Response::Content { lines } = viewer.request(&read(pane)).await else {
+                panic!("expected pane {pane}'s screen");
+            };
+            assert!(
+                lines.join("\n").contains("terminal crashed: injected"),
+                "{lines:?}"
+            );
+        }
+
+        assert_eq!(
+            viewer.request(&send(beside, "after-both\r")).await,
+            Response::Ok
+        );
+        viewer
+            .until(|frame| match frame {
+                Frame::PaneDelta(data) | Frame::PaneSnapshot(data) => (data.pane == beside
+                    && data.bytes.windows(10).any(|bytes| bytes == b"after-both"))
+                .then_some(()),
+                _ => None,
+            })
+            .await;
+        let Response::Notes { notes } = viewer.request(&Request::NotesList { unread: false }).await
+        else {
+            panic!("expected the notes");
+        };
+        let crashes: Vec<PaneId> = notes
+            .iter()
+            .filter(|note| note.title.as_deref() == Some("pane crashed"))
+            .map(|note| note.pane)
+            .collect();
+        assert_eq!(crashes, [reading, drawing]);
 
         let _ = stop.send(());
         server.await.unwrap().unwrap();
