@@ -1326,7 +1326,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rtty-vt"
 version = "0.1.0"
-source = "git+https://github.com/mcginleyr1/rtty?rev=115bcedebf5505af343db12ef488d378a829b9e5#115bcedebf5505af343db12ef488d378a829b9e5"
+source = "git+https://github.com/mcginleyr1/rtty?rev=a9c826647cb5eca47adf36b9989a808b2e542dbd#a9c826647cb5eca47adf36b9989a808b2e542dbd"
 dependencies = [
  "memchr",
  "unicode-segmentation",
