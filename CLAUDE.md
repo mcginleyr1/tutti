@@ -113,6 +113,13 @@ cargo fmt --check
 - **A TUI request whose reply drives a follow-up goes out through
   `App::follow`** (tagged with a `req`), never behind a bare flag — an
   unrelated refusal would cancel it (it did, to a merge's cleanup offer).
+- **Ptys are opened one thread at a time** (`openpty`, pty.rs).
+  - **Why:** macOS's openpty(3) fails now and then, with errno -6, when two
+    threads of one process call it at once. Other processes' calls never
+    collide.
+  - **The test suite hits it:** each server test runs its own daemon in one
+    process.
+  - **Rule:** never open a pty past that function.
 - **Everything written to a pane's pty goes through its writer thread**
   (`tutti-pty-writer`, `PtyPane::writes`, pty.rs), in queue order.
   - **Who queues what:**

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
-use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtyPair, PtySize, native_pty_system};
 use rtty_vt::{ColorScheme, Event, MarkKind, ModeChange, MouseEncoding, MouseMode, Terminal};
 use tokio::sync::watch;
 use tutti_core::{AgentState, HostColors, Rgb, StateSource};
@@ -814,15 +814,7 @@ impl PtyPane {
         {
             bail!("working directory does not exist: {}", cwd.display());
         }
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: size.rows,
-                cols: size.cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("openpty failed")?;
+        let pair = openpty(size)?;
 
         let mut cmd = CommandBuilder::new(&spec.program);
         cmd.args(&spec.args);
@@ -1219,6 +1211,23 @@ fn join_or_detach(handle: JoinHandle<()>) {
         std::thread::sleep(Duration::from_millis(5));
     }
     let _ = handle.join();
+}
+
+/// A fresh native pty pair of `size`, opened one thread at a time: macOS's
+/// openpty(3) now and then fails — with errno -6, which is no errno — when
+/// two threads of one process call it at once, however few ptys are open
+/// (it never collides with other processes' calls).
+fn openpty(size: PaneSize) -> Result<PtyPair> {
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+    let _one = lock(&ONE_AT_A_TIME);
+    native_pty_system()
+        .openpty(PtySize {
+            rows: size.rows,
+            cols: size.cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .context("openpty failed")
 }
 
 /// Lock a pty mutex, recovering it if a panicking thread poisoned it: one
@@ -1946,6 +1955,31 @@ mod tests {
             ),
             Ok(_) => panic!("spawn accepted a missing cwd"),
         }
+    }
+
+    /// Ptys opened from many threads at once all open, as the daemon's
+    /// workers and a test binary's servers open them. Sixteen threads a
+    /// round, let go together: unserialized, macOS's openpty(3) failed 9 and
+    /// 12 times in these 320 (errno -6), and took 4.5 s.
+    #[test]
+    fn ptys_open_from_many_threads_at_once() {
+        let start = std::sync::Barrier::new(16);
+        let failed: usize = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..20)
+                            .filter(|_| {
+                                start.wait();
+                                openpty(PaneSize::new(24, 80)).is_err()
+                            })
+                            .count()
+                    })
+                })
+                .collect();
+            threads.into_iter().map(|t| t.join().unwrap()).sum()
+        });
+        assert_eq!(failed, 0);
     }
 
     #[test]

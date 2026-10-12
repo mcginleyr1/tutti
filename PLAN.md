@@ -663,6 +663,9 @@ In order; each lands its TUI path in the same wave as its verbs.
      pty goes through one writer thread in queue order: answers, light/dark
      notices and input alike. Before this, typed input took a second path and
      could overtake a report queued before it.
+   - ✅ The openpty flake is fixed: ptys are opened one thread at a time.
+     macOS's openpty(3) fails with errno -6 when two threads of one process
+     call it at once. Processes never collide.
    - Step 3, rtty itself.
 
 **Open** — the headline items; each phase item above keeps its own list:
