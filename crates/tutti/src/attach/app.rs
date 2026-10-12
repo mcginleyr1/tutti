@@ -1206,7 +1206,7 @@ impl App {
                 _ => {}
             }
         }
-        match (self.focused, input::encode_key(key)) {
+        match (self.focused, input::encode_key(key, self.keyboard())) {
             (Some(pane), Some(bytes)) => vec![WireFrame::Input { pane, bytes }],
             // No pane to type into: honor the dashboard's advertised key so
             // `a → add a project` works without focusing the sidebar first.
@@ -1217,6 +1217,13 @@ impl App {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// How the focused pane's program asked for its keys.
+    fn keyboard(&self) -> input::Keyboard {
+        self.focused
+            .and_then(|pane| self.panes.get(&pane))
+            .map_or_else(input::Keyboard::default, |s| input::Keyboard::of(&s.term))
     }
 
     /// Enter prefix mode if `key` is the prefix chord, returning whether it was.
@@ -1264,7 +1271,7 @@ impl App {
         }
         // The prefix pressed twice forwards the literal prefix chord to the pane.
         if self.config.prefix.matches(key) {
-            return match (self.focused, input::encode_key(key)) {
+            return match (self.focused, input::encode_key(key, self.keyboard())) {
                 (Some(pane), Some(bytes)) => vec![WireFrame::Input { pane, bytes }],
                 _ => Vec::new(),
             };
@@ -1925,8 +1932,10 @@ impl App {
                     | KeyCode::BackTab
                     | KeyCode::Backspace
             );
+        // Answer keys are text the guarded send types: plain, as a prompt
+        // takes them whatever keyboard protocol its program asked for.
         let text = answer
-            .then(|| input::encode_key(key))
+            .then(|| input::encode_key(key, input::Keyboard::default()))
             .flatten()
             .and_then(|bytes| String::from_utf8(bytes).ok());
         let (Some(text), Some(state)) = (text, self.panes.get(&pane)) else {
@@ -5302,6 +5311,31 @@ mod tests {
         assert_eq!(app.cursor_shape(), 6, "a steady bar");
         app.set_scroll(PaneId(1), Some(5));
         assert_eq!(app.cursor_shape(), 0);
+    }
+
+    /// Keys go to the focused pane as its program asked for them: plain
+    /// until it pushes kitty's flags, then Ctrl+I apart from Tab.
+    #[test]
+    fn keys_follow_the_focused_panes_keyboard_protocol() {
+        let mut app = App::new();
+        attached(&mut app);
+        let snapshot = |bytes: &[u8]| {
+            WireFrame::PaneSnapshot(PaneData {
+                pane: PaneId(1),
+                rows: 24,
+                cols: 80,
+                seq: 0,
+                bytes: bytes.to_vec(),
+            })
+        };
+        let typed = |app: &mut App| match app.on_key(ctrl('i')).as_slice() {
+            [WireFrame::Input { bytes, .. }] => bytes.clone(),
+            frames => panic!("{frames:?}"),
+        };
+        app.handle_frame(snapshot(b""));
+        assert_eq!(typed(&mut app), b"\t");
+        app.handle_frame(snapshot(b"\x1b[>1u"));
+        assert_eq!(typed(&mut app), b"\x1b[105;5u");
     }
 
     #[test]

@@ -37,7 +37,7 @@ use signal_hook::consts::SIGWINCH;
 use signal_hook::iterator::Signals;
 use tutti_core::{Event, Frame, HostColors, PaneDims, PaneId, Request, Response, socket_path};
 
-use super::input::encode_key;
+use super::input::{Keyboard, encode_key};
 use super::theme::host_colors;
 use crate::client;
 use crate::config::{Chord, Theme};
@@ -62,7 +62,7 @@ pub fn run(session: &str, pane: PaneId, prefix: Chord) -> Result<i32> {
     if !std::io::stdin().is_terminal() {
         bail!("pane attach needs a terminal on stdin");
     }
-    let prefix = encode_key(KeyEvent::new(prefix.code, prefix.mods))
+    let prefix = encode_key(KeyEvent::new(prefix.code, prefix.mods), Keyboard::default())
         .with_context(|| format!("the prefix {} has no key bytes", prefix.label()))?;
     let mut stream = match UnixStream::connect(socket_path(session)) {
         Ok(stream) => stream,
@@ -511,7 +511,7 @@ mod tests {
     fn the_configured_chord_gives_the_prefix_bytes() {
         let bytes = |spec| {
             let chord = Chord::parse(spec).unwrap();
-            encode_key(KeyEvent::new(chord.code, chord.mods)).unwrap()
+            encode_key(KeyEvent::new(chord.code, chord.mods), Keyboard::default()).unwrap()
         };
         assert_eq!(bytes("C-b"), vec![0x02]);
         assert_eq!(bytes("C-a"), vec![0x01]);

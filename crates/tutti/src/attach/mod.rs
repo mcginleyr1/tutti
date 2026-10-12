@@ -22,13 +22,15 @@ pub use app::App;
 use app::{control, tagged};
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use ratatui::crossterm::execute;
+use ratatui::crossterm::{execute, terminal};
 use tutti_core::{PaneId, Request};
 
 use connection::Connection;
@@ -70,6 +72,16 @@ pub fn run(
     if config.mouse {
         let _ = execute!(io::stdout(), EnableMouseCapture);
     }
+    // A terminal that speaks kitty's keyboard protocol tells keys apart that
+    // plain bytes cannot — Ctrl+I from Tab, Esc from Alt — for the panes
+    // that asked for them (`input::encode_key`). Its own stack takes the
+    // flags, popped on the way out.
+    if terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS;
+        let pushed = execute!(io::stdout(), PushKeyboardEnhancementFlags(flags)).is_ok();
+        KEYS_PUSHED.store(pushed, Ordering::SeqCst);
+    }
 
     let result = event_loop(&mut terminal, &mut conn, config, first_run, notice);
 
@@ -78,10 +90,17 @@ pub fn run(
     result
 }
 
+/// Whether the terminal's keyboard flags were pushed, for `leave` to pop.
+static KEYS_PUSHED: AtomicBool = AtomicBool::new(false);
+
 /// Hand back what the TUI changed in the terminal beyond what
-/// `ratatui::restore` does: mouse capture and the cursor's shape.
+/// `ratatui::restore` does: mouse capture, the cursor's shape and the
+/// keyboard flags. Safe to run twice.
 fn leave() {
     let _ = execute!(io::stdout(), DisableMouseCapture);
+    if KEYS_PUSHED.swap(false, Ordering::SeqCst) {
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    }
     emit_terminal(b"\x1b[0 q");
 }
 

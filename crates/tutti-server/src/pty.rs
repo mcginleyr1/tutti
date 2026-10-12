@@ -358,11 +358,6 @@ impl Term {
             }
         };
         let kept = match verdict {
-            Verdict::Drop => {
-                feed(&mut self.vt, &[&bytes[fed..seq.start], b"\x18"]);
-                fed = seq.end;
-                true
-            }
             Verdict::Ask | Verdict::Released => {
                 feed(&mut self.vt, &[&held, &bytes[fed..seq.end], then]);
                 fed = seq.end;
@@ -662,17 +657,15 @@ enum Verdict {
     /// pane — and passed on if not, for theirs to answer.
     Ask,
     /// Kept from the taps alone: mode 2031 set or reset — the daemon tells a
-    /// pane of light/dark changes itself (`PtyPane::set_colors`) — and the ST
-    /// of a string kept from them.
+    /// pane of light/dark changes itself (`PtyPane::set_colors`); the
+    /// keyboard protocols, xterm's modifyOtherKeys (`CSI > 4 ; n m`) and
+    /// kitty's push, pop and set (`CSI > u`, `CSI < u`, `CSI = u`), which the
+    /// TUI encodes a pane's keys by, but a `pane attach` terminal that took
+    /// either would encode the prefix where the detach cannot see it, and
+    /// keep it on past the detach (nvim and vim ask for modifyOtherKeys level
+    /// 2, Emacs for 1; nvim pushes kitty flags once its query, an `Ask`, is
+    /// answered); and the ST of a string kept from them.
     Own,
-    /// Kept from the terminal and the taps alike: xterm's modifyOtherKeys
-    /// (`CSI > 4 ; n m`) and kitty's keyboard protocol (`CSI ? u` and its
-    /// push, pop and set). A pane only ever gets legacy keys — the TUI
-    /// encodes no other — and a `pane attach` terminal that took either would
-    /// encode the prefix where the detach cannot see it (nvim and vim ask for
-    /// modifyOtherKeys level 2, Emacs for 1; nvim pushes kitty flags once
-    /// its query is answered).
-    Drop,
     /// Anything else: on to both.
     Pass,
     /// One that went on to both before it ended, too long or plain to be a
@@ -691,7 +684,8 @@ fn verdict(seq: &[u8]) -> Verdict {
                 .take_while(u8::is_ascii_digit)
                 .fold(0u32, |n, b| n.saturating_mul(10) + u32::from(b - b'0'));
             match (private, end) {
-                (Some(_), b'u') | (Some(b'>'), b'm') if *end == b'u' || first == 4 => Verdict::Drop,
+                (Some(b'?'), b'u') => Verdict::Ask,
+                (Some(_), b'u') | (Some(b'>'), b'm') if *end == b'u' || first == 4 => Verdict::Own,
                 _ if params().eq(*b"?2031") && matches!(end, b'h' | b'l') => Verdict::Own,
                 (Some(_), b'm') | (_, b'c' | b'n' | b'p' | b'q' | b't') => Verdict::Ask,
                 _ => Verdict::Pass,
@@ -2503,9 +2497,9 @@ mod tests {
     /// Every query the terminal answers and every sequence the daemon owns,
     /// wherever reads cut the stream: each answered once and in order — a
     /// cursor report where the cursor stood, a row scrolled and all; mode
-    /// 2031 tracked; modifyOtherKeys dropped — and kept from what the taps
-    /// get, which is everything else: what goes unanswered, and the `ESC`
-    /// before another.
+    /// 2031 and modifyOtherKeys tracked — and kept from what the taps get,
+    /// which is everything else: what goes unanswered, and the `ESC` before
+    /// another.
     #[test]
     fn owned_queries_are_answered_and_kept_from_the_taps_across_any_cut() {
         let stream: &[u8] = b"ab\x1b[c\x1b[0cX\x1b[>c\x1b[>0c\r\nL1\r\nL2\r\nL3\x1b[5n\x1b[6n\
@@ -2531,7 +2525,7 @@ mod tests {
             "\x1b]10;rgb:6565/7b7b/8383\x07\x1b]11;rgb:fdfd/f6f6/e3e3\x1b\\",
             "\x1b]12;rgb:5858/6e6e/7575\x07\x1b[?3;3;1R",
             da1,
-            "\x1b[3;3R\x1b[3;3R\x1b[>4;0m\x1b]11;rgb:0000/0000/0000\x1b\\",
+            "\x1b[3;3R\x1b[3;3R\x1b[>4;2m\x1b]11;rgb:0000/0000/0000\x1b\\",
             da1,
             "\x1b[0n\x1b[3;6R",
         ]
@@ -2545,23 +2539,28 @@ mod tests {
         assert_eq!(answered(Some(light()), &bytes), want, "a byte a read");
     }
 
-    /// Kitty's keyboard protocol and xterm's modifyOtherKeys reach neither
-    /// the terminal nor the taps, however a read cuts them: a pane only ever
-    /// gets legacy keys, so the query goes unanswered, nothing is pushed, and
-    /// no snapshot carries either.
+    /// Kitty's keyboard protocol and xterm's modifyOtherKeys reach the
+    /// terminal — which answers their queries, and whose snapshots and
+    /// redraws hand the TUI the flags to encode keys by — but never the
+    /// taps, however a read cuts them: a `pane attach` terminal keeps plain
+    /// keys.
     #[test]
-    fn the_keyboard_protocols_reach_neither_the_terminal_nor_the_taps() {
-        let stream: &[u8] = b"\x1b[?u\x1b[>3u\x1b[=1;1u\x1b[<u\x1b[>4;2m\x1b[>4;2;1m\x1b[?4m\x1b[c";
-        let answers = b"\x1b[>4;0m\x1b[?62;22c".to_vec();
+    fn the_keyboard_protocols_reach_the_terminal_but_not_the_taps() {
+        let stream: &[u8] =
+            b"\x1b[?u\x1b[>3u\x1b[=1;1u\x1b[>5u\x1b[<u\x1b[?u\x1b[>4;2m\x1b[?4m\x1b[c";
+        let answers = b"\x1b[?0u\x1b[?1u\x1b[>4;2m\x1b[?62;22c".to_vec();
         for cut in 0..=stream.len() {
             let mut term = Term::new(PaneSize::new(3, 20), None);
             let (first, second) = (term.process(&stream[..cut]), term.process(&stream[cut..]));
             assert_eq!([first.raw, second.raw].concat(), b"", "cut at {cut}");
             assert_eq!([first.answers, second.answers].concat(), answers);
-            assert_eq!(term.vt.kitty_keyboard(), 0);
-            assert_eq!(term.vt.modes().modify_other_keys, 0);
+            assert_eq!(term.vt.kitty_keyboard(), 1);
+            assert_eq!(term.vt.modes().modify_other_keys, 2);
             let snapshot = String::from_utf8_lossy(&term.vt.snapshot()).into_owned();
-            assert!(!snapshot.contains("\x1b[>"), "{snapshot:?}");
+            assert!(
+                snapshot.contains("\x1b[>1u") && snapshot.contains("\x1b[>4;2m"),
+                "{snapshot:?}"
+            );
         }
     }
 

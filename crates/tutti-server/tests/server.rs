@@ -2017,16 +2017,16 @@ async fn a_2031_pane_hears_of_a_light_dark_flip() {
 /// A read that switches screens reaches a pane stream with the switch in a
 /// frame of its own, so `pane attach` — which redraws a switching frame from
 /// its mirror — loses nothing else the read held: a bell, a cursor shape.
-/// The queries a program sends as it switches (nvim's DECRQM and DECRQSS)
-/// are answered by the daemon and never reach the stream; kitty's keyboard
-/// query is dropped, and the DA1 after it says there is no such protocol.
+/// The queries a program sends as it switches (nvim's DECRQM, DECRQSS and
+/// kitty's keyboard query, then DA1) are answered by the daemon and never
+/// reach the stream.
 #[tokio::test]
 async fn a_screen_switching_read_loses_nothing_on_a_stream() {
     let server = TestServer::start();
     let mut control = server.connect().await;
     let script = "stty -echo -icanon; echo ready; read -r go; \
                   printf 'before\\007\\033[?1049h\\033[?2026$p\\033P$qm\\033\\\\\\033[?u\\033[c\\007\\033[6 qafter'; \
-                  head -c 29 | tr '\\033' E; sleep 30";
+                  head -c 34 | tr '\\033' E; sleep 30";
     let pane = run_marker(&mut control, script).await;
     assert!(read_until(&mut control, pane, "ready").await);
     let mut stream = server.connect().await;
@@ -2063,7 +2063,7 @@ async fn a_screen_switching_read_loses_nothing_on_a_stream() {
         .copied()
         .collect();
     assert_eq!(after, b"\x07\x1b[6 qafter", "{frames:?}");
-    assert!(read_until(&mut control, pane, "E[?2026;2$yEP1$r0mE\\E[?62;22c").await);
+    assert!(read_until(&mut control, pane, "E[?2026;2$yEP1$r0mE\\E[?0uE[?62;22c").await);
 
     server.stop().await;
 }
