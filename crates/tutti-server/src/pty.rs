@@ -11,13 +11,13 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use rtty_vt::{ColorScheme, Event, MarkKind, Terminal};
+use rtty_vt::{ColorScheme, Event, MarkKind, ModeChange, Terminal};
 use tokio::sync::watch;
 use tutti_core::{AgentState, HostColors, Rgb, StateSource};
 
@@ -192,7 +192,13 @@ struct Term {
     /// The engine panicked (`crash`): `vt` is a blank terminal telling of
     /// it, and nothing the pane writes reaches it.
     crashed: bool,
+    /// When the program opened the synchronized update (2026) it has open.
+    synced: Option<Instant>,
 }
+
+/// The longest the render tick holds a pane's frame for a synchronized
+/// update its program has yet to end: one that never does still draws.
+const SYNC_HOLD: Duration = Duration::from_millis(250);
 
 impl Term {
     fn new(size: PaneSize, colors: Option<HostColors>) -> Self {
@@ -204,6 +210,7 @@ impl Term {
             string_kept: None,
             taps: Vec::new(),
             crashed: false,
+            synced: None,
         };
         if let Some(colors) = colors {
             term.set_colors(colors);
@@ -221,6 +228,7 @@ impl Term {
             .advance(format!("\r\ntutti: this pane's terminal crashed: {message}\r\n").as_bytes());
         (self.seq, self.released, self.string_kept, self.crashed) =
             (Seq::Ground, false, None, true);
+        self.synced = None;
         self.held.clear();
         let (size, snapshot) = (PaneSize::new(rows, cols), self.vt.snapshot());
         self.taps
@@ -403,10 +411,19 @@ impl Term {
                     answered = true;
                     out.answers.extend(answer);
                 }
+                Event::Mode(ModeChange::SyncUpdate(open)) => {
+                    self.synced = open.then(Instant::now);
+                }
                 event => out.signals.extend(signal(event)),
             }
         }
         answered
+    }
+
+    /// Whether the program has a synchronized update open, and opened it
+    /// less than `SYNC_HOLD` ago.
+    fn holding(&self) -> bool {
+        self.synced.is_some_and(|at| at.elapsed() < SYNC_HOLD)
     }
 
     /// One broadcast tick's look; see `PtyPane::look`.
@@ -981,6 +998,13 @@ impl PtyPane {
     /// bytes for a client holding none.
     pub fn look(&self, last: Option<(PaneSize, bool)>, snapshot: bool) -> Look {
         self.with(|term| term.look(last, snapshot))
+    }
+
+    /// Whether the render tick holds the pane's frame: its program has a
+    /// synchronized update (2026) open — a frame drawn now would show it
+    /// half done — and opened it less than `SYNC_HOLD` ago.
+    pub fn holding(&self) -> bool {
+        self.with(|term| term.holding())
     }
 
     /// A client snapshot of the screen scrolled `offset` rows back into the
@@ -2562,6 +2586,21 @@ mod tests {
                 "{snapshot:?}"
             );
         }
+    }
+
+    /// A synchronized update holds the pane's frame until its program ends
+    /// it, or `SYNC_HOLD` has gone by.
+    #[test]
+    fn a_synchronized_update_holds_the_frame_until_it_ends() {
+        let mut term = Term::new(PaneSize::new(3, 20), None);
+        assert!(!term.holding());
+        term.process(b"\x1b[?2026hhalf");
+        assert!(term.holding());
+        term.process(b" done\x1b[?2026l");
+        assert!(!term.holding());
+        term.process(b"\x1b[?2026h");
+        term.synced = term.synced.map(|at| at - SYNC_HOLD);
+        assert!(!term.holding(), "a program that never ends one still draws");
     }
 
     /// A switch of screens and a reset each reach the taps alone, however

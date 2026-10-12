@@ -2628,6 +2628,11 @@ fn broadcast_tick(hub: &Arc<Hub>) {
         if !moved && !unseen {
             continue;
         }
+        // A frame its program is still drawing waits: the look comes on a
+        // later tick, once the update ends, with all of it.
+        if pty.holding() {
+            continue;
+        }
 
         // The tick is the one consumer of the screen's damage: one look
         // takes it, and fans the same delta out to every client.
