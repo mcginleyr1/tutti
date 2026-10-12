@@ -1233,11 +1233,10 @@ fn draw_screen(
             symbol.clear();
             row.push_grapheme(at, &mut symbol);
             buf_cell.set_symbol(&symbol);
-            let mut style = cell_style(row, at);
             if let Some(link) = row.hyperlink(at) {
-                let position = Position::new(area.x + col, area.y + y);
-                style = style.add_modifier(host::link(position, link));
+                host::link(buf_cell, Position::new(area.x + col, area.y + y), link);
             }
+            let style = cell_style(row, at);
             let selected = selection.is_some_and(|(s, e)| in_span(s, e, cols, r, col));
             buf_cell.set_style(if selected {
                 style.bg(select_bg())
@@ -2433,6 +2432,41 @@ mod tests {
         );
     }
 
+    /// A cell whose link alone changed is drawn again, whatever the two links
+    /// — from one link to another, to none and from none: the buffer diff the
+    /// frame is drawn from never leaves it out. An unlinked cell that did not
+    /// change is left out as ever.
+    #[test]
+    fn a_link_only_change_always_redraws() {
+        let frame = |uri: &Option<String>| {
+            let mut term = rtty_vt::Terminal::new(1, 6, 0);
+            match uri {
+                Some(uri) => {
+                    term.advance(format!("\x1b]8;;{uri}\x1b\\ab\x1b]8;;\x1b\\").as_bytes())
+                }
+                None => term.advance(b"ab"),
+            }
+            let area = Rect::new(0, 0, 6, 1);
+            let mut buf = Buffer::empty(area);
+            host::clear_links();
+            draw_screen(&mut buf, area, &term, 0, None);
+            buf
+        };
+        let uris: Vec<Option<String>> = [None]
+            .into_iter()
+            .chain((0..50).map(|i| Some(format!("https://example.com/{i}"))))
+            .chain([None])
+            .collect();
+        for pair in uris.windows(2) {
+            let redrawn = frame(&pair[0])
+                .diff(&frame(&pair[1]))
+                .iter()
+                .any(|&(x, ..)| x == 0);
+            assert!(redrawn, "{pair:?}");
+        }
+        assert!(frame(&None).diff(&frame(&None)).is_empty());
+    }
+
     /// A linked cell carries its link's mark, and the frame knows its link.
     #[test]
     fn linked_cells_are_marked_for_the_host() {
@@ -2442,7 +2476,8 @@ mod tests {
         let mut buf = Buffer::empty(area);
         host::clear_links();
         draw_screen(&mut buf, area, &term, 0, None);
-        let marked = |x: usize| buf.content[x].modifier.bits() >> 13 != 0;
+        let marked =
+            |x: usize| buf.content[x].diff_option == ratatui::buffer::CellDiffOption::AlwaysUpdate;
         assert!(marked(0) && marked(1) && !marked(2));
     }
 

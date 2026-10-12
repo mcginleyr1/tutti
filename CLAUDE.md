@@ -77,10 +77,11 @@ cargo fmt --check
   (`PtyPane::holding`) so the next look carries the whole frame.
 - **The TUI draws cells through `host::Host`** (attach/host.rs), which says
   what ratatui's cells cannot through the `Modifier` bits ratatui leaves
-  unused (underline styles, overline, a link's mark) and a per-frame link
-  table the renderer fills (`host::link`, cleared by `render::draw`). A widget
-  drawn over pane cells must reset them (`Clear`), or a pane cell's bits ride
-  into it. Whatever the TUI turns on in its terminal beyond raw mode and the
+  unused (underline styles, overline) and, for a link, a per-frame link table
+  the renderer fills (`host::link`, cleared by `render::draw`) with the cell
+  set to `CellDiffOption::AlwaysUpdate`, so a change of link alone is never
+  lost to the buffer diff. A widget drawn over pane cells must reset them
+  (`Clear`), or a pane cell's bits and link ride into it. Whatever the TUI turns on in its terminal beyond raw mode and the
   alternate screen — mouse capture, focus reports, kitty's keyboard flags, a
   cursor shape — `leave` (attach/mod.rs) hands back, on detach and on a panic.
 - **Shutdown order** (`serve`, server.rs): abort *and await* the layout saver,

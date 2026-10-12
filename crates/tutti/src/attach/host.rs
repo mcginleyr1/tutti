@@ -6,19 +6,18 @@
 //!
 //! What a cell cannot hold rides in the bits of its `Modifier` that ratatui
 //! leaves unused: they take part in the buffer diff as any modifier does, so
-//! a cell whose underline style alone changed is drawn again. A hyperlink's
-//! URI is too big for them: the renderer notes each linked cell's link here
-//! for the frame (`link`), and the cell carries a few bits of the link's
-//! hash, so a cell whose link alone changed is very likely drawn again too.
+//! a cell whose underline style alone changed is drawn again. A hyperlink is
+//! too big for them: the renderer notes each linked cell's link here for the
+//! frame (`link`), and a linked cell is drawn every frame — as is the cell
+//! that was one the frame before — so no change of link alone goes unseen.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use std::io::{self, Stdout, Write};
 use std::sync::Arc;
 
 use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
-use ratatui::buffer::Cell;
+use ratatui::buffer::{Cell, CellDiffOption};
 use ratatui::crossterm::cursor::MoveTo;
 use ratatui::crossterm::execute;
 use ratatui::crossterm::queue;
@@ -31,10 +30,6 @@ use rtty_vt::{Hyperlink, Underline};
 const STYLE_SHIFT: u16 = 9;
 const STYLE: u16 = 0b111 << STYLE_SHIFT;
 pub const OVERLINE: Modifier = Modifier::from_bits_retain(1 << 12);
-/// A linked cell: 1–7, a few bits of its link's hash.
-const LINK_SHIFT: u16 = 13;
-const LINK: u16 = 0b111 << LINK_SHIFT;
-const LINKED: Modifier = Modifier::from_bits_retain(LINK);
 
 /// The modifier bits that draw `underline`: none, ratatui's own underline,
 /// or that and the style's.
@@ -60,12 +55,13 @@ pub fn clear_links() {
     LINKS.with_borrow_mut(HashMap::clear);
 }
 
-/// Link the cell at `at` to `link` for this frame, returning the modifier
-/// bits it carries.
-pub fn link(at: Position, link: &Arc<Hyperlink>) -> Modifier {
-    let hash = BuildHasherDefault::<DefaultHasher>::default().hash_one(&**link);
+/// Link `cell`, at `at`, to `link` for this frame. It is drawn whether or
+/// not the buffer diff sees it change: ratatui's cells cannot tell one link
+/// from another, and a cell that was linked differs from itself unlinked by
+/// that alone.
+pub fn link(cell: &mut Cell, at: Position, link: &Arc<Hyperlink>) {
+    cell.set_diff_option(CellDiffOption::AlwaysUpdate);
     LINKS.with_borrow_mut(|links| links.insert(at, Arc::clone(link)));
-    Modifier::from_bits_retain(((1 + hash % 7) as u16) << LINK_SHIFT)
 }
 
 /// Enter raw mode and the alternate screen, and draw there.
@@ -92,17 +88,12 @@ impl Backend for Host {
                 queue!(out, MoveTo(x, y))?;
             }
             last = Some(Position { x, y });
-            let this = Some((
-                cell.fg,
-                cell.bg,
-                cell.underline_color,
-                cell.modifier & !LINKED,
-            ));
+            let this = Some((cell.fg, cell.bg, cell.underline_color, cell.modifier));
             if this != style {
                 write!(out, "\x1b[{}m", rendition(cell))?;
                 style = this;
             }
-            let marked = cell.modifier.bits() & LINK != 0;
+            let marked = cell.diff_option == CellDiffOption::AlwaysUpdate;
             let linked = marked
                 .then(|| LINKS.with_borrow(|links| links.get(&Position { x, y }).cloned()))
                 .flatten();
@@ -292,7 +283,8 @@ mod tests {
         assert_eq!(out, b"\x1b]8;id=ab;http://x/y\x1b\\\x1b]8;;\x1b\\");
     }
 
-    /// A linked cell carries bits of its link, the same for the same link.
+    /// A linked cell is drawn every frame, and the frame knows its link
+    /// until the next one starts.
     #[test]
     fn linked_cells_are_marked() {
         clear_links();
@@ -300,10 +292,9 @@ mod tests {
             id: None,
             uri: "https://example.com".into(),
         });
-        let at = Position { x: 1, y: 2 };
-        let bits = super::link(at, &link);
-        assert_ne!(bits.bits() & LINK, 0);
-        assert_eq!(super::link(at, &link), bits);
+        let (at, mut linked) = (Position { x: 1, y: 2 }, Cell::new("x"));
+        super::link(&mut linked, at, &link);
+        assert_eq!(linked.diff_option, CellDiffOption::AlwaysUpdate);
         assert!(LINKS.with_borrow(|links| links.contains_key(&at)));
         clear_links();
         assert!(LINKS.with_borrow(HashMap::is_empty));
