@@ -2357,22 +2357,43 @@ async fn a_detached_daemon_logs_beside_its_socket() {
 /// Every spawned pane carries `TUTTI_PANE` (its id) and `TUTTI_SESSION` (the
 /// socket's session name) in its environment, so a Claude Code hook running
 /// inside it can address this daemon, and `COLORTERM=truecolor`, so editors
-/// turn on 24-bit colour. The test server's socket is `s.sock`, so the
-/// session name is `s`.
+/// turn on 24-bit colour. A daemon started inside an rtty pane hands its own
+/// panes neither that pane's `RTTY_PANE` nor `RTTY_SOCKET`, which would be
+/// wrong there; `TERM_PROGRAM` goes through.
 #[tokio::test]
 async fn spawned_pane_carries_tutti_env() {
-    let server = TestServer::start();
-    let mut conn = server.connect().await;
+    let base = runtime_dir("env");
+    let mut daemon = std::process::Command::new(env!("CARGO_BIN_EXE_tutti-server"))
+        .args(["--session", "env", "--foreground"])
+        .env("XDG_RUNTIME_DIR", &base)
+        .env("XDG_STATE_HOME", base.join("state"))
+        .env("RTTY_PANE", "7")
+        .env("RTTY_SOCKET", base.join("rtty.sock"))
+        .env("TERM_PROGRAM", "rtty")
+        .spawn()
+        .unwrap();
+    let stop = StopOnDrop(base.join("tutti").join("env.sock"));
+    let mut conn = connect_when_up(&stop.0).await;
     let pane = run_marker(
         &mut conn,
-        "printf 'ENV %s %s %s\\n' \"$TUTTI_PANE\" \"$TUTTI_SESSION\" \"$COLORTERM\"; sleep 30",
+        "printf 'ENV %s %s %s [%s] [%s] %s\\n' \"$TUTTI_PANE\" \"$TUTTI_SESSION\" \"$COLORTERM\" \
+         \"${RTTY_PANE-unset}\" \"${RTTY_SOCKET-unset}\" \"$TERM_PROGRAM\"; sleep 30",
     )
     .await;
     assert!(
-        read_until(&mut conn, pane, &format!("ENV {pane} s truecolor")).await,
-        "the pane env should carry TUTTI_PANE=<id>, TUTTI_SESSION=<name> and COLORTERM=truecolor"
+        read_until(
+            &mut conn,
+            pane,
+            &format!("ENV {pane} env truecolor [unset] [unset] rtty")
+        )
+        .await,
+        "the pane env should carry TUTTI_PANE=<id>, TUTTI_SESSION=<name>, COLORTERM=truecolor \
+         and TERM_PROGRAM, and no RTTY_PANE or RTTY_SOCKET"
     );
-    server.stop().await;
+
+    drop(stop);
+    let _ = daemon.wait();
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// Send one request line to herdr's socket at `socket`; its reply, parsed.

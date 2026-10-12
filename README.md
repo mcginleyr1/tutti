@@ -1226,6 +1226,10 @@ Every pane tutti spawns exports `TUTTI_PANE` (the pane id) and `TUTTI_SESSION`
 a pane can report ground-truth lifecycle events back to tutti through Claude
 Code's hooks, replacing the screen-heuristic guessing with exact signals.
 
+(A daemon started inside an [rtty](https://github.com/mcginleyr1/rtty) pane
+leaves that pane's `RTTY_PANE` and `RTTY_SOCKET` out of its own panes', where
+they would be wrong; its `TERM_PROGRAM` goes through.)
+
 Install the hook config (shows the before/after merge and asks first):
 
 ```

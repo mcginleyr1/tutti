@@ -1509,10 +1509,14 @@ impl Session {
         // Emacs -nw read this rather than guessing from TERM.
         spec.env.push(("COLORTERM".into(), "truecolor".into()));
         // Its herdr reporters reach this daemon, never a herdr the daemon
-        // itself was started inside.
+        // itself was started inside; and it is no pane of the rtty window the
+        // daemon may have been started in (rtty strips `TUTTI_*` from its
+        // children the same way). `TERM_PROGRAM` stays: tutti may yet name
+        // itself there.
         let inherited = std::env::vars_os().filter_map(|(key, _)| key.into_string().ok());
-        spec.env_remove
-            .extend(inherited.filter(|key| key.starts_with("HERDR_")));
+        spec.env_remove.extend(inherited.filter(|key| {
+            key.starts_with("HERDR_") || matches!(key.as_str(), "RTTY_PANE" | "RTTY_SOCKET")
+        }));
         if let (Some(socket), Some(workspace)) = (&self.herdr, self.workspace_of_tab(tab)) {
             spec.env.extend(herdr::env(socket, workspace, tab, id));
         }

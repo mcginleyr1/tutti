@@ -130,7 +130,10 @@ cargo fmt --check
 - **Every spawn stamps `COLORTERM=truecolor` in `spawn_into_tab`**
   (session.rs), beside `TUTTI_PANE`/`TUTTI_SESSION`: Neovim's `termguicolors`
   and Emacs's 24-bit colour read it, not `TERM`. A spawn that bypassed the
-  funnel would give its pane 256 colours.
+  funnel would give its pane 256 colours. The same place drops what the
+  daemon inherited but its panes must not: `HERDR_*`, and an rtty pane's
+  `RTTY_PANE`/`RTTY_SOCKET` (rtty drops `TUTTI_*` likewise); `TERM_PROGRAM`
+  goes through.
 - **User vars are never persisted** (`PaneInfo.user_vars`): they describe a
   running program — an nvim server socket, a claim on the keys — that a
   restore does not bring back. A restored pane starts with none; never write
