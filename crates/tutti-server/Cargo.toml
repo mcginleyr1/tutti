@@ -8,7 +8,8 @@ tutti-core.workspace = true
 tutti-agents.workspace = true
 tokio.workspace = true
 portable-pty.workspace = true
-vt100.workspace = true
+rtty-vt.workspace = true
+memchr.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
@@ -20,3 +21,6 @@ tokio.workspace = true
 anyhow.workspace = true
 tutti-core.workspace = true
 serde_json.workspace = true
+# Today's TUI and `pane attach` parse the daemon's bytes with vt100: the
+# tests check them as those clients do.
+vt100.workspace = true

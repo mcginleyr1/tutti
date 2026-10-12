@@ -142,10 +142,8 @@ pub struct Hub {
     /// and the size it votes for it. Outside `clients` — a stream gets no
     /// events, answers no approval, and is no watcher's attached terminal.
     taps: Mutex<HashMap<u64, PaneDims>>,
-    /// Last screen broadcast per pane — a scrollback-free `Mirror` parser,
-    /// cheap to keep and diff — with its running delta sequence number and the
-    /// pty output generation it was captured at.
-    last: Mutex<HashMap<PaneId, (vt100::Parser, u32, u64)>>,
+    /// What the render tick last broadcast of each pane (`Last`).
+    last: Mutex<HashMap<PaneId, Last>>,
     next_client: AtomicU64,
     /// Set as `serve` winds down: the panes its shutdown kills did not exit on
     /// their own, so no pane stream is told they did — it loses its daemon.
@@ -167,6 +165,17 @@ pub struct Hub {
     approvals: Mutex<HashMap<u64, oneshot::Sender<ApprovalDecision>>>,
     /// The notification history, for clients that missed a note to catch up.
     notes: Mutex<Notes>,
+}
+
+/// What the render tick last broadcast of a pane: the screen's size and
+/// which one was up — a delta needs the same — the running delta sequence
+/// number, and the pty output generation it was looked at.
+#[derive(Clone, Copy)]
+struct Last {
+    size: PaneSize,
+    alt_screen: bool,
+    seq: u32,
+    generation: u64,
 }
 
 /// The notification history: the newest `NOTES_CAP` notes, oldest first, and
@@ -205,7 +214,7 @@ impl Hub {
         lock(&self.taps)
     }
 
-    fn last(&self) -> MutexGuard<'_, HashMap<PaneId, (vt100::Parser, u32, u64)>> {
+    fn last(&self) -> MutexGuard<'_, HashMap<PaneId, Last>> {
         lock(&self.last)
     }
 
@@ -2603,68 +2612,61 @@ fn broadcast_tick(hub: &Arc<Hub>) {
     let mut doomed: HashSet<u64> = HashSet::new();
     for (pane, pty) in panes {
         let generation = *pty.output_receiver().borrow();
+        let last = hub.last().get(&pane).copied();
+        let unseen = hub
+            .clients()
+            .values()
+            .any(|c| c.ready && !c.seen.contains(&pane));
 
-        // A quiescent pane (output generation unchanged since we last stored it)
-        // whose screen every client already holds needs no fresh mirror/diff
-        // this tick. A fresh client, missing it from `seen`, still gets its
-        // snapshot below, so only skip when every client has already seen it.
-        let unchanged = matches!(
-            hub.last().get(&pane),
-            Some((_, _, stored)) if *stored == generation
-        );
-        if unchanged && hub.clients().values().all(|c| c.seen.contains(&pane)) {
+        // A quiescent pane (output generation unchanged since we last looked)
+        // whose screen every client already holds needs no look this tick.
+        let moved = last.is_none_or(|last| last.generation != generation);
+        if !moved && !unseen {
             continue;
         }
 
-        // A scrollback-free mirror, not a clone of the live screen: the clone
-        // would copy the whole 10k-row ring, twice per changed pane per tick.
-        let cur = pty.mirror();
-        let (rows, cols) = cur.parser.screen().size();
-
-        let (seq, delta) = {
-            let mut last = hub.last();
-            let outcome = match last.get(&pane) {
-                None => (0, None),
-                Some((prev, seq, _)) => {
-                    // `state_diff` carries content and input modes (alt screen
-                    // aside — vt100 omits it — mouse reporting, its encoding,
-                    // application cursor, bracketed paste), so the client's
-                    // mirror parser routes the wheel correctly. A pure mode
-                    // flip (mouse reporting toggles, content still) must reach
-                    // the client, so it counts toward emptiness.
-                    let diff = cur.parser.screen().state_diff(prev.screen());
-                    if diff.is_empty() {
-                        (*seq, None)
-                    } else {
-                        (seq + 1, Some(diff))
-                    }
-                }
-            };
-            last.insert(pane, (cur.parser, outcome.0, generation));
-            outcome
-        };
+        // The tick is the one consumer of the screen's damage: one look
+        // takes it, and fans the same delta out to every client.
+        let look = pty.look(last.map(|last| (last.size, last.alt_screen)), unseen);
+        let delta = last.filter(|_| moved).map(|_| look.delta);
+        let seq = last.map_or(0, |last| last.seq + u32::from(delta.is_some()));
+        hub.last().insert(
+            pane,
+            Last {
+                size: look.size,
+                alt_screen: look.alt_screen,
+                seq,
+                generation,
+            },
+        );
+        let PaneSize { rows, cols } = look.size;
 
         let mut clients = hub.clients();
         for (cid, client) in clients.iter_mut() {
             if !client.ready || doomed.contains(cid) {
                 continue;
             }
-            let bytes = if client.seen.insert(pane) {
+            let bytes = if !client.seen.contains(&pane) {
+                // A client that came between the look and here waits a tick.
+                let Some(snapshot) = &look.snapshot else {
+                    continue;
+                };
+                client.seen.insert(pane);
                 Frame::PaneSnapshot(PaneData {
                     pane,
                     rows,
                     cols,
                     seq,
-                    bytes: cur.snapshot.clone(),
+                    bytes: snapshot.clone(),
                 })
                 .encode()
-            } else if let Some(diff) = &delta {
+            } else if let Some(delta) = &delta {
                 Frame::PaneDelta(PaneData {
                     pane,
                     rows,
                     cols,
                     seq,
-                    bytes: diff.clone(),
+                    bytes: delta.clone(),
                 })
                 .encode()
             } else {

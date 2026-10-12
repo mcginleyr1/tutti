@@ -1898,8 +1898,8 @@ async fn a_pane_stream_ends_with_the_exit_after_the_last_output() {
 }
 
 /// The daemon answers a pane's device and cursor queries itself — nothing
-/// else would: vt100 answers none and a TUI never sees them — a cursor
-/// report where the cursor stands. A pane stream never carries them, or its
+/// else would: a TUI never sees them — a cursor report where the cursor
+/// stands. A pane stream never carries them, or its
 /// own terminal would answer them again.
 #[tokio::test]
 async fn a_panes_terminal_queries_are_answered_and_kept_from_its_streams() {
