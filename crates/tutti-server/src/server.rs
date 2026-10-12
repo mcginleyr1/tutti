@@ -2570,7 +2570,11 @@ fn refresh_all_changes(hub: &Arc<Hub>) {
 }
 
 fn broadcast_tick(hub: &Arc<Hub>) {
-    let panes = hub.session().live_panes();
+    // Exited panes too: what a child wrote just before its exit — its last
+    // screen, its last notification — may land after the reaper marks it,
+    // and a corpse stays on screen. A quiescent corpse costs a generation
+    // check.
+    let panes = hub.session().panes_with_pty();
 
     // Drain each pane's bells/notifications every tick so the queues stay
     // bounded even with nobody attached; `broadcast_event` is a no-op then,
@@ -3018,6 +3022,92 @@ mod tests {
             viewer.request(&workspace).await,
             Response::WorkspaceCreated { .. }
         ));
+
+        let _ = stop.send(());
+        server.await.unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What a child writes just before it exits is not lost to the reaper
+    /// marking it first: its notification reaches the history, and a client
+    /// attaching afterwards is drawn its last screen.
+    #[tokio::test]
+    async fn a_pane_s_last_words_outlive_its_exit() {
+        let dir = std::env::temp_dir().join(format!("tutti-unit-last-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("last.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (stop, stopped) = oneshot::channel::<()>();
+        let server = tokio::spawn(serve(
+            listener,
+            path.clone(),
+            PaneSize::new(24, 80),
+            None,
+            async {
+                let _ = stopped.await;
+            },
+        ));
+
+        let mut peer = Peer::connect(&path).await;
+        let workspace = Request::WorkspaceNew {
+            dir: std::env::temp_dir(),
+        };
+        peer.request(&workspace).await;
+        let script = "read go; printf 'last words\\033]9;bye\\007'";
+        let run = Request::PaneRun {
+            tab: None,
+            cmd: vec!["/bin/sh".into(), "-c".into(), script.into()],
+            ephemeral: false,
+            sandbox: None,
+        };
+        let Response::PaneCreated { id: pane } = peer.request(&run).await else {
+            panic!("expected a pane");
+        };
+        let go = Request::PaneSend {
+            pane,
+            text: Some("go\r".into()),
+            keys: None,
+            expect: None,
+        };
+        assert_eq!(peer.request(&go).await, Response::Ok);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let Response::Panes { panes } = peer.request(&Request::PaneList).await else {
+                panic!("expected the pane list");
+            };
+            if panes.iter().any(|p| p.id == pane && p.exited.is_some()) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the pane never ended"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        loop {
+            let Response::Notes { notes } =
+                peer.request(&Request::NotesList { unread: false }).await
+            else {
+                panic!("expected the notes");
+            };
+            if notes.iter().any(|note| note.body.as_deref() == Some("bye")) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the last notification was lost"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        peer.request(&Request::Attach { terminal: None }).await;
+        peer.until(|frame| match frame {
+            Frame::PaneSnapshot(data) => (data.pane == pane
+                && data.bytes.windows(10).any(|bytes| bytes == b"last words"))
+            .then_some(()),
+            _ => None,
+        })
+        .await;
 
         let _ = stop.send(());
         server.await.unwrap().unwrap();

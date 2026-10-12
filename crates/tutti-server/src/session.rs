@@ -785,17 +785,6 @@ impl Session {
             .collect()
     }
 
-    /// Live (not-yet-exited) panes and their ptys, the targets of the agent
-    /// detection pass. Exited panes keep their last-known agent, so they are
-    /// skipped rather than re-detected as "gone".
-    pub fn live_panes(&self) -> Vec<(PaneId, Arc<PtyPane>)> {
-        self.panes
-            .iter()
-            .filter(|(_, s)| s.meta.exited.is_none())
-            .map(|(id, s)| (*id, Arc::clone(&s.pty)))
-            .collect()
-    }
-
     /// The live panes whose agent detection finds by walking their local
     /// process tree: all but sandbox panes, whose agent runs in a pod — their
     /// tree only ever holds `tutti` and `kubectl` — and was declared at spawn.
@@ -812,7 +801,8 @@ impl Session {
     /// program/progress claim (for the stall timer). A hook-driven pane is
     /// excluded: its state comes from exact hook signals, which the screen
     /// heuristics would only fight, and hooks never stall. Agent detection is
-    /// unaffected (it walks `live_panes`), so a hook-driven pane keeps its badge.
+    /// unaffected (it walks `detectable_panes`), so a hook-driven pane keeps its
+    /// badge.
     pub fn agent_panes(&self) -> Vec<(PaneId, Option<AgentKind>, Arc<PtyPane>)> {
         self.panes
             .iter()
@@ -1009,7 +999,13 @@ impl Session {
         report: StatusReport,
         now: Instant,
     ) -> ReportOutcome {
-        let Some(slot) = self.panes.get_mut(&pane) else {
+        // A report drained after the child's exit was written before it: the
+        // exit has the last word.
+        let Some(slot) = self
+            .panes
+            .get_mut(&pane)
+            .filter(|slot| slot.meta.exited.is_none())
+        else {
             return ReportOutcome::default();
         };
         let (from, held) = (slot.meta.state, slot.meta.source);
@@ -2137,6 +2133,19 @@ mod tests {
         assert_eq!(info(&s, pane).agent, Some("sleep".into()));
         s.apply_report(pane, report(Progress, None), t0);
         assert!(s.settle(pane));
+
+        // The tick drains a pane's reports after its exit too; they were
+        // written before it.
+        s.mark_exited(pane, 0);
+        assert_eq!(
+            s.apply_report(pane, app_report(Some(Working), "build", None), t0),
+            super::ReportOutcome::default()
+        );
+        assert_eq!(
+            state_of(&s, pane),
+            (Done, None),
+            "the exit has the last word"
+        );
     }
 
     #[test]
@@ -2485,7 +2494,7 @@ mod tests {
             "a sandbox pane's agent was declared; its local tree is only kubectl"
         );
         assert_eq!(
-            session.live_panes().len(),
+            session.panes_with_pty().len(),
             1,
             "notifications and status reports still flow from its pty"
         );
