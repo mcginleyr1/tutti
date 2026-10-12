@@ -810,7 +810,7 @@ pub enum Response {
     },
     /// A `PaneRead { since: Some(_) }` reply: the rows committed to the pane's
     /// scrollback since that cursor, oldest first, then the live screen (the
-    /// screen alone, cursor held, while its alternate screen is up). `cursor`
+    /// alternate one while that is up). `cursor`
     /// is the next read's `since` — it counts screen rows, so `unwrapped`
     /// folds each read on its own. `truncated`: rows past the cursor had
     /// already left the scrollback ring.

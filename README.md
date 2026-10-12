@@ -212,18 +212,26 @@ starts itself.
 ### Terminal queries and colours
 
 A pane has no terminal of its own, so the daemon answers what programs ask
-theirs, on the pane's pty, attached or not: device attributes (DA1, and DA2 as
-xterm patch 277), status (DSR) and the cursor position (CPR). That is what lets
-Neovim suspend on `Ctrl-Z` (it waits on a DA1 answer first) and a TUI ask where
-its cursor is. Once a client has reported its terminal's colours, it also
-answers the foreground, background and cursor colour queries (OSC 10/11/12)
-and light/dark (`CSI ? 996 n`), so Neovim's `background` and Emacs's
-`background-mode` match what you see. Nothing reported, nothing is made up:
-programs keep their own defaults. Every pane also runs with
+theirs, on the pane's pty, attached or not — each pane runs on tutti's own
+terminal engine, [rtty-vt](https://github.com/mcginleyr1/rtty/tree/main/vt),
+which answers as a terminal does: device attributes (DA1, and DA2 as xterm
+patch 277), the version (XTVERSION), status (DSR), the cursor position (CPR),
+the state of a mode (DECRQM), the current rendition and margins (DECRQSS),
+the terminal's capabilities (XTGETTCAP: Neovim learns of truecolour,
+undercurl and OSC 52 from these) and its size. That is what lets Neovim suspend
+on `Ctrl-Z` (it waits on a DA1 answer first), start without probing timeouts,
+and a TUI ask where its cursor is. Once a client has reported its terminal's
+colours, it also answers the foreground, background and cursor colour queries
+(OSC 10/11/12) and light/dark (`CSI ? 996 n`), so Neovim's `background` and
+Emacs's `background-mode` match what you see. Nothing reported, nothing is
+made up: programs keep their own defaults. Every pane also runs with
 `COLORTERM=truecolor`, so Neovim turns on `termguicolors` and Emacs `-nw` uses
 24-bit colour whatever terminal the daemon started from. A program's request
-for xterm's modifyOtherKeys (Neovim, vim and Emacs make one) is dropped: a
-pane gets legacy keys, under the TUI and `pane attach` alike.
+for xterm's modifyOtherKeys (Neovim, vim and Emacs make one) and anything of
+kitty's keyboard protocol — its query, and pushing, popping or setting its
+flags — are dropped: a pane gets legacy keys, under the TUI and `pane attach`
+alike, and your terminal never encodes the prefix where `pane attach` cannot
+see it.
 
 The TUI reports your terminal's colours when it attaches — on the `dark` and
 `light` themes, the theme's own pane ground and text, which panes are painted
@@ -242,8 +250,10 @@ The daemon is built to outlive its own bugs. A panic in a background pass —
 the render tick, the classifier, detection, the VCS watch — is logged and the
 pass carries on; a panic while handling one connection's request drops only
 that connection; a lock a panic poisoned is recovered; a failed `accept` is
-retried. A pane whose screen parser panics restarts that screen blank and runs
-on. The client survives the same way: a pane update its parser cannot apply
+retried. A pane's terminal engine is built never to panic, whatever a program
+writes — it is property-tested on arbitrary bytes and resizes; were it to,
+that pane's output would stop and every other pane run on. The client
+survives its own parser's: a pane update its parser cannot apply
 resets the pane and asks the daemon for a fresh copy, and any other client
 panic restores your terminal on its way out.
 
@@ -1415,9 +1425,12 @@ not logical lines, so `--unwrapped` folds each read on its own (it joins
 exactly the rows the terminal soft-wrapped; a full-width line stays its own).
 A note on stderr says when some rows had already left the 10k-row scrollback.
 While the pane's alternate screen is up (vim, less, a full-screen TUI), a read
-returns the screen alone and the cursor holds, so nothing scrolled before is
-skipped. A cursor past the pane's count — one from another pane or an earlier
-daemon — is refused. `--json` gives
+returns the rows that scrolled off before it, then that screen; the shell's
+screen under it comes back with the next read once the program leaves. A
+resize rewraps the scrollback to the new width and can number the rows it
+keeps afresh, so a cursor from before one may see some rows again — never
+skip one. A cursor past the pane's count — one from another pane or an
+earlier daemon — is refused. `--json` gives
 `{"type":"tail","lines":[…],"cursor":N,"truncated":false}`.
 
 ### The tutti skill
@@ -1558,7 +1571,7 @@ different one.
 
 ```
 crates/tutti-core     pure domain model, agent state machine, protocol + frame codec
-crates/tutti-server   daemon: PTYs, vt100 grids, socket API, detection & classification
+crates/tutti-server   daemon: PTYs and their terminals (rtty-vt), socket API, detection & classification
 crates/tutti          client: CLI verbs + ratatui TUI
 crates/tutti-agents   agent registry & screen-state classifier (data-driven)
 ```
@@ -1585,15 +1598,11 @@ tutti is alpha; PLAN.md tracks what is open.
 - **Light/dark switches reach panes only through `pane attach`.** The TUI
   reports your terminal's colours when it attaches; reattach after switching
   the OS theme.
-- **`pane attach` and the kitty keyboard protocol.** While a pane program has
-  turned on the kitty keyboard protocol, your terminal encodes the prefix in a
-  form `pane attach` does not watch for, so the prefix then `d` cannot detach;
-  closing the terminal can. (Neovim never turns it on in a pane: the daemon
-  answers the DA1 that closes its startup query before any terminal could
-  answer the query itself. The modifyOtherKeys it, vim and Emacs ask for
-  instead never reaches your terminal.)
-- **An editor in a pane misses some of a terminal.** The TUI draws undercurl as
-  a plain underline, drops underline colours and the cursor's shape (a bar in
-  insert mode stays a block), and never sends focus events, so Neovim's
-  `FocusGained`/`FocusLost` never fire; `tutti pane attach` passes the
-  underline styles and the cursor shape through to your terminal.
+- **An editor in a pane misses some of a terminal.** The TUI still renders
+  panes with vt100, which has a plain underline only: it draws undercurl and
+  the other underline styles as no underline at all (Neovim, told the pane's
+  terminal has them, uses undercurl for spelling), drops underline colours and
+  the cursor's shape (a bar in insert mode stays a block), and never sends
+  focus events, so Neovim's `FocusGained`/`FocusLost` never fire; `tutti pane
+  attach` passes the underline styles and the cursor shape through to your
+  terminal.

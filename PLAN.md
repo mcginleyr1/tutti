@@ -31,7 +31,8 @@ into.
   server running.
 - **Control plane** — the same Unix socket speaks length-prefixed frames: control
   frames carry one JSON object each (NDJSON semantics), pane content travels as
-  binary vt100-delta frames (see `docs/transport-decision.md`). The `tutti` binary
+  binary escape-sequence frames — snapshots and redraws from the daemon's
+  terminal engine (see `docs/transport-decision.md`). The `tutti` binary
   doubles as the CLI: `tutti pane split`, `tutti pane read`, etc. are thin commands
   over the socket. Anything the TUI can do, the CLI and API can do.
 
@@ -73,6 +74,8 @@ trust versions from memory):
 - `portable-pty` — spawn and manage PTYs cross-platform.
 - `vt100` (or `termwiz` escape parsing) — maintain an in-memory screen grid per pane
   so we can render scrollback, detect agent screen content, and serve `pane read`.
+  Since wave 8 the daemon's panes run on `rtty-vt`, our own engine (the rtty
+  repo's `vt/`, on `vte`'s byte parser); the TUI keeps vt100 until it follows.
 - `tokio` — async runtime for the server (PTY I/O, socket clients, timers).
 - `serde` / `serde_json` — protocol.
 - `clap` — CLI.
@@ -114,8 +117,9 @@ deliberately undone.
 **Build order:**
 
 1. **M0 — transport spike.** ✅ Decided — hybrid framing: length-prefixed frames,
-   JSON control messages, server-computed vt100 escape deltas for pane content,
-   snapshot-on-attach. Full analysis in `docs/transport-decision.md`.
+   JSON control messages, server-computed vt100 escape deltas for pane content
+   (since wave 8, rtty-vt's redraws), snapshot-on-attach. Full analysis in
+   `docs/transport-decision.md`.
 2. **M1 — headless core.** Phase 1 acceptance test: `pane run -- top`, close the
    terminal, `pane read` shows it still running.
 3. **M2 — TUI.** Phase 2 acceptance: two agents side by side, split/resize/zoom,
@@ -135,8 +139,9 @@ foundation everything else sits on; get it right before touching ratatui.
    creates `$XDG_RUNTIME_DIR/tutti/<session>.sock` (fallback `/tmp/tutti-$UID/`).
    `tutti` auto-starts the server on first use. Named sessions via `-s <name>`.
 3. **PTY management**: spawn shell/command per pane with `portable-pty`; async read
-   loop feeds a per-pane `vt100::Parser` (screen grid + scrollback ring buffer);
-   handle resize; reap dead children and mark panes exited.
+   loop feeds a per-pane `vt100::Parser` (screen grid + scrollback ring buffer;
+   an `rtty_vt::Terminal` since wave 8); handle resize; reap dead children and
+   mark panes exited.
 4. **Socket protocol + CLI verbs** (each is both an API request and a CLI subcommand):
    - `workspace new --dir <path>` / `workspace list` / `workspace kill`
    - `tab new` / `tab list` / `tab select`
@@ -221,7 +226,7 @@ Goal: the differentiator. Tutti knows which panes are agents and what state they
 2. **State classification** per pane, using layered signals (most→least reliable):
    - agent-specific integrations (e.g. Claude Code hooks writing to a tutti-known
      location, or parsing its status line)
-   - screen-content heuristics on the vt100 grid (prompt patterns like `❯`,
+   - screen-content heuristics on the pane's grid (prompt patterns like `❯`,
      "esc to interrupt", permission dialogs → `Blocked`)
    - process activity (PTY output flow, child process CPU) → `Working` vs quiet
    - fallback `Unknown`
@@ -301,13 +306,15 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    edge can be lost under that load.
 2. **Structured read**: `pane read --unwrapped` (logical lines, no soft wraps) and
    `--since` cursors so a supervisor agent can tail incrementally. ✅
-   `--unwrapped` joins rows by vt100's own soft-wrap flags, so a full-width line
-   stays its own line. ✅ `--since <cursor>` tails incrementally: the cursor
-   counts rows committed to the primary scrollback, which the reader thread
-   counts through vt100's scrollback offset; screen switches, resets and
-   scroll-ups are fed as lone bytes, so the count stays exact through
-   alt-screen trips and a full ring. The reply is the rows since the cursor,
-   then the screen, plus `truncated`; on the alternate screen the cursor holds.
+   `--unwrapped` joins rows by the terminal's own soft-wrap flags, so a
+   full-width line stays its own line. ✅ `--since <cursor>` tails
+   incrementally: the cursor counts rows committed to the primary scrollback —
+   the engine's absolute row numbers (`screen_top`), exact through alt-screen
+   trips, resets and a full ring (before wave 8, a count kept through vt100's
+   scrollback offset). The reply is the rows since the cursor, then the screen,
+   plus `truncated`; under the alternate screen, the committed rows then that
+   screen. A resize reflows and may number kept rows afresh: a cursor sees
+   rows again, never skips one.
 3. **Composite verbs**: `tutti run --workspace <ws> -- claude "fix the tests"` =
    create pane, run agent, return pane id — one call for orchestrators. ✅
    `tutti run [--workspace <ws> | --dir <path>] [--sandbox <p>] [--title <t>] --
@@ -501,7 +508,7 @@ Runnable now that items 1 and 3 have landed (`workspace add`, `run
 --workspace`, `pane wait --until done,blocked`, `workspace diff --stat`); open
 until it has been run for real against live agents.
 
-### Next waves (as of 2026-10-11)
+### Next waves (as of 2026-10-12)
 
 In order; each lands its TUI path in the same wave as its verbs.
 
@@ -554,9 +561,10 @@ In order; each lands its TUI path in the same wave as its verbs.
      `tutti-agents` with guarded answers and held approvals).
    - Shell integration: `tutti shell-init zsh|bash|fish` and a setup-panel
      row; OSC 7 cwd (`PaneInfo.cwd`; a split starts there when it lies inside
-     the workspace); OSC 133 marks read at exact positions by the run-splitting
-     `Seq` scanner, for `pane read --last-output`; a prompt start clears the
-     editor vars, so a crashed editor hands the keys back.
+     the workspace); OSC 133 marks read at exact positions (since wave 8, the
+     engine's own marks, which travel with their rows through a reflow), for
+     `pane read --last-output`; a prompt start clears the editor vars, so a
+     crashed editor hands the keys back.
    - `tutti pane attach` (`PaneAttach`, `PaneRaw` frames): a snapshot, then
      every pty read, taken under one hold of the parser lock; a resize resends
      the snapshot; a stream that falls behind is dropped with an error; it
@@ -573,14 +581,17 @@ In order; each lands its TUI path in the same wave as its verbs.
    Verified live with nvim 0.12.4 and Emacs 32 in zsh panes, under the TUI
    and `pane attach` (the w7-finish acceptance, 76 checks), and `pane attach`
    inside a tmux that honours modifyOtherKeys. Open:
-   - terminal fidelity, for the next wave's own engine: undercurl and
-     underline colour flattened, the cursor shape (DECSCUSR) dropped, no focus
-     events;
+   - terminal fidelity in the TUI, which still parses panes with vt100 (wave
+     8 step 2 moves it onto rtty-vt): underline styles and colours flattened
+     — undercurl, which Neovim now uses, to no underline at all — the cursor
+     shape (DECSCUSR) dropped, no focus events;
    - the TUI's live light/dark: crossterm 0.29 swallows `CSI ? 997 n`, so it
      reports colours at attach only;
    - `pane attach --inline` (primary screen, switches passed through) so
-     editor terminals keep native scrollback; detach under the kitty keyboard
-     protocol; escape-time for an Alt prefix;
+     editor terminals keep native scrollback; escape-time for an Alt prefix;
+   - ✅ detach under the kitty keyboard protocol: since wave 8 the daemon
+     drops the protocol (query, push, pop, set) as it does modifyOtherKeys, so
+     no pane turns it on in a `pane attach` terminal;
    - ✅ `pane attach` lost the rest of a read that switches screens to its
      mirror redraw (a program's startup queries, a bell). Fixed with the
      engine swap: the daemon answers those queries itself, and hands a
@@ -590,8 +601,32 @@ In order; each lands its TUI path in the same wave as its verbs.
      approval, so the plugins read one from each;
    - fish's snippet unrun; bash before 4.4 has no `C` mark; Emacs 29 and
      Neovim before 0.12 unrun;
-   - XTVERSION, DECRQM beyond 2031 and kitty's `CSI ? u` go unanswered without
-     a raw stream.
+   - ✅ XTVERSION, DECRQM beyond 2031, DECRQSS and XTGETTCAP are answered by
+     the engine since wave 8; kitty's `CSI ? u` is dropped, so the DA1 after
+     it says there is no such protocol.
+10. **Own terminal engine (wave 8)** — rtty-vt, the rtty repo's `vt/`, under
+    tutti and rtty alike:
+   - ✅ Step 1, the daemon: each pane is an `rtty_vt::Terminal`. Gone: the
+     scroll-count offset trick, the run-splitting `Seq`, the window tiling,
+     `NotifyScanner`, `Mirror` and its replay, the hub's per-pane vt100
+     parsers and the reader's `catch_unwind`. Rows are the engine's absolute
+     numbers; events (bell, OSC 9/777, 9;4, 7501, 1337, 133) are its own,
+     tutti keeping its 7501 decoding and caps; the render tick takes each
+     pane's damage once (`look`); answers are the engine's `Event::Reply`,
+     through the same answer thread, and a scanner that follows vte keeps
+     from the streams exactly what was answered, mode 2031, and the keyboard
+     protocols the daemon drops. Wire unchanged (rev 10): today's vt100 TUI
+     renders the engine's snapshots and redraws. Release, a pane draining
+     50 MB of dense SGR: daemon CPU 0.68 s → 0.34 s; a full 10k ring holds
+     +31 MiB → +16 MiB. The w7 editor acceptance, plus the screen-switch
+     checks: 90/90.
+   - Step 2, the TUI: its parser onto rtty-vt (underline styles and colours,
+     hyperlinks, clusters, the cursor shape), then honour the keyboard
+     protocols the daemon now drops.
+   - Step 3, rtty itself.
+   Open: answers to a pane's own queries are written by the answer thread,
+   so keys typed through `pane send` can overtake a light/dark report the
+   daemon queued just before (the 2031 server test raced once under load).
 
 **Open** — the headline items; each phase item above keeps its own list:
 - the notification history is not persisted — a restarted daemon starts it
@@ -606,8 +641,8 @@ In order; each lands its TUI path in the same wave as its verbs.
 - under heavy parallel test load `openpty` occasionally fails a test's first
   spawn (`Unknown error: -6`); a rerun passes;
 - Codex and Gemini integrations need the tools installed and a live run;
-- an editor in a pane misses vt100's gaps (undercurl, cursor shape, focus
-  events) until the next wave replaces vt100 with tutti's own engine.
+- an editor in a pane misses the TUI's vt100 gaps (underline styles, cursor
+  shape, focus events) until wave 8 step 2 moves the TUI onto rtty-vt.
 
 **Deliberately not done:** packaging and distribution (Phase 5) — the project
 is private, so install stays `cargo install --path` from a checkout.
@@ -641,12 +676,12 @@ is private, so install stays `cargo install --path` from a checkout.
 - Config file: `~/.config/tutti/config.toml` (prefix key, mouse on/off, default shell,
   agent registry overrides). `theme = terminal|dark|light` landed with it.
 - Crash-safety: server panics must not kill child PTYs where avoidable; client
-  crashes never harm the server. ✅ A vt100 panic on a pane's reader thread
-  restarts that pane's screen blank instead of killing the reader or poisoning
-  the lock every tick takes (the trigger found: a wide character printed into a
-  one-column pane), a mirror vt100 cannot replay falls back to a blank screen
-  (and clients get that blank snapshot rather than the bytes that would panic
-  theirs), and every pty lock recovers from poisoning. ✅ The hub's locks
+  crashes never harm the server. ✅ Every pty lock recovers from poisoning.
+  Until wave 8 a vt100 panic on a pane's reader thread restarted that pane's
+  screen blank (the trigger found: a wide character printed into a one-column
+  pane); the pane's engine is now rtty-vt, property-tested never to panic on
+  any bytes or resize (it writes that wide character as U+FFFD), so the guard
+  went with vt100. ✅ The hub's locks
   recover from poisoning too; the render tick, VCS watch, classify and detect
   passes survive their panics (logged, the loop goes on); a panicking frame
   drops only its connection, which leaves through `drop_client` like any
@@ -659,12 +694,13 @@ is private, so install stays `cargo install --path` from a checkout.
   the log is trimmed only when a daemon starts.
 - Perf targets: 60fps redraw with 8 busy panes; `pane read` on 10k-line scrollback
   < 50ms; input latency indistinguishable from raw terminal. ✅ The render tick
-  keeps scrollback-free mirrors (visible state formatted under the lock and
-  replayed) instead of cloning each screen's 10k ring twice: per changed pane
-  1.5 ms → 24 µs at 80x24 and 5.2 ms → 98 µs at 200x50 (release), so 8 busy
-  panes take about 0.2 ms / 0.8 ms of the 16 ms frame. `pane read` over a full
-  10k ring takes 2.8 ms in release, held by a debug-build test against the 50 ms
-  target.
+  formats only what changed: it takes each pane's damage (`PtyPane::look`)
+  and redraws those rows, a full snapshot only for a new client or after a
+  switch of screens. (Before wave 8 it kept scrollback-free vt100 mirrors and
+  diffed them: per changed pane 24 µs at 80x24, 98 µs at 200x50, release.)
+  `pane read` over a full 10k ring takes ~2 ms in a debug build with the
+  engine optimized (`[profile.dev.package.rtty-vt]`), held by a debug-build
+  test against the 50 ms target.
 - Test matrix: macOS + Linux; kitty/alacritty/wezterm/iTerm2/Terminal.app/ghostty;
   sandbox panes against a local cluster running agent-sandbox (unit tests cover
   the manifests, the cluster run covers the cleanup paths). Open: under heavy

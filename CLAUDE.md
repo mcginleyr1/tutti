@@ -64,11 +64,15 @@ cargo fmt --check
   `UserPromptSubmit`/`SessionStart` hook's stdout to the model as context. The
   one exception is a held `PermissionRequest`'s decision JSON — that is the
   hook's answer. Errors go to stderr; the exit is always 0.
-- **The pty parser's scrollback offset doubles as the scroll counter**
-  (`Term::process`, pty.rs): armed to 1 per run, and back at 0 whenever the lock
-  is released — never `set_scrollback` on the live parser outside one lock hold
-  that resets it. Entering the alt screen zeroes the primary's offset, so screen
-  switches (`CSI … h|l`), `CSI … S` and `ESC c` stay lone-byte runs.
+- **A sequence the pane's terminal might answer ends a run fed to it**
+  (`Term::process`/`settle`, `Verdict::Ask`, pty.rs): the reply it drives out
+  is then that query's own, and the query is kept from the taps exactly when
+  it was answered. A reply from mid-run would be pinned on the next query and
+  strip the wrong bytes. When rtty-vt learns to answer a new sequence, add it
+  to `verdict`'s Ask arms (the owned-queries test enumerates them).
+- **The render tick is the one consumer of a pane's damage**
+  (`PtyPane::look`): it takes it once and fans the same redraw out. Anything
+  else that took the damage would starve the clients' deltas.
 - **Shutdown order** (`serve`, server.rs): abort *and await* the layout saver,
   write the final save, then `kill_all`. A save after `kill_all` — or a saver
   tick racing the final write — records a layout with every pane gone. An empty
@@ -94,14 +98,16 @@ cargo fmt --check
   pty write; a reader blocked there never drains the program's output, and the
   pane deadlocks on something as plain as `cat`ting a file of `ESC[6n`.
 - **Taps are fed in the same parser-lock hold as `Term::process`, minus what
-  the daemon answered or owns** (`Term::taps`, `CSI_OWNED`, `OSC_QUERIES`; it
-  owns modes 2031 and modifyOtherKeys, which never reach a stream): a stream's
-  snapshot and its first raw read come from one hold, so nothing is lost or
-  repeated, and a resize hands taps a fresh snapshot in the hold that resizes.
-  An answered query that reached a raw stream would be answered again by the
-  client's terminal, into the pane; an unanswered one must reach it. A tap
-  runs on the reader thread under that lock: it never blocks, waits or takes
-  another lock — it `try_send`s.
+  the daemon answered or owns** (`Term::taps`, `verdict`; it owns mode 2031,
+  and drops modifyOtherKeys and kitty's keyboard protocol before the terminal
+  sees them, so they never reach a stream or a snapshot): a stream's snapshot
+  and its first raw read come from one hold, so nothing is lost or repeated,
+  and a resize hands taps a fresh snapshot in the hold that resizes. An
+  answered query that reached a raw stream would be answered again by the
+  client's terminal, into the pane; an unanswered one must reach it. A switch
+  of screens goes to a tap alone (`Processed::cuts`): `pane attach` redraws a
+  frame that switches. A tap runs on the reader thread under that lock: it
+  never blocks, waits or takes another lock — it `try_send`s.
 - **A prompt start (OSC 133;A) clears `TUTTI_KEYS` and `TUTTI_EDITOR`**
   (`broadcast_tick`, server.rs): the only thing that hands the direct keys back
   after an editor is `kill -9`'d. A new user var that claims something of the

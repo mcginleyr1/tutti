@@ -3,6 +3,15 @@
 **Status:** Decided. **Recommendation:** Option C (hybrid framing) with
 server-computed `vt100` escape-sequence deltas as the pane-output payload.
 
+> **Since wave 8** the daemon's per-pane grid is no longer a `vt100::Parser`
+> but an `rtty_vt::Terminal` — tutti's own engine, the rtty repo's `vt/`,
+> built on `vte`'s byte parser. The decision stands, payload and all; only its
+> source changed: a snapshot is the engine's `snapshot()`, a delta its
+> `redraw(&take_damage())` — the rows changed since the last tick, plus the
+> cursor and the modes — and a scroll its `scrolled_snapshot(offset)`. The
+> frames are unchanged (wire rev 10), and today's TUI still parses them with
+> vt100. The analysis below is the decision as it was made, with vt100.
+
 This is the gate before any protocol code. It fixes how a pane's screen content
 travels from `tutti-server` (which owns every PTY and a per-pane `vt100::Parser`)
 to a `tutti` client (a ratatui 0.30 TUI attached over a Unix domain socket). The
@@ -171,6 +180,8 @@ The plan already defers OSC 52 to beta and handles copy at the tutti layer, so t
 costs us nothing at alpha. The server also keeps one "last broadcast" screen per pane
 for diffing — a scrollback-free mirror of the visible state, formatted under the
 pane's lock and replayed, never a clone of the 10k-row ring — modest, bounded memory.
+(Since wave 8 nothing is kept to diff against: the engine tracks the rows that
+changed, and the tick keeps only each pane's size, screen and sequence number.)
 
 ## Recommendation
 
@@ -227,10 +238,16 @@ Pane-data payload (`kind = 0x02` snapshot / `0x03` delta):
 
 ```
 [u32 pane_id][u16 rows][u16 cols][u32 seq][escape_bytes...]
-  snapshot escape_bytes = screen.contents_formatted()
-  delta    escape_bytes = screen.contents_diff(&last_broadcast[pane])
+  snapshot escape_bytes = terminal.snapshot()
+  delta    escape_bytes = terminal.redraw(&terminal.take_damage())
+                          — after a switch of screens, ESC c then terminal.snapshot()
   seq increments per pane; a gap after resize tells the client to expect a fresh snapshot
 ```
+
+A redraw follows only the screen it was drawn on: after the program switches
+screens, a client that holds the pane gets a reset and a fresh snapshot as its
+delta (a `PaneDelta`, so a client browsing the scrollback keeps its view). A
+resize sends every client a `PaneSnapshot` at the new size.
 
 Input payload (`kind = 0x04`, client → server): `[u32 pane_id][raw key bytes...]`,
 forwarded verbatim to the PTY (kept binary for the lowest-latency keystroke path).
@@ -244,20 +261,22 @@ forwarded verbatim to the PTY (kept binary for the lowest-latency keystroke path
 1. Client → `Frame{Control, {"t":"attach","session","size"}}`.
 2. Server → `Frame{Control, {"t":"attach_ok","layout":{…tree, geometry, agent+state…}}}`.
 3. Server → for each visible pane: `Frame{PaneSnapshot, pane_id, rows, cols, seq=0,
-   contents_formatted()}`.
+   snapshot()}`.
 4. Client seeds one `vt100::Parser` per pane by `process`-ing each snapshot, then draws
    grids into ratatui.
-5. **Steady state:** every ~16 ms tick, for each pane whose screen changed since its
+5. **Steady state:** every ~16 ms tick, for each pane that had output since its
    last broadcast, Server → `Frame{PaneDelta, pane_id, rows, cols, seq++,
-   contents_diff(last_broadcast)}`; client `process`es it, marks the pane damaged, and
+   redraw(&take_damage())}`; client `process`es it, marks the pane damaged, and
    redraws only damaged panes. The focused pane may be flushed sub-tick for instant echo.
 6. **Resize:** client → `Frame{Control,{"t":"view_sizes","panes":[…]}}`, every pane it
    shows at the size it shows it, sent whenever that set changes; the server sizes
    each pane to the smallest rows and columns among the clients showing it
-   (re-arbitrating when a client leaves), `set_size`s the affected parsers, and sends
-   fresh `PaneSnapshot` frames for resized panes.
+   (re-arbitrating when a client leaves), resizes the affected terminals (the engine
+   reflows the primary screen and its scrollback), and sends fresh `PaneSnapshot`
+   frames for resized panes.
 7. **Scroll:** client → `Frame{Control,{"t":"scroll","pane","offset"}}`; server ships a
-   snapshot of the scrolled region from the authoritative scrollback ring.
+   snapshot of the scrolled region from the authoritative scrollback ring
+   (`scrolled_snapshot(offset)`: the rows from `offset` back, no cursor, no modes).
 8. **Detach:** client → `Frame{Control,{"t":"detach"}}`; server drops the client and
    keeps every PTY and parser alive.
 
@@ -306,18 +325,16 @@ reads before it and the stream exactly the reads after — none lost, none repea
 go out on the connection's single outbound queue, and the socket keeps the order. A
 resize's snapshot is taken in the same hold that resizes the grid.
 
-The snapshot is `state_formatted` — contents, cursor position and visibility, the current
-colours and attributes, and the input modes (keypad, cursor keys, bracketed paste, mouse
-mode and encoding) — plus what it leaves out: which screen is up. While the alternate
-screen is, the primary screen goes first, then `ESC[m ESC[?1049h`, then the alternate
-screen, so the terminal holds the pane's primary screen under it and the program's own
-`?1049l` brings both back to the same one. vt100 has no public handle on the hidden grid,
-so that primary is read off a clone of the screen switched back in a fresh parser (the
-ring comes along, ~1–3 ms) — only at an attach or resize while the alternate screen is
-up. What vt100 does not model, no snapshot can carry: the scroll region, origin mode,
-the DECSC saved cursor, focus reporting, kitty keyboard flags, cursor style, the title. A
-program that redraws on SIGWINCH repairs most of it, and an attach at a new size sends
-one.
+The snapshot is the engine's `snapshot()`: both screens while the alternate one is up
+(the primary first, then the switch, so the terminal holds the pane's primary screen
+under it and the program's own `?1049l` brings both back to the same one), the saved
+cursors, the scroll region, tab stops, the cursor (position, a pending wrap, shape,
+visibility), the rendition and character sets, the modes input depends on (cursor keys,
+keypad, mouse mode and encoding, focus reporting, bracketed paste), the colours a
+program set, and the title. What it does not carry: the scrollback, an open
+synchronized update (2026), the title stack and the host palette. (Before wave 8, vt100's
+`state_formatted` left out the scroll region, origin mode, the DECSC cursor, focus
+reporting, the cursor style and the title.)
 
 **Backpressure.** The reader never waits on a client. A tap `try_send`s into its
 connection's bounded queue (256 frames, each at most one 8 KiB read — 2 MiB). Once the
@@ -345,36 +362,46 @@ screen keeps none.
 
 ## Terminal queries: the daemon answers what it can
 
-A pane has no terminal of its own: vt100 answers nothing, and a TUI client never sees the
-raw bytes. So a program that waits on an answer would hang or time out in tutti — nvim
-0.12's Ctrl-Z waits on a DA1 barrier, crossterm's `cursor::position()` on a CPR — and one
-that asks its background colour (nvim's startup OSC 11, fish) would guess. **The rule:
-the daemon answers what it can, on the pane's pty, and a raw stream carries only the
-queries it did not answer.** A stream's terminal would otherwise answer each one again,
-and its answer reach the pane as `Input`.
+A pane has no terminal of its own, and a TUI client never sees the raw bytes. So a
+program that waits on an answer would hang or time out in tutti — nvim 0.12's Ctrl-Z
+waits on a DA1 barrier, crossterm's `cursor::position()` on a CPR — and one that asks its
+background colour (nvim's startup OSC 11, fish) would guess. **The rule: the daemon
+answers what it can, on the pane's pty, and a raw stream carries only the queries it did
+not answer.** A stream's terminal would otherwise answer each one again, and its answer
+reach the pane as `Input`. Since wave 8 the answers are the pane's terminal engine's own
+(rtty-vt's `Event::Reply`; before, vt100 answered nothing and the daemon matched a few
+queries itself):
 
 | Asked | Bytes | Answered |
 |---|---|---|
-| DA1 | `CSI c`, `CSI 0 c` | `CSI ? 62 ; 22 c` — a VT220 with ANSI colour |
-| DA2 | `CSI > c`, `CSI > 0 c` | `CSI > 1 ; 277 ; 0 c` — xterm patch 277, as WezTerm answers: Emacs asks a terminal its colours (OSC 10/11, below) only from 242 up, and guesses a light background under it |
+| DA1 | `CSI c`, `CSI 0 c`, `ESC Z` | `CSI ? 62 ; 22 c` — a VT220 with ANSI colour |
+| DA2 | `CSI > c`, `CSI > 0 c` | `CSI > 1 ; 277 ; 0 c` (`rtty_vt::XTERM_VERSION`) — xterm patch 277, as WezTerm answers: Emacs asks a terminal its colours (OSC 10/11, below) only from 242 up, and guesses a light background under it |
+| XTVERSION | `CSI > q`, `CSI > 0 q` | `DCS > \| rtty-vt <version> ST` |
 | DSR | `CSI 5 n` | `CSI 0 n` |
-| CPR | `CSI 6 n` | `CSI row ; col R`, 1-based, read once the parser has every byte before the query; a pending wrap reports the last column |
-| Colours | `OSC 10 ; ?`, `OSC 11 ; ?`, `OSC 12 ; ?` | `OSC 1x ; rgb:rrrr/gggg/bbbb`, closed as asked (BEL, or `ESC \`) — only once a client has reported its terminal's colours, and OSC 12 only with a cursor colour; else unanswered, and passed on |
+| CPR | `CSI 6 n`, `CSI ? 6 n` | `CSI row ; col R` (`CSI ? row ; col ; 1 R`), 1-based, where the query found the cursor; a pending wrap reports the last column |
+| DECRQM | `CSI ? Pm $ p`, `CSI Pm $ p` | `CSI ? Pm ; 1\|2 $ y` from the mode's state (nvim probes 2026, 2027, 2031, 2048, 69), 0 for a mode the engine does not know |
+| DECRQSS | `DCS $ q m ST`, `r`, ` q` | the current rendition with colon subparameters (nvim's undercurl probe: `0;4:3 m`), the margins, the cursor style |
+| XTGETTCAP | `DCS + q <hex names> ST` | `TN`, `Co`, `RGB`, `Smulx`, `Setulc`, `Ms`; any other name answered as unknown |
+| XTQMODKEYS | `CSI ? 4 m` | `CSI > 4 ; 0 m`: modifyOtherKeys is always off (below) |
+| Window size | `CSI 18 t` | `CSI 8 ; rows ; cols t` (14 and 16, in pixels, go on unanswered) |
+| Colours | `OSC 10 ; ?`, `OSC 11 ; ?`, `OSC 12 ; ?`, `OSC 4 ; n ; ?` | `OSC 1x ; rgb:rrrr/gggg/bbbb`, closed as asked (BEL, or `ESC \`) — what the program set, else, once a client has reported its terminal's colours, those; OSC 12 only with a cursor colour, OSC 4 only for a slot the program set; else unanswered, and passed on |
 | Light/dark | `CSI ? 996 n` | `CSI ? 997 ; 1 n` (dark) or `; 2 n` (light) — only with colours reported |
 | Mode 2031 | `CSI ? 2031 h` / `l` | nothing: the daemon keeps the mode per pane, and never passes it on |
-| DECRQM 2031 | `CSI ? 2031 $ p` | `CSI ? 2031 ; 1 $ y` (set) or `; 2 $ y` (reset) |
-| modifyOtherKeys | `CSI > 4 m`, `CSI > 4 ; 0 m`, `; 1 m`, `; 2 m` | nothing: dropped, never passed on. A pane only ever gets legacy keys — the TUI encodes no other — and a `pane attach` terminal that took it (nvim and vim ask for level 2, Emacs for 1) would encode the prefix where the detach cannot see it, and keep it after the detach |
+| modifyOtherKeys | `CSI > 4 ; … m` | nothing: dropped before the engine sees it, never passed on. A pane only ever gets legacy keys — the TUI encodes no other — and a `pane attach` terminal that took it (nvim and vim ask for level 2, Emacs for 1) would encode the prefix where the detach cannot see it, and keep it after the detach |
+| Kitty keyboard | `CSI ? u`, `CSI > … u`, `CSI < … u`, `CSI = … u` | nothing: dropped the same way, for the same reason. Unanswered, the query is closed by the DA1 nvim sends after it, so nvim never pushes flags |
 
-Each is matched exactly as spelled — parameter and intermediate bytes and final byte; C0
-controls inside execute as in vte — so `CSI 00 c`, `CSI ? 6 n` or `CSI ? 1049 ; 2031 h` go
-unanswered and on to the streams. They are picked out by the reader's own escape scanner
-(`Seq`), across read boundaries: the bytes of a sequence that could still be one are held
-from the streams until it completes — answered and dropped, or not and passed on. A
-query's last byte ends a parser run, as an OSC terminator does, so a cursor report reads
-the cursor where the query found it. The answers go to the pty from a per-pane thread, off
-the parser lock and through a bounded queue (64 writes): a program that asks and never
-reads its input fills it and stops getting answers, instead of stalling the reader — and
-with it its own output.
+The reader's own escape scanner (`Seq`, pty.rs) follows vte through every sequence,
+across read boundaries, and gives each one a verdict where vte ends it. A sequence the
+engine might answer ends a run of bytes fed to it, so a reply that comes back is that
+query's own — and a cursor report reads the cursor where the query found it — and the
+query is kept from the streams exactly when it was answered. Mode 2031 is kept from the
+streams; the keyboard protocols reach neither the engine nor the streams (the engine is
+handed a CAN in their place). Plain text and every other sequence go to the engine in runs
+as long as the read. The bytes of a sequence a read cut off are held from both until a
+later read ends it — up to 256 bytes, past which, too long to be a query, it goes on. The
+answers go to the pty from a per-pane thread, off the parser lock and through a bounded
+queue (64 writes): a program that asks and never reads its input fills it and stops
+getting answers, instead of stalling the reader — and with it its own output.
 
 **Colours.** `{"type":"host_colors","fg":{"r":…,"g":…,"b":…},"bg":{…},"cursor":{…}|null,
 "dark":bool}` reports the terminal a client shows panes on, 16 bits a channel. One store
