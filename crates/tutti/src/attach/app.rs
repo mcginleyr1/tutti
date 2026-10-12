@@ -281,6 +281,11 @@ pub struct App {
     /// The focus last reported to the server via `PaneFocus`; lets the event
     /// loop notice a focus change from any source (input, layout, attach).
     focus_sent: Option<PaneId>,
+    /// Whether the terminal the TUI runs in has the focus, as it last
+    /// reported (mode 1004); it has until it says otherwise.
+    host_focused: bool,
+    /// The pane last told it has the focus (`focus_reports`).
+    focus_reported: Option<PaneId>,
     /// Set when a non-focused pane finished or blocked; the event loop rings the
     /// terminal bell once and clears it.
     bell: bool,
@@ -504,6 +509,8 @@ impl App {
             status: None,
             view_sent: Vec::new(),
             focus_sent: None,
+            host_focused: true,
+            focus_reported: None,
             bell: false,
             prefix_since: None,
             sidebar_selected: 0,
@@ -650,6 +657,35 @@ impl App {
         }
         self.focused
             .map(|pane| control(&Request::PaneFocus { pane }))
+    }
+
+    /// The terminal the TUI runs in gained or lost the focus.
+    pub fn host_focus(&mut self, focused: bool) {
+        self.host_focused = focused;
+    }
+
+    /// The focus reports (`CSI I`, `CSI O`, mode 1004) owed since the last
+    /// call: a pane has the focus while it is tutti's focused pane and the
+    /// terminal has it, and a program that asked hears when that changes.
+    pub fn focus_reports(&mut self) -> Vec<WireFrame> {
+        let now = self.focused.filter(|_| self.host_focused);
+        if now == self.focus_reported {
+            return Vec::new();
+        }
+        let was = std::mem::replace(&mut self.focus_reported, now);
+        [(was, b"\x1b[O"), (now, b"\x1b[I")]
+            .into_iter()
+            .filter_map(|(pane, report)| {
+                let pane = pane?;
+                let state = self.panes.get(&pane)?;
+                (state.term.modes().focus_reports && state.info.exited.is_none()).then(|| {
+                    WireFrame::Input {
+                        pane,
+                        bytes: report.to_vec(),
+                    }
+                })
+            })
+            .collect()
     }
 
     /// The DECSCUSR parameter the terminal's cursor takes: the shape the
@@ -5311,6 +5347,48 @@ mod tests {
         assert_eq!(app.cursor_shape(), 6, "a steady bar");
         app.set_scroll(PaneId(1), Some(5));
         assert_eq!(app.cursor_shape(), 0);
+    }
+
+    /// A program that asked for focus reports hears when its pane gains and
+    /// loses the focus — the terminal's too — and only then.
+    #[test]
+    fn focus_reports_reach_the_pane_that_asked() {
+        let mut app = App::new();
+        attached(&mut app);
+        let reports = |app: &mut App| -> Vec<Vec<u8>> {
+            app.focus_reports()
+                .into_iter()
+                .map(|frame| match frame {
+                    WireFrame::Input {
+                        pane: PaneId(1),
+                        bytes,
+                    } => bytes,
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        app.handle_frame(WireFrame::PaneSnapshot(PaneData {
+            pane: PaneId(1),
+            rows: 24,
+            cols: 80,
+            seq: 0,
+            bytes: b"\x1b[?1004h".to_vec(),
+        }));
+        assert_eq!(reports(&mut app), [b"\x1b[I"]);
+        assert!(reports(&mut app).is_empty());
+        app.host_focus(false);
+        assert_eq!(reports(&mut app), [b"\x1b[O"]);
+        app.host_focus(true);
+        assert_eq!(reports(&mut app), [b"\x1b[I"]);
+        app.handle_frame(WireFrame::PaneSnapshot(PaneData {
+            pane: PaneId(1),
+            rows: 24,
+            cols: 80,
+            seq: 0,
+            bytes: b"".to_vec(),
+        }));
+        app.host_focus(false);
+        assert!(reports(&mut app).is_empty(), "it stopped asking");
     }
 
     /// Keys go to the focused pane as its program asked for them: plain

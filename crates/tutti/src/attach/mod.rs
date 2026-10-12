@@ -27,8 +27,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
+    KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::{execute, terminal};
 use tutti_core::{PaneId, Request};
@@ -72,6 +73,8 @@ pub fn run(
     if config.mouse {
         let _ = execute!(io::stdout(), EnableMouseCapture);
     }
+    // The terminal's focus, for the panes that ask to hear of theirs.
+    let _ = execute!(io::stdout(), EnableFocusChange);
     // A terminal that speaks kitty's keyboard protocol tells keys apart that
     // plain bytes cannot — Ctrl+I from Tab, Esc from Alt — for the panes
     // that asked for them (`input::encode_key`). Its own stack takes the
@@ -94,10 +97,10 @@ pub fn run(
 static KEYS_PUSHED: AtomicBool = AtomicBool::new(false);
 
 /// Hand back what the TUI changed in the terminal beyond what
-/// `ratatui::restore` does: mouse capture, the cursor's shape and the
-/// keyboard flags. Safe to run twice.
+/// `ratatui::restore` does: mouse capture, focus reports, the cursor's shape
+/// and the keyboard flags. Safe to run twice.
 fn leave() {
-    let _ = execute!(io::stdout(), DisableMouseCapture);
+    let _ = execute!(io::stdout(), DisableMouseCapture, DisableFocusChange);
     if KEYS_PUSHED.swap(false, Ordering::SeqCst) {
         let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
     }
@@ -196,6 +199,8 @@ fn event_loop(
                         dirty = true;
                     }
                     Event::Resize(_, _) => dirty = true,
+                    Event::FocusGained => app.host_focus(true),
+                    Event::FocusLost => app.host_focus(false),
                     _ => {}
                 }
                 if !event::poll(Duration::ZERO).context("poll terminal input")? {
@@ -236,6 +241,9 @@ fn event_loop(
         }
 
         if let Some(frame) = app.focus_change() {
+            let _ = conn.send(&frame);
+        }
+        for frame in app.focus_reports() {
             let _ = conn.send(&frame);
         }
         if app.take_bell() {
