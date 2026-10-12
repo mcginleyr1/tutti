@@ -72,7 +72,17 @@ cargo fmt --check
   to `verdict`'s Ask arms (the owned-queries test enumerates them).
 - **The render tick is the one consumer of a pane's damage**
   (`PtyPane::look`): it takes it once and fans the same redraw out. Anything
-  else that took the damage would starve the clients' deltas.
+  else that took the damage would starve the clients' deltas. While a pane's
+  program holds a synchronized update open, the tick leaves the damage be
+  (`PtyPane::holding`) so the next look carries the whole frame.
+- **The TUI draws cells through `host::Host`** (attach/host.rs), which says
+  what ratatui's cells cannot through the `Modifier` bits ratatui leaves
+  unused (underline styles, overline, a link's mark) and a per-frame link
+  table the renderer fills (`host::link`, cleared by `render::draw`). A widget
+  drawn over pane cells must reset them (`Clear`), or a pane cell's bits ride
+  into it. Whatever the TUI turns on in its terminal beyond raw mode and the
+  alternate screen — mouse capture, focus reports, kitty's keyboard flags, a
+  cursor shape — `leave` (attach/mod.rs) hands back, on detach and on a panic.
 - **Shutdown order** (`serve`, server.rs): abort *and await* the layout saver,
   write the final save, then `kill_all`. A save after `kill_all` — or a saver
   tick racing the final write — records a layout with every pane gone. An empty
@@ -101,9 +111,11 @@ cargo fmt --check
   pty write; a reader blocked there never drains the program's output, and the
   pane deadlocks on something as plain as `cat`ting a file of `ESC[6n`.
 - **Taps are fed in the same parser-lock hold as `Term::process`, minus what
-  the daemon answered or owns** (`Term::taps`, `verdict`; it owns mode 2031,
-  and drops modifyOtherKeys and kitty's keyboard protocol before the terminal
-  sees them, so they never reach a stream or a snapshot): a stream's snapshot
+  the daemon answered or owns** (`Term::taps`, `verdict`; it owns mode 2031
+  and the keyboard protocols — modifyOtherKeys and kitty's push, pop and set
+  reach the terminal, whose snapshots and redraws hand them to the TUI's key
+  encoder, but never a stream, and `pane attach`'s mirror redraws leave them
+  out too, so its terminal keeps plain keys): a stream's snapshot
   and its first raw read come from one hold, so nothing is lost or repeated,
   and a resize hands taps a fresh snapshot in the hold that resizes. An
   answered query that reached a raw stream would be answered again by the

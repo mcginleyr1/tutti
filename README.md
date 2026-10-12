@@ -185,6 +185,18 @@ tmux, and grows back when the smaller client detaches or switches away; a pane
 nobody shows keeps its size. A client whose window is bigger than a pane draws
 the pane from its top-left. `tutti watch` watchers never count.
 
+### What the TUI shows of a pane
+
+The TUI runs each pane on the daemon's own terminal engine, so it draws what
+the pane's terminal holds: every rendition, underline styles and colours
+(Neovim's red undercurl for spelling), overline, OSC 8 hyperlinks and whole
+grapheme clusters. Your terminal's cursor takes the focused pane's shape — a
+bar in Neovim's insert mode — and a program that asks for focus events hears
+when its pane gains or loses the focus, your terminal's included. A program
+drawing inside a synchronized update (mode 2026) is shown once the update
+ends, never half drawn, and each of the TUI's own frames reaches your terminal
+as one such update too.
+
 ### One pane in a real terminal
 
 `tutti pane attach <pane>` shows one pane in the terminal you run it in, drawn
@@ -226,12 +238,19 @@ colours, it also answers the foreground, background and cursor colour queries
 Emacs's `background-mode` match what you see. Nothing reported, nothing is
 made up: programs keep their own defaults. Every pane also runs with
 `COLORTERM=truecolor`, so Neovim turns on `termguicolors` and Emacs `-nw` uses
-24-bit colour whatever terminal the daemon started from. A program's request
-for xterm's modifyOtherKeys (Neovim, vim and Emacs make one) and anything of
-kitty's keyboard protocol — its query, and pushing, popping or setting its
-flags — are dropped: a pane gets legacy keys, under the TUI and `pane attach`
-alike, and your terminal never encodes the prefix where `pane attach` cannot
-see it.
+24-bit colour whatever terminal the daemon started from.
+
+A program's keyboard protocol is the pane's own: the daemon answers kitty's
+keyboard query and keeps the flags a program pushes, and the level of xterm's
+modifyOtherKeys it asks for (Neovim pushes kitty's flags; Emacs asks for
+modifyOtherKeys). The TUI encodes each key for the focused pane as its program
+asked — under kitty's flags Ctrl+I is not Tab, Esc not the start of Alt — and
+asks your terminal for kitty's disambiguated keys when it speaks the protocol,
+so it can tell them apart in the first place; it hands the terminal back as it
+was on detach. Under a terminal without it, keys still reach a kitty pane in
+its encoding, but only those your terminal can tell apart. `pane attach` keeps
+plain keys: the protocols never reach your terminal there, as it watches for
+the prefix in plain bytes and a detach could not be sure to turn them off.
 
 The TUI reports your terminal's colours when it attaches — on the `dark` and
 `light` themes, the theme's own pane ground and text, which panes are painted
@@ -1600,11 +1619,6 @@ tutti is alpha; PLAN.md tracks what is open.
 - **Light/dark switches reach panes only through `pane attach`.** The TUI
   reports your terminal's colours when it attaches; reattach after switching
   the OS theme.
-- **An editor in a pane misses some of a terminal.** The TUI still renders
-  panes with vt100, which has a plain underline only: it draws undercurl and
-  the other underline styles as no underline at all (Neovim, told the pane's
-  terminal has them, uses undercurl for spelling), drops underline colours and
-  the cursor's shape (a bar in insert mode stays a block), and never sends
-  focus events, so Neovim's `FocusGained`/`FocusLost` never fire; `tutti pane
-  attach` passes the underline styles and the cursor shape through to your
-  terminal.
+- **The TUI hears no light/dark switch while attached** (above), and a pane's
+  program that asked for key releases or the text of a key (kitty's flags 2
+  and 16) gets presses only: the TUI asks your terminal for neither.

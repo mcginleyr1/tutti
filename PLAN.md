@@ -74,8 +74,8 @@ trust versions from memory):
 - `portable-pty` — spawn and manage PTYs cross-platform.
 - `vt100` (or `termwiz` escape parsing) — maintain an in-memory screen grid per pane
   so we can render scrollback, detect agent screen content, and serve `pane read`.
-  Since wave 8 the daemon's panes run on `rtty-vt`, our own engine (the rtty
-  repo's `vt/`, on `vte`'s byte parser); the TUI keeps vt100 until it follows.
+  Since wave 8 the panes run on `rtty-vt`, our own engine (the rtty repo's
+  `vt/`, on `vte`'s byte parser), in the daemon and the TUI alike.
 - `tokio` — async runtime for the server (PTY I/O, socket clients, timers).
 - `serde` / `serde_json` — protocol.
 - `clap` — CLI.
@@ -569,29 +569,34 @@ In order; each lands its TUI path in the same wave as its verbs.
      every pty read, taken under one hold of the parser lock; a resize resends
      the snapshot; a stream that falls behind is dropped with an error; it
      votes in the pane's size. The CLI draws on the alternate screen and
-     redraws a pane program's own screen switches from a vt100 mirror.
+     redraws a pane program's own screen switches from a mirror (rtty-vt
+     since wave 8).
    - The daemon answers DA1/DA2/DSR/CPR always (DA2 as xterm patch 277, the
      version from which Emacs asks for colours), OSC 10/11/12 and `CSI ? 996
      n` from the newest client colour report (`HostColors`), and owns mode
      2031 (a light/dark change is told to the panes that set it) and
-     modifyOtherKeys (dropped: panes get legacy keys, and a `pane attach`
-     terminal keeps its prefix); answers go out through a per-pane thread,
+     modifyOtherKeys (kept from raw streams, so a `pane attach` terminal
+     keeps its prefix; since wave 8 the TUI encodes keys by it); answers go
+     out through a per-pane thread,
      and raw streams carry only what it did not answer. Every pane runs with
      `COLORTERM=truecolor`.
    Verified live with nvim 0.12.4 and Emacs 32 in zsh panes, under the TUI
    and `pane attach` (the w7-finish acceptance, 76 checks), and `pane attach`
    inside a tmux that honours modifyOtherKeys. Open:
-   - terminal fidelity in the TUI, which still parses panes with vt100 (wave
-     8 step 2 moves it onto rtty-vt): underline styles and colours flattened
-     — undercurl, which Neovim now uses, to no underline at all — the cursor
-     shape (DECSCUSR) dropped, no focus events;
-   - the TUI's live light/dark: crossterm 0.29 swallows `CSI ? 997 n`, so it
-     reports colours at attach only;
+   - ✅ terminal fidelity in the TUI (wave 8 step 2, on rtty-vt): underline
+     styles and colours, Neovim's undercurl included; the cursor shape
+     (DECSCUSR); focus events; hyperlinks; clusters;
+   - the TUI's live light/dark: crossterm 0.29 takes `CSI ? 997 n` for a
+     sequence still arriving and holds every key behind it, so it reports
+     colours at attach only; making it live means reading the terminal
+     without crossterm — keys, kitty's key reports, mouse, paste, focus —
+     which wave 8 left undone;
    - `pane attach --inline` (primary screen, switches passed through) so
      editor terminals keep native scrollback; escape-time for an Alt prefix;
-   - ✅ detach under the kitty keyboard protocol: since wave 8 the daemon
-     drops the protocol (query, push, pop, set) as it does modifyOtherKeys, so
-     no pane turns it on in a `pane attach` terminal;
+   - ✅ detach under the kitty keyboard protocol: the daemon keeps the
+     protocol (push, pop, set; its query it answers) from raw streams as it
+     does modifyOtherKeys, so no pane turns it on in a `pane attach`
+     terminal;
    - ✅ `pane attach` lost the rest of a read that switches screens to its
      mirror redraw (a program's startup queries, a bell). Fixed with the
      engine swap: the daemon answers those queries itself, and hands a
@@ -601,9 +606,8 @@ In order; each lands its TUI path in the same wave as its verbs.
      approval, so the plugins read one from each;
    - fish's snippet unrun; bash before 4.4 has no `C` mark; Emacs 29 and
      Neovim before 0.12 unrun;
-   - ✅ XTVERSION, DECRQM beyond 2031, DECRQSS and XTGETTCAP are answered by
-     the engine since wave 8; kitty's `CSI ? u` is dropped, so the DA1 after
-     it says there is no such protocol.
+   - ✅ XTVERSION, DECRQM beyond 2031, DECRQSS, XTGETTCAP and kitty's `CSI ?
+     u` are answered by the engine since wave 8.
 10. **Own terminal engine (wave 8)** — rtty-vt, the rtty repo's `vt/`, under
     tutti and rtty alike:
    - ✅ Step 1, the daemon: each pane is an `rtty_vt::Terminal`. Gone: the
@@ -616,14 +620,22 @@ In order; each lands its TUI path in the same wave as its verbs.
      pane's damage once (`look`); answers are the engine's `Event::Reply`,
      through the same answer thread, and a scanner that follows vte keeps
      from the streams exactly what was answered, mode 2031, and the keyboard
-     protocols the daemon drops. Wire unchanged (rev 10): today's vt100 TUI
-     renders the engine's snapshots and redraws. Release, a pane draining
-     50 MB of dense SGR: daemon CPU 0.68 s → 0.34 s; a full 10k ring holds
-     +31 MiB → +16 MiB. The w7 editor acceptance, plus the screen-switch
-     checks: 90/90.
-   - Step 2, the TUI: its parser onto rtty-vt (underline styles and colours,
-     hyperlinks, clusters, the cursor shape), then honour the keyboard
-     protocols the daemon now drops.
+     protocols. Wire unchanged (rev 10). Release, a pane draining 50 MB of
+     dense SGR: daemon CPU 0.68 s → 0.34 s; a full 10k ring holds +31 MiB →
+     +16 MiB. The w7 editor acceptance, plus the screen-switch checks: 90/90.
+   - ✅ Step 2, the TUI: each pane's mirror is an `rtty_vt::Terminal`, and
+     `pane attach`'s too; vt100 left tutti. The TUI draws through its own
+     backend (`host::Host`): every rendition, underline styles and colours,
+     overline, OSC 8 links, whole clusters, a synchronized update (2026) a
+     frame; the terminal's cursor takes the focused pane's DECSCUSR shape;
+     focus reports reach the panes that asked. Keys: the daemon keeps a
+     pane's kitty flags and modifyOtherKeys level (from raw streams still),
+     the TUI encodes each key by them, and asks a kitty terminal for
+     disambiguated keys, popped on detach. The render tick holds a pane's
+     frame while its program's synchronized update is open (250 ms at most).
+     Wire unchanged (rev 10). Acceptance: 99/99, the new checks undercurl in
+     the TUI's bytes, nvim's insert-mode bar, Ctrl+I apart from Tab under a
+     kitty terminal, focus events, and key modes left clean on detach.
    - Step 3, rtty itself.
    Open: answers to a pane's own queries are written by the answer thread,
    so keys typed through `pane send` can overtake a light/dark report the
@@ -642,8 +654,9 @@ In order; each lands its TUI path in the same wave as its verbs.
 - under heavy parallel test load `openpty` occasionally fails a test's first
   spawn (`Unknown error: -6`); a rerun passes;
 - Codex and Gemini integrations need the tools installed and a live run;
-- an editor in a pane misses the TUI's vt100 gaps (underline styles, cursor
-  shape, focus events) until wave 8 step 2 moves the TUI onto rtty-vt.
+- the TUI hears no light/dark switch while attached (crossterm reads its
+  input), and gives a pane key presses only (no kitty release or text
+  reports).
 
 **Deliberately not done:** packaging and distribution (Phase 5) — the project
 is private, so install stays `cargo install --path` from a checkout.

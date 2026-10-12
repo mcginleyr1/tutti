@@ -9,8 +9,12 @@ server-computed `vt100` escape-sequence deltas as the pane-output payload.
 > source changed: a snapshot is the engine's `snapshot()`, a delta its
 > `redraw(&take_damage())` — the rows changed since the last tick, plus the
 > cursor and the modes — and a scroll its `scrolled_snapshot(offset)`. The
-> frames are unchanged (wire rev 10), and today's TUI still parses them with
-> vt100. The analysis below is the decision as it was made, with vt100.
+> frames are unchanged (wire rev 10). Since wave 8's step 2 the TUI parses
+> them with the same engine, so both ends are rtty-vt and the fidelity
+> ceiling the analysis below accepts is gone: the TUI draws underline styles
+> and colours, overline, links and whole clusters, and encodes keys by the
+> pane's keyboard protocol. The analysis below is the decision as it was
+> made, with vt100.
 
 This is the gate before any protocol code. It fixes how a pane's screen content
 travels from `tutti-server` (which owns every PTY and a per-pane `vt100::Parser`)
@@ -262,12 +266,14 @@ forwarded verbatim to the PTY (kept binary for the lowest-latency keystroke path
 2. Server → `Frame{Control, {"t":"attach_ok","layout":{…tree, geometry, agent+state…}}}`.
 3. Server → for each visible pane: `Frame{PaneSnapshot, pane_id, rows, cols, seq=0,
    snapshot()}`.
-4. Client seeds one `vt100::Parser` per pane by `process`-ing each snapshot, then draws
-   grids into ratatui.
+4. Client seeds one terminal per pane (an `rtty_vt::Terminal` since wave 8; a
+   `vt100::Parser` before) by feeding it each snapshot, then draws grids into ratatui.
 5. **Steady state:** every ~16 ms tick, for each pane that had output since its
    last broadcast, Server → `Frame{PaneDelta, pane_id, rows, cols, seq++,
-   redraw(&take_damage())}`; client `process`es it, marks the pane damaged, and
+   redraw(&take_damage())}`; client feeds it, marks the pane damaged, and
    redraws only damaged panes. The focused pane may be flushed sub-tick for instant echo.
+   A pane whose program holds a synchronized update (2026) open waits — 250 ms at
+   most — so the delta that goes out has the whole frame.
 6. **Resize:** client → `Frame{Control,{"t":"view_sizes","panes":[…]}}`, every pane it
    shows at the size it shows it, sent whenever that set changes; the server sizes
    each pane to the smallest rows and columns among the clients showing it
@@ -346,10 +352,12 @@ gap in a raw stream would leave the terminal wrong for good.
 **The CLI's alternate screen.** `tutti pane attach` draws on the terminal's alternate
 screen and leaves it on exit, so the shell's own screen and scrollback come back as they
 were. That one alternate screen cannot also be the pane program's: passed through, a
-program's `?1049l` would land the stream on the shell's screen. So the CLI keeps a vt100
-mirror of the pane (fed every frame, checked after each `h`/`l` byte, where a screen
-switch ends), and a frame that switches screens — or resets the terminal with `ESC c` — is
-replaced by a redraw from the mirror. Leaving vim brings back the pane's shell screen,
+program's `?1049l` would land the stream on the shell's screen. So the CLI keeps a
+mirror of the pane (an `rtty_vt::Terminal` since wave 8, vt100 before; fed every frame,
+checked after each `h`/`l` byte, where a screen switch ends), and a frame that switches
+screens — or resets the terminal with `ESC c` — is replaced by a redraw from the mirror:
+its `redraw` of every row onto the cleared alternate screen, less the keyboard
+protocols and mode 2031, which are the terminal's own. Leaving vim brings back the pane's shell screen,
 drawn from the mirror; all other output goes through untouched. So that a redraw takes
 nothing else with it, the daemon hands a stream each switch and reset in a `PaneRaw` frame
 of its own, between frames with the bytes before and after it: the bell or cursor shape
@@ -382,21 +390,20 @@ queries itself):
 | DECRQM | `CSI ? Pm $ p`, `CSI Pm $ p` | `CSI ? Pm ; 1\|2 $ y` from the mode's state (nvim probes 2026, 2027, 2031, 2048, 69), 0 for a mode the engine does not know |
 | DECRQSS | `DCS $ q m ST`, `r`, ` q` | the current rendition with colon subparameters (nvim's undercurl probe: `0;4:3 m`), the margins, the cursor style |
 | XTGETTCAP | `DCS + q <hex names> ST` | `TN`, `Co`, `RGB`, `Smulx`, `Setulc`, `Ms`; any other name answered as unknown |
-| XTQMODKEYS | `CSI ? 4 m` | `CSI > 4 ; 0 m`: modifyOtherKeys is always off (below) |
+| XTQMODKEYS | `CSI ? 4 m` | `CSI > 4 ; n m`, the level the program set (below) |
 | Window size | `CSI 18 t` | `CSI 8 ; rows ; cols t` (14 and 16, in pixels, go on unanswered) |
 | Colours | `OSC 10 ; ?`, `OSC 11 ; ?`, `OSC 12 ; ?`, `OSC 4 ; n ; ?` | `OSC 1x ; rgb:rrrr/gggg/bbbb`, closed as asked (BEL, or `ESC \`) — what the program set, else, once a client has reported its terminal's colours, those; OSC 12 only with a cursor colour, OSC 4 only for a slot the program set; else unanswered, and passed on |
 | Light/dark | `CSI ? 996 n` | `CSI ? 997 ; 1 n` (dark) or `; 2 n` (light) — only with colours reported |
 | Mode 2031 | `CSI ? 2031 h` / `l` | nothing: the daemon keeps the mode per pane, and never passes it on |
-| modifyOtherKeys | `CSI > 4 ; … m` | nothing: dropped before the engine sees it, never passed on. A pane only ever gets legacy keys — the TUI encodes no other — and a `pane attach` terminal that took it (nvim and vim ask for level 2, Emacs for 1) would encode the prefix where the detach cannot see it, and keep it after the detach |
-| Kitty keyboard | `CSI ? u`, `CSI > … u`, `CSI < … u`, `CSI = … u` | nothing: dropped the same way, for the same reason. Unanswered, the query is closed by the DA1 nvim sends after it, so nvim never pushes flags |
+| modifyOtherKeys | `CSI > 4 ; … m` | nothing: the engine keeps the level, and its snapshots and redraws hand it to the TUI, which encodes the pane's keys by it; never passed on. A `pane attach` terminal that took it (nvim and vim ask for level 2, Emacs for 1) would encode the prefix where the detach cannot see it, and keep it after the detach |
+| Kitty keyboard | `CSI ? u` · `CSI > … u`, `CSI < … u`, `CSI = … u` | `CSI ? flags u` · nothing: the engine keeps each screen's stack of flags as it does modifyOtherKeys, for the TUI, and for the same reason never passes them on (nvim pushes `CSI > 3 u` once answered) |
 
 The reader's own escape scanner (`Seq`, pty.rs) follows vte through every sequence,
 across read boundaries, and gives each one a verdict where vte ends it. A sequence the
 engine might answer ends a run of bytes fed to it, so a reply that comes back is that
 query's own — and a cursor report reads the cursor where the query found it — and the
-query is kept from the streams exactly when it was answered. Mode 2031 is kept from the
-streams; the keyboard protocols reach neither the engine nor the streams (the engine is
-handed a CAN in their place). Plain text and every other sequence go to the engine in runs
+query is kept from the streams exactly when it was answered. Mode 2031 and the keyboard
+protocols reach the engine but are kept from the streams. Plain text and every other sequence go to the engine in runs
 as long as the read. The bytes of a sequence a read cut off are held from both until a
 later read ends it — up to 256 bytes, past which, too long to be a query, it goes on. The
 answers go to the pty from a per-pane thread, off the parser lock and through a bounded
