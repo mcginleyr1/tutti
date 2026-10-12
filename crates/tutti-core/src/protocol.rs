@@ -11,7 +11,7 @@ use crate::state::{AgentState, StateSource};
 /// Response / Event shapes (including additive fields): the daemon reports it
 /// on attach and mismatched clients tell the user to restart the daemon —
 /// binaries upgrade on install, running daemons do not.
-pub const WIRE_REV: u32 = 10;
+pub const WIRE_REV: u32 = 11;
 
 /// The most notes the daemon's notification history keeps, the oldest going
 /// first. A client caps its copy the same, so the two agree.
@@ -230,9 +230,10 @@ pub enum Request {
     /// `wrap`) as `PaneFocus` would, answered with `Response::Neighbor` —
     /// whose `pane` is `None` at an edge, nothing focused. At a left or right
     /// edge without `wrap`, an attached client focused on `from` is handed
-    /// the move (`Event::FocusEdge`), as its own direct key would take it.
-    /// `from` defaults to the attached client's focused pane; Error when
-    /// there is none.
+    /// the move (`Event::FocusEdge`), as its own direct key would take it; at
+    /// the top or bottom only a client that hands moves on (`Attach`'s
+    /// `handoff`). `from` defaults to the attached client's focused pane;
+    /// Error when there is none.
     PaneFocusToward {
         #[serde(default)]
         from: Option<PaneId>,
@@ -242,7 +243,9 @@ pub enum Request {
     },
     /// Move the border of the nearest split enclosing `from` on `toward`'s
     /// axis that way by `delta` — what a direct resize key's
-    /// `PaneResizeSplit` does. `from` defaults as in `PaneFocusToward`.
+    /// `PaneResizeSplit` does. With no such split, an attached client focused
+    /// on `from` that hands moves on is handed the resize
+    /// (`Event::ResizeEdge`). `from` defaults as in `PaneFocusToward`.
     PaneResizeToward {
         #[serde(default)]
         from: Option<PaneId>,
@@ -374,10 +377,16 @@ pub enum Request {
     /// Join the attached-client set. `terminal` names the terminal app the
     /// client runs in — macOS's `__CFBundleIdentifier`, e.g.
     /// `com.mitchellh.ghostty` — which watchers are told so they can raise it.
-    /// `None` off macOS and from older clients.
+    /// `None` off macOS and from older clients. `handoff`: the client runs in
+    /// a terminal of panes of its own (rtty) and hands a move past tutti's
+    /// edge on to it — at any edge, so it is handed top and bottom ones too
+    /// (`Event::FocusEdge`), and resizes no split of tutti's takes
+    /// (`Event::ResizeEdge`).
     Attach {
         #[serde(default)]
         terminal: Option<String>,
+        #[serde(default)]
+        handoff: bool,
     },
     Detach,
     /// Subscribe this connection to `Event::Snapshot`s: one at once, then one
@@ -987,11 +996,19 @@ pub enum Event {
     PaneFocused {
         pane: PaneId,
     },
-    /// A `PaneFocusToward` found no pane `toward` (left or right) of `pane`,
-    /// the pane this client shows focused: the client takes the move on as
-    /// its own direct key would at that edge — into a panel, or on to the
-    /// next tab. Sent only to such a client.
+    /// A `PaneFocusToward` found no pane `toward` of `pane`, the pane this
+    /// client shows focused: the client takes the move on as its own direct
+    /// key would at that edge — into a panel, on to the next tab, or out to
+    /// the terminal it runs in. Sent only to such a client, and for the top
+    /// and bottom edges only to one that hands moves on (`Attach`).
     FocusEdge {
+        pane: PaneId,
+        toward: Toward,
+    },
+    /// A `PaneResizeToward` found no split of `pane`'s on `toward`'s axis:
+    /// the client focused on it, which hands moves on (`Attach`), resizes the
+    /// terminal's own split that way instead.
+    ResizeEdge {
         pane: PaneId,
         toward: Toward,
     },
@@ -1315,9 +1332,13 @@ mod tests {
             pane: PaneId(3),
             name: None,
         });
-        roundtrip(&Request::Attach { terminal: None });
+        roundtrip(&Request::Attach {
+            terminal: None,
+            handoff: false,
+        });
         roundtrip(&Request::Attach {
             terminal: Some("com.mitchellh.ghostty".into()),
+            handoff: true,
         });
         roundtrip(&Request::Watch);
         roundtrip(&Request::PaneAttach {
@@ -1797,6 +1818,10 @@ mod tests {
             pane: PaneId(3),
             toward: Toward::Left,
         });
+        roundtrip(&Event::ResizeEdge {
+            pane: PaneId(3),
+            toward: Toward::Down,
+        });
         roundtrip(&sample_snapshot());
         roundtrip(&Event::Snapshot {
             session: "tutti".into(),
@@ -2113,9 +2138,16 @@ mod tests {
                 last_output: false,
             }
         );
-        // `attach` from before `terminal` existed names no terminal.
+        // `attach` from before `terminal` and `handoff` existed names no
+        // terminal and hands nothing on.
         let attach: Request = serde_json::from_str(r#"{"type":"attach"}"#).unwrap();
-        assert_eq!(attach, Request::Attach { terminal: None });
+        assert_eq!(
+            attach,
+            Request::Attach {
+                terminal: None,
+                handoff: false
+            }
+        );
         // ...and an older daemon, whose `Attach` is a unit variant, still
         // accepts an attach that names one.
         #[derive(Debug, PartialEq, Deserialize)]

@@ -163,7 +163,10 @@ fn attach_seeds_app_and_input_updates_grid() {
 
     // Attach a viewer and drive its App from the wire.
     let mut viewer = daemon.connect();
-    viewer.send(&Request::Attach { terminal: None });
+    viewer.send(&Request::Attach {
+        terminal: None,
+        handoff: false,
+    });
 
     let mut app = App::new();
     match viewer.response() {
@@ -234,7 +237,10 @@ fn a_scripted_pane_focus_jumps_the_attached_client() {
     let second = cat_in_new_workspace();
 
     let mut viewer = daemon.connect();
-    viewer.send(&Request::Attach { terminal: None });
+    viewer.send(&Request::Attach {
+        terminal: None,
+        handoff: false,
+    });
     let mut app = App::new();
     let response = viewer.response();
     app.handle_frame(Frame::Control(serde_json::to_vec(&response).unwrap()));

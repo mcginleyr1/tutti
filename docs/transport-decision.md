@@ -286,6 +286,21 @@ forwarded verbatim to the PTY (kept binary for the lowest-latency keystroke path
 8. **Detach:** client → `Frame{Control,{"t":"detach"}}`; server drops the client and
    keeps every PTY and parser alive.
 
+## Edges handed on (wire rev 11)
+
+An attach may say `"handoff": true`: the client runs inside a terminal with
+panes of its own (rtty) and takes a move past tutti's edge on to them. The
+daemon then hands it more of what an editor's `pane focus` and `pane resize`
+find at tutti's edge:
+
+| Event | Sent to an attached client focused on the pane | When |
+| --- | --- | --- |
+| `{"type":"focus_edge","pane","toward"}` | any, for `left`/`right`; with `handoff` only, for `up`/`down` | a `pane_focus_toward` (no `wrap`) found no pane that way; the CLI exits 0 |
+| `{"type":"resize_edge","pane","toward"}` | with `handoff` only | a `pane_resize_toward` found no split on that axis |
+
+A missing `handoff` reads as `false`. An older client hands nothing on, and is
+never sent `resize_edge`.
+
 ## Raw pane streams for real terminals (wire rev 10)
 
 Option C rests on one premise: the client "is not a real terminal" — the TUI draws a

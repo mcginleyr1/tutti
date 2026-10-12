@@ -1061,7 +1061,12 @@ async fn attach_receives_snapshot_then_delta() {
     );
 
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach { terminal: None }).await;
+    viewer
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: false,
+        })
+        .await;
     match viewer.response().await {
         Response::Attached { workspaces, .. } => {
             assert!(
@@ -1116,7 +1121,12 @@ async fn snapshot_carries_mouse_reporting_mode() {
     );
 
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach { terminal: None }).await;
+    viewer
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: false,
+        })
+        .await;
     let _ = viewer.response().await;
 
     let bytes = expect_pane_frame(&mut viewer, pane, true).await.bytes;
@@ -1153,7 +1163,12 @@ async fn attach_resize_reseeds_at_new_size() {
     );
 
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach { terminal: None }).await;
+    viewer
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: false,
+        })
+        .await;
     let _ = viewer.response().await;
     let first = expect_pane_frame(&mut viewer, pane, true).await;
     assert_eq!((first.rows, first.cols), (24, 80));
@@ -1209,7 +1224,11 @@ async fn attach(
     Vec<tutti_core::WorkspaceView>,
     Option<tutti_core::RestoreSummary>,
 ) {
-    conn.send(&Request::Attach { terminal: None }).await;
+    conn.send(&Request::Attach {
+        terminal: None,
+        handoff: false,
+    })
+    .await;
     loop {
         if let Frame::Control(json) = conn.read_frame().await
             && let Ok(Response::Attached {
@@ -1407,7 +1426,12 @@ async fn resize_split_adjusts_ratio_and_broadcasts() {
 
     // Attach after the split so the only LayoutChanged the viewer sees is ours.
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach { terminal: None }).await;
+    viewer
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: false,
+        })
+        .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
 
     assert_eq!(
@@ -1457,7 +1481,12 @@ async fn split_ratio_sets_the_separating_split_and_broadcasts() {
 
     // Attach after the split so the only LayoutChanged the viewer sees is ours.
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach { terminal: None }).await;
+    viewer
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: false,
+        })
+        .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
 
     let drag = |a, b, ratio| Request::PaneSplitRatio { a, b, ratio };
@@ -1544,11 +1573,20 @@ async fn wedged_client_is_dropped_but_others_keep_flowing() {
 
     // Attaches, then never reads again: its bounded queue will fill.
     let mut wedged = server.connect().await;
-    wedged.send(&Request::Attach { terminal: None }).await;
+    wedged
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: false,
+        })
+        .await;
 
     // Attaches and will keep draining.
     let mut good = server.connect().await;
-    good.send(&Request::Attach { terminal: None }).await;
+    good.send(&Request::Attach {
+        terminal: None,
+        handoff: false,
+    })
+    .await;
     assert!(matches!(good.response().await, Response::Attached { .. }));
 
     // Flood a pane with bells; each becomes a broadcast frame, so the
@@ -2170,7 +2208,13 @@ async fn a_requests_req_rides_back_on_its_answer() {
 
     let mut viewer = server.connect().await;
     viewer
-        .write_frame(&tagged(Some(10), Request::Attach { terminal: None }))
+        .write_frame(&tagged(
+            Some(10),
+            Request::Attach {
+                terminal: None,
+                handoff: false,
+            },
+        ))
         .await;
     assert_eq!(answer(&mut viewer).await.req, Some(10));
     conn.send(&Request::PaneKill { pane }).await;
@@ -2587,7 +2631,12 @@ async fn agent_event_blocks_and_broadcasts() {
     let pane = run_sleeper(&mut control).await;
 
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach { terminal: None }).await;
+    viewer
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: false,
+        })
+        .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
 
     assert_eq!(
@@ -2630,7 +2679,12 @@ fn approval(response: Response) -> ApprovalDecision {
 /// Connect a client and attach it, so a hold has someone to answer it.
 async fn attached_viewer(server: &TestServer) -> Conn {
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach { terminal: None }).await;
+    viewer
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: false,
+        })
+        .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
     viewer
 }
@@ -2968,7 +3022,11 @@ async fn notifications_and_attention_transitions_land_in_the_history() {
     );
 
     let mut late = server.connect().await;
-    late.send(&Request::Attach { terminal: None }).await;
+    late.send(&Request::Attach {
+        terminal: None,
+        handoff: false,
+    })
+    .await;
     let caught_up = timeout(DEADLINE, async {
         loop {
             if let Frame::Control(json) = late.read_frame().await
@@ -3321,7 +3379,12 @@ async fn a_shell_panes_own_status_reports_drive_its_state() {
             .await,
     );
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach { terminal: None }).await;
+    viewer
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: false,
+        })
+        .await;
     let label = |p: &PaneInfo| p.agent.as_ref().map(ToString::to_string);
 
     printf_osc(&mut control, pane, "9;4;1;40").await;
@@ -3531,7 +3594,12 @@ async fn agent_state_changes_working_then_blocked() {
     );
 
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach { terminal: None }).await;
+    viewer
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: false,
+        })
+        .await;
 
     let mut order = Vec::new();
 
@@ -3731,7 +3799,12 @@ async fn a_mirror_fingerprints_like_the_live_grid() {
     assert!(read_until(&mut control, pane, "phase one").await);
 
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach { terminal: None }).await;
+    viewer
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: false,
+        })
+        .await;
     let mut mirror = None;
     let live = fingerprint(&mut control, pane).await;
     mirror_until(&mut viewer, pane, &mut mirror, &live).await;
@@ -3966,7 +4039,12 @@ async fn ephemeral_pane_vanishes_on_child_exit() {
     new_workspace(&mut control).await;
 
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach { terminal: None }).await;
+    viewer
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: false,
+        })
+        .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
 
     let pane = pane_id(
@@ -4142,6 +4220,7 @@ async fn a_watcher_snapshots_the_session_beside_an_attached_client() {
     viewer
         .send(&Request::Attach {
             terminal: Some("com.mitchellh.ghostty".into()),
+            handoff: false,
         })
         .await;
     viewer.send(&Request::PaneFocus { pane }).await;
@@ -4207,7 +4286,12 @@ async fn a_scripted_focus_is_relayed_to_the_attached_client() {
     let (own, scripted) = (panes[0], panes[1]);
 
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach { terminal: None }).await;
+    viewer
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: false,
+        })
+        .await;
     viewer.send(&Request::PaneFocus { pane: own }).await;
     let relayed = |json: &[u8]| match serde_json::from_slice(json) {
         Ok(Event::PaneFocused { pane }) => Some(pane),
@@ -4302,7 +4386,12 @@ async fn directional_focus_and_resize_start_from_the_named_or_attached_pane() {
     );
 
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach { terminal: None }).await;
+    viewer
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: false,
+        })
+        .await;
     viewer.send(&Request::PaneFocus { pane: left }).await;
     read_until_control(&mut viewer, |r: &Response| *r == Response::Ok).await;
 
@@ -4393,6 +4482,79 @@ async fn directional_focus_and_resize_start_from_the_named_or_attached_pane() {
     server.stop().await;
 }
 
+/// A client that hands moves on (rtty's, `Attach`'s `handoff`) is handed the
+/// top and bottom edges too, and a resize no split of tutti's takes: the
+/// editor's move goes on through tutti to the terminal tutti runs in. A
+/// resize a split takes stays tutti's.
+#[tokio::test]
+async fn a_handoff_client_takes_every_edge_and_unsplit_resizes() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    new_workspace(&mut control).await;
+    let run = Request::PaneRun {
+        tab: None,
+        cmd: vec!["/bin/cat".into()],
+        ephemeral: false,
+        sandbox: None,
+    };
+    let left = pane_id(control.request(run).await);
+    let split = Request::PaneSplit {
+        pane: left,
+        direction: Direction::Horizontal,
+    };
+    let right = pane_id(control.request(split).await);
+    let mut viewer = server.connect().await;
+    viewer
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: true,
+        })
+        .await;
+    viewer.send(&Request::PaneFocus { pane: right }).await;
+    read_until_control(&mut viewer, |r: &Response| *r == Response::Ok).await;
+
+    let up = Request::PaneFocusToward {
+        from: Some(right),
+        toward: Toward::Up,
+        wrap: false,
+    };
+    assert_eq!(
+        control.request(up).await,
+        Response::Neighbor {
+            from: right,
+            toward: Toward::Up,
+            pane: None,
+            relayed: true,
+        }
+    );
+    read_until_control(&mut viewer, |e: &Event| {
+        *e == Event::FocusEdge {
+            pane: right,
+            toward: Toward::Up,
+        }
+    })
+    .await;
+
+    let resize = |toward| Request::PaneResizeToward {
+        from: Some(right),
+        toward,
+        delta: 0.05,
+    };
+    assert_eq!(control.request(resize(Toward::Down)).await, Response::Ok);
+    read_until_control(&mut viewer, |e: &Event| {
+        *e == Event::ResizeEdge {
+            pane: right,
+            toward: Toward::Down,
+        }
+    })
+    .await;
+    assert_eq!(control.request(resize(Toward::Left)).await, Response::Ok);
+    let ratio = next_split_ratio(&mut viewer).await;
+    assert!((ratio - 0.45).abs() < 1e-3, "tutti's own split: {ratio}");
+
+    server.stop().await;
+}
+
 /// A pane's OSC 1337 user vars land on its `PaneInfo` — in `pane list`, the
 /// attached client's view and a watcher's snapshot — and an empty value
 /// unsets one.
@@ -4409,7 +4571,12 @@ async fn a_panes_user_vars_reach_its_listing_view_and_watchers() {
     };
     let pane = pane_id(control.request(run).await);
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach { terminal: None }).await;
+    viewer
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: false,
+        })
+        .await;
     let mut watcher = server.connect().await;
     watcher.send(&Request::Watch).await;
     let keys = |p: &PaneInfo| p.user_vars.get("TUTTI_KEYS").cloned();
@@ -4518,7 +4685,12 @@ async fn a_shell_side_jj_operation_refreshes_the_change_stat() {
             .await,
     );
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach { terminal: None }).await;
+    viewer
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: false,
+        })
+        .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
     // Let the watch take the repo's first mark, so the operation below is a
     // change it can see rather than its baseline.
@@ -4555,7 +4727,12 @@ async fn the_watch_ignores_the_probes_own_snapshot() {
             .await,
     );
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach { terminal: None }).await;
+    viewer
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: false,
+        })
+        .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
     sleep(Duration::from_millis(1500)).await;
 
@@ -4567,7 +4744,12 @@ async fn the_watch_ignores_the_probes_own_snapshot() {
     )
     .unwrap();
     let mut second = server.connect().await;
-    second.send(&Request::Attach { terminal: None }).await;
+    second
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: false,
+        })
+        .await;
     assert!(matches!(second.response().await, Response::Attached { .. }));
     assert!(
         wait_workspace_changes(&mut viewer, ws, "3 files", DEADLINE).await,
@@ -4676,7 +4858,12 @@ async fn fork_creates_sibling_checkout_with_a_shell_pane() {
     );
 
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach { terminal: None }).await;
+    viewer
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: false,
+        })
+        .await;
     let workspaces = match viewer.response().await {
         Response::Attached { workspaces, .. } => workspaces,
         other => panic!("expected Attached, got {other:?}"),
@@ -4843,7 +5030,12 @@ async fn fork_goes_stale_then_update_clears_it() {
 
     // Attaching triggers a refresh across all workspaces, flipping the stale flag.
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach { terminal: None }).await;
+    viewer
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: false,
+        })
+        .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
     assert!(
         wait_workspace_stale(&mut viewer, fork, true).await,
@@ -5511,7 +5703,12 @@ async fn a_turn_checkpoints_its_diff_and_restores_round_trip() {
     }
 
     let mut viewer = server.connect().await;
-    viewer.send(&Request::Attach { terminal: None }).await;
+    viewer
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: false,
+        })
+        .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
 
     // An edit no turn recorded is saved as `before restore` on the way back.

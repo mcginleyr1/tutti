@@ -636,6 +636,18 @@ In order; each lands its TUI path in the same wave as its verbs.
      Wire unchanged (rev 10). Acceptance: 99/99, the new checks undercurl in
      the TUI's bytes, nvim's insert-mode bar, Ctrl+I apart from Tab under a
      kitty terminal, focus events, and key modes left clean on detach.
+   - ✅ tutti knows rtty (wire rev 11): in an rtty pane (the client's
+     `RTTY_PANE` and a socket at `RTTY_SOCKET`) the TUI claims rtty's keys
+     (`RTTY_KEYS=pane`, given back on detach, panic and SIGTSTP) and hands a
+     move past its edge on to `rtty cli pane focus|resize`. Left and right go
+     past the sidebar or changes panel first, and to the tab wrap at rtty's
+     own edge. Top and bottom go to rtty only. Resize goes to rtty when tutti
+     has no split on that axis. `Attach.handoff` has the daemon hand such a
+     client an editor's top, bottom and resize edges too (`FocusEdge`,
+     `ResizeEdge`), so Neovim → tutti → rtty is one key. Panes no longer
+     inherit `RTTY_PANE`/`RTTY_SOCKET`. A link-only change of a cell always
+     redraws (`CellDiffOption::AlwaysUpdate`). Acceptance 113/113, the
+     harness playing rtty with a stub `rtty` on PATH.
    - Step 3, rtty itself.
    Open: answers to a pane's own queries are written by the answer thread,
    so keys typed through `pane send` can overtake a light/dark report the

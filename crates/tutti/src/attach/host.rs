@@ -66,9 +66,15 @@ pub fn link(cell: &mut Cell, at: Position, link: &Arc<Hyperlink>) {
 
 /// Enter raw mode and the alternate screen, and draw there.
 pub fn init() -> io::Result<ratatui::Terminal<Host>> {
-    enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    take()?;
     ratatui::Terminal::new(Host(CrosstermBackend::new(io::stdout())))
+}
+
+/// Enter raw mode and the alternate screen: at start, and again on resuming
+/// from a stop.
+pub fn take() -> io::Result<()> {
+    enable_raw_mode()?;
+    execute!(io::stdout(), EnterAlternateScreen)
 }
 
 pub struct Host(CrosstermBackend<Stdout>);

@@ -443,10 +443,11 @@ enum PaneAction {
     },
     /// Mark a pane focused (records it active and clears its Done badge) —
     /// or, with `--direction`, the pane beside one, printing its id. At a
-    /// left or right edge the attached TUI showing that pane takes the move on
-    /// as Ctrl+h/l would (sidebar, changes panel, next tab) and nothing
-    /// prints; at any other edge it says `no pane <direction> of <id>` on
-    /// stderr and exits 1.
+    /// left or right edge (at any edge, from a TUI running in rtty) the
+    /// attached TUI showing that pane takes the move on as Ctrl+h/j/k/l would
+    /// (sidebar, changes panel, rtty's panes, next tab) and nothing prints; at
+    /// any other edge it says `no pane <direction> of <id>` on stderr and
+    /// exits 1.
     Focus {
         /// The pane to focus.
         #[arg(
@@ -466,7 +467,7 @@ enum PaneAction {
         wrap: bool,
     },
     /// Move the border of the split beside a pane toward a side, as the TUI's
-    /// Alt+h/j/k/l do.
+    /// Alt+h/j/k/l do; with no such split, a TUI in rtty moves rtty's.
     Resize {
         /// The way the border moves.
         #[arg(long, value_enum)]

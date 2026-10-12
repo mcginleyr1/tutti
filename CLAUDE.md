@@ -83,7 +83,15 @@ cargo fmt --check
   lost to the buffer diff. A widget drawn over pane cells must reset them
   (`Clear`), or a pane cell's bits and link ride into it. Whatever the TUI turns on in its terminal beyond raw mode and the
   alternate screen — mouse capture, focus reports, kitty's keyboard flags, a
-  cursor shape — `leave` (attach/mod.rs) hands back, on detach and on a panic.
+  cursor shape, the claim on rtty's keys (`RTTY_KEYS=pane`) — `leave`
+  (attach/mod.rs) hands back, on detach, on a panic and before a SIGTSTP stop
+  (`suspend`, which `enter`s again on resume). An exit path that skips it
+  strands rtty's keys with a TUI that is gone or stopped.
+- **Top, bottom and resize edges go only to a client that attached with
+  `handoff`** (`relay_edge`, server.rs; the TUI in rtty): left and right
+  `FocusEdge`s go to every client focused there. A plain client handed an
+  upper edge would make `tutti pane focus` exit 0 for a move nobody takes, and
+  an editor outside rtty would think it moved.
 - **Shutdown order** (`serve`, server.rs): abort *and await* the layout saver,
   write the final save, then `kill_all`. A save after `kill_all` — or a saver
   tick racing the final write — records a layout with every pane gone. An empty

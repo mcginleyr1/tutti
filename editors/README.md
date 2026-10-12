@@ -38,12 +38,16 @@ editor's own `$TUTTI_PANE`:
   exits 0 and prints the new pane's id when focus moved. At a left or right
   edge of the pane the attached TUI shows focused, the TUI goes on as its own
   `Ctrl+h`/`Ctrl+l` would — into the sidebar or the changes panel, else to the
-  previous or next tab — and the command exits 0, printing nothing. At any
-  other edge it exits 1 with `no pane <direction> of <pane>`. `--wrap` takes
-  the farthest pane on the other side of the tab instead.
+  previous or next tab — and the command exits 0, printing nothing. A TUI
+  running in rtty takes the top and bottom edges on too (see
+  [Inside rtty](#inside-rtty)). At any other edge it exits 1 with `no pane
+  <direction> of <pane>`. `--wrap` takes the farthest pane on the other side
+  of the tab instead.
 - `tutti pane resize --direction <left|right|up|down> [--amount <ratio>]
   --from <pane>` moves the nearest split border that way, exactly as
   `Alt+h/j/k/l` do. The amount is a fraction of the split, 0.05 by default.
+  With no split of tutti's on that axis, a TUI in rtty moves rtty's split
+  instead.
 
 ## Neovim
 
@@ -199,6 +203,26 @@ the reason appears in the echo area. `y` and `n` read the held approval from
 `tutti --json pane list`, and refuse when the pane holds none.
 
 `tutti-program` (default `"tutti"`) names the executable.
+
+## Inside rtty
+
+When tutti's TUI runs in an [rtty](https://github.com/mcginleyr1/rtty) pane,
+it claims rtty's keys (`RTTY_KEYS=pane`) and hands a move past its own edge on
+to `rtty cli pane focus|resize --from $RTTY_PANE`. The plugins need nothing
+more for the chain Neovim or Emacs → tutti → rtty to work with one key:
+
+1. At the editor's edge, the plugin calls `tutti pane focus` or `tutti pane
+   resize`, as above.
+2. The daemon finds no pane or split of tutti's that way and hands the move to
+   the TUI.
+3. The TUI goes on as its own key would: into the sidebar or the changes panel
+   first, left and right; then to rtty's pane that way.
+4. At rtty's own left or right edge, the TUI wraps to the previous or next
+   tab.
+
+The CLI exits 0 once the TUI has the move, so the plugin reads "moved" even
+when rtty's own edge then stops it. tutti's README has the whole edge table,
+under "tutti in rtty".
 
 ## Tests
 

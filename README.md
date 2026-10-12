@@ -291,7 +291,7 @@ Direct keys work without the prefix (smart-splits / zellij-nav muscle memory):
 | --- | --- |
 | `Ctrl+h/j/k/l` | focus the pane to the left/down/up/right |
 | `Ctrl+h` at the left edge | step into the sidebar (when visible), then the previous tab |
-| `Ctrl+l` at the right edge | move to the next tab |
+| `Ctrl+l` at the right edge | step into the changes panel (when visible), then the next tab |
 | `Alt+h/j/k/l` | resize the focused split toward that direction |
 | `Alt+x` | kill the focused pane (confirms) |
 
@@ -306,6 +306,9 @@ plugins set), the direct keys reach the pane as its own bytes. An editor then
 moves through its own splits first and calls `tutti pane focus --direction` at
 its edge (see [Editors in panes](#editors-in-panes)). The prefix is never handed
 over, and a pane whose program exited claims nothing.
+
+Run the TUI in an [rtty](https://github.com/mcginleyr1/rtty) pane and a move
+past tutti's own edge goes on to rtty's panes: see [tutti in rtty](#tutti-in-rtty).
 
 Everything else lives behind the prefix (`Ctrl+B` by default). The `default`
 preset:
@@ -432,7 +435,8 @@ Sidebar edge-nav: at a pane's **left edge**, `Ctrl+h` steps into the sidebar whe
 it is visible (nvim-explorer muscle memory) instead of jumping straight to the
 previous tab; from the sidebar, `Ctrl+l` returns to the pane you left and `Ctrl+h`
 goes on to the previous tab. With the sidebar hidden the left edge wraps to the
-previous tab as before.
+previous tab as before. In rtty, rtty's pane to the left comes before that tab
+([tutti in rtty](#tutti-in-rtty)).
 
 Mouse: click focuses a pane, click a tab segment or sidebar entry to jump.
 Drag the border between two panes to resize their split: grab the frame column
@@ -530,13 +534,71 @@ pane, else the attached TUI's focused pane. A focus prints the pane it moved
 to. At a left or right edge of the pane the attached TUI shows focused, the
 TUI takes the move on as `Ctrl+h`/`Ctrl+l` would — into the sidebar or the
 changes panel, else to the previous or next tab — and the command prints
-nothing and exits 0, so an editor's edge leads where tutti's own keys do. At
-any other edge it prints `no pane <direction> of <id>` on stderr and exits 1,
-unless `--wrap` goes round to the farthest pane on the other side of the tab,
-level with it. A resize moves the nearest split border that
-way by `--amount` of the split (0.05, the `Alt+h/j/k/l` step). See
-[Known limitations](#known-limitations) for what an editor in a pane does not
-get yet.
+nothing and exits 0, so an editor's edge leads where tutti's own keys do. A
+TUI running in rtty takes the top and bottom edges on the same way, out to
+rtty's panes ([tutti in rtty](#tutti-in-rtty)). At any other edge it prints
+`no pane <direction> of <id>` on stderr and exits 1, unless `--wrap` goes
+round to the farthest pane on the other side of the tab, level with it. A
+resize moves the nearest split border that way by `--amount` of the split
+(0.05, the `Alt+h/j/k/l` step); with no split of tutti's on that axis, a TUI
+in rtty moves rtty's instead. See [Known limitations](#known-limitations) for
+what an editor in a pane does not get yet.
+
+## tutti in rtty
+
+[rtty](https://github.com/mcginleyr1/rtty) is a terminal with panes of its
+own. Run the TUI in an rtty pane, and one set of keys moves through Neovim's
+windows, tutti's panes and rtty's panes alike: `Ctrl+h/j/k/l` to focus, and
+`Alt+h/j/k/l` to resize.
+
+The TUI knows it runs in rtty from its own environment, the one the terminal
+you attach from gives it: `RTTY_PANE` set and `RTTY_SOCKET` naming a socket.
+XTVERSION cannot tell, because rtty and tutti's own panes both answer as
+`rtty-vt`. The daemon's environment never counts, and its panes never see
+either variable. In rtty, the TUI does three things:
+
+- **It claims rtty's keys.** On attach it sets the user var `RTTY_KEYS=pane`
+  in its rtty pane. Under rtty's `keys = "tutti"`, rtty then hands its
+  `Ctrl/Alt+h/j/k/l` to the TUI instead of acting on them.
+- **It gives the keys back** (an empty `RTTY_KEYS`) on detach, on a panic,
+  and when stopped. The keys can't stop it, since raw mode sends `Ctrl-Z` to
+  the pane, but `kill -TSTP` does, and the shell beneath gets rtty's keys
+  while it waits. On `fg` the TUI claims them again and redraws.
+- **It hands a move past its own edge on to rtty.** It runs
+  `rtty cli pane focus --direction <d> --from $RTTY_PANE` or `rtty cli pane
+  resize …`, off its event loop, and gives rtty 500 ms to answer.
+
+Where `Ctrl+h/j/k/l` leads past the focused pane's edge:
+
+| Edge | Goes to |
+| --- | --- |
+| left | the sidebar when visible, then rtty's pane to the left. At rtty's own edge (`rtty cli` exits 1), the previous tab |
+| right | the changes panel when visible, then rtty's pane to the right. At rtty's own edge, the next tab |
+| top, bottom | rtty's pane above or below. At rtty's edge, nowhere |
+
+The order follows what is on screen. tutti's panels are part of its screen,
+so they come first, as they do outside rtty. rtty's panes are on screen and
+tutti's other tabs are not, so rtty's panes come next. The tab wrap is the
+fallback at rtty's edge, so `Ctrl+h/l` still reaches every tab.
+
+`Alt+h/j/k/l` resizes tutti's split when the focused pane has one on that
+axis, else rtty's (`rtty cli pane resize --direction <d> --from
+$RTTY_PANE`).
+
+These stay tutti's alone:
+- the prefix's `h/j/k/l`, which only ever move between tutti's panes;
+- the changes panel's own `l`, which goes to the next tab.
+
+An editor holding tutti's keys carries the chain on, with the same key at
+every step:
+1. Neovim with `keys = true`, or Emacs's `tutti-windmove-*`, calls `tutti
+   pane focus --direction` at its own edge.
+2. The daemon hands that move to the TUI (in rtty, at the top and bottom edges
+   too), which goes on as its own key would.
+3. So one `Ctrl+k` in Neovim's top window lands in rtty's pane above.
+
+An editor's `tutti pane resize` that no split of tutti's takes moves rtty's
+split in the same way.
 
 ## Shell integration
 
@@ -1626,3 +1688,7 @@ tutti is alpha; PLAN.md tracks what is open.
 - **The TUI hears no light/dark switch while attached** (above), and a pane's
   program that asked for key releases or the text of a key (kitty's flags 2
   and 16) gets presses only: the TUI asks your terminal for neither.
+- **In rtty, an editor's move off tutti's edge always reads as made.** The
+  TUI takes it on and `tutti pane focus` exits 0, even where rtty's own edge
+  then stops it. An editor that does something of its own when tutti
+  reports no move does not do it there.

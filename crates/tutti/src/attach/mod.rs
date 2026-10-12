@@ -12,6 +12,7 @@ mod layout;
 mod navigate;
 pub mod raw;
 mod render;
+mod rtty;
 mod sidebar;
 mod theme;
 
@@ -22,6 +23,7 @@ pub use app::App;
 use app::{control, tagged};
 
 use std::io;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -32,6 +34,7 @@ use ratatui::crossterm::event::{
     PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::{execute, terminal};
+use signal_hook::consts::SIGTSTP;
 use tutti_core::{PaneId, Request};
 
 use connection::Connection;
@@ -54,9 +57,16 @@ pub fn run(
 ) -> Result<()> {
     let mut conn = Connection::open(session)?;
     // macOS names the GUI app a process was launched under; watchers raise it.
-    // Tagged, so the reply shows whether the daemon echoes a request's `req`.
+    // In rtty, a move past tutti's edge goes on to rtty's panes — the daemon
+    // hands this client a program's moves at every edge for that. Tagged, so
+    // the reply shows whether the daemon echoes a request's `req`.
     let terminal = std::env::var("__CFBundleIdentifier").ok();
-    conn.send(&tagged(&Request::Attach { terminal }, 0))
+    let rtty = rtty::pane();
+    let attach = Request::Attach {
+        terminal,
+        handoff: rtty.is_some(),
+    };
+    conn.send(&tagged(&attach, 0))
         .context("send attach request")?;
 
     // Asked before crossterm owns input. It stays the attach-time answer: the
@@ -70,41 +80,95 @@ pub fn run(
     }
     let mut terminal = host::init().context("take the terminal")?;
     install_panic_hook();
-    if config.mouse {
-        let _ = execute!(io::stdout(), EnableMouseCapture);
-    }
-    // The terminal's focus, for the panes that ask to hear of theirs.
-    let _ = execute!(io::stdout(), EnableFocusChange);
-    // A terminal that speaks kitty's keyboard protocol tells keys apart that
-    // plain bytes cannot — Ctrl+I from Tab, Esc from Alt — for the panes
-    // that asked for them (`input::encode_key`). Its own stack takes the
-    // flags, popped on the way out.
-    if terminal::supports_keyboard_enhancement().unwrap_or(false) {
-        let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-            | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS;
-        let pushed = execute!(io::stdout(), PushKeyboardEnhancementFlags(flags)).is_ok();
-        KEYS_PUSHED.store(pushed, Ordering::SeqCst);
-    }
+    let modes = Modes {
+        mouse: config.mouse,
+        keys: terminal::supports_keyboard_enhancement().unwrap_or(false),
+        rtty: rtty.is_some(),
+    };
+    enter(modes);
+    // A `kill -TSTP` (the keys cannot send one: raw mode) stops the TUI
+    // only once it has handed the terminal back (`suspend`).
+    let stop = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(SIGTSTP, Arc::clone(&stop)).context("watching for SIGTSTP")?;
 
-    let result = event_loop(&mut terminal, &mut conn, config, first_run, notice);
+    let result = event_loop(
+        &mut terminal,
+        &mut conn,
+        config,
+        first_run,
+        notice,
+        (modes, rtty, stop),
+    );
 
     leave();
     ratatui::restore();
     result
 }
 
-/// Whether the terminal's keyboard flags were pushed, for `leave` to pop.
+/// What the TUI turns on in its terminal beyond raw mode and the alternate
+/// screen: mouse capture, kitty's keyboard flags where the terminal speaks
+/// the protocol, the claim on rtty's keys in rtty — and focus reports.
+#[derive(Clone, Copy)]
+struct Modes {
+    mouse: bool,
+    keys: bool,
+    rtty: bool,
+}
+
+/// Whether the terminal's keyboard flags were pushed, for `leave` to pop,
+/// and whether rtty's keys were claimed, for it to give back.
 static KEYS_PUSHED: AtomicBool = AtomicBool::new(false);
+static RTTY_CLAIMED: AtomicBool = AtomicBool::new(false);
+
+/// Turn on what `modes` asks for.
+/// - Focus reports: the terminal's focus, for the panes that ask to hear of
+///   theirs.
+/// - Kitty's keyboard flags, on the terminal's own stack: it then tells keys
+///   apart that plain bytes cannot — Ctrl+I from Tab, Esc from Alt — for the
+///   panes that asked for them (`input::encode_key`).
+/// - rtty's keys: rtty's `keys = "tutti"` Ctrl/Alt+h/j/k/l then reach tutti,
+///   which hands a move past its own edge back to rtty (`rtty`).
+fn enter(modes: Modes) {
+    if modes.mouse {
+        let _ = execute!(io::stdout(), EnableMouseCapture);
+    }
+    let _ = execute!(io::stdout(), EnableFocusChange);
+    if modes.keys {
+        let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS;
+        let pushed = execute!(io::stdout(), PushKeyboardEnhancementFlags(flags)).is_ok();
+        KEYS_PUSHED.store(pushed, Ordering::SeqCst);
+    }
+    if modes.rtty {
+        emit_terminal(rtty::CLAIM);
+        RTTY_CLAIMED.store(true, Ordering::SeqCst);
+    }
+}
 
 /// Hand back what the TUI changed in the terminal beyond what
-/// `ratatui::restore` does: mouse capture, focus reports, the cursor's shape
-/// and the keyboard flags. Safe to run twice.
+/// `ratatui::restore` does: mouse capture, focus reports, the cursor's shape,
+/// the keyboard flags and the claim on rtty's keys. Safe to run twice.
 fn leave() {
     let _ = execute!(io::stdout(), DisableMouseCapture, DisableFocusChange);
     if KEYS_PUSHED.swap(false, Ordering::SeqCst) {
         let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
     }
+    if RTTY_CLAIMED.swap(false, Ordering::SeqCst) {
+        emit_terminal(rtty::RELEASE);
+    }
     emit_terminal(b"\x1b[0 q");
+}
+
+/// Stop as a SIGTSTP asks, the terminal handed back first — so the shell
+/// gets rtty's keys back with it — and take it again on `fg`, drawn afresh.
+fn suspend(terminal: &mut ratatui::Terminal<host::Host>, modes: Modes) -> Result<()> {
+    leave();
+    ratatui::restore();
+    signal_hook::low_level::emulate_default_handler(SIGTSTP).context("stopping")?;
+    host::take().context("take the terminal again")?;
+    enter(modes);
+    terminal.clear().context("redraw the terminal")?;
+    Ok(())
 }
 
 fn event_loop(
@@ -113,9 +177,11 @@ fn event_loop(
     config: Config,
     first_run: Option<String>,
     notice: Option<String>,
+    (mut modes, rtty, stop): (Modes, Option<String>, Arc<AtomicBool>),
 ) -> Result<()> {
     let mut captured = config.mouse;
     let mut app = App::with_config(config);
+    app.in_rtty(rtty);
     if let Some(prefill) = first_run {
         app.start_first_run_prompt(prefill);
     }
@@ -130,8 +196,14 @@ fn event_loop(
     // the editors the changes panel hands files to.
     let (issues_tx, issues_rx) = std::sync::mpsc::channel();
     let (editor_tx, editor_rx) = std::sync::mpsc::channel::<(PaneId, String, Result<(), String>)>();
+    // So does `rtty cli`, a move handed on past tutti's edge.
+    let (rtty_tx, rtty_rx) = std::sync::mpsc::channel();
 
     loop {
+        if stop.swap(false, Ordering::SeqCst) {
+            suspend(terminal, modes)?;
+            dirty = true;
+        }
         match conn.drain() {
             Ok(frames) => {
                 if !frames.is_empty() {
@@ -151,6 +223,12 @@ fn event_loop(
         }
         while let Ok((pane, file, opened)) = editor_rx.try_recv() {
             for frame in app.editor_opened(pane, &file, opened) {
+                let _ = conn.send(&frame);
+            }
+            dirty = true;
+        }
+        while let Ok((job, moved)) = rtty_rx.try_recv() {
+            for frame in app.rtty_done(job, moved) {
                 let _ = conn.send(&frame);
             }
             dirty = true;
@@ -228,11 +306,20 @@ fn event_loop(
                 let _ = tx.send((job.pane, job.file, opened));
             });
         }
+        // And `rtty cli`, from the rtty pane the TUI runs in.
+        for (pane, job) in app.take_rtty_jobs() {
+            let tx = rtty_tx.clone();
+            std::thread::spawn(move || {
+                let moved = rtty::hand_off("rtty", &pane, job.handoff);
+                let _ = tx.send((job, moved));
+            });
+        }
 
         // The mouse-toggle key releases/re-grabs capture so the terminal's own
         // selection and copy work while released.
         if app.mouse_capture() != captured {
             captured = app.mouse_capture();
+            modes.mouse = captured;
             if captured {
                 let _ = execute!(io::stdout(), EnableMouseCapture);
             } else {

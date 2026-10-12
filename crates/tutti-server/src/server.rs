@@ -99,6 +99,9 @@ struct Client {
     view: Vec<PaneDims>,
     /// The terminal app the client runs in, from its `Attach`, for watchers.
     terminal: Option<String>,
+    /// The client hands a move past tutti's edge on to the terminal it runs
+    /// in (rtty), from its `Attach`: it takes top, bottom and resize edges too.
+    handoff: bool,
     /// The pane the client last reported focused — what it shows, for watchers.
     focused: Option<PaneId>,
 }
@@ -579,7 +582,7 @@ fn handle_frame(
     };
     match frame {
         Frame::Control(json) => match serde_json::from_slice::<Request>(&json) {
-            Ok(Request::Attach { terminal }) => {
+            Ok(Request::Attach { terminal, handoff }) => {
                 // Register this client before snapshotting the view, so a
                 // StateChanged/LayoutChanged broadcast in the gap is delivered
                 // (an early or duplicate event the client applies idempotently)
@@ -596,6 +599,7 @@ fn handle_frame(
                         seen: HashSet::new(),
                         view: Vec::new(),
                         terminal,
+                        handoff,
                         focused: None,
                     },
                 );
@@ -1074,7 +1078,10 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             pane,
             direction,
             delta,
-        } => resize_split(hub, pane, direction, delta),
+        } => match resize_split(hub, pane, direction, delta) {
+            Ok(_) => Response::Ok,
+            Err(err) => error(err),
+        },
         Request::PaneResizeToward {
             from,
             toward,
@@ -1090,7 +1097,17 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
                 Toward::Up => (Direction::Vertical, -delta),
                 Toward::Down => (Direction::Vertical, delta),
             };
-            resize_split(hub, pane, axis, delta)
+            match resize_split(hub, pane, axis, delta) {
+                // No split of tutti's that way: a client that hands moves on
+                // resizes its terminal's split instead.
+                Ok(false) => {
+                    let edge = Event::ResizeEdge { pane, toward };
+                    relay_edge(hub, pane, edge, |client| client.handoff);
+                    Response::Ok
+                }
+                Ok(true) => Response::Ok,
+                Err(err) => error(err),
+            }
         }
         Request::View => Response::View {
             workspaces: hub.session().view(),
@@ -1166,20 +1183,18 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
 }
 
 /// Adjust the ratio of the nearest matching-axis split enclosing `pane` and
-/// broadcast the fresh view. The attached client re-syncs pane sizes off the
-/// new layout, so the ptys resize and reseed on the next tick.
-fn resize_split(hub: &Arc<Hub>, pane: PaneId, axis: Direction, delta: f32) -> Response {
+/// broadcast the fresh view; whether there was such a split. The attached
+/// client re-syncs pane sizes off the new layout, so the ptys resize and
+/// reseed on the next tick.
+fn resize_split(hub: &Arc<Hub>, pane: PaneId, axis: Direction, delta: f32) -> Result<bool> {
     let mut session = hub.session();
-    match session.pane_resize_split(pane, axis, delta) {
-        Ok(true) => {
-            let view = session.view();
-            drop(session);
-            broadcast_event(hub, Event::LayoutChanged { workspaces: view });
-            Response::Ok
-        }
-        Ok(false) => Response::Ok,
-        Err(err) => error(err),
+    let resized = session.pane_resize_split(pane, axis, delta)?;
+    if resized {
+        let view = session.view();
+        drop(session);
+        broadcast_event(hub, Event::LayoutChanged { workspaces: view });
     }
+    Ok(resized)
 }
 
 /// Type `bytes` into `pane` (an `Input` frame or a plain `PaneSend`),
@@ -1248,10 +1263,11 @@ fn focus_pane(hub: &Arc<Hub>, cid: u64, pane: PaneId) -> Response {
 }
 
 /// Focus the pane `toward` of `from` as `focus_pane` does, and answer which it
-/// was — `None` at an edge, where nothing moves here. At a left or right edge
-/// (no `wrap`), each attached client focused on `from` is handed the move
-/// (`FocusEdge`): an editor holding the direct keys then reaches the sidebar,
-/// the changes panel or the next tab, as the key itself would.
+/// was — `None` at an edge, where nothing moves here. At an edge (no `wrap`),
+/// each attached client focused on `from` is handed the move (`FocusEdge`):
+/// an editor holding the direct keys then reaches the sidebar, the changes
+/// panel or the next tab, as the key itself would — or, from a client that
+/// hands moves on, the rtty pane beyond, at the top and bottom edges too.
 fn focus_toward(
     hub: &Arc<Hub>,
     cid: u64,
@@ -1270,7 +1286,14 @@ fn focus_toward(
         Err(err) => return error(err),
     };
     let sideways = matches!(toward, Toward::Left | Toward::Right);
-    let relayed = pane.is_none() && sideways && !wrap && focus_edge(hub, from, toward);
+    let relayed = pane.is_none()
+        && !wrap
+        && relay_edge(
+            hub,
+            from,
+            Event::FocusEdge { pane: from, toward },
+            |client| sideways || client.handoff,
+        );
     match pane.map(|pane| focus_pane(hub, cid, pane)) {
         None | Some(Response::Ok) => Response::Neighbor {
             from,
@@ -1282,15 +1305,16 @@ fn focus_toward(
     }
 }
 
-/// Send `FocusEdge` to each attached client focused on `pane`; whether any
-/// was.
-fn focus_edge(hub: &Hub, pane: PaneId, toward: Toward) -> bool {
-    let bytes = encode_json(&Event::FocusEdge { pane, toward });
+/// Send `edge` to each attached client focused on `pane` that `takes` it;
+/// whether any did.
+fn relay_edge(hub: &Hub, pane: PaneId, edge: Event, takes: impl Fn(&Client) -> bool) -> bool {
+    let bytes = encode_json(&edge);
     let mut doomed = Vec::new();
     let mut sent = false;
     {
         let clients = hub.clients();
-        for (cid, client) in clients.iter().filter(|(_, c)| c.focused == Some(pane)) {
+        let focused = |c: &&Client| c.focused == Some(pane) && takes(c);
+        for (cid, client) in clients.iter().filter(|(_, c)| focused(c)) {
             match client.tx.try_send(bytes.clone()) {
                 Ok(()) => sent = true,
                 Err(_) => doomed.push(*cid),
@@ -3006,7 +3030,10 @@ mod tests {
         let vote = |rows, cols| Request::ViewSizes {
             panes: vec![PaneDims { pane, rows, cols }],
         };
-        let attach = Request::Attach { terminal: None };
+        let attach = Request::Attach {
+            terminal: None,
+            handoff: false,
+        };
         viewer.request(&attach).await;
         assert_eq!(viewer.request(&vote(20, 60)).await, Response::Ok);
         let mut doomed = Peer::connect(&path).await;
@@ -3105,7 +3132,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        peer.request(&Request::Attach { terminal: None }).await;
+        peer.request(&Request::Attach {
+            terminal: None,
+            handoff: false,
+        })
+        .await;
         peer.until(|frame| match frame {
             Frame::PaneSnapshot(data) => (data.pane == pane
                 && data.bytes.windows(10).any(|bytes| bytes == b"last words"))
@@ -3168,7 +3199,12 @@ mod tests {
         let [reading, drawing, beside] = panes[..] else {
             unreachable!()
         };
-        viewer.request(&Request::Attach { terminal: None }).await;
+        viewer
+            .request(&Request::Attach {
+                terminal: None,
+                handoff: false,
+            })
+            .await;
         let send = |pane, text: &str| Request::PaneSend {
             pane,
             text: Some(text.into()),

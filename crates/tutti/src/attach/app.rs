@@ -28,6 +28,7 @@ use super::input;
 use super::launcher::{self, LaunchKind, LauncherRow};
 use super::layout::{Boundary, boundaries, pane_rects};
 use super::navigate;
+use super::rtty::Handoff;
 use super::sidebar::{self, Sidebar, SidebarEntry};
 use crate::config::{
     self, Action, ChangesAction, Config, PrefixAction, RESIZE_DELTA, SidebarAction,
@@ -286,6 +287,11 @@ pub struct App {
     host_focused: bool,
     /// The pane last told it has the focus (`focus_reports`).
     focus_reported: Option<PaneId>,
+    /// The rtty pane the TUI runs in, when it runs in one (`rtty::pane`):
+    /// a move past tutti's edge goes on to rtty (`rtty_jobs`).
+    rtty: Option<String>,
+    /// Moves handed on to rtty, for the event loop to run (`take_rtty_jobs`).
+    rtty_jobs: Vec<RttyJob>,
     /// Set when a non-focused pane finished or blocked; the event loop rings the
     /// terminal bell once and clears it.
     bell: bool,
@@ -511,6 +517,8 @@ impl App {
             focus_sent: None,
             host_focused: true,
             focus_reported: None,
+            rtty: None,
+            rtty_jobs: Vec::new(),
             bell: false,
             prefix_since: None,
             sidebar_selected: 0,
@@ -657,6 +665,40 @@ impl App {
         }
         self.focused
             .map(|pane| control(&Request::PaneFocus { pane }))
+    }
+
+    /// The TUI runs in rtty pane `pane`: moves past tutti's edge go on to
+    /// rtty from here on.
+    pub fn in_rtty(&mut self, pane: Option<String>) {
+        self.rtty = pane;
+    }
+
+    /// The moves handed on to rtty since the last call, for the event loop
+    /// to run (`rtty::hand_off`), each with the rtty pane they start from.
+    pub fn take_rtty_jobs(&mut self) -> Vec<(String, RttyJob)> {
+        let jobs = std::mem::take(&mut self.rtty_jobs);
+        match &self.rtty {
+            Some(pane) => jobs.into_iter().map(|job| (pane.clone(), job)).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// rtty did `job`'s move, or not (`moved`): at rtty's own left or right
+    /// edge too, the move falls back to tutti's own — the next tab that way.
+    pub fn rtty_done(&mut self, job: RttyJob, moved: bool) -> Vec<WireFrame> {
+        match job.fallback {
+            Some(step) if !moved => self.switch_tab(step),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Hand `handoff` on to rtty when the TUI runs in it — `fallback` the
+    /// tab step to take should rtty not move — and say whether it did.
+    fn rtty_handoff(&mut self, handoff: Handoff, fallback: Option<isize>) -> bool {
+        if self.rtty.is_some() {
+            self.rtty_jobs.push(RttyJob { handoff, fallback });
+        }
+        self.rtty.is_some()
     }
 
     /// The terminal the TUI runs in gained or lost the focus.
@@ -878,6 +920,13 @@ impl App {
                         Toward::Up => FocusDir::Up,
                         Toward::Down => FocusDir::Down,
                     });
+                }
+            }
+            // The program holding the direct keys asked tutti to resize, and
+            // no split of tutti's takes it: rtty's does.
+            Event::ResizeEdge { pane, toward } => {
+                if self.mode == Mode::Terminal && self.focused == Some(pane) {
+                    self.rtty_handoff(Handoff::Resize(toward), None);
                 }
             }
             Event::PaneOutput { .. } | Event::Snapshot { .. } => {}
@@ -1275,20 +1324,15 @@ impl App {
         true
     }
 
-    /// Perform a direct-binding action: directional focus (with edge-to-tab
-    /// wrap on left/right), split resize, or killing the focused pane.
+    /// Perform a direct-binding action: directional focus (past the edge on
+    /// to a panel, rtty or the next tab: `focus_or_tab`), split resize, or
+    /// killing the focused pane.
     fn direct_action(&mut self, action: Action) -> Vec<WireFrame> {
         match action {
             Action::FocusLeft => self.focus_or_tab(FocusDir::Left),
             Action::FocusRight => self.focus_or_tab(FocusDir::Right),
-            Action::FocusUp => {
-                self.move_focus(FocusDir::Up);
-                Vec::new()
-            }
-            Action::FocusDown => {
-                self.move_focus(FocusDir::Down);
-                Vec::new()
-            }
+            Action::FocusUp => self.focus_or_tab(FocusDir::Up),
+            Action::FocusDown => self.focus_or_tab(FocusDir::Down),
             Action::ResizeLeft => self.resize_split(Direction::Horizontal, -RESIZE_DELTA),
             Action::ResizeRight => self.resize_split(Direction::Horizontal, RESIZE_DELTA),
             Action::ResizeUp => self.resize_split(Direction::Vertical, -RESIZE_DELTA),
@@ -1830,7 +1874,9 @@ impl App {
         }
         // The directional direct bindings cross the sidebar↔pane edge:
         // focus_right returns to the pane area (keeping its focus), focus_left
-        // steps to the previous tab — the same wrap the pane's left edge does.
+        // goes past tutti's left edge as the pane's left edge would with no
+        // sidebar — on to rtty, else the previous tab — and in rtty, up and
+        // down go on to rtty's pane that way.
         match self.config.keys.action_for(key) {
             Some(Action::FocusRight) => {
                 self.mode = Mode::Terminal;
@@ -1840,7 +1886,11 @@ impl App {
             Some(Action::FocusLeft) => {
                 self.mode = Mode::Terminal;
                 self.status = None;
-                return self.switch_tab(-1);
+                return self.past_edge(FocusDir::Left);
+            }
+            Some(Action::FocusUp) if self.rtty.is_some() => return self.past_edge(FocusDir::Up),
+            Some(Action::FocusDown) if self.rtty.is_some() => {
+                return self.past_edge(FocusDir::Down);
             }
             _ => {}
         }
@@ -2209,7 +2259,9 @@ impl App {
     /// highlighted turn. The panel is the content's
     /// right edge, and its edges behave like a pane's: `h`/`esc`/`q` and the
     /// focus-left binding step back into the pane area keeping its focus; `l`
-    /// and the focus-right binding wrap on to the next tab.
+    /// wraps on to the next tab, and the focus-right binding goes past tutti's
+    /// right edge — on to rtty, else the next tab — as up and down go on to
+    /// rtty in it.
     fn on_key_diff_files(&mut self, key: KeyEvent) -> Vec<WireFrame> {
         if self.enter_prefix(key) {
             return Vec::new();
@@ -2223,7 +2275,11 @@ impl App {
             Some(Action::FocusRight) => {
                 self.mode = Mode::Terminal;
                 self.status = None;
-                return self.switch_tab(1);
+                return self.past_edge(FocusDir::Right);
+            }
+            Some(Action::FocusUp) if self.rtty.is_some() => return self.past_edge(FocusDir::Up),
+            Some(Action::FocusDown) if self.rtty.is_some() => {
+                return self.past_edge(FocusDir::Down);
             }
             _ => {}
         }
@@ -4603,33 +4659,41 @@ impl App {
         }
     }
 
-    /// Directional focus that falls through at the left/right edge. Left steps
-    /// into the sidebar when it is on screen (nvim-explorer parity), else wraps
-    /// to the previous tab; right wraps to the next tab. Vertical edges are
-    /// no-ops.
+    /// Directional focus that falls through at the layout's edge. Left steps
+    /// into the sidebar when it is on screen (nvim-explorer parity), right
+    /// into the changes panel; past them — or at the top or bottom — the
+    /// move goes on to rtty's pane that way when the TUI runs in rtty
+    /// (`past_edge`), and else, left and right, wraps to the next tab.
     fn focus_or_tab(&mut self, dir: FocusDir) -> Vec<WireFrame> {
         if self.move_focus(dir) {
             return Vec::new();
         }
         match dir {
-            FocusDir::Left => {
-                if self.sidebar_rect.is_some() {
-                    self.focus_sidebar();
-                    Vec::new()
-                } else {
-                    self.switch_tab(-1)
-                }
+            FocusDir::Left if self.sidebar_rect.is_some() => {
+                self.focus_sidebar();
+                Vec::new()
             }
-            FocusDir::Right => {
-                if self.diff_panel_rect.is_some() {
-                    self.focus_diff_panel();
-                    Vec::new()
-                } else {
-                    self.switch_tab(1)
-                }
+            FocusDir::Right if self.diff_panel_rect.is_some() => {
+                self.focus_diff_panel();
+                Vec::new()
             }
-            FocusDir::Up | FocusDir::Down => Vec::new(),
+            dir => self.past_edge(dir),
         }
+    }
+
+    /// A move past tutti's own edge — its panes' and its panels' — that way:
+    /// on to rtty's pane beyond when the TUI runs in rtty, else (and at
+    /// rtty's own edge too, left and right) the previous or next tab.
+    fn past_edge(&mut self, dir: FocusDir) -> Vec<WireFrame> {
+        let step = match dir {
+            FocusDir::Left => Some(-1),
+            FocusDir::Right => Some(1),
+            FocusDir::Up | FocusDir::Down => None,
+        };
+        if self.rtty_handoff(Handoff::Focus(dir.toward()), step) {
+            return Vec::new();
+        }
+        step.map(|step| self.switch_tab(step)).unwrap_or_default()
     }
 
     /// Confirm-kill the focused pane, reusing the prefix-`x` flow.
@@ -4645,16 +4709,30 @@ impl App {
     }
 
     /// Ask the server to nudge the focused pane's enclosing split ratio along
-    /// `axis` by `delta`.
+    /// `axis` by `delta` — or, with no split of tutti's on that axis, rtty's
+    /// split that way when the TUI runs in rtty.
     fn resize_split(&mut self, axis: Direction, delta: f32) -> Vec<WireFrame> {
-        match self.focused {
-            Some(pane) => vec![control(&Request::PaneResizeSplit {
-                pane,
-                direction: axis,
-                delta,
-            })],
-            None => Vec::new(),
+        let Some(pane) = self.focused else {
+            return Vec::new();
+        };
+        let split = self
+            .active_tab_view()
+            .and_then(|tab| tab.layout.as_ref())
+            .is_some_and(|layout| layout.resize_split(pane, axis, delta).is_some());
+        let toward = match (axis, delta < 0.0) {
+            (Direction::Horizontal, true) => Toward::Left,
+            (Direction::Horizontal, false) => Toward::Right,
+            (Direction::Vertical, true) => Toward::Up,
+            (Direction::Vertical, false) => Toward::Down,
+        };
+        if !split && self.rtty_handoff(Handoff::Resize(toward), None) {
+            return Vec::new();
         }
+        vec![control(&Request::PaneResizeSplit {
+            pane,
+            direction: axis,
+            delta,
+        })]
     }
 
     fn refocus(&mut self) {
@@ -4769,6 +4847,14 @@ impl EditorJob {
     }
 }
 
+/// A move handed on to rtty (`App::take_rtty_jobs`), and the tab step tutti
+/// takes should rtty not move (`App::rtty_done`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RttyJob {
+    pub handoff: Handoff,
+    fallback: Option<isize>,
+}
+
 #[derive(Clone, Copy)]
 enum FocusDir {
     Left,
@@ -4778,6 +4864,15 @@ enum FocusDir {
 }
 
 impl FocusDir {
+    fn toward(self) -> Toward {
+        match self {
+            FocusDir::Left => Toward::Left,
+            FocusDir::Right => Toward::Right,
+            FocusDir::Up => Toward::Up,
+            FocusDir::Down => Toward::Down,
+        }
+    }
+
     /// Whether `to` lies in this direction from `from` (by rectangle position).
     fn accepts(self, from: Rect, to: Rect) -> bool {
         match self {
@@ -6094,6 +6189,131 @@ mod tests {
         assert!(out.is_empty());
         assert_eq!(app.focused, Some(PaneId(1)));
         assert_eq!(app.active_tab, Some(TabId(1)));
+    }
+
+    /// What a test App has queued for rtty, from rtty pane 7.
+    fn rtty_jobs(app: &mut App) -> Vec<RttyJob> {
+        app.take_rtty_jobs()
+            .into_iter()
+            .map(|(pane, job)| {
+                assert_eq!(pane, "7");
+                job
+            })
+            .collect()
+    }
+
+    /// In rtty, a move past tutti's edge goes on to rtty's pane that way: up
+    /// and down at once, left and right at the layout's edge. At rtty's own
+    /// edge too, left and right fall back to tutti's tab wrap. Outside rtty
+    /// nothing is handed on.
+    #[test]
+    fn in_rtty_a_move_past_every_edge_goes_on_to_rtty() {
+        let focus = |toward, fallback| RttyJob {
+            handoff: Handoff::Focus(toward),
+            fallback,
+        };
+        let mut app = App::with_config(Config::parse("sidebar = \"off\"\n").unwrap());
+        attach_with(&mut app, view_two_tabs());
+        app.sync_sizes(Rect::new(0, 0, 80, 24));
+        app.on_key(ctrl('j'));
+        assert!(rtty_jobs(&mut app).is_empty(), "outside rtty");
+
+        app.in_rtty(Some("7".into()));
+        for (key, toward) in [('j', Toward::Down), ('k', Toward::Up)] {
+            assert!(app.on_key(ctrl(key)).is_empty());
+            assert_eq!(rtty_jobs(&mut app), [focus(toward, None)]);
+        }
+        assert!(app.on_key(ctrl('h')).is_empty(), "rtty first, not the tab");
+        let left = focus(Toward::Left, Some(-1));
+        assert_eq!(rtty_jobs(&mut app), [left]);
+        assert!(app.rtty_done(left, true).is_empty(), "rtty moved");
+        assert_eq!(app.active_tab, Some(TabId(1)));
+        assert_eq!(
+            app.rtty_done(left, false),
+            vec![control(&Request::TabSelect { id: TabId(2) })],
+            "at rtty's own edge too: tutti's tab wrap"
+        );
+        app.on_key(ctrl('l'));
+        assert_eq!(rtty_jobs(&mut app), [focus(Toward::Right, Some(1))]);
+    }
+
+    /// tutti's own panels come before rtty: the left edge steps into the
+    /// sidebar, and only past it does the move go on to rtty — as an
+    /// editor's move handed back through the daemon (`FocusEdge`) does.
+    #[test]
+    fn in_rtty_the_sidebar_comes_before_rtty() {
+        let mut app = App::new();
+        attach_with(&mut app, view_two_tabs());
+        app.sync_sizes(Rect::new(0, 0, 100, 24));
+        app.in_rtty(Some("7".into()));
+        let edge = |toward| {
+            let event = Event::FocusEdge {
+                pane: PaneId(1),
+                toward,
+            };
+            WireFrame::Control(serde_json::to_vec(&event).unwrap())
+        };
+        assert!(app.handle_frame(edge(Toward::Left)).is_empty());
+        assert_eq!(app.mode, Mode::Sidebar);
+        assert!(rtty_jobs(&mut app).is_empty());
+        assert!(app.on_key(ctrl('h')).is_empty());
+        assert_eq!(app.mode, Mode::Terminal);
+        assert_eq!(
+            rtty_jobs(&mut app),
+            [RttyJob {
+                handoff: Handoff::Focus(Toward::Left),
+                fallback: Some(-1),
+            }]
+        );
+        app.handle_frame(edge(Toward::Up));
+        assert_eq!(
+            rtty_jobs(&mut app),
+            [RttyJob {
+                handoff: Handoff::Focus(Toward::Up),
+                fallback: None,
+            }],
+            "an editor's upper edge, through tutti, on to rtty"
+        );
+    }
+
+    /// In rtty, a resize no split of tutti's takes moves rtty's split that
+    /// way — from the direct keys, and from an editor's resize the daemon
+    /// handed back (`ResizeEdge`); one a split takes stays tutti's.
+    #[test]
+    fn in_rtty_a_resize_with_no_split_of_tuttis_goes_on_to_rtty() {
+        let resize = |toward| RttyJob {
+            handoff: Handoff::Resize(toward),
+            fallback: None,
+        };
+        let mut app = App::new();
+        let split = split(Direction::Horizontal, leaf(1), leaf(2));
+        attach_with(
+            &mut app,
+            vec![workspace(
+                1,
+                "w",
+                None,
+                vec![tab(1, "1", true, split, vec![shell(1), shell(2)])],
+            )],
+        );
+        app.in_rtty(Some("7".into()));
+        assert_eq!(
+            app.on_key(alt('l')),
+            vec![control(&Request::PaneResizeSplit {
+                pane: PaneId(1),
+                direction: Direction::Horizontal,
+                delta: RESIZE_DELTA,
+            })]
+        );
+        assert!(rtty_jobs(&mut app).is_empty(), "tutti's own split");
+        assert!(app.on_key(alt('j')).is_empty());
+        assert_eq!(rtty_jobs(&mut app), [resize(Toward::Down)]);
+        let event = Event::ResizeEdge {
+            pane: PaneId(1),
+            toward: Toward::Up,
+        };
+        app.handle_frame(WireFrame::Control(serde_json::to_vec(&event).unwrap()));
+        assert_eq!(rtty_jobs(&mut app), [resize(Toward::Up)]);
     }
 
     #[test]
