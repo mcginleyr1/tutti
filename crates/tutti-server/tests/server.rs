@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use rtty_vt::Terminal;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::oneshot;
@@ -1742,19 +1743,19 @@ async fn a_tab_switch_stops_a_client_voting_for_panes_it_left() {
 /// raw bytes fed and the control frames passed on the way.
 async fn stream_until(
     stream: &mut Conn,
-    terminal: &mut vt100::Parser,
-    done: impl Fn(&vt100::Screen) -> bool,
+    terminal: &mut Terminal,
+    done: impl Fn(&Terminal) -> bool,
 ) -> (Vec<u8>, Vec<Vec<u8>>) {
     let (mut raw, mut controls) = (Vec::new(), Vec::new());
     timeout(DEADLINE, async {
-        while !done(terminal.screen()) {
+        while !done(terminal) {
             match stream.read_frame().await {
                 Frame::PaneSnapshot(data) => {
-                    *terminal = vt100::Parser::new(data.rows, data.cols, 0);
-                    terminal.process(&data.bytes);
+                    *terminal = Terminal::new(data.rows, data.cols, 0);
+                    terminal.advance(&data.bytes);
                 }
                 Frame::PaneRaw { bytes, .. } => {
-                    terminal.process(&bytes);
+                    terminal.advance(&bytes);
                     raw.extend(bytes);
                 }
                 Frame::Control(json) => controls.push(json),
@@ -1788,9 +1789,9 @@ async fn a_pane_stream_sends_a_snapshot_then_raw_output_in_order() {
         panic!("the snapshot comes first");
     };
     assert_eq!((data.pane, data.rows, data.cols), (pane, 24, 80));
-    let mut terminal = vt100::Parser::new(24, 80, 0);
-    terminal.process(&data.bytes);
-    assert_eq!(terminal.screen().contents(), "before");
+    let mut terminal = Terminal::new(24, 80, 0);
+    terminal.advance(&data.bytes);
+    assert_eq!(terminal.contents(), "before");
 
     stream
         .write_frame(&Frame::Input {
@@ -1817,7 +1818,7 @@ async fn a_pane_stream_sends_a_snapshot_then_raw_output_in_order() {
         Response::Content { lines } => lines,
         other => panic!("expected Content, got {other:?}"),
     };
-    assert_eq!(terminal.screen().contents(), lines.join("\n"));
+    assert_eq!(terminal.contents(), lines.join("\n"));
 
     stream.send(&pane_attach(pane, 24, 80)).await;
     let refusal = error_message(stream.response().await);
@@ -1871,7 +1872,7 @@ async fn a_pane_stream_ends_with_the_exit_after_the_last_output() {
     let pane = run_marker(&mut control, "read line; printf 'bye-%s' \"$line\"; exit 3").await;
     let mut stream = server.connect().await;
     stream.send(&pane_attach(pane, 24, 80)).await;
-    let mut terminal = vt100::Parser::new(24, 80, 0);
+    let mut terminal = Terminal::new(24, 80, 0);
     stream
         .write_frame(&Frame::Input {
             pane,
@@ -1918,7 +1919,7 @@ async fn a_panes_terminal_queries_are_answered_and_kept_from_its_streams() {
         })
         .await;
     let answered = "abE[?62;22cE[>1;277;0cE[0nE[2;3R";
-    let mut terminal = vt100::Parser::new(24, 80, 0);
+    let mut terminal = Terminal::new(24, 80, 0);
     let (raw, _) = stream_until(&mut stream, &mut terminal, |screen| {
         screen.contents().contains(answered)
     })
@@ -1958,7 +1959,7 @@ async fn a_colour_query_is_answered_once_a_client_reports_colours() {
         pane,
         bytes: b"go\r".to_vec(),
     };
-    let mut terminal = vt100::Parser::new(24, 80, 0);
+    let mut terminal = Terminal::new(24, 80, 0);
     stream.write_frame(&go).await;
     let (raw, _) = stream_until(&mut stream, &mut terminal, |s| s.contents().contains("one")).await;
     assert!(
@@ -3733,28 +3734,24 @@ async fn a_mirror_fingerprints_like_the_live_grid() {
 
 /// Feed `pane`'s snapshot and delta frames off an attached connection into
 /// `mirror` the way the client does, until its rows fingerprint as `want`.
-async fn mirror_until(
-    viewer: &mut Conn,
-    pane: PaneId,
-    mirror: &mut Option<vt100::Parser>,
-    want: &str,
-) {
-    let rows = |parser: &vt100::Parser| -> Vec<String> {
-        let screen = parser.screen();
-        screen.rows(0, screen.size().1).collect()
+async fn mirror_until(viewer: &mut Conn, pane: PaneId, mirror: &mut Option<Terminal>, want: &str) {
+    let rows = |term: &Terminal| -> Vec<String> {
+        (0..term.size().0)
+            .map(|r| term.screen_row(r).text())
+            .collect()
     };
     let caught_up = timeout(DEADLINE, async {
         loop {
             match viewer.read_frame().await {
                 Frame::PaneSnapshot(d) if d.pane == pane => {
-                    let mut parser = vt100::Parser::new(d.rows, d.cols, 0);
-                    parser.process(&d.bytes);
-                    *mirror = Some(parser);
+                    let mut term = Terminal::new(d.rows, d.cols, 0);
+                    term.advance(&d.bytes);
+                    *mirror = Some(term);
                 }
                 Frame::PaneDelta(d) if d.pane == pane => mirror
                     .as_mut()
                     .expect("a delta arrived before the snapshot")
-                    .process(&d.bytes),
+                    .advance(&d.bytes),
                 _ => continue,
             }
             if tutti_core::prompt_fingerprint(&rows(mirror.as_ref().unwrap())) == want {

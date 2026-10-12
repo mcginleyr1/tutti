@@ -21,7 +21,6 @@ clap = { version = "4", features = ["derive"] }
 portable-pty = "0.9"
 rtty-vt = { git = "https://github.com/mcginleyr1/rtty", rev = "115bcedebf5505af343db12ef488d378a829b9e5" }
 memchr = "2.7"
-vt100 = "0.16"
 anyhow = "1"
 sysinfo = "0.39"
 toml = "1"
@@ -32,12 +31,9 @@ tutti-core = { path = "crates/tutti-core" }
 tutti-server = { path = "crates/tutti-server" }
 tutti-agents = { path = "crates/tutti-agents" }
 
-# The terminal engines run on every pty read, render tick and `pane read`
-# (rtty-vt in the daemon, vt100 in the TUI); optimized even in dev builds, a
-# debug build and the read perf test see their real cost rather than their
-# unoptimized iterator chains (a full 10k-row read: ~22 ms → ~2 ms).
-[profile.dev.package.vt100]
-opt-level = 3
-
+# The terminal engine runs on every pty read, render tick and `pane read`,
+# and on every frame the TUI is handed; optimized even in dev builds, a debug
+# build and the read perf test see its real cost rather than its unoptimized
+# iterator chains (a full 10k-row read: ~22 ms → ~2 ms).
 [profile.dev.package.rtty-vt]
 opt-level = 3

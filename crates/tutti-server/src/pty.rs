@@ -2412,45 +2412,49 @@ mod tests {
         "primary\r\n\x1b[?1049h\x1b[2;3Halternate\x1b[32m green",
     ];
 
-    /// What a vt100 parser shows: each row's cells — their text, a cell never
-    /// written showing as a space does, and rendition — and soft wrap; the
-    /// cursor and whether it shows; the input modes; which screen is up.
+    /// A client terminal, as the TUI and `pane attach` hold one, fed `bytes`.
+    fn client(rows: u16, cols: u16, bytes: &[u8]) -> Terminal {
+        let mut client = Terminal::new(rows, cols, 0);
+        client.advance(bytes);
+        client
+    }
+
+    /// What a terminal shows: each row's cells — their text and rendition —
+    /// and soft wrap; the cursor; the modes, which screen is up and whether
+    /// the cursor shows among them.
     type Shown = (
-        Vec<(Vec<(String, vt100::Color, vt100::Color, [bool; 4])>, bool)>,
-        (u16, u16, bool),
-        Vec<u8>,
-        bool,
+        Vec<(
+            Vec<(String, rtty_vt::Color, rtty_vt::Color, rtty_vt::Attrs)>,
+            bool,
+        )>,
+        (u16, u16),
+        rtty_vt::Modes,
     );
 
-    fn shown(parser: &vt100::Parser) -> Shown {
-        let screen = parser.screen();
-        let (rows, cols) = screen.size();
+    fn shown(term: &Terminal) -> Shown {
+        let (rows, cols) = term.size();
         let row = |r: u16| {
-            let cells = (0..cols)
-                .filter_map(|c| screen.cell(r, c))
-                .map(|cell| {
-                    let text = match cell.contents() {
-                        "" => " ".to_string(),
-                        text => text.to_string(),
-                    };
-                    let attrs = [cell.bold(), cell.italic(), cell.underline(), cell.inverse()];
-                    (text, cell.fgcolor(), cell.bgcolor(), attrs)
+            let row = term.screen_row(r);
+            let cells = (0..usize::from(cols))
+                .map(|c| {
+                    let mut text = String::new();
+                    row.push_grapheme(c, &mut text);
+                    let cell = row.cells()[c];
+                    (text, cell.fg(), cell.bg(), cell.attrs())
                 })
                 .collect();
-            (cells, screen.row_wrapped(r))
+            (cells, row.wrapped())
         };
-        let (cursor_row, cursor_col) = screen.cursor_position();
         (
             (0..rows).map(row).collect(),
-            (cursor_row, cursor_col, screen.hide_cursor()),
-            screen.input_mode_formatted(),
-            screen.alternate_screen(),
+            term.cursor_position(),
+            term.modes().clone(),
         )
     }
 
-    /// `seen` — a vt100 parser, as today's TUI and `pane attach` run — shows
-    /// what `want`, a vt100 parser fed the pane's own bytes, does.
-    fn level(seen: &vt100::Parser, want: &vt100::Parser, step: &str) {
+    /// `seen` — a client, as the TUI and `pane attach` run one — shows what
+    /// `want`, a terminal fed the pane's own bytes, does.
+    fn level(seen: &Terminal, want: &Terminal, step: &str) {
         assert_eq!(shown(seen), shown(want), "{step}");
     }
 
@@ -2461,37 +2465,34 @@ mod tests {
     fn looks_keep_a_client_level_with_the_live_screen() {
         let size = PaneSize::new(24, 80);
         let mut live = Term::new(size, None);
-        let mut reference = vt100::Parser::new(size.rows, size.cols, 0);
         let first = numbered(0, 30);
         live.process(first.as_bytes());
-        reference.process(first.as_bytes());
+        let mut reference = client(size.rows, size.cols, first.as_bytes());
         let look = live.look(None, true);
-        let mut client = vt100::Parser::new(size.rows, size.cols, 0);
-        client.process(&look.snapshot.unwrap());
+        let mut client = client(size.rows, size.cols, &look.snapshot.unwrap());
         let mut last = (look.size, look.alt_screen);
         let back = "\x1b[?1049l\x1b[?25h\x1b[?1002l\x1b[0mback on the primary\r\n";
         for screen in SCREENS.iter().chain([&back]) {
             live.process(screen.as_bytes());
-            reference.process(screen.as_bytes());
+            reference.advance(screen.as_bytes());
             let look = live.look(Some(last), false);
-            client.process(&look.delta);
+            client.advance(&look.delta);
             last = (look.size, look.alt_screen);
             level(&client, &reference, &format!("after {screen:?}"));
         }
     }
 
     /// A shrink to one column leaves no wide character there — rtty-vt
-    /// writes one that cannot fit as the replacement character — so a vt100
-    /// client, which panics on one, replays the snapshot.
+    /// writes one that cannot fit as the replacement character — and a
+    /// client replays the snapshot to the same screen.
     #[test]
-    fn a_snapshot_after_a_shrink_to_one_column_replays_in_vt100() {
+    fn a_snapshot_after_a_shrink_to_one_column_replays() {
         let mut live = Term::new(PaneSize::new(2, 4), None);
         live.process("日本".as_bytes());
         live.vt.resize(2, 1);
         assert!(live.vt.contents().contains('\u{FFFD}'));
-        let snapshot = live.vt.snapshot();
-        let replayed = std::panic::catch_unwind(|| vt100::Parser::new(2, 1, 0).process(&snapshot));
-        assert!(replayed.is_ok(), "vt100 panicked on the snapshot");
+        let replayed = client(2, 1, &live.vt.snapshot());
+        assert_eq!(replayed.contents(), live.vt.contents());
     }
 
     /// Solarized Light, its cursor too.
@@ -2714,13 +2715,11 @@ mod tests {
         for screen in SCREENS {
             let stream = format!("{}{screen}", numbered(0, 30));
             let live = fed(24, 80, stream.as_bytes(), READ);
-            let mut terminal = vt100::Parser::new(24, 80, 0);
-            terminal.process(&live.vt.snapshot());
-            let mut reference = vt100::Parser::new(24, 80, 0);
-            reference.process(stream.as_bytes());
+            let mut terminal = client(24, 80, &live.vt.snapshot());
+            let mut reference = client(24, 80, stream.as_bytes());
             for next in ["", "\x1b[?1049l after"] {
-                terminal.process(next.as_bytes());
-                reference.process(next.as_bytes());
+                terminal.advance(next.as_bytes());
+                reference.advance(next.as_bytes());
                 level(&terminal, &reference, &format!("{screen:?} then {next:?}"));
             }
         }
@@ -2756,18 +2755,12 @@ mod tests {
 
         let (size, snapshot) = rx.recv().unwrap();
         assert_eq!(size, Some(PaneSize::new(24, 80)));
-        let mut seeded = vt100::Parser::new(24, 80, 0);
-        seeded.process(&snapshot);
-        let mut text = seeded.screen().contents();
+        let seeded = client(24, 80, &snapshot);
+        let mut text = seeded.contents();
         // The cursor at the start of an empty row: the last line ended. At
         // the start of a written one, a read ended between its CR and LF.
-        let (row, col) = seeded.screen().cursor_position();
-        let mut rows = seeded.screen().rows(0, 80);
-        if col == 0
-            && rows
-                .nth(usize::from(row))
-                .is_some_and(|text| text.is_empty())
-        {
+        let (row, col) = seeded.cursor_position();
+        if col == 0 && seeded.screen_row(row).text().is_empty() {
             text.push('\n');
         }
         let mut reads = 0;
@@ -2786,9 +2779,7 @@ mod tests {
         pane.resize(10, 40).unwrap();
         let (size, snapshot) = rx.recv().unwrap();
         assert_eq!(size, Some(PaneSize::new(10, 40)));
-        let mut seeded = vt100::Parser::new(10, 40, 0);
-        seeded.process(&snapshot);
-        assert_eq!(seeded.screen().contents(), pane.contents());
+        assert_eq!(client(10, 40, &snapshot).contents(), pane.contents());
         pane.untap(7);
         assert!(rx.recv().is_err(), "an untapped tap is dropped");
     }
@@ -2803,8 +2794,8 @@ mod tests {
     }
 
     /// A wide character echoed into a one-column pane — which once panicked
-    /// vt100 on the reader thread — lands as the replacement character, and
-    /// the pane runs on.
+    /// the daemon's vt100 on the reader thread — lands as the replacement
+    /// character, and the pane runs on.
     #[test]
     fn a_wide_character_in_a_one_column_pane_never_stops_the_reader() {
         let pane = PtyPane::spawn(PtySpec::new("/bin/cat"), PaneSize::new(24, 1)).unwrap();
@@ -2846,9 +2837,8 @@ mod tests {
         let tail = pane.tail(0, None, false).unwrap();
         assert!(tail.lines.iter().any(|line| line == "after-poison"));
         let look = pane.look(None, true);
-        let mut client = vt100::Parser::new(look.size.rows, look.size.cols, 0);
-        client.process(&look.snapshot.unwrap());
-        assert!(client.screen().contents().contains("after-poison"));
+        let client = client(look.size.rows, look.size.cols, &look.snapshot.unwrap());
+        assert!(client.contents().contains("after-poison"));
         assert!(pane.take_notifications().is_empty());
         pane.kill().unwrap();
     }
@@ -2892,14 +2882,8 @@ mod tests {
             "the title never landed",
         );
         let look = drawing.look(None, true);
-        let mut client = vt100::Parser::new(24, 80, 0);
-        client.process(&look.snapshot.unwrap());
-        assert!(
-            client
-                .screen()
-                .contents()
-                .contains("terminal crashed: injected")
-        );
+        let shown = client(24, 80, &look.snapshot.unwrap());
+        assert!(shown.contents().contains("terminal crashed: injected"));
         crashed(&drawing);
 
         beside.write_input(b"still-here\n").unwrap();
@@ -2908,9 +2892,8 @@ mod tests {
             "the pane beside stopped",
         );
         let look = beside.look(None, true);
-        let mut client = vt100::Parser::new(24, 80, 0);
-        client.process(&look.snapshot.unwrap());
-        assert!(client.screen().contents().contains("still-here"));
+        let shown = client(24, 80, &look.snapshot.unwrap());
+        assert!(shown.contents().contains("still-here"));
         assert!(beside.exit_status().is_none() && !beside.term.is_poisoned());
         beside.kill().unwrap();
     }
