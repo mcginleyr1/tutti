@@ -28,6 +28,7 @@ use super::input;
 use super::launcher::{self, LaunchKind, LauncherRow};
 use super::layout::{Boundary, boundaries, pane_rects};
 use super::navigate;
+use super::reader::{Decoder, Input};
 use super::rtty::Handoff;
 use super::sidebar::{self, Sidebar, SidebarEntry};
 use crate::config::{
@@ -1247,6 +1248,37 @@ impl App {
                 Vec::new()
             }
         }
+    }
+
+    /// Text the terminal pasted (bracketed paste). In a pane, as a terminal
+    /// hands a paste to its program: whole, inside the paste marks when the
+    /// program set bracketed paste, so a shell runs none of its lines, and
+    /// never to an exited pane, whose keys act on it. Elsewhere — a prompt,
+    /// a panel — typed, as the keys its bytes are.
+    pub fn on_paste(&mut self, text: &[u8]) -> Vec<WireFrame> {
+        if self.mode == Mode::Terminal {
+            return match self.focused.map(|pane| (pane, self.panes.get(&pane))) {
+                Some((pane, Some(state))) if state.info.exited.is_none() => {
+                    let bytes = if state.term.modes().bracketed_paste {
+                        [b"\x1b[200~".as_slice(), text, b"\x1b[201~"].concat()
+                    } else {
+                        text.to_vec()
+                    };
+                    vec![WireFrame::Input { pane, bytes }]
+                }
+                _ => Vec::new(),
+            };
+        }
+        let mut decoder = Decoder::default();
+        let mut inputs = decoder.feed(text);
+        inputs.extend(decoder.flush());
+        inputs
+            .into_iter()
+            .flat_map(|input| match input {
+                Input::Key(key) => self.on_key(key),
+                _ => Vec::new(),
+            })
+            .collect()
     }
 
     fn on_key_terminal(&mut self, key: KeyEvent) -> Vec<WireFrame> {
@@ -5509,6 +5541,37 @@ mod tests {
         assert_eq!(typed(&mut app), b"\t");
         app.handle_frame(snapshot(b"\x1b[>1u"));
         assert_eq!(typed(&mut app), b"\x1b[105;5u");
+    }
+
+    /// A paste reaches the focused pane whole — inside the paste marks once
+    /// its program set bracketed paste, so a shell runs none of its lines —
+    /// and a prompt types it in, as the keys its bytes are.
+    #[test]
+    fn a_paste_reaches_the_pane_whole_and_a_prompt_as_typing() {
+        let mut app = App::new();
+        attached(&mut app);
+        let snapshot = |bytes: &[u8]| {
+            WireFrame::PaneSnapshot(PaneData {
+                pane: PaneId(1),
+                rows: 24,
+                cols: 80,
+                seq: 0,
+                bytes: bytes.to_vec(),
+            })
+        };
+        let pasted = |app: &mut App| match app.on_paste(b"ls\rrm -rf x\r").as_slice() {
+            [WireFrame::Input { pane, bytes }] if *pane == PaneId(1) => bytes.clone(),
+            frames => panic!("{frames:?}"),
+        };
+        app.handle_frame(snapshot(b""));
+        assert_eq!(pasted(&mut app), b"ls\rrm -rf x\r");
+        app.handle_frame(snapshot(b"\x1b[?2004h"));
+        assert_eq!(pasted(&mut app), b"\x1b[200~ls\rrm -rf x\r\x1b[201~");
+
+        app.open_project_prompt();
+        app.sidebar_prompt.clear();
+        assert!(app.on_paste(b"/nonexistent/src").is_empty());
+        assert_eq!(app.sidebar_prompt, "/nonexistent/src");
     }
 
     #[test]

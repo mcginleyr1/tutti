@@ -11,6 +11,7 @@ mod launcher;
 mod layout;
 mod navigate;
 pub mod raw;
+mod reader;
 mod render;
 mod rtty;
 mod sidebar;
@@ -25,21 +26,22 @@ use app::{control, tagged};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ratatui::crossterm::event::{
-    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
-    KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, KeyEventKind,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use ratatui::crossterm::{execute, terminal};
-use signal_hook::consts::SIGTSTP;
+use ratatui::crossterm::execute;
+use signal_hook::consts::{SIGTSTP, SIGWINCH};
 use tutti_core::{PaneId, Request};
 
 use connection::Connection;
+use reader::{Asked, Decoder, Input};
 
-use crate::config::Config;
+use crate::config::{Config, Theme};
 
 const POLL: Duration = Duration::from_millis(16);
 
@@ -69,35 +71,58 @@ pub fn run(
     conn.send(&tagged(&attach, 0))
         .context("send attach request")?;
 
-    // Asked before crossterm owns input. It stays the attach-time answer: the
-    // terminal's later light/dark reports (mode 2031, `CSI ? 997 ; 1|2 n`)
-    // are not asked for, as crossterm 0.29 takes `CSI ?` ending in anything
-    // but `u` or `c` for a sequence still arriving — it would sit on every
-    // key typed after one until a `u` or `c` came.
-    if let Some(colors) = theme::host_colors(config.theme) {
+    // A truecolor theme's panes are painted over its own ground, which their
+    // colour queries are answered with; on `terminal` the terminal's own
+    // colours are asked once the TUI reads it (`Asked`), and again on each
+    // light/dark change it reports.
+    let scheme = config.theme == Theme::Terminal;
+    if !scheme && let Some(colors) = theme::host_colors(config.theme) {
         conn.send(&control(&Request::HostColors(colors)))
-            .context("send the terminal's colours")?;
+            .context("send the theme's colours")?;
     }
     let mut terminal = host::init().context("take the terminal")?;
     install_panic_hook();
+    let (reads_tx, reads) = mpsc::channel();
+    reader::spawn(reads_tx).context("read the terminal")?;
+    // Kitty's keyboard flags are pushed once the terminal says it speaks the
+    // protocol.
     let modes = Modes {
         mouse: config.mouse,
-        keys: terminal::supports_keyboard_enhancement().unwrap_or(false),
+        keys: false,
         rtty: rtty.is_some(),
+        scheme,
     };
     enter(modes);
+    emit_terminal(reader::ASK_KEYBOARD);
+    let asked = scheme.then(|| {
+        let (asked, query) = Asked::ask(None, None);
+        emit_terminal(&query);
+        asked
+    });
     // A `kill -TSTP` (the keys cannot send one: raw mode) stops the TUI
     // only once it has handed the terminal back (`suspend`).
     let stop = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGTSTP, Arc::clone(&stop)).context("watching for SIGTSTP")?;
+    let resized = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(SIGWINCH, Arc::clone(&resized)).context("watching for SIGWINCH")?;
 
+    let tty = Tty {
+        modes,
+        reads,
+        decoder: Decoder::default(),
+        held: None,
+        asked,
+        stop,
+        resized,
+    };
     let result = event_loop(
         &mut terminal,
         &mut conn,
         config,
         first_run,
         notice,
-        (modes, rtty, stop),
+        rtty,
+        tty,
     );
 
     leave();
@@ -107,12 +132,30 @@ pub fn run(
 
 /// What the TUI turns on in its terminal beyond raw mode and the alternate
 /// screen: mouse capture, kitty's keyboard flags where the terminal speaks
-/// the protocol, the claim on rtty's keys in rtty — and focus reports.
+/// the protocol, the claim on rtty's keys in rtty, light/dark reports on the
+/// `terminal` theme — and focus reports and bracketed paste.
 #[derive(Clone, Copy)]
 struct Modes {
     mouse: bool,
     keys: bool,
     rtty: bool,
+    scheme: bool,
+}
+
+/// The TUI's hold on its terminal beyond the drawing: what it turned on,
+/// its reads and what it asked of it, and the signals that stop or resize
+/// it.
+struct Tty {
+    modes: Modes,
+    /// The reader thread's reads (`reader::spawn`).
+    reads: Receiver<Vec<u8>>,
+    decoder: Decoder,
+    /// Since when the decoder has held the start of a sequence, which is
+    /// what a person typed once `reader::ESC_WAIT` goes by with no more.
+    held: Option<Instant>,
+    asked: Option<Asked>,
+    stop: Arc<AtomicBool>,
+    resized: Arc<AtomicBool>,
 }
 
 /// Whether the terminal's keyboard flags were pushed, for `leave` to pop,
@@ -128,16 +171,19 @@ static RTTY_CLAIMED: AtomicBool = AtomicBool::new(false);
 ///   panes that asked for them (`input::encode_key`).
 /// - rtty's keys: rtty's `keys = "tutti"` Ctrl/Alt+h/j/k/l then reach tutti,
 ///   which hands a move past its own edge back to rtty (`rtty`).
+/// - Light/dark reports (2031), so the TUI follows the terminal's flips.
+/// - Bracketed paste: a paste reaches a pane whole (`App::on_paste`).
 fn enter(modes: Modes) {
     if modes.mouse {
         let _ = execute!(io::stdout(), EnableMouseCapture);
     }
     let _ = execute!(io::stdout(), EnableFocusChange);
+    emit_terminal(b"\x1b[?2004h");
+    if modes.scheme {
+        emit_terminal(b"\x1b[?2031h");
+    }
     if modes.keys {
-        let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-            | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS;
-        let pushed = execute!(io::stdout(), PushKeyboardEnhancementFlags(flags)).is_ok();
-        KEYS_PUSHED.store(pushed, Ordering::SeqCst);
+        push_keys();
     }
     if modes.rtty {
         emit_terminal(rtty::CLAIM);
@@ -145,11 +191,22 @@ fn enter(modes: Modes) {
     }
 }
 
+/// Push kitty's keyboard flags on the terminal's own stack, for `leave` to
+/// pop.
+fn push_keys() {
+    let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS;
+    let pushed = execute!(io::stdout(), PushKeyboardEnhancementFlags(flags)).is_ok();
+    KEYS_PUSHED.store(pushed, Ordering::SeqCst);
+}
+
 /// Hand back what the TUI changed in the terminal beyond what
-/// `ratatui::restore` does: mouse capture, focus reports, the cursor's shape,
-/// the keyboard flags and the claim on rtty's keys. Safe to run twice.
+/// `ratatui::restore` does: mouse capture, focus reports, bracketed paste,
+/// light/dark reports, the cursor's shape, the keyboard flags and the claim
+/// on rtty's keys. Safe to run twice.
 fn leave() {
     let _ = execute!(io::stdout(), DisableMouseCapture, DisableFocusChange);
+    emit_terminal(b"\x1b[?2004l\x1b[?2031l");
     if KEYS_PUSHED.swap(false, Ordering::SeqCst) {
         let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
     }
@@ -177,7 +234,8 @@ fn event_loop(
     config: Config,
     first_run: Option<String>,
     notice: Option<String>,
-    (mut modes, rtty, stop): (Modes, Option<String>, Arc<AtomicBool>),
+    rtty: Option<String>,
+    mut tty: Tty,
 ) -> Result<()> {
     let mut captured = config.mouse;
     let mut app = App::with_config(config);
@@ -200,8 +258,17 @@ fn event_loop(
     let (rtty_tx, rtty_rx) = std::sync::mpsc::channel();
 
     loop {
-        if stop.swap(false, Ordering::SeqCst) {
-            suspend(terminal, modes)?;
+        if tty.stop.swap(false, Ordering::SeqCst) {
+            suspend(terminal, tty.modes)?;
+            // The terminal may have turned light or dark meanwhile.
+            if tty.modes.scheme {
+                let (asked, query) = Asked::ask(None, tty.asked.as_ref());
+                tty.asked = Some(asked);
+                emit_terminal(&query);
+            }
+            dirty = true;
+        }
+        if tty.resized.swap(false, Ordering::SeqCst) {
             dirty = true;
         }
         match conn.drain() {
@@ -261,30 +328,81 @@ fn event_loop(
             emit_terminal(format!("\x1b[{cursor_shape} q").as_bytes());
         }
 
-        if event::poll(POLL).context("poll terminal input")? {
-            loop {
-                match event::read().context("read terminal input")? {
-                    Event::Key(key) if key.kind != KeyEventKind::Release => {
-                        for frame in app.on_key(key) {
-                            conn.send(&frame)?;
-                        }
-                        dirty = true;
-                    }
-                    Event::Mouse(mouse) => {
-                        for frame in app.on_mouse_event(mouse) {
-                            conn.send(&frame)?;
-                        }
-                        dirty = true;
-                    }
-                    Event::Resize(_, _) => dirty = true,
-                    Event::FocusGained => app.host_focus(true),
-                    Event::FocusLost => app.host_focus(false),
-                    _ => {}
+        // Wait on the terminal: its next read, or the tick — or, while the
+        // start of a sequence is held, what is left of `ESC_WAIT`, after
+        // which a person typed it.
+        let wait = tty
+            .held
+            .map_or(POLL, |at| reader::ESC_WAIT.saturating_sub(at.elapsed()));
+        let mut inputs = Vec::new();
+        match tty.reads.recv_timeout(wait) {
+            Ok(read) => {
+                inputs.extend(tty.decoder.feed(&read));
+                while let Ok(read) = tty.reads.try_recv() {
+                    inputs.extend(tty.decoder.feed(&read));
                 }
-                if !event::poll(Duration::ZERO).context("poll terminal input")? {
-                    break;
+                tty.held = tty.decoder.waiting().then(Instant::now);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if tty.held.is_some_and(|at| at.elapsed() >= reader::ESC_WAIT) {
+                    inputs.extend(tty.decoder.flush());
+                    tty.held = None;
                 }
             }
+            // The terminal is gone.
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        let mut told = None;
+        for input in inputs {
+            match input {
+                Input::Key(key) if key.kind != KeyEventKind::Release => {
+                    for frame in app.on_key(key) {
+                        conn.send(&frame)?;
+                    }
+                    dirty = true;
+                }
+                Input::Mouse(mouse) => {
+                    for frame in app.on_mouse_event(mouse) {
+                        conn.send(&frame)?;
+                    }
+                    dirty = true;
+                }
+                Input::Paste(text) => {
+                    for frame in app.on_paste(&text) {
+                        conn.send(&frame)?;
+                    }
+                    dirty = true;
+                }
+                Input::Focus(focused) => app.host_focus(focused),
+                Input::KeyboardFlags(_) if !tty.modes.keys => {
+                    tty.modes.keys = true;
+                    push_keys();
+                }
+                // The terminal turned light or dark: the chrome follows at
+                // once, and the panes once its colours are in.
+                Input::Scheme(dark) if tty.modes.scheme => {
+                    theme::set_light(!dark);
+                    let (asked, query) = Asked::ask(Some(dark), tty.asked.as_ref());
+                    tty.asked = Some(asked);
+                    emit_terminal(&query);
+                    dirty = true;
+                }
+                input => {
+                    if let Some(done) = tty.asked.as_mut().and_then(|asked| asked.take(&input)) {
+                        tty.asked = None;
+                        told = done.or(told);
+                    }
+                }
+            }
+        }
+        if let Some(done) = tty.asked.as_ref().and_then(Asked::expired) {
+            tty.asked = None;
+            told = done.or(told);
+        }
+        if let Some(colors) = told {
+            theme::set_light(!colors.dark);
+            let _ = conn.send(&control(&Request::HostColors(colors)));
+            dirty = true;
         }
 
         // An opening issues panel fetches each source on a thread of its own:
@@ -319,7 +437,7 @@ fn event_loop(
         // selection and copy work while released.
         if app.mouse_capture() != captured {
             captured = app.mouse_capture();
-            modes.mouse = captured;
+            tty.modes.mouse = captured;
             if captured {
                 let _ = execute!(io::stdout(), EnableMouseCapture);
             } else {

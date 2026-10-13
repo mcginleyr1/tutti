@@ -446,10 +446,27 @@ its own terminal, keeps the `CSI ? 997 ; 1|2 n` reports that terminal sends out 
 types into the pane (split across reads once their `ESC [ ?` has come — no key types
 that; a lone `ESC` or `ESC [` ending a read is the key it looks like), and turns each into
 a fresh report: the colours asked again from its keyboard thread, which is then the only
-reader of the terminal, with the light/dark the terminal said. The TUI does not: crossterm
-0.29 reads `CSI ?` ending in anything but `u` or `c` as a sequence still arriving, so after
-a `CSI ? 997 ; 1 n` it would sit on every key typed until a `u` or `c` came. The TUI keeps
-its attach-time answer until it reattaches.
+reader of the terminal, with the light/dark the terminal said.
+
+**The TUI reads its terminal itself** (`attach/reader.rs`). crossterm 0.29's reader treats
+a `CSI ?` that ends in anything but `u` or `c` as a sequence still arriving, so it held
+every key after a 997 report; crossterm now only draws.
+- **What it decodes:** keys, mouse, focus, bracketed paste, and the replies to the queries
+  it asks.
+- **Queries:** kitty's `CSI ? u` once at attach, whose reply alone says the protocol is
+  spoken. OSC 10/11 for the colours, followed by a DA1 that fences their replies. A query
+  that takes over from one still out also waits for its fence.
+- **On a switch report:** the `terminal` theme's chrome recolours at once, and the TUI
+  asks the colours again. It hands them to the daemon with the light/dark the report said.
+
+The ESC wait:
+- **Lone ESC:** an `ESC` at the end of a read waits 15 ms for the rest of a sequence
+  before it counts as the key.
+- **Replies it doesn't expect:** `ESC ]` and `ESC P` count as string replies only in the
+  forms the TUI asks for. Otherwise they are Alt+] and Alt+P.
+
+Nothing else reads the terminal; even ratatui's cursor-position query (before a clear) is
+answered without asking.
 
 **What a command left on.** The daemon turns off what a command left on at its shell's
 command-end mark (OSC 133;D, from `tutti shell-init` or fish itself), at the mark's byte. That

@@ -252,16 +252,26 @@ its encoding, but only those your terminal can tell apart. `pane attach` keeps
 plain keys: the protocols never reach your terminal there, as it watches for
 the prefix in plain bytes and a detach could not be sure to turn them off.
 
-The TUI reports your terminal's colours when it attaches — on the `dark` and
-`light` themes, the theme's own pane ground and text, which panes are painted
-over. `tutti pane attach` reports them too, and also passes on your terminal's
-light/dark switches: the daemon owns mode 2031 for each pane, and tells a
-program that set it (Neovim does) of every change, as a terminal would. The TUI
-cannot: its input library would stall on the terminal's switch report, so it
-keeps its attach-time answer. Reattach after switching the OS theme, and the
-programs that set 2031 hear of the change then. A raw stream carries every
-query the daemon did not answer, so your terminal answers those and never one
-twice. The full table is in `docs/transport-decision.md`.
+The TUI reports your terminal's colours when it attaches. On the `dark` and
+`light` themes it reports the theme's own pane ground and text instead, since
+panes are painted over them. The TUI and `tutti pane attach` both follow your
+terminal's light/dark switches live:
+- **Asking for them:** each asks the terminal for its switch reports (mode
+  2031).
+- **On a switch:** it asks the terminal's colours again and hands them to the
+  daemon. The TUI's own chrome takes the new light or dark at once.
+- **Telling the panes:** the daemon owns mode 2031 for each pane, and tells a
+  program that set it (Neovim does) of every change, as a terminal would.
+
+A raw stream carries every query the daemon did not answer, so your terminal
+answers those and never answers one twice. The full table is in
+`docs/transport-decision.md`.
+
+The TUI reads its terminal itself, so it decodes your keys, mouse, focus and
+those reports on its own. It also turns on bracketed paste: a paste reaches
+the focused pane whole, inside paste marks when the pane's program asked for
+them. A shell then runs none of a multi-line paste's lines until you press
+Enter.
 
 ### When something crashes
 
@@ -1697,12 +1707,11 @@ tutti is alpha; PLAN.md tracks what is open.
 - **A slow request whose handler panics never answers.** The daemon logs the
   panic and carries on, but the CLI waiting on that merge, diff or wait waits
   until you interrupt it.
-- **Light/dark switches reach panes only through `pane attach`.** The TUI
-  reports your terminal's colours when it attaches; reattach after switching
-  the OS theme.
-- **The TUI hears no light/dark switch while attached** (above), and a pane's
-  program that asked for key releases or the text of a key (kitty's flags 2
-  and 16) gets presses only: the TUI asks your terminal for neither.
+- **A pane's program that asked for key releases or the text of a key**
+  (kitty's flags 2 and 16) gets presses only: the TUI asks your terminal for
+  neither.
+- **The TUI follows light/dark only on terminals that report it** (mode
+  2031). On one that doesn't, reattach after switching the OS theme.
 - **In rtty, an editor's move off tutti's edge always reads as made.** The
   TUI takes it on and `tutti pane focus` exits 0, even where rtty's own edge
   then stops it. An editor that does something of its own when tutti

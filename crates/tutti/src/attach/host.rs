@@ -123,8 +123,16 @@ impl Backend for Host {
         self.0.show_cursor()
     }
 
+    /// Never asked of the terminal: crossterm's query reads the tty for the
+    /// answer, which the TUI's own reader (`reader`) would take first — and
+    /// ratatui asks only to put the cursor back after a clear, which the
+    /// next fullscreen draw places anyway.
+    /// Never asked of the terminal: crossterm's query reads the tty for the
+    /// answer, which the TUI's own reader (`reader`) would take first — and
+    /// ratatui asks only to put the cursor back after a clear, which the
+    /// next fullscreen draw places anyway.
     fn get_cursor_position(&mut self) -> io::Result<Position> {
-        self.0.get_cursor_position()
+        Ok(Position::ORIGIN)
     }
 
     fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {

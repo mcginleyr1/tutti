@@ -92,6 +92,18 @@ cargo fmt --check
   `FocusEdge`s go to every client focused there. A plain client handed an
   upper edge would make `tutti pane focus` exit 0 for a move nobody takes, and
   an editor outside rtty would think it moved.
+- **The TUI's terminal has one reader**, `attach/reader.rs`'s thread.
+  - **What would race it:** crossterm's `event::read`, `cursor::position`
+    and `supports_keyboard_enhancement`, and terminal-colorsaurus, each read
+    the tty for their answer. They would take the reader's bytes, or lose
+    their answer to it.
+  - **The query rule:** a new query goes out as bytes and comes back through
+    the decoder (`reader::Asked`, fenced by a DA1).
+  - **The cursor rule:** `host::Host` answers ratatui's cursor-position
+    query without asking the terminal. A resize or a resume once made it
+    time out after 2 s and end the TUI.
+  - **Key events:** keys come out as the same `KeyEvent`s crossterm made, so
+    a new decoding must keep every binding's chord as it was.
 - **Shutdown order** (`serve`, server.rs): abort *and await* the layout saver,
   write the final save, then `kill_all`. A save after `kill_all` — or a saver
   tick racing the final write — records a layout with every pane gone. An empty
@@ -195,11 +207,14 @@ cargo fmt --check
 - All colour goes through `attach/theme.rs` (`theme::current()`, activated
   per draw): never write a `Color::…` literal in render code outside that file.
   Three palettes: `terminal` (default), `dark`, `light` — `theme = …` in config,
-  an explicit choice. The one detection is `theme::host_colors` (OSC 10/11 via
-  terminal-colorsaurus, once at attach, before crossterm owns input — the
-  colours the daemon then answers panes' colour queries with): a light terminal
-  selects with ANSI 7 instead of ANSI 8, because some light schemes (Ghostty
-  "Primary") map ANSI 8 to pure black.
+  an explicit choice. The one detection is the terminal's colours.
+  - **How the TUI asks:** OSC 10/11 through its reader (`reader::Asked`), at
+    attach and again on each 997 report. `pane attach` uses terminal-colorsaurus
+    (`theme::host_colors`) instead.
+  - **What they're for:** the daemon answers panes' colour queries with them.
+  - **The selection colour:** a light terminal selects with ANSI 7 instead of
+    ANSI 8 (`theme::set_light`), because some light schemes (Ghostty
+    "Primary") map ANSI 8 to pure black.
 - Dim by default; ONE accent marks the focused/active thing (focused pane frame
   and title, the focused panel's header and the rail down its edge, the `▎`
   gutter + name chip on a selected row); red/yellow/green on state dots, the working spinner, the

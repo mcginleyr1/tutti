@@ -586,11 +586,12 @@ In order; each lands its TUI path in the same wave as its verbs.
    - ✅ terminal fidelity in the TUI (wave 8 step 2, on rtty-vt): underline
      styles and colours, Neovim's undercurl included; the cursor shape
      (DECSCUSR); focus events; hyperlinks; clusters;
-   - the TUI's live light/dark: crossterm 0.29 takes `CSI ? 997 n` for a
-     sequence still arriving and holds every key behind it, so it reports
-     colours at attach only; making it live means reading the terminal
-     without crossterm — keys, kitty's key reports, mouse, paste, focus —
-     which wave 8 left undone;
+   - ✅ the TUI's live light/dark (wave 8): the TUI reads its terminal
+     itself (`attach/reader.rs`) — keys as crossterm made them, kitty's and
+     modifyOtherKeys reports, SGR/X10/urxvt mouse, bracketed paste (now on:
+     a paste reaches a pane whole), focus, and the replies it asks for (OSC
+     10/11, DA1, kitty's flags, XTVERSION, DECRPM); on a `CSI ? 997` report
+     it recolours and hands the daemon fresh colours. crossterm only draws;
    - `pane attach --inline` (primary screen, switches passed through) so
      editor terminals keep native scrollback; escape-time for an Alt prefix;
    - ✅ detach under the kitty keyboard protocol: the daemon keeps the
@@ -678,12 +679,8 @@ In order; each lands its TUI path in the same wave as its verbs.
   for Pi, a different product);
 - a spawned request task (merge, fork, diff, wait, …) that panics leaves its
   caller waiting: the daemon logs it, but the CLI has no client-side timeout;
-- under heavy parallel test load `openpty` occasionally fails a test's first
-  spawn (`Unknown error: -6`); a rerun passes;
 - Codex and Gemini integrations need the tools installed and a live run;
-- the TUI hears no light/dark switch while attached (crossterm reads its
-  input), and gives a pane key presses only (no kitty release or text
-  reports).
+- the TUI gives a pane key presses only (no kitty release or text reports).
 
 **Deliberately not done:** packaging and distribution (Phase 5) — the project
 is private, so install stays `cargo install --path` from a checkout.

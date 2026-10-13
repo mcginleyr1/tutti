@@ -5,9 +5,10 @@
 //! truecolor themes: a shaded chrome over a tinted pane ground, an explicit
 //! muted grey instead of DIM, and state/diff colours tuned to that ground. A
 //! theme is a fixed choice made in config. The one thing detected is the
-//! terminal's own colours, once at attach: whether its background is light
-//! only picks which ANSI colour the `terminal` theme's selection row uses,
-//! and the daemon answers the panes' colour queries with them.
+//! terminal's own colours, at attach and again on each light/dark flip it
+//! reports: whether its background is light only picks which ANSI colour
+//! the `terminal` theme's selection row uses, and the daemon answers the
+//! panes' colour queries with them.
 //!
 //! The active palette is thread-local, set for the span of one `draw` by
 //! `activate`, so every styling helper reads it without threading a parameter
@@ -113,13 +114,20 @@ pub static TERMINAL_LIGHT: Palette = Palette {
 
 static LIGHT_TERMINAL: AtomicBool = AtomicBool::new(false);
 
+/// The terminal is light (or dark): the `terminal` theme's selection takes
+/// the colour for it from the next draw.
+pub fn set_light(light: bool) {
+    LIGHT_TERMINAL.store(light, Ordering::Relaxed);
+}
+
 /// The colours a pane shows on, which the daemon answers its colour queries
-/// with (`Request::HostColors`). On the `terminal` theme they are the
-/// terminal's own, asked once here before the TUI takes over input — which
-/// also picks the selection colour, fixed for the attach, a later light/dark
-/// flip keeping it. A terminal that doesn't answer gives `None` and is
-/// treated as dark. On `dark` and `light` they are the theme's own pane
-/// ground and text, which panes are painted over.
+/// with (`Request::HostColors`). On `dark` and `light` they are the theme's
+/// own pane ground and text, which panes are painted over. On the
+/// `terminal` theme they are the terminal's own, asked here — for `pane
+/// attach`, which reads its terminal a read at a time; the TUI asks through
+/// its own reader (`reader::Asked`) — and they also pick the selection
+/// colour. A terminal that doesn't answer gives `None` and is treated as
+/// dark.
 pub fn host_colors(theme: Theme) -> Option<HostColors> {
     if theme != Theme::Terminal {
         let theme_palette = palette(theme);
@@ -146,7 +154,7 @@ pub fn host_colors(theme: Theme) -> Option<HostColors> {
     let dark = detected
         .as_ref()
         .is_none_or(|found| matches!(found.theme_mode(), ThemeMode::Dark));
-    LIGHT_TERMINAL.store(!dark, Ordering::Relaxed);
+    set_light(!dark);
     let rgb = |c: terminal_colorsaurus::Color| Rgb {
         r: c.r,
         g: c.g,
