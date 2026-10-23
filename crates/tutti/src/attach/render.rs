@@ -4298,16 +4298,17 @@ mod tests {
         let mut app = app_with_pane(b"hi");
         app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
         app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
-        // Find the command row, whatever this machine has on PATH.
+        // Walk to the command row, whatever this machine has on PATH.
         use crate::attach::launcher::LaunchKind;
-        let command_number = app
+        let command_row = app
             .launcher_rows()
             .iter()
             .position(|r| matches!(r.kind, LaunchKind::Command))
-            .unwrap()
-            + 1;
-        let digit = char::from_digit(command_number as u32, 10).unwrap();
-        app.on_key(KeyEvent::new(KeyCode::Char(digit), KeyModifiers::NONE));
+            .unwrap();
+        for _ in 0..command_row {
+            app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.mode, Mode::LauncherCommand);
 
         let mut terminal = Terminal::new(TestBackend::new(64, 20)).unwrap();

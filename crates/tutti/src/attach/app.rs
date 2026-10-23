@@ -11078,15 +11078,17 @@ mod tests {
         let mut app = App::new();
         attached(&mut app);
         app.open_launcher(false, None, None);
-        // Find the command row, whatever this machine has on PATH.
-        let command_number = app
+        // Walk to the command row, whatever this machine has on PATH: past
+        // nine installed agents it has no quick-select number.
+        let command_row = app
             .launcher_rows()
             .iter()
             .position(|r| matches!(r.kind, LaunchKind::Command))
-            .unwrap()
-            + 1;
-        let digit = char::from_digit(command_number as u32, 10).unwrap();
-        let out = app.on_key(plain(digit));
+            .unwrap();
+        for _ in 0..command_row {
+            app.on_key(plain('j'));
+        }
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(out.is_empty(), "opening the command input emits nothing");
         assert_eq!(app.mode, Mode::LauncherCommand);
 
@@ -11194,14 +11196,15 @@ mod tests {
         let mut app = App::new();
         attached(&mut app);
         app.open_launcher(false, None, None);
-        let command_number = app
+        let command_row = app
             .launcher_rows()
             .iter()
             .position(|r| matches!(r.kind, LaunchKind::Command))
-            .unwrap()
-            + 1;
-        let digit = char::from_digit(command_number as u32, 10).unwrap();
-        app.on_key(plain(digit));
+            .unwrap();
+        for _ in 0..command_row {
+            app.on_key(plain('j'));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         app.on_key(plain('x'));
         assert_eq!(app.mode, Mode::LauncherCommand);
         let out = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
