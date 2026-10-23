@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtyPair, PtySize, native_pty_system};
-use rtty_vt::{ColorScheme, Event, MarkKind, ModeChange, MouseEncoding, MouseMode, Terminal};
+use rtty_vt::{ColorScheme, Event, MarkKind, ModeChange, Terminal};
 use tokio::sync::watch;
 use tutti_core::{AgentState, HostColors, Rgb, StateSource};
 
@@ -34,17 +34,10 @@ type PtyWrite = (Vec<u8>, Option<SyncSender<std::io::Result<()>>>);
 /// The longest sequence held from the terminal and the taps while it could
 /// still be one the daemon answers or owns; past it, it goes on to both.
 const HOLD_MAX: usize = 256;
-/// What a program can leave on in its terminal that the shell after it
-/// never asked for: the reports the terminal writes into the pane unbidden —
-/// the mouse's (every tracking mode and encoding), focus (1004), light/dark
-/// (2031) — and the key encodings the TUI types into it by, xterm's
-/// modifyOtherKeys and kitty's flags (every entry popped). A program killed
-/// with SIGKILL turns none of them off; a shell drawing its prompt sets its
-/// own after the command's end (`Term::drain`). Bracketed paste stays: every
-/// shell sets it itself.
-const LEFT_ON: &[u8] =
-    b"\x1b[?9;1000;1002;1003;1004;1005;1006;1015;1016;2031l\x1b[>4;0m\x1b[<65535u";
-/// `LEFT_ON` less what never reaches a tap (`Verdict::Own`).
+/// What a command's end turns off in a pane's terminal (rtty-vt's
+/// `set_command_end_reset`) that reaches a tap: the mouse's reports (every
+/// tracking mode and encoding) and focus (1004). The rest — 2031 and the key
+/// encodings — never reaches one (`Verdict::Own`).
 const LEFT_ON_TAPS: &[u8] = b"\x1b[?9;1000;1002;1003;1004;1005;1006;1015;1016l";
 
 /// What to run in a pane.
@@ -211,10 +204,8 @@ struct Term {
     crashed: bool,
     /// When the program opened the synchronized update (2026) it has open.
     synced: Option<Instant>,
-    /// The last shell mark was a command's end (OSC 133;D).
-    ended: bool,
-    /// A command's end turned off what it left on (`LEFT_ON`): the taps are
-    /// told once the mark has ended, its ST included.
+    /// A command's end turned off what it left on (`LEFT_ON_TAPS`): the taps
+    /// are told once the mark has ended, its ST included.
     taps_owed: bool,
 }
 
@@ -233,9 +224,9 @@ impl Term {
             taps: Vec::new(),
             crashed: false,
             synced: None,
-            ended: false,
             taps_owed: false,
         };
+        term.vt.set_command_end_reset(true);
         if let Some(colors) = colors {
             term.set_colors(colors);
         }
@@ -433,7 +424,7 @@ impl Term {
     /// Take the terminal's events: its answers to write back, and the
     /// signals tutti reads. True when there was an answer.
     fn drain(&mut self, out: &mut Processed) -> bool {
-        let mut answered = false;
+        let (mut answered, mut ended) = (false, false);
         for event in self.vt.take_events() {
             match event {
                 Event::Reply(answer) => {
@@ -443,28 +434,15 @@ impl Term {
                 Event::Mode(ModeChange::SyncUpdate(open)) => {
                     self.synced = open.then(Instant::now);
                 }
-                // A shell marked the end of the command it ran: what that
-                // left on goes off, at the mark — the shell's next prompt
-                // sets its own after it (fish its 2031 and modifyOtherKeys).
-                // Only at the first of a run of ends: zsh's integration marks
-                // one from PROMPT_SP and one from precmd, and a hook between
-                // them belongs to the shell.
+                // A shell marked the end of the command it ran, and the
+                // terminal turned off what that left on: the mode changes
+                // right after the mark are those. A mark is the last thing
+                // fed before its drain (`Verdict::Ask`).
                 Event::Mark(mark) => {
-                    let ended = matches!(mark.kind, MarkKind::CommandEnd { .. });
-                    let modes = self.vt.modes();
-                    let on = modes.mouse != MouseMode::None
-                        || modes.mouse_encoding != MouseEncoding::Default
-                        || modes.focus_reports
-                        || modes.color_scheme_reports
-                        || modes.modify_other_keys != 0
-                        || self.vt.kitty_keyboard() != 0;
-                    if ended && !self.ended && on {
-                        self.vt.advance(LEFT_ON);
-                        self.taps_owed = true;
-                    }
-                    self.ended = ended;
+                    ended = matches!(mark.kind, MarkKind::CommandEnd { .. });
                     out.signals.extend(signal(Event::Mark(mark)));
                 }
+                Event::Mode(_) if ended => self.taps_owed = true,
                 event => out.signals.extend(signal(event)),
             }
         }
@@ -1476,6 +1454,7 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rtty_vt::{MouseEncoding, MouseMode};
 
     /// The reader's buffer.
     const READ: usize = 8192;
@@ -1879,6 +1858,18 @@ mod tests {
             vec![Notification {
                 title: Some("T".into()),
                 body: Some("a;b;c".into()),
+            }]
+        );
+    }
+
+    /// kitty's OSC 99: its chunks with one id add up to one notification.
+    #[test]
+    fn osc99_carries_title_and_body() {
+        assert_eq!(
+            scan(b"\x1b]99;i=1:d=0;Agent\x1b\\\x1b]99;i=1:p=body;ready to merge\x07"),
+            vec![Notification {
+                title: Some("Agent".into()),
+                body: Some("ready to merge".into()),
             }]
         );
     }

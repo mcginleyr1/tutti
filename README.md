@@ -1056,7 +1056,7 @@ reverting change. Workspaces outside jj get no checkpoints.
 ### Notifications
 
 Agents inside panes emit terminal bells and desktop-notification escapes (OSC 9,
-OSC 777). Tutti captures these from each pane's output and, for a **background**
+OSC 777, kitty's OSC 99). Tutti captures these from each pane's output and, for a **background**
 (non-focused) pane, flashes the text in the status bar and re-emits a bell plus
 an OSC 9 to *your* real terminal — so wezterm/kitty/etc. raise an actual desktop
 notification naming the pane. The focused pane is left alone (you are already

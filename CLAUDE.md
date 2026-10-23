@@ -159,9 +159,12 @@ cargo fmt --check
   frame that switches. A tap runs on the reader thread under that lock: it
   never blocks, waits or takes another lock — it `try_send`s.
 - **A command's end (OSC 133;D) turns off the modes the command left on**
-  (`LEFT_ON`, `Term::drain`, pty.rs):
+  (rtty-vt's `set_command_end_reset`, on in `Term::new`; the taps hear of it
+  through `LEFT_ON_TAPS`, `Term::drain`, pty.rs):
   - **What it covers:** mouse, focus, 2031 and the key encodings, applied at
-    the mark's byte and only at the first of a run of ends.
+    the mark's byte and only at the first of a run of ends. The taps learn
+    of it from the mode changes the engine posts right after the mark's
+    event, so a mark must stay the last thing fed before its drain.
   - **Don't move it to the prompt start (A).** fish sets 2031 and
     modifyOtherKeys between its own A and the integration's A, so it would
     lose them at every prompt.

@@ -660,6 +660,9 @@ In order; each lands its TUI path in the same wave as its verbs.
      - **Why at D:** shells set their own prompt modes after D (zsh, bash,
        fish measured), and fish's 2031 comes before the integration's A.
      - **Acceptance:** 115/115.
+     - **Since 2026-10-23 the engine's:** rtty-vt's `set_command_end_reset`
+       does it (the pin moved to rtty `ef7d4328`, which also reads kitty's
+       OSC 99 notifications); tutti only tells the taps.
    - ✅ The 2031 server test's race is fixed. Everything written to a pane's
      pty goes through one writer thread in queue order: answers, light/dark
      notices and input alike. Before this, typed input took a second path and
