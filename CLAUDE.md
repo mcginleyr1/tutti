@@ -20,7 +20,7 @@ that isn't derivable from those.
 cargo check --workspace --all-targets
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --check
+cargo fmt --all --check
 ```
 
 - **Never run the gate through pipes that mask exit codes** (`cmd | rg | bc &&
@@ -62,8 +62,10 @@ cargo fmt --check
   its end and deduped away).
 - **`tutti agent-event` never writes stdout**: Claude Code feeds a
   `UserPromptSubmit`/`SessionStart` hook's stdout to the model as context. The
-  one exception is a held `PermissionRequest`'s decision JSON — that is the
-  hook's answer. Errors go to stderr; the exit is always 0.
+  exceptions are a held request's answer: a `PermissionRequest`'s decision
+  JSON (Claude's, and Codex's in the same schema), and the reply JSON tutti's
+  opencode plugin posts for a held `permission.asked`. Errors go to stderr;
+  the exit is always 0.
 - **A sequence the pane's terminal might answer ends a run fed to it**
   (`Term::process`/`settle`, `Verdict::Ask`, pty.rs): the reply it drives out
   is then that query's own, and the query is kept from the taps exactly when

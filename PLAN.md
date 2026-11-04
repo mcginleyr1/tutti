@@ -163,8 +163,14 @@ foundation everything else sits on; get it right before touching ratatui.
    revive into it (Phase 4 item 7); every other pane comes back as a shell, and
    saved commands are never re-run. An empty session never writes the save, so
    a restarted daemon cannot push its pending offer aside. A save that does not
-   parse is set aside as `.restore.json.bad`. Open: a turn in flight at
-   shutdown loses its prompt label.
+   parse is set aside as `.restore.json.bad`. ✅ The save also holds the
+   notification history and each pane's in-flight prompt (wave 9). A starting
+   daemon takes the history back at once, its new panes taking ids past every
+   one a note names; a restore points each note at the pane it came back as,
+   and closes a turn left in flight as a `restart` checkpoint under its
+   prompt. Known limitation, deliberate: a session with no workspaces at all
+   saves nothing, so its notification history is lost at the next restart.
+   Open: restored panes' 🔔 marks come back only at the next attach.
 
 **Acceptance:** with no TUI at all — `tutti workspace new --dir .`, `tutti pane run -- top`,
 close the terminal, reopen, `tutti pane read` shows `top` still running.
@@ -222,7 +228,12 @@ Goal: the differentiator. Tutti knows which panes are agents and what state they
    opencode, amp, copilot, etc. Registry is data-driven (a table of process names +
    heuristics), so adding an agent is a one-line change. Sandbox panes skip the
    walk (it only ever finds `tutti` and `kubectl`); their kind is declared from
-   the command at spawn.
+   the command at spawn. ✅ A `node` process is named by its script
+   (`tutti_agents::program_name`, from the argv the walk now reads), so Gemini
+   CLI (`node …/gemini`) reads as `gemini`. Open: a node flag with a separate
+   value is taken for the script (`node --require x script` reads as `x`);
+   Cursor's docs now name its binary `agent`, but the catalog still detects
+   and runs `cursor-agent`.
 2. **State classification** per pane, using layered signals (most→least reliable):
    - agent-specific integrations (e.g. Claude Code hooks writing to a tutti-known
      location, or parsing its status line)
@@ -253,13 +264,17 @@ Goal: the differentiator. Tutti knows which panes are agents and what state they
    the daemon answers herdr's v0.9.3 reporting socket per session, so Crush (and
    other native herdr reporters) claim their own state at the Hook rank — no new
    `StateSource` variant on the wire. Unlike a hook claim, that claim ends on
-   release/clear, child exit, or another agent's detection. Open:
-   `notification.show` without a `pane_id` (needs peer-pid attribution), and
-   Prime Agent, which reports to herdr as `prime-agent` (source `herdr:pi`),
-   a kind with no registry row. Its process name is unverified: if it runs as
-   `pi`, detection takes it for the registry's Pi (badlogic's pi-mono, a
-   different product) and ends its first claim once; an alias would conflate
-   the two, so it wants a registry row of its own once the name is known.
+   release/clear, child exit, or another agent's detection. ✅ A
+   `notification.show` naming no pane lands on the pane whose process sent
+   it: the socket's peer pid (tokio `peer_cred`: LOCAL_PEEREPID /
+   SO_PEERCRED), walked up its parents to a pane's own process; one from
+   outside every pane is refused as before (`pane_id is required`). ✅ Prime
+   Agent has its own registry row, `prime-agent`: its installer's launcher
+   execs `share/prime-agent/prime-agent` (the Rust port's `[[bin]]`), so it
+   never reads as Pi, and detection catching up keeps its `herdr:pi` /
+   `prime-agent` claim. Open: Prime Agent reports `agent_session_path`, not
+   an id, so its pane holds no conversation to revive (`prime-agent
+   --resume` takes a path or id); its screen patterns are guesses.
 3. **Surfacing**: colored state badge per pane border + tab, workspace overview in
    navigate mode grouped by state (Blocked first), optional terminal bell / OSC 9
    desktop notification on `Working → Blocked/Done`. ✅ The go-to overlay
@@ -273,14 +288,21 @@ Goal: the differentiator. Tutti knows which panes are agents and what state they
    newest first (enter jumps and marks read, `r` reads all, `X` clears after a
    confirm), the app bar's census ends with an unread `🔔 N` chip, a focus or
    `NotesRead` from anywhere clears the sidebar 🔔, and `tutti notes [--unread]
-   | read | clear` serves scripts. Open: persist the history with the saved
-   layout; carry a hook's Blocked message onto its note; fold a 7501 `msg` into
-   the transition note it accompanies (today that is two notes).
+   | read | clear` serves scripts. ✅ The history is saved with the layout and
+   back as the next daemon starts (Phase 1 item 5). A transition's note
+   carries what came with it — a hook's blocked message as its body, an OSC
+   7501 or herdr report's `msg` under its app — one note, not two; a note
+   carrying text keeps its pane's 🔔 as a notification does. Open: a second
+   blocked hook event on a pane already Blocked is no transition, so its
+   message lands in no note (it matters more now that a pane holds several
+   approvals).
 4. **API**: `pane list --json` includes agent + state; emit state-change events on the
    socket event stream. ✅ For tools outside tutti (a notch app): `tutti watch`
    (the socket's `Watch`) streams whole-session snapshots, one per change,
    beside the attached TUI without touching it; a scripted `pane focus` jumps
-   that TUI to the pane.
+   that TUI to the pane. ✅ Snapshots carry each pane's `cwd`, its held
+   `approval` (the oldest) and its `issue` link, and `pane list` names each
+   pane's `workspace` id (wire rev 12).
 
 **Acceptance:** start a Claude Code task; badge shows Working; when it asks for
 permission the pane flags Blocked within ~1s; when it finishes, Done until you focus it.
@@ -293,17 +315,20 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
 1. **Wait conditions**: `tutti pane wait <pane> --until done|blocked|idle [--timeout]`
    blocks until the state transition (server-side subscription, not polling).
    ✅ `tutti pane wait <pane>... [--until working|blocked|done|idle] [--next]
-   [--timeout <secs>]` blocks on a server-side subscription: a broadcast of pane
-   signals fed by the `publish_transition` funnel, the reaper and every removal
-   path, never polling. Level-triggered by default; `--next` counts only a
+   [--timeout <secs>]` blocks on a server-side subscription: a queue of its
+   pane's signals fed by the `publish_transition` funnel, the reaper and every
+   removal path, never polling. Level-triggered by default; `--next` counts only a
    transition into a state from outside it, so a Done → Idle focus is never a
    fresh finish. A child exit ends the wait: a matching final state answers,
    anything else is an error naming the exit code, and a wait for idle outlives
    the exit, since a look can still bring Idle. A killed pane is an error, and a
    timeout exits 124. A waiter whose client hangs up is cancelled: a
-   connection's writer closes its queue once its reader sees the peer go. Open:
-   a waiter lagging 256 signals behind re-checks level-triggered, so a `--next`
-   edge can be lost under that load.
+   connection's writer closes its queue once its reader sees the peer go. ✅
+   Each wait's queue is its own and unbounded (`Hub.waits`, `tell_waits`), so
+   a wait however far behind its pane still answers on its edge. The
+   256-signal broadcast it replaced dropped the edge of a wait 256 moves
+   behind and answered from a level re-check (tested at 255, 256 and 4096
+   behind).
 2. **Structured read**: `pane read --unwrapped` (logical lines, no soft wraps) and
    `--since` cursors so a supervisor agent can tail incrementally. ✅
    `--unwrapped` joins rows by the terminal's own soft-wrap flags, so a
@@ -369,9 +394,13 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    `project list` keeps the top-level entries. The old `workspace new --dir` /
    `workspace fork` spellings still parse, hidden, to the same requests. No
    help screen or CLI message says "fork"; the wire's `WorkspaceFork` keeps its
-   name. Open: a `workspace add` whose `-r` names a missing revision leaves a
-   half-made checkout (jj 0.46 registers the workspace before resolving the
-   revision; `sandbox pull` checks first).
+   name. ✅ A `-r` naming no commit — missing, or a revset resolving to none —
+   is refused before `jj workspace add` runs (`jj::fork`); jj 0.46 registers
+   the workspace and makes its checkout before it resolves the revision.
+   Open: an add that fails after that point for another reason (a timeout;
+   `-r 'root() | @'`, a merge with the root the Git backend refuses) still
+   leaves a half-made checkout, and tutti does not clean it up: `jj workspace
+   forget <name>` could remove a same-named workspace tutti never made.
 6. **Agent-event ingest + Claude Code hook integration**: ✅ panes get
    `TUTTI_PANE`/`TUTTI_SESSION` in their env; `tutti hooks claude` prints a hook
    config that makes the agent call `tutti agent-event claude` on subagent
@@ -392,9 +421,25 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    (`tutti::integrations`: `plan` → status, contents, summary and preview, then
    `apply` with a backup and a changed-since-inspected guard), shared by the
    CLI's `--install` flows and the TUI's setup panel (prefix `i`), which plans
-   and installs each for the user or the active project. Open: Codex/Gemini
-   integrations need their specs read, the tools installed, and a live run
-   before they land.
+   and installs each for the user or the active project. ✅ Codex (verified
+   live against codex-cli 0.166.0) and Gemini CLI (0.66.0) join through
+   `tutti hooks codex|gemini [--install [--project]]` → `tutti agent-event
+   codex|gemini`, with the same plan/confirm/backup flow and setup-panel rows.
+   Codex's hooks speak Claude's schema: Interrupt ends a turn (no Stop follows
+   it), PermissionRequest blocks, and its hooks must be trusted once in
+   `/hooks`. Codex runs embedded (`--no-daemon`) in panes tutti launches: its
+   shared app-server runs every session's hooks with the env of whichever
+   codex started it (observed: another pane's events landed on the first), so
+   `agent-event codex` drops an event unless the session's daemon is its
+   ancestor. A Gemini Notification blocks only for a `ToolPermission`. ✅
+   Claude Code 2.1's subagent tool is `Agent`, not `Task`; both start a
+   subagent row. Open: a codex typed by hand without `--no-daemon` runs in the
+   shared app-server, so the guard drops its hook events and the pane falls
+   back to the screen (no turn labels, no conversation); the guard fails open
+   when the session's pid file is missing; Claude's `StopFailure` (an API
+   error ends the turn with no Stop; the next prompt closes it as
+   `interrupted`) and `PostToolUseFailure` (an approved tool that fails sends
+   no `PostToolUse`) are not wired.
 7. **Conversation resume**: ✅ wave 1 — the launcher harvests resumable
    conversations for its target workspace from the agent tools' own session
    stores (read-only; each candidate verified against the working directory
@@ -413,7 +458,10 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    (claude, muse, vibe, opencode `--session`). ✅ Wave 2: the id is saved with
    the layout, and a restore revives every agent pane that held one in exactly
    that conversation via its tool's recipe, under its old title; other panes
-   come back as shells — saved commands are never re-run.
+   come back as shells — saved commands are never re-run. ✅ Codex (`codex
+   resume --no-daemon <id>`, verified live) and Gemini CLI (`gemini --resume
+   <id>`, per its docs) resume recipes, with their hooks naming the id;
+   neither store is harvested yet.
 8. **Per-turn checkpoints**: ✅ each agent turn's end (a pane leaving Working,
    through the single `publish_transition` funnel in server.rs) checkpoints the
    workspace's jj `@` — the commit id the change probe's own snapshot already
@@ -429,8 +477,13 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    would offer to undo someone else's work. ✅ Turns are labelled with the first
    line of the prompt that started them (`Checkpoint.prompt`, from
    `UserPromptSubmit`; a blocked turn keeps its prompt for the work after you
-   answer). Open: Esc interrupts a turn without a Stop, so its edits fold into
-   the next turn's checkpoint under the next prompt.
+   answer). ✅ A turn interrupted with Esc (Claude sends no Stop) closes as
+   `interrupted`, under its own prompt, when the next `UserPromptSubmit`
+   arrives with a new `prompt_id` and no Stop since; more typed into a
+   running turn (same `prompt_id`) stays in it under its first prompt. Open:
+   the pane reads working from the Esc until that next prompt, and edits made
+   in between join the interrupted turn; Codex's and Gemini's prompts carry
+   no id, so input typed into their running turn splits it as `interrupted`.
 9. **Answer from the queue**: ✅ `p` (or a right-click) on a blocked sidebar row
    opens a peek overlay of that agent's live prompt; answer keys go out as a
    guarded `PaneSend` whose `expect` is the prompt fingerprint (FNV-1a over the
@@ -457,9 +510,21 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    echoes on that request's answer, async ones included; the TUI keys its
    add-project, workspace, merge, sandbox-pull and issue-deploy follow-ups on it
    (`App::follow`), so a refused answer cancels only its own request's
-   follow-up. Open: one held approval per pane; Blocked lasting through an
-   approved tool's run when it was answered in Claude's own dialog (Claude has
-   no granted-permission hook); an opencode hold path.
+   follow-up. ✅ A pane holds every request its agent raises
+   (`PaneInfo.approvals`, oldest first; `approval` stays as the oldest for
+   older clients), each on its own waiting row in arrival order, answered on
+   its own (`pane approve --id`) with its own timeout; the pane stays blocked
+   until the last, or while one passed to the agent's own dialog waits, and
+   an exit drops what it held. ✅ Answered in Claude's own dialog, the pane
+   leaves Blocked once its screen, having shown the dialog, shows Claude busy
+   again (`· ↓ … tokens` spinner, `Running`) — the hooks reference has no
+   event between that answer and `PostToolUse`. ✅ opencode holds too: its
+   plugin sends `permission.asked` through `agent-event` and posts tutti's
+   answer as opencode's `/permission/{id}/reply`; an answer in opencode's own
+   dialog drops tutti's hold. Open: that dialog-to-Working gate relies on
+   Claude 2.1.318's spinner marker; opencode's dialog shows beside a held
+   request (1.18.5 never calls the plugin's `permission.ask`), and the reply
+   goes through the plugin client's undocumented `_client`.
 10. **Kubernetes sandboxes**: ✅ `[[sandboxes]]` client-config profiles name
    an agent-sandbox target, either a `SandboxClaim` on a warm pool or a
    `Sandbox` from an image. `PaneRun { sandbox }` (CLI `pane run --sandbox`,
@@ -497,10 +562,23 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    crush takes none) on the issue's rendered prompt, and links the pane
    (`Run.issue` → `PaneInfo.issue`, shown in the sidebar and pane title, kept
    by a revived agent across a restore). The TUI deploy's fork and run ride
-   `req`-keyed follow-ups. Read-only toward trackers. Open: write-back (comment
-   the link, move the issue's state); carry the link in watch snapshots; a
-   Linear run with a real key; prompt-passing data for the unverified catalog
-   agents; a prompt past Linux's 128 KiB single-argument limit fails the spawn.
+   `req`-keyed follow-ups. ✅ Write-back, opt-in per source: once the agent
+   runs, the deploying client comments where it runs (`comment = true`:
+   workspace and project, pane and session, a sandbox's branch — never a
+   local path), assigns and labels the issue on GitHub (`assign`, `label`
+   through `gh issue edit`) and moves it to a named workflow state on Linear
+   (`state`). The CLI exits 1 after the pane id if the tracker refuses; the
+   TUI writes back on a thread, with a flash. The daemon still never talks to
+   a tracker. ✅ Watch snapshots carry the link (`WatchPane.issue`). ✅ A
+   prompt of 128 KiB or more (Linux's MAX_ARG_STRLEN) goes to a 0600 file in
+   the temp dir that the agent's first message names; tutti never deletes
+   that file, so the agent can come back to it, and the OS's temp cleanup
+   takes it; a sandbox deploy of one is refused. ✅ Every catalog row says how
+   it takes a first message and from where that is known: Pi joins from its
+   `--help`; Goose, Qwen Code, Cursor CLI, Copilot CLI, Factory Droid, Augment
+   Code and Amazon Q from their docs; Crush, Aider and Amp take none. Open:
+   the native file inputs (Ori's `--prompt-file`, Pi's and Augment's `@file`,
+   Goose's `--instructions`) go unused for long prompts.
 
 **Acceptance:** a script (or an agent) can: create 3 worktree workspaces, launch an
 agent in each, `wait --until done` on all three, read back each diff summary.
@@ -508,7 +586,7 @@ Runnable now that items 1 and 3 have landed (`workspace add`, `run
 --workspace`, `pane wait --until done,blocked`, `workspace diff --stat`); open
 until it has been run for real against live agents.
 
-### Next waves (as of 2026-10-12)
+### Next waves (as of 2026-11-04)
 
 In order; each lands its TUI path in the same wave as its verbs.
 
@@ -526,15 +604,17 @@ In order; each lands its TUI path in the same wave as its verbs.
    follow-up.
 4. ✅ **Survive a daemon restart** — the layout, each pane's conversation id
    and its checkpoint list share one small state file, offered back on attach.
-5. **Candidates from prior art** — ✅ herdr-compatible reporting (Crush reports
-   with no install step); ✅ hook-held approvals answered from the queue. Open:
-   Codex and Gemini hook integrations — read each spec, install the tool, and
-   verify with a live run.
+   Since wave 9 the notification history and an in-flight turn's prompt
+   survive too.
+5. ✅ **Candidates from prior art** — herdr-compatible reporting (Crush reports
+   with no install step); hook-held approvals answered from the queue; Codex
+   and Gemini CLI hook integrations (wave 9, Phase 4 item 6).
 6. ✅ **Connections** — several clients attach (the smallest viewer sizes each
    pane), and the daemon and client survive panics and a wedged peer (Phase 2
    item 1, Phase 5).
 7. ✅ **Notifications pane** — a 200-note daemon-side history behind prefix `N`
-   and `tutti notes` (Phase 3 item 3).
+   and `tutti notes` (Phase 3 item 3). Since wave 9 the history survives a
+   restart and a transition's note carries its message.
 8. ✅ **Issue dispatch** — `[[issues]]` sources behind prefix `I` and `tutti
    issue list|deploy` (Phase 4 item 11).
 9. ✅ **Editor interop (wave 7)** — Neovim and Emacs in panes, wire rev 10:
@@ -592,8 +672,21 @@ In order; each lands its TUI path in the same wave as its verbs.
      a paste reaches a pane whole), focus, and the replies it asks for (OSC
      10/11, DA1, kitty's flags, XTVERSION, DECRPM); on a `CSI ? 997` report
      it recolours and hands the daemon fresh colours. crossterm only draws;
-   - `pane attach --inline` (primary screen, switches passed through) so
-     editor terminals keep native scrollback; escape-time for an Alt prefix;
+   - ✅ `pane attach --inline` (wave 9): the primary screen, a program's
+     screen switches passed through, so an editor's terminal keeps native
+     scrollback. Attach first scrolls the lines on screen, to the cursor's (a
+     CPR), up into the scrollback; each snapshot (attach, resize) and a reset
+     are drawn from the mirror's `snapshot()`, both screens, less the
+     terminal's own modes; detach leaves a program's alternate screen and
+     puts the cursor under the pane's last text. Verified in Neovim 0.12.4's
+     `:terminal`. Open: the pane's history from before the attach is not
+     replayed (wave 10);
+   - ✅ the escape time (wave 9): `escape_time_ms` (default 15, 0–1000),
+     tmux's escape-time — a lone ESC waits it for the key after it, which
+     goes with it as Alt — in the TUI's reader and in `pane attach`, which
+     holds the ESC (poll(2) on stdin) and sends both in one write, an
+     `A-…` prefix included. A lone Esc reaches a pane 15–20 ms after it is
+     typed at the default;
    - ✅ detach under the kitty keyboard protocol: the daemon keeps the
      protocol (push, pop, set; its query it answers) from raw streams as it
      does modifyOtherKeys, so no pane turns it on in a `pane attach`
@@ -603,13 +696,17 @@ In order; each lands its TUI path in the same wave as its verbs.
      engine swap: the daemon answers those queries itself, and hands a
      stream each switch of screens (or reset) in a frame of its own
      (`a_screen_switching_read_loses_nothing_on_a_stream`);
-   - `cwd` in watch snapshots; `pane list` has no workspace and watch no
-     approval, so the plugins read one from each;
+   - ✅ `cwd` and the held `approval` in watch snapshots, the workspace id in
+     `pane list` (wave 9, wire rev 12); the Emacs agents list reads
+     approvals from its watch like the rest, and `:TuttiAgents` already read
+     only the watch. Open: the Emacs agents list answers with `tutti pane
+     approve <pane>`, no `--id`, so it answers the oldest held request, not
+     necessarily the one it showed; it should pass the snapshot's id;
    - fish's snippet unrun; bash before 4.4 has no `C` mark; Emacs 29 and
      Neovim before 0.12 unrun;
    - ✅ XTVERSION, DECRQM beyond 2031, DECRQSS, XTGETTCAP and kitty's `CSI ?
      u` are answered by the engine since wave 8.
-10. **Own terminal engine (wave 8)** — rtty-vt, the rtty repo's `vt/`, under
+10. ✅ **Own terminal engine (wave 8)** — rtty-vt, the rtty repo's `vt/`, under
     tutti and rtty alike:
    - ✅ Step 1, the daemon: each pane is an `rtty_vt::Terminal`. Gone: the
      scroll-count offset trick, the run-splitting `Seq`, the window tiling,
@@ -667,50 +764,108 @@ In order; each lands its TUI path in the same wave as its verbs.
      pty goes through one writer thread in queue order: answers, light/dark
      notices and input alike. Before this, typed input took a second path and
      could overtake a report queued before it.
+   - ✅ Full kitty key reports (wave 9): the TUI asks a kitty terminal for
+     1|4 plus what the focused pane's program pushed — event types (2), and
+     every key an escape code with its text (8|16) — set on the entry it
+     pushed as the focus or the flags change (`CSI = n ; 1 u`), popped on
+     detach. A `CSI … u` key keeps kitty's `Report` (code, alternates, raw
+     modifier bits, text) beside its `KeyEvent`, and the encoder passes it on
+     as far as the pane asked; a key held down stays with the pane it was
+     pressed into — repeats and release, whatever the focus since — with
+     event types kept on until it is let go; a release never reaches a pane
+     whose press was tutti's, and a lone modifier is never a tutti key.
+     Neovim 0.12 pushes 1|2, so it now hears repeats and releases. Wire
+     unchanged. Acceptance: 58/58 (inline in nvim's `:terminal`, the escape
+     time, kitty reports through a harness playing kitty), and the wave 8
+     harness 120/120.
    - ✅ The openpty flake is fixed: ptys are opened one thread at a time.
      macOS's openpty(3) fails with errno -6 when two threads of one process
      call it at once. Processes never collide.
-   - Step 3, rtty itself.
+   - ✅ Step 3, rtty itself: rtty runs on rtty-vt and its own pty since rtty
+     commit nkmtylwp. `alacritty_terminal` stays only as rtty-vt's
+     dev-dependency, the oracle of its differential tests.
+11. ✅ **Wave 9** — six stacks, wire rev 12:
+   - robust: a request whose task panics is answered with an error, and the
+     CLI times out an unanswered one; the daemon log is trimmed while it
+     runs; `pane wait --next` loses no edge; `workspace add -r` checks the
+     revision before jj makes a checkout (Phase 4 items 1 and 5, Phase 5).
+   - notes: the notification history and an in-flight turn's prompt are
+     saved; a transition's note carries its message; a `notification.show`
+     with no pane finds it by the peer's pid; watch carries `cwd` and the
+     held approval, `pane list` the workspace (Phase 1 item 5, Phase 3 items
+     2–4).
+   - issues: opt-in tracker write-back; the issue link in watch snapshots;
+     a long prompt goes through a 0600 file; every catalog row's
+     first-message data (Phase 4 item 11).
+   - hooks: Codex and Gemini CLI integrations, Codex launched `--no-daemon`
+     behind an ancestry guard; a Prime Agent registry row; a node program
+     detected by its script (Phase 3 items 1–2, Phase 4 item 6).
+   - approvals: several held approvals per pane; a turn Esc interrupted
+     closed by the next `prompt_id`; Blocked ending once Claude's screen
+     shows its own dialog answered; an opencode hold path; Claude 2.1's
+     `Agent` subagent tool (Phase 4 items 6, 8 and 9).
+   - attach: `pane attach --inline`, `escape_time_ms`, and full kitty key
+     reports, a held key's release staying with the pane it was pressed
+     into (items 9 and 10 above).
+12. **Wave 10** — approved by the user, queued:
+   - a `pane attach` stream that falls behind is resynced with a fresh
+     snapshot instead of closed;
+   - `tutti attach --view`: no input, no size vote;
+   - snapshots that carry scrollback rows, so `--inline` fills the
+     terminal's native scrollback. rtty-vt needs a history-range formatter
+     first, then tutti's pin bump;
+   - (rtty) a global hotkey through the `global-hotkey` crate (Carbon
+     `RegisterEventHotKey`).
+   Their source is tarp (unlicensed: read for ideas only, nothing copied;
+   its GPL renderer repo, gpui-terminal, unread).
 
 **Open** — the headline items; each phase item above keeps its own list:
-- the notification history is not persisted — a restarted daemon starts it
-  empty;
-- no tracker write-back: a deploy never comments on, assigns, or moves its
-  issue;
-- Prime Agent reports to herdr as `prime-agent`, a kind with no registry
-  row, and its process name is unverified (if it is `pi`, detection takes it
-  for Pi, a different product);
-- a spawned request task (merge, fork, diff, wait, …) that panics leaves its
-  caller waiting: the daemon logs it, but the CLI has no client-side timeout;
-- Codex and Gemini integrations need the tools installed and a live run;
-- the TUI gives a pane key presses only (no kitty release or text reports).
+- tracker write-back stops at the deploy: tutti never closes an issue
+  (GitHub's own `Fixes #N` can), and command sources stay read-only;
+- the launcher's number quick-select reaches rows 1–9 only: a later row
+  shows a number no key selects;
+- under a terminal without kitty's keyboard protocol, a pane that asked for
+  releases, repeats or text gets presses only (its text derived from the
+  key).
 
 **Deliberately not done:** packaging and distribution (Phase 5) — the project
 is private, so install stays `cargo install --path` from a checkout.
 
 **Unverified live** — cover these in the acceptance run:
-- checkpoints through a real Claude Code turn (verified only with synthetic
-  hook JSON) and through the screen-classifier, agent-exit and focus paths;
-  `jj util gc` pruning a checkpoint's commit; a turn-end probe racing a
-  restore;
+- checkpoints through the screen-classifier, agent-exit and focus paths (a
+  real Claude Code and Codex turn's hook path ran live in wave 9); `jj util
+  gc` pruning a checkpoint's commit; a turn-end probe racing a restore;
 - whether Claude Code emits its own OSC 9;4 (a hook-less claude pane would
   then hold off `Done` until the progress clears);
-- opencode's question/error/retry events and `hooks opencode --install
-  --project`;
-- prompt labels and conversation ids from a real Claude Code and opencode
-  (checked against the hooks reference and the opencode 1.18.5 bundle), and
-  whether Claude fires `UserPromptSubmit` for a message typed mid-turn (if it
-  does, the newest prompt relabels the running turn);
+- opencode's question/error/retry events;
+- conversation ids from a real Claude Code and opencode, and prompt labels
+  from a real opencode (checked against the hooks reference and the opencode
+  1.18.5 bundle);
 - a restore reviving a real `claude --resume` / `opencode --session` (proven
   with a stand-in recipe);
-- `approvals = "hold"` against a real Claude: what its UI shows while the hook
-  holds, that its own dialog stays back until `esc` or the timeout, and that a
-  timed-out hold falls through to it;
+- a held Claude request passed with `esc`, or timed out, falling through to
+  Claude's own dialog (holds answered from tutti, the dialog kept back, ran
+  live in wave 9);
 - a real Claude in a sandbox pod running the `hooks claude --tty` commands with
   the session's tty, so `/dev/tty` resolves (checked only by typing the
   commands into a busybox pod);
-- Linear's issue data with a real key (the request documents validate against
-  the live API; the replies are covered only by fixtures).
+- Linear's issue data and write-back with a real key, and a real `gh`
+  write-back (the read documents validate against the live API, and every
+  document against Linear's published schema; the replies are covered only
+  by fixtures, the writes only by stubs);
+- Codex: a held approval answered from tutti; SubagentStart/Stop rows; the
+  ancestry guard dropping a shared-daemon hook (unit-tested only);
+- Gemini CLI's tool and permission events and `--resume`: they need the
+  user's Gemini login (SessionStart and a prompt's BeforeAgent → AfterAgent
+  ran live);
+- the first-message data for Goose, Qwen Code, Cursor, Copilot, Factory
+  Droid, Augment and Amazon Q, from their docs only and unrun (Amazon Q's
+  from a search excerpt of its reference page);
+- kitty key reports against a real kitty, WezTerm or Ghostty (only a harness
+  played kitty), and `pane attach --inline` in Emacs vterm or eat; on a
+  terminal that scrolls its screen into scrollback on `ED 2` (tmux's
+  scroll-on-clear), each inline resize likely leaves a copy of the screen
+  there.
 
 ## Phase 5 — Hardening & distribution
 
@@ -732,11 +887,19 @@ is private, so install stays `cargo install --path` from a checkout.
   drops only its connection, which leaves through `drop_client` like any
   other; a failed accept is logged and retried. The detached daemon appends
   its stderr to `<session>.log` beside its socket (trimmed to its newest MiB
-  past 4 MiB, at start), and `server start` prints the path. The TUI reseeds a
-  pane whose snapshot or delta panics its parser, its panic hook restores the
-  terminal, and `agent-event` gives a wedged daemon 2 s. Open: a spawned
-  request task that panics leaves its caller waiting (no client-side timeout);
-  the log is trimmed only when a daemon starts.
+  past 4 MiB, at start and within a second while it runs), and `server
+  start` prints the path. The TUI reseeds a pane whose snapshot or delta
+  panics its parser, its panic hook restores the terminal, and `agent-event`
+  gives a wedged daemon 2 s. ✅ A request's spawned task that panics answers
+  that request with an error carrying its `req` (`Reply::spawn`). The CLI
+  gives up on a request left unanswered after 10 s, or 3 min for one the
+  daemon runs jj for (`client::deadline`); `pane wait`, `watch` and attach
+  stay unbounded, and an approval hold keeps its `approval_timeout_secs`.
+  Open: a `pane restore` task that panics leaves its workspace's VCS-watch
+  `in_flight` raised, so the watch stands off that workspace until the
+  daemon restarts; an approval hold's task that panics leaves its approval
+  on the pane; the TUI's own follow-ups have no client-side timeout, so a
+  wedged daemon still leaves them waiting.
 - Perf targets: 60fps redraw with 8 busy panes; `pane read` on 10k-line scrollback
   < 50ms; input latency indistinguishable from raw terminal. ✅ The render tick
   formats only what changed: it takes each pane's damage (`PtyPane::look`)
@@ -748,9 +911,13 @@ is private, so install stays `cargo install --path` from a checkout.
   test against the 50 ms target.
 - Test matrix: macOS + Linux; kitty/alacritty/wezterm/iTerm2/Terminal.app/ghostty;
   sandbox panes against a local cluster running agent-sandbox (unit tests cover
-  the manifests, the cluster run covers the cleanup paths). Open: under heavy
-  parallel test load `openpty` occasionally fails a test's first spawn
-  (`Unknown error: -6`); a rerun passes.
+  the manifests, the cluster run covers the cleanup paths). ✅ The `openpty`
+  flake (`Unknown error: -6` on a test's first spawn) is fixed since wave 8:
+  every pty opens through `pty::openpty`, one thread at a time — the tree's
+  only `openpty` call; rtty-vt opens none. Wave 9 ran the whole suite 10
+  times at `--test-threads=4` with no openpty failure. (Without the lock, 8
+  threads did not reproduce it in 1,280 opens; wave 8's 16-thread run is the
+  only reproduction.)
 - Packaging: `cargo install tutti`, Homebrew tap, curl installer. Windows deferred.
   Deliberately not done: the project is private, so install stays `cargo
   install --path` from a checkout. (Should that change, `cargo package` needs
