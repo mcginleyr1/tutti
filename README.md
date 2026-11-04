@@ -427,8 +427,9 @@ its project link (`gemini   Gemini CLI · github.com/google-gemini/gemini-cli`)
 so the picker doubles as "what else is out there". Its title names the
 workspace the choice lands in, so it is never ambiguous where a pane will
 spawn.
-Move with `j/k`/arrows, press a row's number (`1`–`9`; a later row only by
-moving to it) to launch it outright, `enter` launches the highlight, `esc`
+Move with `j/k`/arrows, press a row's number (`1`–`9`; a later row and the
+dim catalog show none, and a later row is reached by moving to it) to launch
+it outright, `enter` launches the highlight, `esc`
 closes; `command…` opens a one-line input that runs
 whatever you type via your login shell. With [sandboxes](#kubernetes-sandboxes)
 configured, `tab` switches where the pick runs — locally, then each sandbox

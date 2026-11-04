@@ -1545,7 +1545,7 @@ fn draw_restore_offer(frame: &mut Frame, app: &App, area: Rect) {
 /// ` run in <workspace> ` listing what can start in a pane — the registry agents
 /// (dim-italic and `(not installed)` when their binary is absent), then the
 /// shell and command rows. The selected row takes an accent `❯` marker and
-/// accent name; each row shows its quick-select number.
+/// accent name; a row a digit key launches shows that digit.
 fn draw_launcher(frame: &mut Frame, app: &App, area: Rect) {
     let selected = app.launcher_selected();
     let mut lines: Vec<Line> = app
@@ -1562,10 +1562,15 @@ fn draw_launcher(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// One launcher row: `<n>  <name>   <role>`, an accent `❯` marker and accent
-/// name when selected. An unavailable agent row is dim-italic and tagged
-/// ` (not installed)`.
+/// name when selected. Only rows 1–9 that a digit launches show their `<n>`
+/// (`App::on_key_launcher`); a later row, or an unavailable agent's in the
+/// dim-italic catalog foot, shows blanks in its place.
 fn launcher_line(idx: usize, row: &LauncherRow, selected: bool) -> Line<'static> {
-    let num = Span::styled(format!(" {} ", idx + 1), dim());
+    let num = match idx + 1 {
+        n @ 1..=9 if row.selectable() => format!(" {n} "),
+        _ => "   ".into(),
+    };
+    let num = Span::styled(num, dim());
     if !row.available {
         // The dim catalog foot: not selectable, the role already carries the
         // product name and its project link.
@@ -3939,6 +3944,28 @@ mod tests {
             text.contains("command"),
             "the command row is missing: {text:?}"
         );
+    }
+
+    /// A launcher row shows a number only where a digit key launches it:
+    /// rows 1–9, not a tenth, and not a dim catalog row.
+    #[test]
+    fn a_launcher_row_shows_only_a_number_a_key_launches() {
+        use crate::attach::launcher::LaunchKind;
+        let row = |available| LauncherRow {
+            name: "claude".into(),
+            role: "Claude Code".into(),
+            kind: LaunchKind::Agent(vec!["claude".into()]),
+            available,
+        };
+        let text = |line: Line| {
+            line.spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        assert!(text(launcher_line(8, &row(true), false)).starts_with(" 9 "));
+        assert!(text(launcher_line(9, &row(true), false)).starts_with("   "));
+        assert!(text(launcher_line(0, &row(false), false)).starts_with("   "));
     }
 
     /// The issues panel over `w`: GitHub's two issues landed, Linear failed.
