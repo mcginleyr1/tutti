@@ -1861,7 +1861,13 @@ fn pane_wait(
     timeout_ms: Option<u64>,
 ) -> ControlFlow<()> {
     let (queue, mut signals) = mpsc::unbounded_channel();
-    hub.waits().push((pane, queue));
+    {
+        // Dropping the ended waits here too keeps a quiet session's list to
+        // the live ones: `tell_waits` prunes only when some pane moves.
+        let mut waits = hub.waits();
+        waits.retain(|(_, tx)| !tx.is_closed());
+        waits.push((pane, queue));
+    }
     let start = hub.session().pane(pane);
     let hub = Arc::clone(hub);
     reply.spawn(|reply| async move {
@@ -3344,6 +3350,33 @@ mod tests {
             };
             assert_eq!(info.state, AgentState::Done, "{behind} behind");
         }
+        hub.session().kill_all();
+    }
+
+    /// Waits that end in a quiet session — timed out here, on a pane that
+    /// never moves, so nothing ever signals — leave no queue behind: each new
+    /// wait drops the ended ones as it registers.
+    #[tokio::test]
+    async fn ended_waits_in_a_quiet_session_leave_no_queue_behind() {
+        let hub = Arc::new(Hub::new(PaneSize::new(24, 80), "quiet".into(), None));
+        let pane = {
+            let mut session = hub.session();
+            session.workspace_new(std::env::temp_dir());
+            session.pane_run(None, vec!["/bin/cat".into()], false, None)
+        }
+        .unwrap();
+        for _ in 0..100 {
+            let (tx, mut rx) = mpsc::channel(1);
+            let reply = Reply { tx, req: None };
+            let until = vec![WaitFor::Done];
+            assert!(pane_wait(&hub, &reply, pane, until, false, Some(0)).is_continue());
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the wait times out at once")
+                .unwrap();
+        }
+        let kept = hub.waits().len();
+        assert!(kept <= 1, "{kept} queues kept for one live wait at most");
         hub.session().kill_all();
     }
 
