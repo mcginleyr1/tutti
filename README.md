@@ -66,8 +66,10 @@ Optional finishing touches:
   screen heuristics to exact hook signals — recommended; see
   [Claude Code integration](#claude-code-integration). It shows the merge and
   asks before touching `~/.claude/settings.json`. `tutti hooks codex
-  --install` does the same for Codex — see [Codex integration](#codex-integration)
-  — and `tutti hooks opencode --install` for opencode via a plugin — see
+  --install` and `tutti hooks gemini --install` do the same for Codex and
+  Gemini CLI — see [Codex integration](#codex-integration) and
+  [Gemini CLI integration](#gemini-cli-integration) — and `tutti hooks
+  opencode --install` for opencode via a plugin — see
   [opencode integration](#opencode-integration).
 - `tutti skill --install` gives the Claude Code agents in your panes the tutti
   skill, so they can start and coordinate sub-agents of their own — see
@@ -1277,7 +1279,8 @@ name, or a node program's script — Gemini CLI runs as `node …/gemini`.
 A pane's state can come from five sources, ranked highest first:
 
 1. **hook** — the agent's own exact lifecycle signals: its hooks (`tutti hooks
-   claude`, `tutti hooks codex`, `tutti hooks opencode`) or a
+   claude`, `tutti hooks codex`, `tutti hooks gemini`, `tutti hooks
+   opencode`) or a
    [herdr report](#herdr-compatible-reporting).
 2. **program** — the pane's program reporting itself with OSC 7501.
 3. **progress** — an OSC 9;4 progress report (ConEmu / Windows Terminal /
@@ -1481,6 +1484,40 @@ event unless the session's tutti-server is among its ancestors, with a note on
 stderr; such a pane falls back to screen detection. (Passing Codex a `-c`
 override also keeps it embedded.) Otherwise `agent-event codex` is fail-safe
 as Claude's is.
+
+## Gemini CLI integration
+
+Gemini CLI reports through hooks in its settings.json. Install them (shows the
+before/after merge and asks first):
+
+```
+tutti hooks gemini --install            # merge into ~/.gemini/settings.json ($GEMINI_CLI_HOME honoured)
+tutti hooks gemini --install --project  # …into ./.gemini/settings.json instead
+tutti hooks gemini --install --yes      # skip the confirmation (scripts)
+tutti hooks gemini                      # or just print the snippet…
+tutti hooks gemini --raw                # …as bare JSON, for piping
+```
+
+`--install` keeps the rest of the settings, is idempotent, backs the old file
+up to `settings.json.bak`, and writes atomically; `Ctrl+B i` installs the same
+through the setup panel. Each hook is named `tutti`, so `/hooks disable tutti`
+in Gemini turns them off. A project's hooks run once Gemini trusts the folder
+(it asks), with a one-time warning naming them. Each wired event runs `tutti
+agent-event gemini`:
+
+- **BeforeAgent** (a submitted prompt) starts a turn and labels its
+  checkpoint; **BeforeTool**/**AfterTool** keep it **working**; **AfterAgent**
+  marks it **done**;
+- a **Notification** — Gemini's one type, a tool permission prompt — marks it
+  **blocked** with its message; the tool's run puts it back to working;
+- **SessionStart** and every event's `session_id` record the conversation,
+  resumable with `gemini --resume <id>` and revived by a
+  [restore](#restoring-after-a-restart).
+
+Gemini CLI runs as `node …/gemini`; tutti detects it by that script. Gemini's
+Notification hook only observes a permission prompt — it cannot answer one —
+so `approvals = "hold"` does not apply. `agent-event gemini` is fail-safe as
+Claude's is.
 
 ## opencode integration
 
@@ -1770,12 +1807,12 @@ tutti issue list [--source <name>]   # every configured tracker's open issues (-
 tutti issue deploy <source> <id> [--agent claude] [--project <id>] [--here] [--sandbox <profile>]  # an agent on the issue, in its own workspace; prints the pane id, then writes back as the source opts in
 tutti notes [--unread]               # the notification history, newest first
 tutti notes read [--up-to <id>] [--pane <id>] | clear  # mark notes read (all, or narrowed) / empty the history
-tutti hooks claude|codex|opencode [--raw]  # print the Claude Code or Codex hooks / the opencode plugin
-tutti hooks claude|codex|opencode --install [--project] [--yes]  # install them (shows the change, asks first)
+tutti hooks claude|codex|gemini|opencode [--raw]  # print the Claude Code, Codex or Gemini CLI hooks / the opencode plugin
+tutti hooks claude|codex|gemini|opencode --install [--project] [--yes]  # install them (shows the change, asks first)
 tutti hooks claude --tty [--raw]     # print Claude hooks that report over OSC 7501 to /dev/tty — for sandbox images
 tutti skill [--raw]                  # print the tutti skill (a Claude Code SKILL.md)
 tutti skill --install [--project] [--yes]  # install it into ~/.claude/skills/tutti/ (or ./.claude/skills/tutti/)
-tutti agent-event claude|codex|opencode  # forward an agent hook event (JSON on stdin) — used by the hooks/plugin
+tutti agent-event claude|codex|gemini|opencode  # forward an agent hook event (JSON on stdin) — used by the hooks/plugin
 tutti edit <path>[:<line>[:<col>]] [--workspace <id>]  # open in the workspace's editor pane (TUTTI_EDITOR) and focus it; returns at once
 tutti shell-init zsh|bash|fish       # print the shell integration (OSC 7 cwd + OSC 133 marks) for your rc file
 tutti watch                          # JSON-line snapshots of every pane's state, one per change (read-only; never starts a daemon)

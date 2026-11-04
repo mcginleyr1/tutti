@@ -64,12 +64,14 @@ impl Stores {
 /// tool's own recipe — or `None` for an agent without one tutti knows.
 /// opencode's is from its `--help` (1.18.5: `-s, --session  session id to
 /// continue`), Codex's from its own (0.166.0: `codex resume [SESSION_ID]`,
-/// the UUID its hooks name, embedded as the registry launches it); neither
-/// is harvested, but their hooks report the id.
+/// the UUID its hooks name, embedded as the registry launches it), Gemini
+/// CLI's from its session-management docs (0.66.0: `gemini --resume <UUID>`);
+/// none is harvested, but their hooks report the id.
 pub fn resume_cmd(agent: &str, id: &str) -> Option<Vec<String>> {
     let cmd: &[&str] = match agent {
         "claude" => &["claude", "--resume", id],
         "codex" => &["codex", "resume", "--no-daemon", id],
+        "gemini" => &["gemini", "--resume", id],
         "muse" => &["muse", "resume", id],
         "vibe" => &["vibe", "--resume", id],
         "opencode" => &["opencode", "--session", id],
@@ -658,6 +660,7 @@ mod tests {
         assert_eq!(cmd("vibe"), ["vibe", "--resume", "s1"]);
         assert_eq!(cmd("opencode"), ["opencode", "--session", "s1"]);
         assert_eq!(cmd("codex"), ["codex", "resume", "--no-daemon", "s1"]);
+        assert_eq!(cmd("gemini"), ["gemini", "--resume", "s1"]);
         assert_eq!(resume_cmd("aider", "s1"), None, "no recipe known");
     }
 

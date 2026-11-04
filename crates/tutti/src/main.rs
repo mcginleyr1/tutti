@@ -122,15 +122,16 @@ enum Command {
         action: Option<NotesAction>,
     },
     /// Forward an agent's hook event to tutti (reads its JSON on stdin): a
-    /// Claude Code or Codex hook payload, or an opencode event from tutti's
-    /// plugin. Wired up by `tutti hooks <agent>`; a silent no-op outside a
-    /// tutti pane.
+    /// Claude Code, Codex or Gemini CLI hook payload, or an opencode event
+    /// from tutti's plugin. Wired up by `tutti hooks <agent>`; a silent no-op
+    /// outside a tutti pane.
     AgentEvent {
         #[arg(value_enum)]
         agent: HookAgent,
     },
     /// Print or install the hooks wiring an agent to tutti: Claude Code's
-    /// settings.json hooks, Codex's hooks.json, or opencode's plugin.
+    /// settings.json hooks, Codex's hooks.json, Gemini CLI's settings.json
+    /// hooks, or opencode's plugin.
     Hooks {
         #[arg(value_enum)]
         agent: HookAgent,
@@ -146,8 +147,8 @@ enum Command {
         #[arg(long)]
         install: bool,
         /// Install into the project (./.claude/settings.json,
-        /// ./.codex/hooks.json, ./.opencode/plugins/) instead of the user
-        /// config.
+        /// ./.codex/hooks.json, ./.gemini/settings.json, ./.opencode/plugins/)
+        /// instead of the user config.
         #[arg(long, requires = "install")]
         project: bool,
         /// Skip the confirmation prompt.
@@ -187,6 +188,7 @@ enum Command {
 enum HookAgent {
     Claude,
     Codex,
+    Gemini,
     Opencode,
 }
 
@@ -660,13 +662,16 @@ fn run(cli: Cli) -> Result<i32> {
             project,
             yes,
         }) => match (agent, install) {
-            (HookAgent::Codex | HookAgent::Opencode, _) if tty => {
+            (HookAgent::Codex | HookAgent::Gemini | HookAgent::Opencode, _) if tty => {
                 bail!("--tty is for claude: a sandbox image bakes in Claude Code's hooks")
             }
             (HookAgent::Claude, true) => {
                 install_integration(Integration::ClaudeHooks, project, yes)
             }
             (HookAgent::Codex, true) => install_integration(Integration::CodexHooks, project, yes),
+            (HookAgent::Gemini, true) => {
+                install_integration(Integration::GeminiHooks, project, yes)
+            }
             (HookAgent::Opencode, true) => {
                 install_integration(Integration::OpencodePlugin, project, yes)
             }
@@ -676,6 +681,10 @@ fn run(cli: Cli) -> Result<i32> {
             }
             (HookAgent::Codex, false) => {
                 emit_codex_hooks(raw);
+                Ok(0)
+            }
+            (HookAgent::Gemini, false) => {
+                emit_gemini_hooks(raw);
                 Ok(0)
             }
             (HookAgent::Opencode, false) => {
@@ -1419,6 +1428,7 @@ fn run_agent_event(session: &str, agent: HookAgent) -> Result<i32> {
     let mapped = match agent {
         HookAgent::Claude => hooks::map_claude_event(&value),
         HookAgent::Codex => hooks::map_codex_event(&value),
+        HookAgent::Gemini => hooks::map_gemini_event(&value),
         HookAgent::Opencode => hooks::map_opencode_event(&value),
     };
     let Some((event, conversation)) = mapped else {
@@ -1606,6 +1616,19 @@ fn emit_codex_hooks(raw: bool) {
     }
 }
 
+/// Print Gemini CLI's settings.json hooks: the JSON to stdout, plus — unless
+/// `--raw` — where it goes on stderr, so the JSON pipes cleanly on its own.
+fn emit_gemini_hooks(raw: bool) {
+    let snippet = serde_json::to_string_pretty(&hooks::gemini_hooks_json());
+    println!("{}", snippet.expect("hooks snippet serializes"));
+    if !raw {
+        eprintln!("# Merge the object above into ~/.gemini/settings.json at the TOP level");
+        eprintln!("# ($GEMINI_CLI_HOME honoured; .gemini/settings.json in a project) — or");
+        eprintln!("# let tutti do it: `tutti hooks gemini --install`. Outside a tutti pane");
+        eprintln!("# the hook does nothing.");
+    }
+}
+
 /// Print the opencode plugin: the JavaScript to stdout, plus — unless `--raw` —
 /// where it goes on stderr, so the plugin pipes cleanly on its own.
 fn emit_opencode_plugin(raw: bool) {
@@ -1643,7 +1666,9 @@ fn install_integration(integration: Integration, project: bool, yes: bool) -> Re
     let path = plan.path.display();
     // Hooks merge into a file of the tool's; the plugin and skill are files of tutti's.
     let (noun, the, at) = match integration {
-        Integration::ClaudeHooks | Integration::CodexHooks => ("hooks", "", "in"),
+        Integration::ClaudeHooks | Integration::CodexHooks | Integration::GeminiHooks => {
+            ("hooks", "", "in")
+        }
         Integration::OpencodePlugin => ("plugin", "the ", "at"),
         Integration::Skill => ("skill", "the ", "at"),
         Integration::ShellInit => ("shell integration", "", "in"),
@@ -3032,6 +3057,24 @@ mod tests {
                 install: true,
                 project: true,
                 ..
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["tutti", "hooks", "gemini", "--raw"])
+                .unwrap()
+                .command,
+            Some(Command::Hooks {
+                agent: HookAgent::Gemini,
+                raw: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["tutti", "agent-event", "gemini"])
+                .unwrap()
+                .command,
+            Some(Command::AgentEvent {
+                agent: HookAgent::Gemini
             })
         ));
         // An unknown agent is rejected at parse time.

@@ -1,5 +1,5 @@
-//! Agent hook integrations: map a Claude Code or Codex hook-event JSON
-//! object, or an opencode bus event forwarded by tutti's opencode plugin
+//! Agent hook integrations: map a Claude Code, Codex or Gemini CLI hook-event
+//! JSON object, or an opencode bus event forwarded by tutti's opencode plugin
 //! (each delivered on `tutti agent-event`'s stdin), to a tutti
 //! `AgentHookEvent` and the agent's own conversation id; print the hooks
 //! snippets that wire each tool's events to `tutti agent-event <agent>` (or,
@@ -18,6 +18,8 @@ use tutti_core::{AgentHookEvent, ApprovalDecision};
 pub const HOOK_COMMAND: &str = "tutti agent-event claude";
 /// The command Codex's hooks run.
 pub const CODEX_HOOK_COMMAND: &str = "tutti agent-event codex";
+/// The command Gemini CLI's hooks run.
+pub const GEMINI_HOOK_COMMAND: &str = "tutti agent-event gemini";
 
 /// The opencode plugin `tutti hooks opencode` prints and installs.
 pub const OPENCODE_PLUGIN: &str = include_str!("opencode_plugin.js");
@@ -149,6 +151,30 @@ pub fn map_codex_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
             desc: text(v, "agent_type").unwrap_or_else(|| "subagent".into()),
         },
         _ => return map_claude_event(v),
+    };
+    Some((event, text(v, "session_id")))
+}
+
+/// Map one Gemini CLI hook event, per its hooks reference (0.66.0): every
+/// event carries `hook_event_name` and `session_id` (the UUID `gemini
+/// --resume` takes; `SessionStart` observed live); `BeforeAgent` carries the
+/// submitted `prompt`, a turn's start; `BeforeTool`/`AfterTool` the
+/// `tool_name`; `Notification` a `message` — its one type, `ToolPermission`,
+/// waits on you; `AfterAgent` ends the turn.
+pub fn map_gemini_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
+    let event = match v.get("hook_event_name")?.as_str()? {
+        "SessionStart" => AgentHookEvent::SessionStarted,
+        "BeforeAgent" => AgentHookEvent::Prompt {
+            text: text(v, "prompt").and_then(|p| tutti_agents::first_prompt_line(&p)),
+        },
+        "BeforeTool" | "AfterTool" => AgentHookEvent::Activity {
+            detail: tool_name(v).map(str::to_string),
+        },
+        "Notification" => AgentHookEvent::Blocked {
+            message: text(v, "message"),
+        },
+        "AfterAgent" => AgentHookEvent::Done,
+        _ => return None,
     };
     Some((event, text(v, "session_id")))
 }
@@ -319,6 +345,24 @@ pub fn codex_hooks_json() -> Value {
     })
 }
 
+/// Gemini CLI's settings.json `hooks` wiring every relevant event to `tutti
+/// agent-event gemini`, each named `tutti` for its `/hooks enable|disable`.
+pub fn gemini_hooks_json() -> Value {
+    let cmd = json!({ "name": "tutti", "type": "command", "command": GEMINI_HOOK_COMMAND });
+    let every_tool = json!([{ "matcher": "*", "hooks": [cmd] }]);
+    let every = json!([{ "hooks": [cmd] }]);
+    json!({
+        "hooks": {
+            "SessionStart": every,
+            "BeforeAgent": every,
+            "BeforeTool": every_tool,
+            "AfterTool": every_tool,
+            "Notification": every,
+            "AfterAgent": every,
+        }
+    })
+}
+
 /// The Notification types that wait on you, as the `--tty` hooks' matcher. A
 /// matcher can only name types, so an unknown one cannot read as blocked the
 /// way it does through `tutti agent-event`.
@@ -366,8 +410,8 @@ pub fn merge_claude_hooks(settings: &Value) -> anyhow::Result<Option<(Value, Vec
 
 /// `merge_claude_hooks` for any tool whose hooks file nests as Claude's
 /// does — `{"hooks": {event: [{matcher?, hooks: [{command}]}]}}`, as Codex's
-/// hooks.json does: `ours` merged in, an event counting as wired once a
-/// group of it runs `command`.
+/// hooks.json and Gemini CLI's settings.json do: `ours` merged in, an event
+/// counting as wired once a group of it runs `command`.
 pub fn merge_hooks(
     settings: &Value,
     ours: &Value,
@@ -1217,6 +1261,124 @@ mod tests {
             merge_claude_hooks(&merged).unwrap().unwrap().1.len(),
             8,
             "Codex's hooks are not Claude's"
+        );
+    }
+
+    /// A Gemini CLI hook payload: the base fields its hooks reference lists
+    /// (and its `SessionStart` sent live, ids and paths made up), with
+    /// `fields` on top.
+    fn gemini(event: &str, fields: Value) -> Option<(AgentHookEvent, Option<String>)> {
+        let mut payload = json!({
+            "session_id": "a864e70e-0000-4000-8000-000000000001",
+            "transcript_path": "/home/u/.gemini/tmp/api/chats/session-1.jsonl",
+            "cwd": "/srv/api",
+            "hook_event_name": event,
+            "timestamp": "2026-11-04T14:51:39.343Z",
+        });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        map_gemini_event(&payload)
+    }
+
+    #[test]
+    fn gemini_events_map_onto_a_turn_naming_the_session() {
+        let id = Some("a864e70e-0000-4000-8000-000000000001".to_string());
+        assert_eq!(
+            gemini("SessionStart", json!({ "source": "startup" })),
+            Some((AgentHookEvent::SessionStarted, id.clone()))
+        );
+        assert_eq!(
+            gemini(
+                "BeforeAgent",
+                json!({ "prompt": "fix the build\nit is red" })
+            ),
+            Some((
+                AgentHookEvent::Prompt {
+                    text: Some("fix the build".into())
+                },
+                id.clone()
+            ))
+        );
+        let shell = json!({ "tool_name": "run_shell_command", "tool_input": { "command": "ls" } });
+        let working = Some((
+            AgentHookEvent::Activity {
+                detail: Some("run_shell_command".into()),
+            },
+            id.clone(),
+        ));
+        assert_eq!(gemini("BeforeTool", shell.clone()), working);
+        let mut ran = shell.clone();
+        ran["tool_response"] = json!({ "llmContent": "notes.txt", "returnDisplay": "notes.txt" });
+        assert_eq!(gemini("AfterTool", ran), working);
+        assert_eq!(
+            gemini(
+                "Notification",
+                json!({
+                    "notification_type": "ToolPermission",
+                    "message": "Allow run_shell_command: rm -rf build?",
+                    "details": { "tool_name": "run_shell_command" }
+                })
+            ),
+            Some((
+                AgentHookEvent::Blocked {
+                    message: Some("Allow run_shell_command: rm -rf build?".into())
+                },
+                id.clone()
+            ))
+        );
+        let answered =
+            json!({ "prompt": "fix it", "prompt_response": "done", "stop_hook_active": false });
+        assert_eq!(
+            gemini("AfterAgent", answered),
+            Some((AgentHookEvent::Done, id.clone()))
+        );
+        for quiet in [
+            "SessionEnd",
+            "BeforeModel",
+            "AfterModel",
+            "BeforeToolSelection",
+            "PreCompress",
+        ] {
+            assert_eq!(gemini(quiet, json!({})), None, "{quiet}");
+        }
+    }
+
+    #[test]
+    fn gemini_hooks_wire_every_event_to_agent_event_gemini() {
+        let value = gemini_hooks_json();
+        let hooks = value["hooks"].as_object().unwrap();
+        for (event, matcher) in [
+            ("SessionStart", None),
+            ("BeforeAgent", None),
+            ("BeforeTool", Some("*")),
+            ("AfterTool", Some("*")),
+            ("Notification", None),
+            ("AfterAgent", None),
+        ] {
+            let group = &hooks[event][0];
+            assert_eq!(group["matcher"].as_str(), matcher, "{event}");
+            assert_eq!(
+                group["hooks"][0],
+                json!({ "name": "tutti", "type": "command", "command": GEMINI_HOOK_COMMAND }),
+                "{event}"
+            );
+            let payload = json!({ "hook_event_name": event });
+            assert!(map_gemini_event(&payload).is_some(), "{event} maps");
+        }
+        assert_eq!(hooks.len(), 6);
+        let settings = json!({ "theme": "GitHub", "hooksConfig": { "disabled": ["lint"] } });
+        let (merged, added) = merge_hooks(&settings, &value, GEMINI_HOOK_COMMAND)
+            .unwrap()
+            .unwrap();
+        assert_eq!(added.len(), 6);
+        assert_eq!(merged["theme"], "GitHub");
+        assert_eq!(merged["hooksConfig"], settings["hooksConfig"]);
+        assert!(
+            merge_hooks(&merged, &value, GEMINI_HOOK_COMMAND)
+                .unwrap()
+                .is_none()
         );
     }
 

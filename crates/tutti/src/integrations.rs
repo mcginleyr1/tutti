@@ -1,6 +1,6 @@
-//! The integrations tutti installs: Claude Code's and Codex's hooks, the
-//! opencode plugin, the tutti skill, and the shell integration's line in the
-//! user's rc file.
+//! The integrations tutti installs: Claude Code's, Codex's and Gemini CLI's
+//! hooks, the opencode plugin, the tutti skill, and the shell integration's
+//! line in the user's rc file.
 //! `Integration::plan` inspects one's target file and works out what
 //! installing would change, with no side effects — cheap enough to run
 //! whenever a status is wanted — and `apply` carries a plan out. No stdin or
@@ -25,6 +25,8 @@ pub enum Integration {
     ClaudeHooks,
     /// Codex hooks in hooks.json, running `tutti agent-event codex`.
     CodexHooks,
+    /// Gemini CLI hooks in settings.json, running `tutti agent-event gemini`.
+    GeminiHooks,
     /// The opencode plugin, piping to `tutti agent-event opencode`.
     OpencodePlugin,
     /// The tutti skill, for Claude Code.
@@ -82,6 +84,9 @@ pub struct Dirs {
     pub xdg_config_home: Option<PathBuf>,
     /// `$CODEX_HOME`, Codex's user config dir (else `~/.codex`).
     pub codex_home: Option<PathBuf>,
+    /// `$GEMINI_CLI_HOME`, which Gemini CLI keeps its `.gemini` in instead of
+    /// `$HOME`.
+    pub gemini_cli_home: Option<PathBuf>,
     /// Install into this project instead of the user's config. A relative
     /// path resolves against the cwd — an empty one is the cwd itself.
     pub project: Option<PathBuf>,
@@ -93,8 +98,8 @@ pub struct Dirs {
 
 impl Dirs {
     /// The user's directories from the environment — `$HOME`,
-    /// `$XDG_CONFIG_HOME`, `$CODEX_HOME`, `$SHELL` and `$ZDOTDIR`, each
-    /// ignored when empty — and no project.
+    /// `$XDG_CONFIG_HOME`, `$CODEX_HOME`, `$GEMINI_CLI_HOME`, `$SHELL` and
+    /// `$ZDOTDIR`, each ignored when empty — and no project.
     pub fn from_env() -> Dirs {
         let var = |name| {
             std::env::var_os(name)
@@ -105,6 +110,7 @@ impl Dirs {
             home: var("HOME"),
             xdg_config_home: var("XDG_CONFIG_HOME"),
             codex_home: var("CODEX_HOME"),
+            gemini_cli_home: var("GEMINI_CLI_HOME"),
             project: None,
             shell: var("SHELL"),
             zdotdir: var("ZDOTDIR"),
@@ -199,6 +205,13 @@ impl Integration {
                 hooks::CODEX_HOOK_COMMAND,
                 " (then trust them in Codex: /hooks)",
             ),
+            Integration::GeminiHooks => hooks_status(
+                &path,
+                found.as_deref(),
+                &hooks::gemini_hooks_json(),
+                hooks::GEMINI_HOOK_COMMAND,
+                "",
+            ),
             Integration::OpencodePlugin => whole_file_status(
                 found.as_deref(),
                 hooks::OPENCODE_PLUGIN,
@@ -227,6 +240,11 @@ impl Integration {
             (Integration::CodexHooks, None) => match &dirs.codex_home {
                 Some(codex) => codex.join("hooks.json"),
                 None => home()?.join(".codex/hooks.json"),
+            },
+            (Integration::GeminiHooks, Some(project)) => project.join(".gemini/settings.json"),
+            (Integration::GeminiHooks, None) => match &dirs.gemini_cli_home {
+                Some(gemini) => gemini.join(".gemini/settings.json"),
+                None => home()?.join(".gemini/settings.json"),
             },
             (Integration::OpencodePlugin, Some(project)) => {
                 project.join(".opencode/plugins/tutti.js")
@@ -295,7 +313,8 @@ pub fn apply(plan: &Plan) -> Result<Option<PathBuf>> {
 }
 
 /// A hooks file nested as Claude Code's settings.json is — Codex's hooks.json
-/// too: tutti's hooks, `ours`, each running `command`, merged into whatever
+/// and Gemini CLI's settings.json too: tutti's hooks, `ours`, each running
+/// `command`, merged into whatever
 /// else it holds, foreign hooks included. With none of tutti's events wired
 /// yet it is `Missing`; with some, `Outdated` (an older install, or a
 /// hand-pruned one). `then` ends the summary: what the tool still asks.
@@ -533,6 +552,44 @@ mod tests {
         );
         assert_eq!(
             Integration::CodexHooks.plan(&project).unwrap().status,
+            Status::Installed
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn gemini_hooks_go_in_its_settings_keeping_the_rest() {
+        let home = temp_home();
+        let path = |dirs: &Dirs| Integration::GeminiHooks.plan(dirs).unwrap().path;
+        assert_eq!(path(&user(&home)), home.join(".gemini/settings.json"));
+        let gemini_home = Dirs {
+            gemini_cli_home: Some(home.join("g")),
+            ..user(&home)
+        };
+        assert_eq!(path(&gemini_home), home.join("g/.gemini/settings.json"));
+
+        let project = Dirs {
+            project: Some(home.join("repo")),
+            ..Dirs::default()
+        };
+        let settings = home.join("repo/.gemini/settings.json");
+        write(&settings, r#"{ "model": { "name": "a-model" } }"#);
+        let plan = Integration::GeminiHooks.plan(&project).unwrap();
+        assert_eq!(plan.path, settings);
+        assert!(
+            matches!(&plan.status, Status::Missing(_)),
+            "{:?}",
+            plan.status
+        );
+        apply(&plan).unwrap();
+        let now: Value = serde_json::from_str(&text(&settings)).unwrap();
+        assert_eq!(now["model"]["name"], "a-model");
+        assert_eq!(
+            now["hooks"]["AfterAgent"][0]["hooks"][0]["command"],
+            hooks::GEMINI_HOOK_COMMAND
+        );
+        assert_eq!(
+            Integration::GeminiHooks.plan(&project).unwrap().status,
             Status::Installed
         );
         let _ = std::fs::remove_dir_all(&home);
