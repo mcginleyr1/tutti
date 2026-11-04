@@ -379,9 +379,12 @@ pub struct App {
     /// hit-testing. `None` while neither is open.
     peek_rect: Option<Rect>,
     /// The approval the approval overlay last opened for — the one it shows
-    /// and an answer names. Ids count up, so it opens by itself once per
-    /// approval: never on one older than this, answered or dismissed.
+    /// and an answer names.
     approval_shown: Option<u64>,
+    /// Every approval the overlay has opened for while it is still held, so
+    /// it opens by itself once per approval: never again on one answered or
+    /// dismissed. Ids are never reused, so one no longer held is dropped.
+    approvals_seen: HashSet<u64>,
     /// The mode the approval overlay hands back to on closing: the sidebar it
     /// was opened from, or the terminal of the pane it opened over.
     approval_back: Mode,
@@ -557,6 +560,7 @@ impl App {
             tab_bar_rect: None,
             peek_rect: None,
             approval_shown: None,
+            approvals_seen: HashSet::new(),
             approval_back: Mode::Terminal,
             approval_opened: None,
             navigate_query: String::new(),
@@ -2117,16 +2121,23 @@ impl App {
     fn open_approval(&mut self, pane: PaneId, id: u64, back: Mode) {
         self.mode = Mode::Approval(pane);
         self.approval_shown = Some(id);
+        self.approvals_seen.insert(id);
         self.approval_back = back;
         self.approval_opened = None;
         self.status = None;
     }
 
     /// Open the approval overlay over the focused pane when it holds an
-    /// approval newer than any the overlay opened for — the pane in view is
-    /// asking, as Claude's own dialog would; the oldest such first — but only
-    /// from the terminal: a panel, prompt or overlay in use is never cut into.
+    /// approval the overlay has not opened for — the pane in view is asking,
+    /// as Claude's own dialog would; the oldest such first — but only from
+    /// the terminal: a panel, prompt or overlay in use is never cut into.
     fn open_focused_approval(&mut self) {
+        let held: HashSet<u64> = self
+            .panes
+            .values()
+            .flat_map(|s| s.info.approvals.iter().map(|a| a.id))
+            .collect();
+        self.approvals_seen.retain(|id| held.contains(id));
         let Some(pane) = self.focused.filter(|_| self.mode == Mode::Terminal) else {
             return;
         };
@@ -2135,7 +2146,7 @@ impl App {
             .into_iter()
             .flatten()
             .map(|a| a.id)
-            .find(|id| Some(*id) > self.approval_shown)
+            .find(|id| !self.approvals_seen.contains(id))
         {
             self.open_approval(pane, id, Mode::Terminal);
             self.approval_opened = Some(Instant::now());
@@ -7152,13 +7163,59 @@ mod tests {
         assert_eq!(approval_shown_input(&app), "touch 9");
         app.approval_opened = None;
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        layout_changed(&mut app, view_holding(&[7, 9]));
+        layout_changed(&mut app, view_holding(&[9]));
         app.focus_change();
         assert_eq!(
             app.mode,
             Mode::Terminal,
-            "an answer still in flight never reopens it, nor does an older one"
+            "an answer still in flight never reopens it"
         );
+    }
+
+    /// The overlay remembers which approvals it opened for, not the newest:
+    /// pane 2's later #8, shown and answered, never keeps pane 3's earlier
+    /// #7 from opening once pane 3 is in view.
+    #[test]
+    fn an_older_approval_on_another_pane_still_opens_when_its_pane_is_in_view() {
+        let held = |id: u64| PendingApproval {
+            id,
+            tool: "Bash".into(),
+            summary: format!("touch {id}"),
+        };
+        let view = |two: &[u64], three: &[u64]| {
+            let mut view = view_two_workspaces();
+            let panes = &mut view[1].tabs[0].panes;
+            panes[0].approvals = two.iter().map(|&id| held(id)).collect();
+            panes[1].approvals = three.iter().map(|&id| held(id)).collect();
+            view
+        };
+        let mut app = App::new();
+        attach_with(&mut app, view(&[], &[]));
+        app.active_tab = Some(TabId(2));
+        app.focused = Some(PaneId(2));
+        app.focus_change();
+        layout_changed(&mut app, view(&[8], &[7]));
+        assert_eq!(app.mode, Mode::Approval(PaneId(2)), "pane 2 is in view");
+        app.approval_opened = None;
+        assert_eq!(
+            app.on_key(plain('y')),
+            vec![control(&Request::ApprovalAnswer {
+                pane: PaneId(2),
+                id: Some(8),
+                decision: ApprovalDecision::Allow,
+            })]
+        );
+        layout_changed(&mut app, view(&[], &[7]));
+        assert_eq!(app.mode, Mode::Terminal);
+
+        app.focused = Some(PaneId(3));
+        app.focus_change();
+        assert_eq!(
+            app.mode,
+            Mode::Approval(PaneId(3)),
+            "#7 opens over its pane"
+        );
+        assert_eq!(approval_shown_input(&app), "touch 7");
     }
 
     #[test]
