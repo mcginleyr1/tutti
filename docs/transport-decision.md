@@ -235,7 +235,8 @@ Control payload (`kind = 0x01`), one JSON object per frame:
 
 A control frame may also carry a top-level `"req": <u64>` beside its tag; the
 daemon echoes it on that request's response, async ones included, so a client
-can tell which request a reply or a refusal answers. Events never carry one.
+can tell which request a reply or a refusal answers. An async request whose
+task panics is answered too, with an error. Events never carry one.
 (`id` was taken by some variants' own fields.)
 
 Pane-data payload (`kind = 0x02` snapshot / `0x03` delta):

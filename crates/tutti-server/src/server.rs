@@ -5,8 +5,9 @@
 //! pushed a whole-session snapshot whenever it changes, outside that set, and
 //! one that sends `PaneAttach` is streamed one pane's raw output, for a real
 //! terminal to parse. A panic is contained where it happens — one frame's ends
-//! its connection, one background pass's ends that pass — so the daemon, and
-//! every pane with it, lives on.
+//! its connection, one request task's answers its request with an error, one
+//! background pass's ends that pass — so the daemon, and every pane with it,
+//! lives on.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
@@ -134,6 +135,21 @@ impl Reply {
     /// Answer from a spawned task, waiting for room in the queue.
     async fn send(&self, response: Response) {
         let _ = self.tx.send(self.encode(&response)).await;
+    }
+
+    /// Do a request's work on a task of its own, which answers through the
+    /// reply it is handed. Should the work panic, the request is answered
+    /// with an error rather than left waiting; the panic hook logged it.
+    fn spawn<F: Future<Output = ()> + Send + 'static>(&self, work: impl FnOnce(Reply) -> F) {
+        let task = tokio::spawn(work(self.clone()));
+        let reply = self.clone();
+        tokio::spawn(async move {
+            if task.await.is_err_and(|err| err.is_panic()) {
+                eprintln!("tutti: a request's task panicked; answering it with an error");
+                let message = "the daemon panicked serving this request; its log has why".into();
+                reply.send(Response::Error { message }).await;
+            }
+        });
     }
 }
 
@@ -1571,8 +1587,7 @@ fn approval_hold(
         return send_reply(hub, cid, &reply.tx, reply.encode(&pass));
     };
     let hub = Arc::clone(hub);
-    let reply = reply.clone();
-    tokio::spawn(async move {
+    reply.spawn(|reply| async move {
         let decision = tokio::select! {
             () = reply.tx.closed() => None,
             decision = answered => decision.ok(),
@@ -1807,8 +1822,7 @@ fn scroll(
 /// answers Error without touching jj.
 fn workspace_diff(hub: &Arc<Hub>, reply: &Reply, id: WorkspaceId, stat: bool) -> ControlFlow<()> {
     let dir = hub.session().workspace_dir(id);
-    let reply = reply.clone();
-    tokio::spawn(async move {
+    reply.spawn(|reply| async move {
         let response = match dir {
             Some(dir) => jj::diff(&dir, stat).await,
             None => Response::Error {
@@ -1842,8 +1856,7 @@ fn pane_wait(
     let mut signals = hub.signals.subscribe();
     let start = hub.session().pane(pane);
     let hub = Arc::clone(hub);
-    let reply = reply.clone();
-    tokio::spawn(async move {
+    reply.spawn(|reply| async move {
         let gone = || Response::Error {
             message: format!("pane {pane} is gone"),
         };
@@ -1993,8 +2006,7 @@ fn workspace_kill(
             // fork has still left tutti (the LayoutChanged above already dropped
             // it). The reply follows the cleanup on the requester's channel.
             let fork = fork.expect("discard on a non-fork was rejected above");
-            let reply = reply.clone();
-            tokio::spawn(async move {
+            reply.spawn(|reply| async move {
                 let mut errors = Vec::new();
                 if let Err(e) = jj::forget(&fork.origin_root, &fork.jj_name).await {
                     errors.push(e);
@@ -2123,8 +2135,7 @@ fn workspace_fork(
     }
 
     let hub = Arc::clone(hub);
-    let reply = reply.clone();
-    tokio::spawn(async move {
+    reply.spawn(|reply| async move {
         let forked = async {
             let revision = match &checkout {
                 Checkout::Revision(revision) => revision.clone(),
@@ -2219,8 +2230,7 @@ fn workspace_merge(
         );
     };
     let hub = Arc::clone(hub);
-    let reply = reply.clone();
-    tokio::spawn(async move {
+    reply.spawn(|reply| async move {
         let response = match jj::merge(&fork.origin_root, &dir, &fork.jj_name, push).await {
             Ok(outcome) => {
                 if let Some(note) = &outcome.push_error {
@@ -2252,8 +2262,7 @@ fn workspace_merge(
 fn workspace_update(hub: &Arc<Hub>, reply: &Reply, id: WorkspaceId) -> ControlFlow<()> {
     let dir = hub.session().workspace_dir(id);
     let hub = Arc::clone(hub);
-    let reply = reply.clone();
-    tokio::spawn(async move {
+    reply.spawn(|reply| async move {
         let response = match dir {
             Some(dir) => {
                 let response = jj::update_stale(&dir).await;
@@ -2307,8 +2316,7 @@ fn checkpoint_diff(
     stat: bool,
 ) -> ControlFlow<()> {
     let target = find_checkpoint(hub, pane, n);
-    let reply = reply.clone();
-    tokio::spawn(async move {
+    reply.spawn(|reply| async move {
         let response = match target {
             Ok((
                 _,
@@ -2359,8 +2367,7 @@ fn pane_restore(
         hub.vcs().entry(*workspace).or_default().in_flight += 1;
     }
     let hub = Arc::clone(hub);
-    let reply = reply.clone();
-    tokio::spawn(async move {
+    reply.spawn(|reply| async move {
         let response = match target {
             Ok((workspace, dir, commit)) => {
                 let response = restore_to(&hub, &dir, pane, n, &commit).await;
@@ -3270,6 +3277,27 @@ mod tests {
         let _ = stop.send(());
         server.await.unwrap().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A request whose task panics — merge, diff, wait, … — is answered with
+    /// an error tagged with its `req`, never left waiting.
+    #[tokio::test]
+    async fn a_request_whose_task_panics_is_answered() {
+        let (tx, mut rx) = mpsc::channel(1);
+        Reply { tx, req: Some(7) }.spawn(|_| async { panic!("injected: a request task panics") });
+        let bytes = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the request is answered")
+            .unwrap();
+        let Some((Frame::Control(json), _)) = Frame::decode(&bytes).unwrap() else {
+            panic!("expected a control frame");
+        };
+        let answer: Tagged<Response> = serde_json::from_slice(&json).unwrap();
+        assert_eq!(answer.req, Some(7));
+        let Response::Error { message } = answer.body else {
+            panic!("expected an error, got {:?}", answer.body);
+        };
+        assert!(message.contains("panicked"), "{message}");
     }
 
     /// A background pass that panics is caught, and its loop runs the next.

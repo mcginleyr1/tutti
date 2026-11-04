@@ -278,12 +278,14 @@ Enter.
 The daemon is built to outlive its own bugs. A panic in a background pass —
 the render tick, the classifier, detection, the VCS watch — is logged and the
 pass carries on; a panic while handling one connection's request drops only
-that connection; a lock a panic poisoned is recovered; a failed `accept` is
-retried. A pane is the unit of failure. Its terminal engine is built never to
-panic, whatever a program writes — it is property-tested on arbitrary bytes
-and resizes — but were it to, that pane alone ends: its program is killed,
-its screen says the terminal crashed and why, a `pane crashed` note joins the
-history, the panic goes to the log, and every other pane runs on. The client
+that connection, and one in a request's own task (a merge, a diff, a wait)
+answers that request with an error; a lock a panic poisoned is recovered; a
+failed `accept` is retried. A pane is the unit of failure. Its terminal engine
+is built never to panic, whatever a program writes — it is property-tested on
+arbitrary bytes and resizes — but were it to, that pane alone ends: its
+program is killed, its screen says the terminal crashed and why, a `pane
+crashed` note joins the history, the panic goes to the log, and every other
+pane runs on. The client
 survives its own parser's: a pane update its parser cannot apply
 resets the pane and asks the daemon for a fresh copy, and any other client
 panic restores your terminal on its way out.
@@ -1704,9 +1706,6 @@ tutti is alpha; PLAN.md tracks what is open.
   its issue.
 - **The notification history starts empty after a restart**: it lives in the
   daemon's memory, unlike the layout.
-- **A slow request whose handler panics never answers.** The daemon logs the
-  panic and carries on, but the CLI waiting on that merge, diff or wait waits
-  until you interrupt it.
 - **A pane's program that asked for key releases or the text of a key**
   (kitty's flags 2 and 16) gets presses only: the TUI asks your terminal for
   neither.
