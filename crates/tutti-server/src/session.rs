@@ -111,6 +111,10 @@ struct PaneSlot {
     /// hook event blocked the pane — what lets the screen end that block
     /// (`observe`).
     dialog: bool,
+    /// Whether a permission request went on to the agent's own dialog —
+    /// passed, its hook gone, or never held — with no sign since that the
+    /// agent moved on: tutti's answer to another then leaves the pane blocked.
+    passed: bool,
 }
 
 #[derive(Default)]
@@ -892,6 +896,9 @@ impl Session {
             }
             AgentHookEvent::SessionStarted => {}
         }
+        if matches!(classified, Some(Observation::Working | Observation::Done)) {
+            slot.passed = false;
+        }
         let transition = classified.and_then(|obs| {
             let from = slot.meta.state;
             let to = from.apply(StateEvent::Classified(obs));
@@ -921,12 +928,23 @@ impl Session {
 
     /// End `pane`'s pending approval `id` (its oldest, when `None`) —
     /// answered, or its hook gone — returning the id ended and whether the
-    /// pane still holds others.
+    /// pane still waits on you: it holds others, or one went on to the
+    /// agent's own dialog (`passed_to_dialog`).
     pub fn take_approval(&mut self, pane: PaneId, id: Option<u64>) -> Option<(u64, bool)> {
-        let held = &mut self.panes.get_mut(&pane)?.meta.approvals;
+        let slot = self.panes.get_mut(&pane)?;
+        let held = &mut slot.meta.approvals;
         let at = held.iter().position(|a| id.is_none_or(|id| id == a.id))?;
         let taken = held.remove(at).id;
-        Some((taken, !held.is_empty()))
+        Some((taken, !held.is_empty() || slot.passed))
+    }
+
+    /// Note that one of `pane`'s permission requests went on to the agent's
+    /// own dialog — passed, its hook gone, or never held — until a hook (or
+    /// the screen, `observe`) shows the agent moved on.
+    pub fn passed_to_dialog(&mut self, pane: PaneId) {
+        if let Some(slot) = self.panes.get_mut(&pane) {
+            slot.passed = true;
+        }
     }
 
     /// Record the agent kind detected for a pane. Returns whether it changed. A
@@ -1167,7 +1185,10 @@ impl Session {
         if slot.meta.source == Some(StateSource::Hook) && slot.meta.state == AgentState::Blocked {
             match classified {
                 Some(Observation::Blocked) => slot.dialog = true,
-                Some(Observation::Working) if slot.dialog => slot.meta.state = AgentState::Working,
+                Some(Observation::Working) if slot.dialog => {
+                    slot.meta.state = AgentState::Working;
+                    slot.passed = false;
+                }
                 _ => {}
             }
         }
@@ -1599,6 +1620,7 @@ impl Session {
                 herdr: None,
                 herdr_seqs: HashMap::new(),
                 dialog: false,
+                passed: false,
             },
         );
         Ok(id)
@@ -2149,6 +2171,20 @@ mod tests {
             s.hold_approval(PaneId(99), "Bash".into(), "ls".into()),
             None,
             "an unknown pane holds nothing"
+        );
+
+        s.passed_to_dialog(pane);
+        let fifth = s.hold_approval(pane, "Bash".into(), "ls".into()).unwrap();
+        assert_eq!(
+            s.take_approval(pane, None),
+            Some((fourth, true)),
+            "one in the agent's own dialog still waits on you"
+        );
+        s.apply_agent_event(pane, AgentHookEvent::Activity { detail: None }, None);
+        assert_eq!(
+            s.take_approval(pane, None),
+            Some((fifth, false)),
+            "until a hook shows the agent moved on"
         );
     }
 

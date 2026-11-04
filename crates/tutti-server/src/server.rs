@@ -1663,6 +1663,7 @@ fn approval_hold(
     }
     agent_event(hub, pane, AgentHookEvent::Blocked { message }, conversation);
     let Some(id) = held else {
+        hub.session().passed_to_dialog(pane);
         let pass = Response::Approval {
             decision: ApprovalDecision::Pass,
         };
@@ -1677,9 +1678,11 @@ fn approval_hold(
         hub.approvals().remove(&id);
         let view = {
             let mut session = hub.session();
-            session
-                .take_approval(pane, Some(id))
-                .map(|_| session.view())
+            let taken = session.take_approval(pane, Some(id));
+            if taken.is_some() && decision.is_none() {
+                session.passed_to_dialog(pane);
+            }
+            taken.map(|_| session.view())
         };
         if let Some(view) = view {
             broadcast_event(&hub, Event::LayoutChanged { workspaces: view });
@@ -1697,9 +1700,10 @@ fn approval_hold(
 /// broadcast the view without it. An allow or a deny sets the agent going
 /// again — the tool runs, or the model hears the refusal — and Claude sends
 /// no hook until that tool is done, so the pane moves to Working here rather
-/// than sitting Blocked through it, unless another approval still waits on
-/// you; a pass hands the request to Claude's own dialog, still blocked.
-/// Error when the pane holds no such approval.
+/// than sitting Blocked through it — unless the pane still waits on you,
+/// holding another or with one in the agent's own dialog; a pass hands the
+/// request to that dialog, still blocked. Error when the pane holds no such
+/// approval.
 fn approval_answer(
     hub: &Arc<Hub>,
     pane: PaneId,
@@ -1713,9 +1717,13 @@ fn approval_answer(
             message: format!("pane {pane} has no pending approval{which}"),
         };
     };
+    let passed = matches!(decision, ApprovalDecision::Pass);
+    if passed {
+        session.passed_to_dialog(pane);
+    }
     let view = session.view();
     drop(session);
-    let resumes = !waiting && !matches!(decision, ApprovalDecision::Pass);
+    let resumes = !waiting && !passed;
     let answer = hub.approvals().remove(&held);
     if let Some(answer) = answer {
         let _ = answer.send(decision);

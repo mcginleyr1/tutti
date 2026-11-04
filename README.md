@@ -997,7 +997,9 @@ nothing and exiting 0 — when no TUI is attached to answer it, on `esc`, and
 when nobody answers within `approval_timeout_secs` (default 120, at most 599:
 Claude stops a hook at 600 s). The hook never fails a Claude session. An allow
 or a deny from tutti sets the pane **working** at once — the tool runs, or the
-agent hears the refusal. Answered in Claude's own dialog instead, the pane goes
+agent hears the refusal — unless another request still waits on you: held in
+tutti, or one that fell through to Claude's dialog, until a hook (or the
+screen, below) shows Claude moved on. Answered in Claude's own dialog, the pane goes
 back to **working** once its screen shows Claude busy again — its spinner's
 `(12s · ↓ 98 tokens)`, or `Running…`: Claude has no "permission granted" hook
 (between your answer and the tool's end, `PostToolUse`, none fires), so tutti,

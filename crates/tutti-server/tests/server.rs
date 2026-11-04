@@ -3044,6 +3044,13 @@ async fn a_pane_holds_parallel_approvals_each_answered_on_its_own() {
         .await,
         "a pass leaves the last one to Claude's dialog"
     );
+    // The tool Claude's dialog let through has run: the agent moved on.
+    hook(
+        &mut control,
+        pane,
+        AgentHookEvent::Activity { detail: None },
+    )
+    .await;
 
     let mut last = server.connect().await;
     last.send(&hold(pane)).await;
@@ -3064,6 +3071,56 @@ async fn a_pane_holds_parallel_approvals_each_answered_on_its_own() {
         wait_state(&mut control, pane, AgentState::Working).await,
         "the last answer sets the agent going"
     );
+
+    server.stop().await;
+}
+
+/// A request handed on to the agent's own dialog — passed from tutti, or its
+/// hook gone — still waits on you there, so tutti's answer to another keeps
+/// the pane blocked until a hook shows the agent moved on.
+#[tokio::test]
+async fn a_request_left_to_the_agents_dialog_keeps_the_pane_blocked() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let pane = run_sleeper(&mut control).await;
+    let _viewer = attached_viewer(&server).await;
+    let answer = |id, decision| Request::ApprovalAnswer {
+        pane,
+        id: Some(id),
+        decision,
+    };
+
+    for passed in [true, false] {
+        let (mut first, mut second) = (server.connect().await, server.connect().await);
+        first.send(&hold(pane)).await;
+        assert!(wait_pane(&mut control, pane, |p| p.approvals.len() == 1).await);
+        second.send(&hold(pane)).await;
+        assert!(wait_pane(&mut control, pane, |p| p.approvals.len() == 2).await);
+        let held = held_approvals(&mut control, pane).await;
+        if passed {
+            let pass = answer(held[0].id, ApprovalDecision::Pass);
+            assert_eq!(control.request(pass).await, Response::Ok);
+        } else {
+            drop(first);
+            assert!(wait_pane(&mut control, pane, |p| p.approvals.len() == 1).await);
+        }
+        let allow = answer(held[1].id, ApprovalDecision::Allow);
+        assert_eq!(control.request(allow).await, Response::Ok);
+        assert_eq!(approval(second.response().await), ApprovalDecision::Allow);
+        assert!(
+            wait_pane(&mut control, pane, |p| p.approvals.is_empty()
+                && p.state == AgentState::Blocked)
+            .await,
+            "Claude's dialog still asks (passed: {passed})"
+        );
+        hook(
+            &mut control,
+            pane,
+            AgentHookEvent::Activity { detail: None },
+        )
+        .await;
+        assert!(wait_state(&mut control, pane, AgentState::Working).await);
+    }
 
     server.stop().await;
 }
