@@ -28,7 +28,7 @@ The examples below use project `2`, workspace `5`, and sub-agent panes `7`,
 ```sh
 tutti project list            # the projects: top-level directories, ID NAME DIR
 tutti workspace list          # every project and workspace, with the PARENT it is nested under
-tutti pane list               # every pane: ID TITLE AGENT STATE EXIT
+tutti pane list               # every pane: ID TITLE AGENT STATE EXIT WORKSPACE
 ```
 
 Your project is the entry whose DIR holds your working directory. Projects and
@@ -236,9 +236,9 @@ tutti --json pane wait 7 --until done,blocked --timeout 120
 
 `--json` prints each raw response as one JSON object per line. `pane list`
 gives every pane's `id`, `title`, `agent`, `state` (`unknown`, `working`,
-`blocked`, `done`, `idle`), `exited` code, and `conversation`: the agent's own
-session id when its hooks report one (`claude --resume <id>` picks it up
-again).
+`blocked`, `done`, `idle`), `exited` code, `workspace` (the id `workspace
+diff` and `run --workspace` take), and `conversation`: the agent's own session
+id when its hooks report one (`claude --resume <id>` picks it up again).
 
 ## Rules
 

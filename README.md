@@ -1658,7 +1658,7 @@ tutti tab new [--workspace <id>] | list [--workspace <id>] | select <id>
 tutti run [--workspace <id> | --dir <path>] [--title <t>] [--sandbox <profile>] -- <cmd...>  # a fresh tab; prints the bare pane id
 tutti pane run [--tab <id>] [--ephemeral] [--sandbox <profile>] -- <cmd...>
 tutti pane split <pane> right|down
-tutti pane list | kill <pane> | focus <pane>   # focus: the attached TUI jumps to the pane
+tutti pane list | kill <pane> | focus <pane>   # list: each pane with its workspace's id; focus: the attached TUI jumps to the pane
 tutti pane focus --direction left|right|up|down [--from <pane>] [--wrap]  # focus the pane beside one (default: this pane, else the TUI's) and print it; at the TUI's focused pane's left/right edge the TUI moves on (sidebar, panel, tab), exit 0; else `no pane <dir> of <id>`, exit 1
 tutti pane resize --direction left|right|up|down [--amount <f>] [--from <pane>]  # move its split's border that way, as Alt+h/j/k/l (default step 0.05 of the split)
 tutti pane attach <pane>             # show one pane in this terminal, drawn by the terminal itself; prefix d detaches (never starts a daemon)

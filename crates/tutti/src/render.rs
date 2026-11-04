@@ -49,6 +49,8 @@ pub fn tabs(items: &[TabInfo]) -> String {
     table(&["ID", "NAME", "ACTIVE"], &rows)
 }
 
+/// Every pane, with the id of the workspace it lives in last (`-` from a
+/// daemon too old to say).
 pub fn panes(items: &[PaneInfo]) -> String {
     let rows: Vec<Vec<String>> = items
         .iter()
@@ -61,10 +63,15 @@ pub fn panes(items: &[PaneInfo]) -> String {
                     .map_or_else(|| "-".to_string(), |a| a.to_string()),
                 state_label(p.state).to_string(),
                 p.exited.map_or_else(|| "-".to_string(), |c| c.to_string()),
+                p.workspace
+                    .map_or_else(|| "-".to_string(), |w| w.to_string()),
             ]
         })
         .collect();
-    table(&["ID", "TITLE", "AGENT", "STATE", "EXIT"], &rows)
+    table(
+        &["ID", "TITLE", "AGENT", "STATE", "EXIT", "WORKSPACE"],
+        &rows,
+    )
 }
 
 /// Tracker issues: source, the id `issue deploy` takes, title, labels, url.
@@ -296,8 +303,8 @@ mod tests {
     }
 
     #[test]
-    fn pane_table_shows_missing_agent_and_exit_as_dash() {
-        let rendered = panes(&[PaneInfo {
+    fn pane_table_shows_missing_agent_and_exit_as_dash_and_names_the_workspace() {
+        let shell = PaneInfo {
             id: PaneId(3),
             title: "shell".into(),
             agent: None,
@@ -313,12 +320,18 @@ mod tests {
             sandbox_name: None,
             user_vars: Default::default(),
             cwd: None,
+            workspace: Some(WorkspaceId(5)),
+        };
+        let older = PaneInfo {
+            id: PaneId(4),
             workspace: None,
-        }]);
+            ..shell.clone()
+        };
         assert_eq!(
-            rendered,
-            "ID  TITLE  AGENT  STATE  EXIT\n\
-             3   shell  -      idle   -\n"
+            panes(&[shell, older]),
+            "ID  TITLE  AGENT  STATE  EXIT  WORKSPACE\n\
+             3   shell  -      idle   -     5\n\
+             4   shell  -      idle   -     -\n"
         );
     }
 
