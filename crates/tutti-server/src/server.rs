@@ -1095,9 +1095,11 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             last_reply,
         } => {
             if last_reply {
-                if since.is_some() || last_output {
+                if lines.is_some() || unwrapped || since.is_some() || last_output {
                     return Response::Error {
-                        message: "a read takes one of since, last_output and last_reply".into(),
+                        message: "a last_reply read takes no lines, unwrapped, since or \
+                                  last_output: it is the agent's text, not the screen"
+                            .into(),
                     };
                 }
                 let reply = hub.session().last_reply(pane);

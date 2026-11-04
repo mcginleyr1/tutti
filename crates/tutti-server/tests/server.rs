@@ -376,19 +376,23 @@ async fn a_turns_reply_is_read_back_once_its_wait_answers() {
     hook(&mut control, pane, AgentHookEvent::Done { reply: None }).await;
     let ended = error_message(control.request(read()).await);
     assert!(ended.contains("ended without a reply"), "{ended}");
-    let both = Request::PaneRead {
-        pane,
-        lines: None,
-        unwrapped: false,
-        since: None,
-        last_output: true,
-        last_reply: true,
-    };
-    let both = error_message(control.request(both).await);
-    assert!(
-        both.contains("one of since, last_output and last_reply"),
-        "{both}"
-    );
+    for (lines, unwrapped, since, last_output) in [
+        (Some(3), false, None, false),
+        (None, true, None, false),
+        (None, false, Some(0), false),
+        (None, false, None, true),
+    ] {
+        let shaped = Request::PaneRead {
+            pane,
+            lines,
+            unwrapped,
+            since,
+            last_output,
+            last_reply: true,
+        };
+        let refused = error_message(control.request(shaped).await);
+        assert!(refused.contains("takes no lines, unwrapped"), "{refused}");
+    }
 
     server.stop().await;
 }

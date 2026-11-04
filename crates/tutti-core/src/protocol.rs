@@ -215,7 +215,7 @@ pub enum Request {
         /// Read the final message of the last turn the pane's agent hooks
         /// ended instead, answered with `Response::LastReply`; an Error when
         /// no hook reports the pane's turns, none has ended, or the last
-        /// ended with no message. Never with `since` or `last_output`.
+        /// ended with no message. Takes none of the other read fields.
         #[serde(default)]
         last_reply: bool,
     },
