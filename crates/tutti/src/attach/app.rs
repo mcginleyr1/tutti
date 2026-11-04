@@ -147,6 +147,9 @@ enum FollowUp {
     Deploy(Box<Request>),
     /// A deploy's `Run`: `Ran` jumps to the agent.
     Deployed,
+    /// A `PaneRead` of this pane's last reply: `LastReply` opens the reply
+    /// overlay over the sidebar it was asked from.
+    Reply(PaneId),
 }
 
 /// An in-progress or just-finished mouse text selection within one pane. `anchor`
@@ -236,6 +239,10 @@ pub enum Mode {
     /// peek; `y` allows, `n` denies, `esc` passes it on to Claude's own
     /// dialog.
     Approval(PaneId),
+    /// Reading a done agent's last reply from the sidebar: the final message
+    /// of its last finished turn floats in an overlay framed like the peek;
+    /// `esc` closes it.
+    Reply(PaneId),
     /// The notifications panel: the daemon's history of bells, desktop
     /// notifications and agents wanting attention, newest first; enter jumps
     /// to the highlighted note's pane.
@@ -380,9 +387,11 @@ pub struct App {
     diff_selected: usize,
     /// The top tab-bar row from the last size sync, for mouse hit-testing.
     tab_bar_rect: Option<Rect>,
-    /// The peek or approval overlay from the last size sync, for mouse
-    /// hit-testing. `None` while neither is open.
+    /// The peek, approval or reply overlay from the last size sync, for mouse
+    /// hit-testing. `None` while none is open.
     peek_rect: Option<Rect>,
+    /// The text the reply overlay shows: the last reply it was handed.
+    reply: String,
     /// The approval the approval overlay last opened for — the one it shows
     /// and an answer names.
     approval_shown: Option<u64>,
@@ -565,6 +574,7 @@ impl App {
             diff_selected: 0,
             tab_bar_rect: None,
             peek_rect: None,
+            reply: String::new(),
             approval_shown: None,
             approvals_seen: HashSet::new(),
             approval_back: Mode::Terminal,
@@ -884,6 +894,12 @@ impl App {
         {
             self.mode = self.approval_back;
         }
+        // A reply overlay closes with its pane.
+        if let Mode::Reply(pane) = self.mode
+            && !self.panes.contains_key(&pane)
+        {
+            self.mode = Mode::Sidebar;
+        }
         self.open_focused_approval();
         frames
     }
@@ -1141,6 +1157,18 @@ impl App {
                     return frames;
                 }
             }
+            // The asked-for reply came: show it, unless the sidebar it was
+            // asked from has moved on to something else meanwhile.
+            Response::LastReply { text, .. } => {
+                let replies = |f: &FollowUp| matches!(f, FollowUp::Reply(_));
+                if let Some(FollowUp::Reply(pane)) = self.take_follow_up(req, replies)
+                    && self.mode == Mode::Sidebar
+                {
+                    self.reply = text;
+                    self.mode = Mode::Reply(pane);
+                    self.status = None;
+                }
+            }
             Response::Restored { n, saved } => self.set_status(match saved {
                 Some(saved) => format!("restored to #{n} — the state it replaced is #{saved}"),
                 None => format!("restored to #{n}"),
@@ -1329,6 +1357,7 @@ impl App {
                 Vec::new()
             }
             Mode::Approval(pane) => self.on_key_approval(key, pane),
+            Mode::Reply(_) => self.on_key_reply(key),
             Mode::Notes => self.on_key_notes(key),
             Mode::ConfirmClearNotes => self.on_key_confirm_clear_notes(key),
             Mode::Issues => {
@@ -1721,6 +1750,7 @@ impl App {
                 | Mode::ConfirmMerge(_)
                 | Mode::ConfirmCleanup(_)
                 | Mode::Peek(_)
+                | Mode::Reply(_)
         ) || (matches!(self.mode, Mode::Approval(_)) && self.approval_back == Mode::Sidebar)
     }
 
@@ -2040,10 +2070,7 @@ impl App {
                 Vec::new()
             }
             SidebarAction::Jump => self.jump_to_selected(&sidebar),
-            SidebarAction::Peek => {
-                self.open_peek(&sidebar);
-                Vec::new()
-            }
+            SidebarAction::Peek => self.open_peek(&sidebar),
             SidebarAction::NewAgent => self.new_agent_in_selected(&sidebar),
             SidebarAction::AddProject => {
                 self.open_project_prompt();
@@ -2107,7 +2134,8 @@ impl App {
     /// so the pane underneath and the prompt being fingerprinted stay put. A
     /// row whose pane holds an approval opens the approval overlay instead:
     /// Claude's dialog is held back, so there is no prompt on screen to peek.
-    fn open_peek(&mut self, sidebar: &Sidebar) {
+    /// A done row asks for its last reply, which opens the reply overlay.
+    fn open_peek(&mut self, sidebar: &Sidebar) -> Vec<WireFrame> {
         match sidebar.entries.get(self.sidebar_selected) {
             Some(SidebarEntry::Agent(sidebar::AgentRow {
                 pane,
@@ -2118,8 +2146,31 @@ impl App {
                 self.mode = Mode::Peek(a.pane);
                 self.status = None;
             }
-            _ => self.set_status("peek answers a blocked agent".into()),
+            Some(SidebarEntry::Agent(a))
+                if matches!(a.state, AgentState::Done | AgentState::Idle) =>
+            {
+                let read = Request::PaneRead {
+                    pane: a.pane,
+                    lines: None,
+                    unwrapped: false,
+                    since: None,
+                    last_output: false,
+                    last_reply: true,
+                };
+                return vec![self.follow(&read, FollowUp::Reply(a.pane))];
+            }
+            _ => self.set_status("peek answers a blocked agent or reads a done one's reply".into()),
         }
+        Vec::new()
+    }
+
+    /// Keys over the reply overlay: `esc` closes it back to the sidebar;
+    /// nothing else does anything.
+    fn on_key_reply(&mut self, key: KeyEvent) -> Vec<WireFrame> {
+        if key.code == KeyCode::Esc {
+            self.mode = Mode::Sidebar;
+        }
+        Vec::new()
     }
 
     /// Keys while peeking. `esc` closes back to the sidebar — never forwarded,
@@ -2263,28 +2314,43 @@ impl App {
         })]
     }
 
-    /// The approval overlay while one is open: its pane, the popup rect —
-    /// sized and centred as the peek's — and the body rows: the tool, then
-    /// its input hard-wrapped to the popup's inner width, a column of padding
-    /// each side; a terminal too short for every row cuts the last one shown
-    /// with `…`. The one geometry source the renderer and the mouse hit-test
-    /// share.
-    pub fn approval_popup(&self, area: Rect) -> Option<(PaneId, Rect, Vec<String>)> {
-        let Mode::Approval(pane) = self.mode else {
-            return None;
+    /// The approval or reply overlay while one is open: its pane, the popup
+    /// rect — sized and centred as the peek's — and the body rows,
+    /// hard-wrapped to the popup's inner width, a column of padding each side:
+    /// an approval's tool, then its input; a reply's lines, blank ones kept.
+    /// A terminal too short for every row cuts the last one shown with `…`.
+    /// The one geometry source the renderer and the mouse hit-test share.
+    pub fn text_popup(&self, area: Rect) -> Option<(PaneId, Rect, Vec<String>)> {
+        let pane = match self.mode {
+            Mode::Approval(pane) | Mode::Reply(pane) => pane,
+            _ => return None,
         };
         let state = self.panes.get(&pane)?;
-        let approval = self.shown_approval(pane)?;
         let width = (state.term.size().1 + 2)
             .max(PEEK_MIN_WIDTH)
             .min(area.width);
-        let summary: Vec<char> = approval.summary.chars().collect();
-        let mut rows = vec![approval.tool.clone()];
-        rows.extend(
-            summary
-                .chunks(usize::from(width.saturating_sub(4)).max(1))
-                .map(|chunk| chunk.iter().collect()),
-        );
+        let wrap = |text: &str| -> Vec<String> {
+            let chars: Vec<char> = text.chars().collect();
+            let inner = usize::from(width.saturating_sub(4)).max(1);
+            chars
+                .chunks(inner)
+                .map(|chunk| chunk.iter().collect())
+                .collect()
+        };
+        let mut rows = Vec::new();
+        if let Mode::Approval(_) = self.mode {
+            let approval = self.shown_approval(pane)?;
+            rows.push(approval.tool.clone());
+            rows.extend(wrap(&approval.summary));
+        } else {
+            for line in self.reply.lines() {
+                let wrapped = wrap(line);
+                if wrapped.is_empty() {
+                    rows.push(String::new());
+                }
+                rows.extend(wrapped);
+            }
+        }
         // Two border rows and the hint row around the body.
         let height = (rows.len() as u16 + 3).min(area.height);
         let shown = usize::from(height.saturating_sub(3));
@@ -4152,10 +4218,10 @@ impl App {
         if self.mode == Mode::RestoreOffer {
             return Vec::new();
         }
-        // The peek and approval overlays are modal: a press inside one is
-        // swallowed — the pane beneath must not take focus — and a press
+        // The peek, approval and reply overlays are modal: a press inside one
+        // is swallowed — the pane beneath must not take focus — and a press
         // outside dismisses it, answering nothing.
-        if let Mode::Peek(_) | Mode::Approval(_) = self.mode {
+        if let Mode::Peek(_) | Mode::Approval(_) | Mode::Reply(_) = self.mode {
             if matches!(kind, MouseEventKind::Down(_))
                 && !self.peek_rect.is_some_and(|r| contains(r, col, row))
             {
@@ -4669,7 +4735,7 @@ impl App {
         self.peek_rect = self
             .peek_popup(area)
             .map(|(_, rect, _)| rect)
-            .or_else(|| self.approval_popup(area).map(|(_, rect, _)| rect));
+            .or_else(|| self.text_popup(area).map(|(_, rect, _)| rect));
         self.navigate_rect = (self.mode == Mode::Navigate).then_some(content);
         self.notes_area = self.notes_popup(area).map(|_| area);
         self.rects = self.compute_rects(content);
@@ -7173,6 +7239,63 @@ mod tests {
         assert!(app.transient().is_some_and(|t| t.contains("blocked")));
     }
 
+    /// `p` on a done agent's row asks for its last reply, and the answer
+    /// opens the reply overlay over the sidebar — its lines wrapped, blank
+    /// ones kept — which `esc` closes. A refusal only flashes, and a reply
+    /// landing after the sidebar moved on opens nothing.
+    #[test]
+    fn p_on_a_done_row_reads_its_last_reply() {
+        let mut app = peek_fixture();
+        state_changed(&mut app, PaneId(2), AgentState::Working, AgentState::Done);
+        let row = app
+            .sidebar()
+            .index_of(sidebar::EntryIdent::Agent(PaneId(2)));
+        app.sidebar_selected = row.expect("pane 2's row");
+        let read = Request::PaneRead {
+            pane: PaneId(2),
+            lines: None,
+            unwrapped: false,
+            since: None,
+            last_output: false,
+            last_reply: true,
+        };
+        let asked = app.on_key(plain('p'));
+        assert_eq!(asked, vec![tagged(&read, app.last_req)]);
+        assert_eq!(app.mode, Mode::Sidebar, "nothing opens before the answer");
+
+        let said = Response::LastReply {
+            text: format!("pong\n\n{}", "x".repeat(150)),
+            truncated: false,
+        };
+        app.handle_frame(reply(app.last_req, said.clone()));
+        assert_eq!(app.mode, Mode::Reply(PaneId(2)));
+        let (pane, _, rows) = app.text_popup(Rect::new(0, 0, 100, 24)).unwrap();
+        assert_eq!(pane, PaneId(2));
+        assert_eq!(rows[..2], ["pong", ""], "a blank line is kept");
+        assert!(rows.len() > 3, "a long line wraps: {rows:?}");
+        assert_eq!(rows[2..].concat(), "x".repeat(150));
+        assert_eq!(app.on_key(plain('q')), Vec::new());
+        assert_eq!(app.mode, Mode::Reply(PaneId(2)), "it only reads");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Sidebar);
+
+        app.on_key(plain('p'));
+        let refused = Response::Error {
+            message: "pane 2's last turn ended without a reply".into(),
+        };
+        app.handle_frame(reply(app.last_req, refused));
+        assert_eq!(app.mode, Mode::Sidebar);
+        assert!(
+            app.transient()
+                .is_some_and(|t| t.contains("without a reply"))
+        );
+
+        app.on_key(plain('p'));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_frame(reply(app.last_req, said));
+        assert_ne!(app.mode, Mode::Reply(PaneId(2)), "the sidebar was left");
+    }
+
     #[test]
     fn the_peek_closes_itself_once_the_agent_leaves_blocked() {
         let mut app = peek_fixture();
@@ -7333,7 +7456,7 @@ mod tests {
 
     /// The overlay's input row: the held tool call's.
     fn approval_shown_input(app: &App) -> String {
-        let (_, _, rows) = app.approval_popup(Rect::new(0, 0, 100, 24)).unwrap();
+        let (_, _, rows) = app.text_popup(Rect::new(0, 0, 100, 24)).unwrap();
         rows[1].clone()
     }
 

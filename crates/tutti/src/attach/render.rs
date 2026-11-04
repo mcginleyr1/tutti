@@ -105,6 +105,9 @@ const SETUP_PATH_W: usize = 60;
 /// answers too — it hands the request on to the agent's own dialog.
 const APPROVAL_HINT: &[(&str, &str)] = &[("y", "allow"), ("n", "deny"), ("esc", "pass to agent")];
 
+/// The reply overlay's hint row: it only reads, so only closes.
+const REPLY_HINT: &[(&str, &str)] = &[("esc", "close")];
+
 /// The go-to overlay's key hint, two-tone at its input row's right edge —
 /// typing filters, so the movement keys are the ones worth saying.
 const NAVIGATE_HINT: &[(&str, &str)] = &[("↑↓", "move"), ("enter", "jump"), ("esc", "back")];
@@ -194,7 +197,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_footer(frame, app, footer);
     // Under the band, so a refused answer's flash stays readable over it.
     draw_peek(frame, app, area);
-    draw_approval(frame, app, area);
+    draw_text_overlay(frame, app, area);
     // A transient fires the one-row notification band over the last content row,
     // just above the footer.
     if app.transient().is_some() && footer.y > content.y {
@@ -1384,6 +1387,7 @@ fn mode_label(mode: Mode) -> Option<&'static str> {
         Mode::Navigate => Some("GO TO"),
         Mode::Issues => Some("ISSUES"),
         Mode::Approval(_) => Some("APPROVE"),
+        Mode::Reply(_) => Some("REPLY"),
         Mode::Notes => Some("NOTES"),
         Mode::ConfirmClearNotes => Some("CONFIRM"),
     }
@@ -1864,20 +1868,27 @@ fn draw_peek(frame: &mut Frame, app: &App, area: Rect) {
 
 /// The approval overlay, framed as the peek is — ` approve <agent> ·
 /// <workspace> ` — naming the tool a held permission request would run, in
-/// bold, over its input and the two-tone hint row. Geometry comes from
-/// `App::approval_popup`, which the mouse hit-test shares.
-fn draw_approval(frame: &mut Frame, app: &App, area: Rect) {
-    let Some((pane, popup, rows)) = app.approval_popup(area) else {
+/// bold, over its input and the two-tone hint row; or the reply overlay, `
+/// reply <agent> · <workspace> `, over a done agent's last reply. Geometry
+/// comes from `App::text_popup`, which the mouse hit-test shares.
+fn draw_text_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let Some((pane, popup, rows)) = app.text_popup(area) else {
         return;
     };
-    let Some(body) = draw_overlay_frame(frame, app, popup, pane, "approve", APPROVAL_HINT) else {
+    let approval = matches!(app.mode, Mode::Approval(_));
+    let (verb, hint) = if approval {
+        ("approve", APPROVAL_HINT)
+    } else {
+        ("reply", REPLY_HINT)
+    };
+    let Some(body) = draw_overlay_frame(frame, app, popup, pane, verb, hint) else {
         return;
     };
     let lines: Vec<Line> = rows
         .into_iter()
         .enumerate()
         .map(|(i, row)| {
-            let style = if i == 0 {
+            let style = if approval && i == 0 {
                 Style::default().add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -4126,6 +4137,57 @@ mod tests {
         assert!(row_text(buf, 23).contains("ANSWER"), "the footer mode chip");
     }
 
+    /// A done agent's last reply floats in an overlay framed as the peek is —
+    /// ` reply <agent> · <workspace> ` — over its one key, the footer chip
+    /// saying REPLY.
+    #[test]
+    fn a_done_agents_last_reply_shows_in_its_overlay() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        let mut app = app_two_workspaces();
+        let done = tutti_core::Event::StateChanged {
+            pane: PaneId(2),
+            from: AgentState::Blocked,
+            to: AgentState::Done,
+        };
+        app.handle_frame(WireFrame::Control(serde_json::to_vec(&done).unwrap()));
+        let area = Rect::new(0, 0, 100, 24);
+        app.sync_sizes(area);
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        app.on_key(key('w'));
+        // api, web, then web's agent.
+        app.on_key(key('j'));
+        app.on_key(key('j'));
+        let asked = app.on_key(key('p'));
+        let [WireFrame::Control(json)] = asked.as_slice() else {
+            panic!("expected the reply's read, got {asked:?}");
+        };
+        let req = serde_json::from_slice::<tutti_core::Tagged<tutti_core::Request>>(json)
+            .unwrap()
+            .req;
+        let said = tutti_core::Tagged {
+            req,
+            body: Response::LastReply {
+                text: "pong\nping".into(),
+                truncated: false,
+            },
+        };
+        app.handle_frame(WireFrame::Control(serde_json::to_vec(&said).unwrap()));
+        assert_eq!(app.mode, Mode::Reply(PaneId(2)));
+
+        app.sync_sizes(area);
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let (_, popup, _) = app.text_popup(area).unwrap();
+        let row = |n: u16| row_text(buf, usize::from(popup.y + n));
+        assert!(row(0).contains("reply claude · web"), "{:?}", row(0));
+        assert!(row(1).contains(" pong "), "{:?}", row(1));
+        assert!(row(2).contains(" ping "), "{:?}", row(2));
+        assert!(row(3).contains("esc close"), "{:?}", row(3));
+        assert!(row_text(buf, 23).contains("REPLY"), "the footer mode chip");
+    }
+
     /// A held approval's waiting row names what would run, and its overlay
     /// — framed as the peek is — puts the tool over its input above the
     /// three answers, the footer chip saying APPROVE.
@@ -4162,7 +4224,7 @@ mod tests {
         assert_eq!(app.mode, Mode::Approval(PaneId(2)));
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let buf = terminal.backend().buffer();
-        let (_, popup, _) = app.approval_popup(area).unwrap();
+        let (_, popup, _) = app.text_popup(area).unwrap();
         let row = |n: u16| row_text(buf, usize::from(popup.y + n));
         assert!(row(0).contains("approve claude · web"), "{:?}", row(0));
         assert!(row(1).contains(" Bash "), "the tool: {:?}", row(1));

@@ -228,7 +228,8 @@ pub enum SidebarAction {
     Up,
     /// Jump to the selected row's tab (and an agent row's pane).
     Jump,
-    /// Peek at a blocked agent's prompt and answer it in place.
+    /// Peek at a blocked agent's prompt and answer it in place, or read a
+    /// done agent's last reply.
     Peek,
     NewAgent,
     NewWorkspace,
