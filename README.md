@@ -343,7 +343,7 @@ preset:
 | `N` | notifications: the history of bells, desktop notifications, and agents that blocked or finished |
 | `r` | run an agent / shell / command here (opens the launcher) |
 | `I` | issues: list your trackers' issues and deploy one to an agent |
-| `i` | setup: install the Claude Code hooks, the opencode plugin, the tutti skill, and the shell integration — for you, or (`s`) into the active project |
+| `i` | setup: install the Claude Code, Codex and Gemini CLI hooks, the opencode plugin, the tutti skill, and the shell integration — for you, or (`s`) into the active project |
 | `o`, arrows | focus next pane / directional focus |
 | `z` | zoom focused pane |
 | `x` | kill pane (confirms) |
@@ -439,8 +439,8 @@ closes. The highlight sticks to its row while agents change state underneath
 it. The footer chip reads `GO TO`.
 
 **Setup panel** (`Ctrl+B i`): a floating ` setup · user ` panel listing what
-tutti installs — the Claude Code hooks, the opencode plugin, the
-[tutti skill](#the-tutti-skill), and the [shell integration](#shell-integration)'s
+tutti installs — the Claude Code, Codex and Gemini CLI hooks, the opencode
+plugin, the [tutti skill](#the-tutti-skill), and the [shell integration](#shell-integration)'s
 line in your shell's rc file — each with a status dot and word (installed,
 needs update, not installed, not tutti's, unreadable) over its target file.
 `s` switches to the active project (` setup · project <name> `). `enter` on a

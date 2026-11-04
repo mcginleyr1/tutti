@@ -4380,6 +4380,8 @@ mod tests {
                 "not installed",
                 ".claude/settings.json",
             ),
+            ("Codex hooks", "not installed", ".codex/hooks.json"),
+            ("Gemini CLI hooks", "not installed", ".gemini/settings.json"),
             (
                 "opencode plugin",
                 "not tutti's",

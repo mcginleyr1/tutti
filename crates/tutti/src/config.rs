@@ -79,8 +79,9 @@ pub enum PrefixAction {
     /// Open the issues panel: every configured tracker's issues for the
     /// active project, each deployable to an agent.
     Issues,
-    /// Open the setup panel: install the Claude Code hooks, the opencode
-    /// plugin, and the tutti skill, for the user or into the active project.
+    /// Open the setup panel: install the Claude Code, Codex and Gemini CLI
+    /// hooks, the opencode plugin, the tutti skill and the shell integration,
+    /// for the user or into the active project.
     Integrations,
     /// Release/re-grab mouse capture so the terminal's own drag-to-select and
     /// copy work while released.
