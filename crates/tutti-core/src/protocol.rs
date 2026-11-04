@@ -11,7 +11,7 @@ use crate::state::{AgentState, StateSource};
 /// Response / Event shapes (including additive fields): the daemon reports it
 /// on attach and mismatched clients tell the user to restart the daemon —
 /// binaries upgrade on install, running daemons do not.
-pub const WIRE_REV: u32 = 11;
+pub const WIRE_REV: u32 = 12;
 
 /// The most notes the daemon's notification history keeps, the oldest going
 /// first. A client caps its copy the same, so the two agree.
@@ -613,6 +613,10 @@ pub struct PaneInfo {
     /// starts there. `None` before a report and from older servers.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// The workspace (or project) the pane lives in, by the id `workspace
+    /// list` shows and `--workspace` takes. `None` from older servers.
+    #[serde(default)]
+    pub workspace: Option<WorkspaceId>,
 }
 
 /// The tracker issue a pane was deployed on: the configured source it came
@@ -688,6 +692,13 @@ pub struct WatchPane {
     /// As `PaneInfo::user_vars`.
     #[serde(default)]
     pub user_vars: BTreeMap<String, String>,
+    /// As `PaneInfo::cwd`.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// As `PaneInfo::approval`: the permission request the pane's agent holds
+    /// for an answer, `None` without one.
+    #[serde(default)]
+    pub approval: Option<PendingApproval>,
 }
 
 /// One subagent row under a hook-driven agent in the sidebar: a short
@@ -797,8 +808,9 @@ pub enum Response {
     },
     /// A `PaneWait` ended: `pane` as it is now, its `state` the one that
     /// satisfied the wait — or, when `timed_out`, the one it is still in.
+    /// Boxed: every `Response` would carry a whole pane's room.
     Waited {
-        pane: PaneInfo,
+        pane: Box<PaneInfo>,
         timed_out: bool,
     },
     /// A `Run` landed: the workspace it ran in, its fresh tab, the new pane.
@@ -1600,6 +1612,7 @@ mod tests {
                     sandbox_name: None,
                     user_vars: BTreeMap::from([("TUTTI_KEYS".into(), "pane".into())]),
                     cwd: None,
+                    workspace: Some(WorkspaceId(1)),
                 }],
             }],
         }]
@@ -1612,7 +1625,7 @@ mod tests {
             message: "boom".into(),
         });
         roundtrip(&Response::PaneCreated { id: PaneId(5) });
-        let pane = sample_view()[0].tabs[0].panes[0].clone();
+        let pane = Box::new(sample_view()[0].tabs[0].panes[0].clone());
         roundtrip(&Response::Waited {
             pane: pane.clone(),
             timed_out: false,
@@ -1651,6 +1664,7 @@ mod tests {
                 sandbox_name: Some("tutti-p1-18f2a9c0de".into()),
                 user_vars: BTreeMap::from([("TUTTI_EDITOR".into(), "nvim /tmp/nvim.sock".into())]),
                 cwd: Some("/src/app/a dir".into()),
+                workspace: Some(WorkspaceId(3)),
             }],
         });
         roundtrip(&Response::Panes {
@@ -1670,6 +1684,7 @@ mod tests {
                 sandbox_name: None,
                 user_vars: BTreeMap::new(),
                 cwd: None,
+                workspace: None,
             }],
         });
         for (pane, relayed) in [(Some(PaneId(3)), false), (None, false), (None, true)] {
@@ -1855,6 +1870,12 @@ mod tests {
                 exited: None,
                 focused: true,
                 user_vars: BTreeMap::from([("TUTTI_KEYS".into(), "pane".into())]),
+                cwd: Some("/Users/me/develop/smartnotch/src".into()),
+                approval: Some(PendingApproval {
+                    id: 4,
+                    tool: "Bash".into(),
+                    summary: "rm -rf build".into(),
+                }),
             }],
         }
     }
@@ -1869,7 +1890,8 @@ mod tests {
                 r#"{"type":"snapshot","session":"tutti","wire_rev":6,"attached_terminal":"com.mitchellh.ghostty","#,
                 r#""panes":[{"id":3,"workspace":"smartnotch","dir":"/Users/me/develop/smartnotch","tab":"main","#,
                 r#""title":"claude","agent":"claude","state":"working","source":"hook","exited":null,"focused":true,"#,
-                r#""user_vars":{"TUTTI_KEYS":"pane"}}]}"#
+                r#""user_vars":{"TUTTI_KEYS":"pane"},"cwd":"/Users/me/develop/smartnotch/src","#,
+                r#""approval":{"id":4,"tool":"Bash","summary":"rm -rf build"}}]}"#
             )
         );
     }
@@ -2035,13 +2057,16 @@ mod tests {
         assert!(pane.user_vars.is_empty(), "and before `user_vars`, none");
         assert_eq!(pane.cwd, None, "and before `cwd`, no report");
         assert_eq!(pane.approval, None, "and before `approval`, nothing held");
-        // A watcher's pane from before `user_vars` existed has none.
+        assert_eq!(pane.workspace, None, "and before `workspace`, unnamed");
+        // A watcher's pane from before `user_vars`, `cwd` and `approval`
+        // existed has none of them.
         let watched: WatchPane = serde_json::from_str(concat!(
             r#"{"id":3,"workspace":"w","dir":"/w","tab":"t","title":"sh","agent":null,"#,
             r#""state":"idle","source":null,"exited":null,"focused":false}"#
         ))
         .unwrap();
         assert!(watched.user_vars.is_empty());
+        assert_eq!((watched.cwd, watched.approval), (None, None));
         // A directional focus naming neither its source nor `wrap` starts at
         // the attached client's pane and stops at the edge.
         let focus: Request =

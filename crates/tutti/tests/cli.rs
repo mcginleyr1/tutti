@@ -654,7 +654,7 @@ fn issue_list_prints_what_a_command_source_lists() {
 #[test]
 fn pane_wait_prints_the_state_and_exits_124_on_a_timeout() {
     use tutti_core::{PaneInfo, WaitFor};
-    let pane = |state: &str| -> PaneInfo {
+    let pane = |state: &str| -> Box<PaneInfo> {
         serde_json::from_str(&format!(
             r#"{{"id":3,"title":"claude","agent":"claude","state":"{state}","exited":null}}"#
         ))
@@ -1095,6 +1095,8 @@ fn watch_prints_snapshot_lines_until_the_daemon_goes() {
             exited: None,
             focused: false,
             user_vars: Default::default(),
+            cwd: None,
+            approval: None,
         }],
     };
     let lines: Vec<String> = [AgentState::Working, AgentState::Blocked]

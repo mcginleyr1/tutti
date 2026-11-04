@@ -313,6 +313,7 @@ mod tests {
             sandbox_name: None,
             user_vars: Default::default(),
             cwd: None,
+            workspace: None,
         }]);
         assert_eq!(
             rendered,

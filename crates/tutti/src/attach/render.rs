@@ -2351,6 +2351,7 @@ fn placeholder_title(pane: PaneId) -> PaneInfo {
         sandbox_name: None,
         user_vars: Default::default(),
         cwd: None,
+        workspace: None,
     }
 }
 
@@ -3163,6 +3164,7 @@ mod tests {
             sandbox_name: None,
             user_vars: Default::default(),
             cwd: None,
+            workspace: None,
         };
         assert_eq!(title_text(&info), "claude · blocked");
     }
@@ -3185,6 +3187,7 @@ mod tests {
             sandbox_name: None,
             user_vars: Default::default(),
             cwd: None,
+            workspace: None,
         };
         assert_eq!(title_text(&info), "claude · ⠋ working");
     }
@@ -3222,6 +3225,7 @@ mod tests {
             sandbox_name: None,
             user_vars: Default::default(),
             cwd: None,
+            workspace: None,
         };
         assert_eq!(title_text(&info), "zsh", "no `· unknown` suffix");
     }
@@ -3244,6 +3248,7 @@ mod tests {
             sandbox_name: None,
             user_vars: Default::default(),
             cwd: None,
+            workspace: None,
         };
         assert_eq!(
             title_text(&info),
@@ -4879,6 +4884,7 @@ mod tests {
             sandbox_name: None,
             user_vars: Default::default(),
             cwd: None,
+            workspace: None,
         };
         let focused = pane_title_line(&info, true, ' ');
         assert_eq!(

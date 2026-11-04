@@ -4404,6 +4404,8 @@ async fn a_watcher_snapshots_the_session_beside_an_attached_client() {
             exited: None,
             focused: false,
             user_vars: Default::default(),
+            cwd: None,
+            approval: None,
         }]
     );
 
@@ -4453,6 +4455,55 @@ async fn a_watcher_snapshots_the_session_beside_an_attached_client() {
     let (_, panes) = snapshot_until(&mut watcher, |terminal, _| terminal.is_none()).await;
     assert!(!panes[0].focused, "nobody attached, nothing focused");
     assert_eq!(panes[0].state, AgentState::Done);
+
+    server.stop().await;
+}
+
+/// A watcher's snapshot carries each pane's reported directory and the
+/// approval its agent holds, as `pane list` does, so a tool reads both from
+/// one place; `pane list` names each pane's workspace.
+#[tokio::test]
+async fn a_snapshot_carries_cwd_and_the_held_approval_and_the_list_the_workspace() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let ws = new_workspace(&mut control).await;
+    let shell = Request::PaneRun {
+        tab: None,
+        cmd: vec!["/bin/sh".into()],
+        ephemeral: false,
+        sandbox: None,
+    };
+    let pane = pane_id(control.request(shell).await);
+    assert!(
+        wait_pane(&mut control, pane, |p| p.workspace == Some(ws)).await,
+        "the list names the pane's workspace"
+    );
+
+    let mut watcher = server.connect().await;
+    watcher.send(&Request::Watch).await;
+    printf_osc(&mut control, pane, "7;file://host/srv/api").await;
+    snapshot_until(&mut watcher, |_, panes| {
+        panes[0].cwd.as_deref() == Some("/srv/api")
+    })
+    .await;
+
+    let _viewer = attached_viewer(&server).await;
+    let mut hook = server.connect().await;
+    hook.send(&hold(pane)).await;
+    let (_, panes) = snapshot_until(&mut watcher, |_, panes| panes[0].approval.is_some()).await;
+    let held = panes[0].approval.clone().unwrap();
+    assert_eq!(
+        (held.tool.as_str(), held.summary.as_str()),
+        ("Bash", "rm -rf build")
+    );
+    let answer = Request::ApprovalAnswer {
+        pane,
+        id: Some(held.id),
+        decision: ApprovalDecision::Allow,
+    };
+    assert_eq!(control.request(answer).await, Response::Ok);
+    assert_eq!(approval(hook.response().await), ApprovalDecision::Allow);
+    snapshot_until(&mut watcher, |_, panes| panes[0].approval.is_none()).await;
 
     server.stop().await;
 }

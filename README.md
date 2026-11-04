@@ -1597,14 +1597,16 @@ it against the CLI, so it cannot drift from the verbs it teaches.
 a menu-bar or notch app, a status line — as JSON lines on stdout, each flushed
 as it lands. Every line is a full snapshot of the session (replace, don't
 merge). The first comes at once, then one on each change to any pane's state,
-agent, title, exit or user vars, to the workspace/tab/pane structure, or to the
-attached TUI's focus or terminal; bursts coalesce.
+agent, title, exit, user vars, directory or held approval, to the
+workspace/tab/pane structure, or to the attached TUI's focus or terminal;
+bursts coalesce.
 
 ```json
-{"type":"snapshot","session":"tutti","wire_rev":10,"attached_terminal":"com.mitchellh.ghostty",
+{"type":"snapshot","session":"tutti","wire_rev":12,"attached_terminal":"com.mitchellh.ghostty",
  "panes":[{"id":3,"workspace":"smartnotch","dir":"/Users/me/develop/smartnotch","tab":"main",
-           "title":"claude","agent":"claude","state":"working","source":"hook","exited":null,"focused":true,
-           "user_vars":{}}]}
+           "title":"claude","agent":"claude","state":"blocked","source":"hook","exited":null,"focused":true,
+           "user_vars":{},"cwd":"/Users/me/develop/smartnotch/src",
+           "approval":{"id":4,"tool":"Bash","summary":"rm -rf build"}}]}
 ```
 
 - `id` is the pane id `tutti pane focus` takes; `workspace` and `dir` are its
@@ -1619,6 +1621,11 @@ attached TUI's focus or terminal; bursts coalesce.
 - `user_vars` holds what the pane's programs set with OSC 1337 `SetUserVar`
   (`TUTTI_KEYS`, `TUTTI_EDITOR`, …), name → value, `{}` when none (see
   [Editors in panes](#editors-in-panes)).
+- `cwd` is the directory the pane's shell last reported (OSC 7, see [Shell
+  integration](#shell-integration)), `null` before a report.
+- `approval` is the permission request the pane's agent holds for an answer
+  (see [Held approvals](#held-approvals)) — its `id`, `tool` and one-line
+  `summary` — `null` without one; answer it with `tutti pane approve <pane>`.
 - `attached_terminal` is the terminal app the attached TUI runs in (macOS's
   `__CFBundleIdentifier`), `null` with nobody attached or off macOS;
   `wire_rev` is the daemon's protocol revision.

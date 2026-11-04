@@ -44,6 +44,7 @@ pub(crate) fn pane(id: u64, title: &str, agent: Option<&str>, state: AgentState)
         sandbox_name: None,
         user_vars: Default::default(),
         cwd: None,
+        workspace: None,
     }
 }
 

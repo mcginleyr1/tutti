@@ -1985,7 +1985,7 @@ fn pane_wait(
                             let info = hub.session().pane(pane);
                             return match info {
                                 Some(info) => Response::Waited {
-                                    pane: PaneInfo { state: to, ..info },
+                                    pane: Box::new(PaneInfo { state: to, ..info }),
                                     timed_out: false,
                                 },
                                 None => gone(),
@@ -2023,7 +2023,7 @@ fn pane_wait(
                 None => {
                     let info = hub.session().pane(pane);
                     info.map_or_else(gone, |pane| Response::Waited {
-                        pane,
+                        pane: Box::new(pane),
                         timed_out: true,
                     })
                 }
@@ -2041,7 +2041,7 @@ fn pane_wait(
 fn wait_verdict(info: PaneInfo, until: &[WaitFor], level: bool) -> Option<Response> {
     if level && until.iter().any(|w| w.matches(info.state)) {
         return Some(Response::Waited {
-            pane: info,
+            pane: Box::new(info),
             timed_out: false,
         });
     }

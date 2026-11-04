@@ -601,6 +601,8 @@ impl Session {
                         exited: slot.meta.exited,
                         focused: focused == Some(slot.meta.id),
                         user_vars: slot.meta.user_vars.clone(),
+                        cwd: slot.pty.cwd(),
+                        approval: slot.meta.approval.clone(),
                     })
             })
             .collect()
@@ -1561,6 +1563,7 @@ impl Session {
                     sandbox_name: None,
                     user_vars: BTreeMap::new(),
                     cwd: None,
+                    workspace: self.workspace_of_tab(tab),
                 },
                 pty,
                 tab,

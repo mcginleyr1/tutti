@@ -5384,6 +5384,7 @@ fn placeholder_info(pane: PaneId) -> PaneInfo {
         sandbox_name: None,
         user_vars: Default::default(),
         cwd: None,
+        workspace: None,
     }
 }
 
