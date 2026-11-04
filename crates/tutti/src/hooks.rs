@@ -159,8 +159,9 @@ pub fn map_codex_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
 /// event carries `hook_event_name` and `session_id` (the UUID `gemini
 /// --resume` takes; `SessionStart` observed live); `BeforeAgent` carries the
 /// submitted `prompt`, a turn's start; `BeforeTool`/`AfterTool` the
-/// `tool_name`; `Notification` a `message` — its one type, `ToolPermission`,
-/// waits on you; `AfterAgent` ends the turn.
+/// `tool_name`; `Notification` a `notification_type` and `message` — only a
+/// `ToolPermission` waits on you, so any other type is a report and sends
+/// nothing; `AfterAgent` ends the turn.
 pub fn map_gemini_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
     let event = match v.get("hook_event_name")?.as_str()? {
         "SessionStart" => AgentHookEvent::SessionStarted,
@@ -170,9 +171,11 @@ pub fn map_gemini_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
         "BeforeTool" | "AfterTool" => AgentHookEvent::Activity {
             detail: tool_name(v).map(str::to_string),
         },
-        "Notification" => AgentHookEvent::Blocked {
-            message: text(v, "message"),
-        },
+        "Notification" if text(v, "notification_type").as_deref() == Some("ToolPermission") => {
+            AgentHookEvent::Blocked {
+                message: text(v, "message"),
+            }
+        }
         "AfterAgent" => AgentHookEvent::Done,
         _ => return None,
     };
@@ -1345,6 +1348,18 @@ mod tests {
         }
     }
 
+    /// Only a tool permission waits on you; any other notification type —
+    /// one Gemini adds later, or none named — is a report and sends nothing.
+    #[test]
+    fn a_gemini_notification_blocks_only_for_a_tool_permission() {
+        for report in [
+            json!({ "notification_type": "ExtensionUpdate", "message": "an update is ready" }),
+            json!({ "message": "no type named" }),
+        ] {
+            assert_eq!(gemini("Notification", report.clone()), None, "{report}");
+        }
+    }
+
     #[test]
     fn gemini_hooks_wire_every_event_to_agent_event_gemini() {
         let value = gemini_hooks_json();
@@ -1364,7 +1379,8 @@ mod tests {
                 json!({ "name": "tutti", "type": "command", "command": GEMINI_HOOK_COMMAND }),
                 "{event}"
             );
-            let payload = json!({ "hook_event_name": event });
+            let payload =
+                json!({ "hook_event_name": event, "notification_type": "ToolPermission" });
             assert!(map_gemini_event(&payload).is_some(), "{event} maps");
         }
         assert_eq!(hooks.len(), 6);

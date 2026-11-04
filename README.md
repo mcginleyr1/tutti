@@ -1481,9 +1481,11 @@ app-server, which runs every session's hooks with the environment of
 whichever codex started it: their `TUTTI_PANE` names that first pane, and
 another pane's events would land on it. `agent-event codex` therefore drops an
 event unless the session's tutti-server is among its ancestors, with a note on
-stderr; such a pane falls back to screen detection. (Passing Codex a `-c`
-override also keeps it embedded.) Otherwise `agent-event codex` is fail-safe
-as Claude's is.
+stderr. So a `codex` you type into a pane yourself, without `--no-daemon`,
+runs in that shared app-server and its hooks never reach tutti: the pane falls
+back to screen detection, its turns unlabelled and its conversation unrecorded.
+Type `codex --no-daemon` (passing Codex a `-c` override also keeps it
+embedded). Otherwise `agent-event codex` is fail-safe as Claude's is.
 
 ## Gemini CLI integration
 
@@ -1508,8 +1510,9 @@ agent-event gemini`:
 - **BeforeAgent** (a submitted prompt) starts a turn and labels its
   checkpoint; **BeforeTool**/**AfterTool** keep it **working**; **AfterAgent**
   marks it **done**;
-- a **Notification** — Gemini's one type, a tool permission prompt — marks it
-  **blocked** with its message; the tool's run puts it back to working;
+- a **Notification** of type `ToolPermission` — a tool permission prompt —
+  marks it **blocked** with its message, and the tool's run puts it back to
+  working; any other type is a report and changes nothing;
 - **SessionStart** and every event's `session_id` record the conversation,
   resumable with `gemini --resume <id>` and revived by a
   [restore](#restoring-after-a-restart).
