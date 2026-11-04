@@ -2899,18 +2899,22 @@ async fn detect_pass(hub: Arc<Hub>) {
 }
 
 /// A `sysinfo` snapshot reduced to the pid → name and pid → children maps the
-/// registry walks. Built on a blocking thread so the refresh never stalls the
-/// async runtime.
+/// registry walks, each process named as detection knows it
+/// (`tutti_agents::program_name`, which needs the argv). Built on a blocking
+/// thread so the refresh never stalls the async runtime.
 fn process_tree() -> ProcessTree {
-    use sysinfo::{ProcessesToUpdate, System};
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
     let mut sys = System::new();
-    sys.refresh_processes(ProcessesToUpdate::All, true);
+    let argv = ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always);
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, argv);
     let mut tree = ProcessTree::default();
     for (pid, process) in sys.processes() {
+        let name = process.name().to_string_lossy();
+        let args = process.cmd().iter().skip(1).filter_map(|arg| arg.to_str());
         tree.insert(
             pid.as_u32(),
             process.parent().map(sysinfo::Pid::as_u32),
-            process.name().to_string_lossy(),
+            tutti_agents::program_name(&name, args),
         );
     }
     tree

@@ -1268,7 +1268,8 @@ a plain shell shows just its name. Background panes ring the terminal bell when
 they block or finish. Detection covers the whole catalog under
 [Install](#install), with screen patterns tuned per agent where they have been
 checked live; adding an agent is one data-table row in
-`crates/tutti-agents/src/registry.rs`.
+`crates/tutti-agents/src/registry.rs`. It matches the process's executable
+name, or a node program's script — Gemini CLI runs as `node …/gemini`.
 
 ### Agent state sources
 

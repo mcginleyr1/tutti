@@ -31,6 +31,18 @@ impl ProcessTree {
     }
 }
 
+/// The name detection knows a process by: its executable's `name`, or — for
+/// a node program, which runs as `node [flags] <script>` — its script's,
+/// from `args` (the argv after the executable). Gemini CLI runs so, then
+/// relaunches itself as `node --max-old-space-size=… <script>`: its
+/// executable is only ever `node`.
+pub fn program_name<'a>(name: &'a str, mut args: impl Iterator<Item = &'a str>) -> &'a str {
+    if name != "node" {
+        return name;
+    }
+    args.find(|arg| !arg.starts_with('-')).unwrap_or(name)
+}
+
 /// One agent's identity plus the screen-text patterns that classify its state.
 /// Patterns are plain case-sensitive substrings, so the whole registry stays a
 /// data table: tuning a heuristic or adding an agent is an edit here, not code.
@@ -558,6 +570,28 @@ mod tests {
         tree.insert(101, Some(100), "bash");
         tree.insert(102, Some(101), "codex");
         assert_eq!(reg.detect(&tree, 100), Some(AgentKind::from("codex")));
+    }
+
+    /// Gemini CLI's process tree as observed (0.66.0): `node <script>`, and
+    /// the child it relaunches with a bigger heap.
+    #[test]
+    fn a_node_program_is_known_by_its_script() {
+        let args = |line: &'static str| line.split(' ');
+        let script = "/usr/local/lib/node_modules/.bin/gemini";
+        let relaunch = "--max-old-space-size=24576 /usr/local/lib/node_modules/.bin/gemini";
+        assert_eq!(program_name("node", args(script)), script);
+        assert_eq!(program_name("node", args(relaunch)), script);
+        assert_eq!(program_name("node", std::iter::empty()), "node", "a REPL");
+        assert_eq!(program_name("claude", args("--resume s1")), "claude");
+
+        let mut tree = ProcessTree::default();
+        tree.insert(100, None, "zsh");
+        tree.insert(101, Some(100), program_name("node", args(script)));
+        tree.insert(102, Some(101), program_name("node", args(relaunch)));
+        assert_eq!(
+            Registry::default().detect(&tree, 100),
+            Some(AgentKind::from("gemini"))
+        );
     }
 
     #[test]
