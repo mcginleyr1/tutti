@@ -1094,7 +1094,8 @@ app bar's `🔔 N` chip opens the panel too.
 
 Focusing a pane marks its notes read, and a pane whose notifications have been
 read — anywhere, by any client or script — loses its sidebar 🔔; attaching
-brings back the 🔔 of panes with unread ones. A bell from the pane you are
+brings back the 🔔 of panes with unread ones, a transition's note that carries
+a message counting as one. A bell from the pane you are
 looking at is not recorded (a bell says nothing else), nor is a bell repeating
 its pane's still-unread bell; any other note about a pane in view lands already
 read. Scripts and agents read the same history: `tutti notes [--unread]`

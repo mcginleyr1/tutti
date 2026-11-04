@@ -5083,12 +5083,15 @@ fn notification_text(title: Option<String>, body: Option<String>) -> Option<Stri
     }
 }
 
-/// The panes holding an unread bell or desktop notification in `notes` — the
-/// ones the sidebar's bell marks catch up to.
+/// The panes holding an unread note that rang or said something in `notes` —
+/// a bell, a desktop notification, or a transition carrying the message that
+/// came with it — the ones the sidebar's bell marks catch up to.
 fn notified_panes(notes: &[Note]) -> HashSet<PaneId> {
     notes
         .iter()
-        .filter(|n| !n.read && matches!(n.kind, NoteKind::Bell | NoteKind::Notify))
+        .filter(|n| {
+            !n.read && (matches!(n.kind, NoteKind::Bell | NoteKind::Notify) || !n.text().is_empty())
+        })
         .map(|n| n.pane)
         .collect()
 }
@@ -10398,16 +10401,30 @@ mod tests {
             read: true,
             ..note(1, 2, NoteKind::Notify)
         };
+        let built = Note {
+            title: Some("build".into()),
+            body: Some("Built".into()),
+            ..note(4, 5, NoteKind::Done)
+        };
         attach_noting(
             &mut app,
-            vec![read, note(2, 3, NoteKind::Bell), note(3, 2, NoteKind::Done)],
+            vec![
+                read,
+                note(2, 3, NoteKind::Bell),
+                note(3, 2, NoteKind::Done),
+                built,
+            ],
         );
-        assert_eq!(app.notes().len(), 3);
-        assert_eq!(app.unread_notes(), 2);
+        assert_eq!(app.notes().len(), 4);
+        assert_eq!(app.unread_notes(), 3);
         assert!(app.is_notified(PaneId(3)), "an unread bell marks its pane");
         assert!(
             !app.is_notified(PaneId(2)),
-            "a read notification marks nothing, and a done is no notification"
+            "a read notification marks nothing, and a bare done is no notification"
+        );
+        assert!(
+            app.is_notified(PaneId(5)),
+            "a done carrying its report's msg is that notification"
         );
     }
 
