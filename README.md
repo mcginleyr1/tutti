@@ -984,7 +984,8 @@ keeping Claude's dialog back:
   a `y` or `n` already on its way into the pane can't answer it. It never
   opens over a panel, prompt or overlay you are using, and it closes itself
   once the approval ends — answered from another client or the CLI, timed
-  out, or the pane gone.
+  out, or the pane gone or its program exited (an exit drops every request
+  the pane held).
 - Scripts and agents answer with `tutti pane approve <pane> [--id <n>]
   [--deny] [--message <reason>]`: the oldest request, or the one `--id`
   names. The reason is what Claude is told; it defaults to "the user denied

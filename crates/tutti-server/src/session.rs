@@ -1272,9 +1272,10 @@ impl Session {
 
     /// Record a child's exit, keeping the pane and its grid readable. A child
     /// exit is a `Done` observation, so the state advances the same way the
-    /// classifier would, and it ends whatever claim the pane held. Returns the
-    /// `(from, to)` state transition, or `None` when the pane is already gone
-    /// or already marked exited.
+    /// classifier would, and it ends whatever claim the pane held and the
+    /// approvals it held — nobody is left to ask; each hook's hanging up ends
+    /// its hold. Returns the `(from, to)` state transition, or `None` when the
+    /// pane is already gone or already marked exited.
     pub fn mark_exited(&mut self, pane: PaneId, code: i32) -> Option<(AgentState, AgentState)> {
         match self.panes.get_mut(&pane) {
             Some(slot) if slot.meta.exited.is_none() => {
@@ -1284,6 +1285,7 @@ impl Session {
                 slot.meta.state = to;
                 slot.meta.source = None;
                 slot.herdr = None;
+                slot.meta.approvals.clear();
                 Some((from, to))
             }
             _ => None,

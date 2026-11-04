@@ -876,15 +876,18 @@ impl App {
                     self.bell = true;
                 }
             }
+            // The daemon dropped the pane's held approvals with it.
             Event::PaneExited { pane, code } => {
-                if let Some(state) = self.panes.get_mut(&pane) {
-                    state.info.exited = Some(code);
-                    state.info.state = AgentState::Done;
-                }
-                self.patch_view(pane, |info| {
+                let exit = |info: &mut PaneInfo| {
                     info.exited = Some(code);
                     info.state = AgentState::Done;
-                });
+                    info.approval = None;
+                    info.approvals.clear();
+                };
+                if let Some(state) = self.panes.get_mut(&pane) {
+                    exit(&mut state.info);
+                }
+                self.patch_view(pane, exit);
             }
             Event::PaneNotification { pane, title, body } => {
                 self.on_notification(pane, title, body)
@@ -7169,6 +7172,31 @@ mod tests {
             app.mode,
             Mode::Terminal,
             "an answer still in flight never reopens it"
+        );
+    }
+
+    /// A pane whose child exits leaves the queue's approval rows, and its
+    /// overlay closes: the daemon dropped what it held.
+    #[test]
+    fn an_exited_panes_approvals_leave_the_queue() {
+        let mut app = approval_fixture();
+        app.handle_frame(WireFrame::Control(
+            serde_json::to_vec(&Event::PaneExited {
+                pane: PaneId(3),
+                code: 0,
+            })
+            .unwrap(),
+        ));
+        assert_eq!(app.mode, Mode::Sidebar);
+        assert!(
+            app.sidebar().entries.iter().all(|e| !matches!(
+                e,
+                SidebarEntry::Agent(sidebar::AgentRow {
+                    approval: Some(_),
+                    ..
+                })
+            )),
+            "no row offers an approval"
         );
     }
 

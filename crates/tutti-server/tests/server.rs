@@ -3075,6 +3075,46 @@ async fn a_pane_holds_parallel_approvals_each_answered_on_its_own() {
     server.stop().await;
 }
 
+/// A pane's child exiting drops the approvals it held — nobody is left to
+/// ask — and each hook's own hang-up ends its hold quietly.
+#[tokio::test]
+async fn an_exiting_pane_drops_its_held_approvals() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    new_workspace(&mut control).await;
+    let pane = pane_id(
+        control
+            .request(Request::PaneRun {
+                tab: None,
+                cmd: vec!["/bin/sh".into(), "-c".into(), "read line".into()],
+                ephemeral: false,
+                sandbox: None,
+            })
+            .await,
+    );
+    let _viewer = attached_viewer(&server).await;
+    let mut hook = server.connect().await;
+    hook.send(&hold(pane)).await;
+    assert!(wait_pane(&mut control, pane, |p| p.approvals.len() == 1).await);
+    let enter = Request::PaneSend {
+        pane,
+        text: Some("\n".into()),
+        keys: None,
+        expect: None,
+    };
+    assert_eq!(control.request(enter).await, Response::Ok);
+    assert!(
+        wait_pane(&mut control, pane, |p| p.exited.is_some()
+            && p.approvals.is_empty()
+            && p.approval.is_none())
+        .await
+    );
+    drop(hook);
+    assert!(held_approvals(&mut control, pane).await.is_empty());
+
+    server.stop().await;
+}
+
 /// A request handed on to the agent's own dialog — passed from tutti, or its
 /// hook gone — still waits on you there, so tutti's answer to another keeps
 /// the pane blocked until a hook shows the agent moved on.
