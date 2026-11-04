@@ -167,6 +167,7 @@ async fn read_until(conn: &mut Conn, pane: PaneId, needle: &str) -> bool {
                     unwrapped: false,
                     since: None,
                     last_output: false,
+                    last_reply: false,
                 })
                 .await;
             if let Response::Content { lines } = response
@@ -274,7 +275,7 @@ async fn pane_wait_answers_at_once_or_times_out() {
         (AgentState::Working, false),
         "a pane already in a wanted state answers at once"
     );
-    hook(&mut conn, pane, AgentHookEvent::Done).await;
+    hook(&mut conn, pane, AgentHookEvent::Done { reply: None }).await;
     assert_eq!(
         waited(
             conn.request(wait_for(pane, &[WaitFor::Done], false, None))
@@ -329,6 +330,68 @@ async fn pane_wait_answers_on_a_later_transition() {
     server.stop().await;
 }
 
+/// A turn's end keeps its final message for `pane read --last-reply`, kept
+/// before the wait that ends with the turn answers, until the next turn
+/// ends; no turn yet, or one that ended with none, is an error saying so.
+#[tokio::test]
+async fn a_turns_reply_is_read_back_once_its_wait_answers() {
+    use tutti_core::WaitFor;
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let pane = run_sleeper(&mut control).await;
+    let read = || Request::PaneRead {
+        pane,
+        lines: None,
+        unwrapped: false,
+        since: None,
+        last_output: false,
+        last_reply: true,
+    };
+    let none = error_message(control.request(read()).await);
+    assert!(none.contains("no turn has ended there"), "{none}");
+
+    hook(
+        &mut control,
+        pane,
+        AgentHookEvent::Activity { detail: None },
+    )
+    .await;
+    let mut waiter = server.connect().await;
+    let until = [WaitFor::Done, WaitFor::Blocked];
+    start_wait(&mut waiter, wait_for(pane, &until, true, None)).await;
+    let done = AgentHookEvent::Done {
+        reply: Some("pong\nping".into()),
+    };
+    hook(&mut control, pane, done).await;
+    assert_eq!(waited(waiter.response().await), (AgentState::Done, false));
+    assert_eq!(
+        waiter.request(read()).await,
+        Response::LastReply {
+            text: "pong\nping".into(),
+            truncated: false
+        }
+    );
+
+    hook(&mut control, pane, AgentHookEvent::Done { reply: None }).await;
+    let ended = error_message(control.request(read()).await);
+    assert!(ended.contains("ended without a reply"), "{ended}");
+    let both = Request::PaneRead {
+        pane,
+        lines: None,
+        unwrapped: false,
+        since: None,
+        last_output: true,
+        last_reply: true,
+    };
+    let both = error_message(control.request(both).await);
+    assert!(
+        both.contains("one of since, last_output and last_reply"),
+        "{both}"
+    );
+
+    server.stop().await;
+}
+
 /// `next` waits for a fresh transition: it ignores the state the pane is
 /// already in, and a human focusing a Done pane (Done → Idle) is no fresh
 /// finish — though it is exactly what `--until idle --next` waits for.
@@ -338,7 +401,7 @@ async fn pane_wait_next_ignores_the_current_state_and_a_focus() {
     let server = TestServer::start();
     let mut control = server.connect().await;
     let pane = run_sleeper(&mut control).await;
-    hook(&mut control, pane, AgentHookEvent::Done).await;
+    hook(&mut control, pane, AgentHookEvent::Done { reply: None }).await;
     assert_eq!(
         waited(
             control
@@ -359,7 +422,7 @@ async fn pane_wait_next_ignores_the_current_state_and_a_focus() {
         AgentHookEvent::Activity { detail: None },
     )
     .await;
-    hook(&mut control, pane, AgentHookEvent::Done).await;
+    hook(&mut control, pane, AgentHookEvent::Done { reply: None }).await;
     assert_eq!(
         waited(waiter.response().await),
         (AgentState::Done, false),
@@ -393,7 +456,7 @@ async fn a_child_exit_ends_a_wait() {
     };
 
     let done = run_marker(&mut control, "read code; exit $code").await;
-    hook(&mut control, done, AgentHookEvent::Done).await;
+    hook(&mut control, done, AgentHookEvent::Done { reply: None }).await;
     start_wait(&mut waiter, wait_for(done, &[WaitFor::Done], true, None)).await;
     assert_eq!(control.request(exit_with(done, "0")).await, Response::Ok);
     assert_eq!(waited(waiter.response().await), (AgentState::Done, false));
@@ -495,7 +558,7 @@ async fn a_waiter_hanging_up_leaves_the_server_serving() {
         let mut waiter = server.connect().await;
         start_wait(&mut waiter, wait_for(pane, &[WaitFor::Done], false, None)).await;
     }
-    hook(&mut control, pane, AgentHookEvent::Done).await;
+    hook(&mut control, pane, AgentHookEvent::Done { reply: None }).await;
     let mut waiter = server.connect().await;
     assert_eq!(
         waited(
@@ -878,6 +941,7 @@ async fn pane_read_last_output_answers_the_marked_command() {
         unwrapped: false,
         since,
         last_output: true,
+        last_reply: false,
     };
     assert_eq!(
         conn.request(read(marked, None)).await,
@@ -981,6 +1045,7 @@ async fn read_since(conn: &mut Conn, pane: PaneId, since: u64) -> (Vec<String>, 
             unwrapped: false,
             since: Some(since),
             last_output: false,
+            last_reply: false,
         })
         .await
     {
@@ -1941,6 +2006,7 @@ async fn a_pane_stream_sends_a_snapshot_then_raw_output_in_order() {
             unwrapped: false,
             since: None,
             last_output: false,
+            last_reply: false,
         })
         .await
     {
@@ -3219,7 +3285,7 @@ async fn agent_event_maintains_subagent_list_with_cap() {
     assert_eq!(
         conn.request(Request::AgentEvent {
             pane,
-            event: AgentHookEvent::Done,
+            event: AgentHookEvent::Done { reply: None },
             conversation: None,
         })
         .await,
@@ -3323,7 +3389,7 @@ async fn notifications_and_attention_transitions_land_in_the_history() {
             message: Some("Bash · rm -rf build".into()),
         },
         AgentHookEvent::Activity { detail: None },
-        AgentHookEvent::Done,
+        AgentHookEvent::Done { reply: None },
     ] {
         hook(&mut control, pane, event).await;
     }
@@ -4671,7 +4737,7 @@ async fn a_watcher_snapshots_the_session_beside_an_attached_client() {
             AgentHookEvent::Activity { detail: None },
             AgentState::Working,
         ),
-        (AgentHookEvent::Done, AgentState::Done),
+        (AgentHookEvent::Done { reply: None }, AgentState::Done),
     ] {
         assert_eq!(
             control
@@ -6210,7 +6276,7 @@ async fn a_turn_checkpoints_its_diff_and_restores_round_trip() {
 
     std::fs::write(dir.join("a.txt"), "one\nTWO\nthree\n").unwrap();
     std::fs::write(dir.join("b.txt"), "bee\n").unwrap();
-    hook(&mut conn, pane, AgentHookEvent::Done).await;
+    hook(&mut conn, pane, AgentHookEvent::Done { reply: None }).await;
     let turn = wait_checkpoints(&mut conn, pane, 2).await.remove(1);
     assert_eq!((turn.n, turn.label.as_str()), (2, "done"));
     assert_eq!(turn.prompt, prompt, "the turn lists as its prompt");
@@ -6377,7 +6443,7 @@ async fn the_next_prompt_closes_an_interrupted_turn_under_its_own() {
     assert_eq!(interrupted.files, 2);
 
     std::fs::write(dir.join("c.txt"), "c\n").unwrap();
-    hook(&mut conn, pane, AgentHookEvent::Done).await;
+    hook(&mut conn, pane, AgentHookEvent::Done { reply: None }).await;
     let done = wait_checkpoints(&mut conn, pane, 3).await.remove(2);
     assert_eq!(
         (done.label.as_str(), done.prompt.as_deref(), done.files),
@@ -6446,7 +6512,7 @@ async fn checkpoints_stay_empty_outside_jj() {
         .await,
     );
     hook(&mut conn, pane, AgentHookEvent::Activity { detail: None }).await;
-    hook(&mut conn, pane, AgentHookEvent::Done).await;
+    hook(&mut conn, pane, AgentHookEvent::Done { reply: None }).await;
     sleep(Duration::from_millis(300)).await;
     assert_eq!(
         conn.request(Request::PaneCheckpoints { pane }).await,

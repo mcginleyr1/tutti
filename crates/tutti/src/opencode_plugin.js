@@ -5,7 +5,8 @@
 // opencode's own dialog waits beside it: whichever answers first wins.
 // Outside a tutti pane (no TUTTI_PANE) it does nothing. Each forwarded event
 // is opencode's own `{ type, properties }`, piped to `tutti agent-event
-// opencode`, which maps it and never fails.
+// opencode`, which maps it and never fails. A session's idle also carries the
+// turn's final text as `reply`, for `tutti pane read --last-reply`.
 
 const FORWARDED = new Set([
   "session.status",
@@ -22,19 +23,37 @@ const FORWARDED = new Set([
 // (its permission prompts still need you, so those pass).
 const ROOT_ONLY = new Set(["session.status", "session.idle", "session.error"]);
 
+const idle = ({ type, properties }) =>
+  type === "session.idle" || (type === "session.status" && properties.status?.type === "idle");
+
 export const TuttiPlugin = async ({ $, client }) => {
   if (!process.env.TUTTI_PANE) return {};
   const children = new Set();
+  // The text of the session's last message, when that is the assistant's —
+  // each step of a turn is a message of its own — less opencode's own parts.
+  const reply = async (sessionID) => {
+    const { data } = await client.session.messages({ path: { id: sessionID } });
+    const last = data?.at(-1);
+    if (last?.info.role !== "assistant") return undefined;
+    return last.parts
+      .filter((part) => part.type === "text" && !part.synthetic && !part.ignored)
+      .map((part) => part.text)
+      .join("\n");
+  };
   // One send at a time, in order: a `busy` overtaken by its `idle` would
-  // leave the pane working.
+  // leave the pane working. Every idle carries the reply, since the first
+  // is the one that ends the turn in tutti.
   let queue = Promise.resolve();
   const send = (payload) => {
     queue = queue
-      .then(() =>
-        $`tutti agent-event opencode < ${new Response(JSON.stringify(payload))}`
+      .then(async () => {
+        if (idle(payload)) {
+          payload.reply = await reply(payload.properties.sessionID).catch(() => undefined);
+        }
+        await $`tutti agent-event opencode < ${new Response(JSON.stringify(payload))}`
           .quiet()
-          .nothrow(),
-      )
+          .nothrow();
+      })
       .catch(() => {});
   };
   // A permission request's `agent-event` may wait on tutti for an answer, so

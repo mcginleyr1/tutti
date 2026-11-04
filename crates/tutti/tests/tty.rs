@@ -114,6 +114,7 @@ impl Wire {
             unwrapped: false,
             since: None,
             last_output: false,
+            last_reply: false,
         };
         match self.request(&read) {
             Response::Content { lines } => lines.join("\n"),

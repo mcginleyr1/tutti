@@ -35,6 +35,9 @@ const REPORT_NOTIFY_EVERY: Duration = Duration::from_secs(30);
 /// The most user vars (OSC 1337) one pane keeps; a new name past it is
 /// dropped.
 const USER_VARS_CAP: usize = 16;
+/// The most of a turn's final message a pane keeps, in bytes: a longer one
+/// keeps its beginning.
+const REPLY_CAP: usize = 64 * 1024;
 
 struct TabEntry {
     id: TabId,
@@ -115,6 +118,10 @@ struct PaneSlot {
     /// passed, its hook gone, or never held — with no sign since that the
     /// agent moved on: tutti's answer to another then leaves the pane blocked.
     passed: bool,
+    /// The final message of the last turn the pane's hooks ended — empty when
+    /// it ended with none, `None` before any has — cut to `REPLY_CAP`, and
+    /// whether it was. Never persisted: a restored agent has ended no turn.
+    reply: Option<(String, bool)>,
 }
 
 #[derive(Default)]
@@ -885,7 +892,11 @@ impl Session {
             AgentHookEvent::Blocked { .. } => {
                 classified = Some(Observation::Blocked);
             }
-            AgentHookEvent::Done => {
+            AgentHookEvent::Done { reply } => {
+                let mut text = reply.unwrap_or_default();
+                let truncated = text.len() > REPLY_CAP;
+                text.truncate(text.floor_char_boundary(REPLY_CAP));
+                slot.reply = Some((text, truncated));
                 classified = Some(Observation::Done);
                 slot.turns.stopped();
                 // The turn ended: sweep the finished subagents that were kept
@@ -910,6 +921,26 @@ impl Session {
             relisted,
             noted,
         })
+    }
+
+    /// The final message of the last turn `pane`'s agent hooks ended, and
+    /// whether it was cut to `REPLY_CAP`; an error saying why there is none.
+    pub fn last_reply(&self, pane: PaneId) -> Result<(String, bool)> {
+        let slot = self
+            .panes
+            .get(&pane)
+            .with_context(|| format!("no pane {pane}"))?;
+        match &slot.reply {
+            Some((text, truncated)) if !text.is_empty() => Ok((text.clone(), *truncated)),
+            Some(_) => {
+                bail!("pane {pane}'s last turn ended without a reply (interrupted or failed)")
+            }
+            None => bail!(
+                "pane {pane} has no reply: no turn has ended there through its agent's hooks \
+                 (Claude Code, Codex, Gemini CLI and opencode report theirs once `tutti hooks \
+                 <agent> --install` wires them)"
+            ),
+        }
     }
 
     /// Hold a permission request on `pane` for an answer from tutti: a
@@ -1623,6 +1654,7 @@ impl Session {
                 herdr_seqs: HashMap::new(),
                 dialog: false,
                 passed: false,
+                reply: None,
             },
         );
         Ok(id)
@@ -1810,8 +1842,8 @@ fn parse_head(contents: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ForkMeta, STALL_AFTER, Session, git_branch, pane_title, parse_head, rename_leaves,
-        sandbox_argv, sandbox_name, stop_subagent,
+        ForkMeta, REPLY_CAP, STALL_AFTER, Session, git_branch, pane_title, parse_head,
+        rename_leaves, sandbox_argv, sandbox_name, stop_subagent,
     };
     use crate::herdr;
     use crate::persist::{Saved, SavedPane};
@@ -2083,6 +2115,38 @@ mod tests {
         }
     }
 
+    /// Each turn's end replaces the last reply — one that ended with none
+    /// too — and a reply past `REPLY_CAP` keeps its beginning, cut on a char.
+    #[test]
+    fn a_turn_end_keeps_its_reply_until_the_next_one() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let done = |reply: &str| AgentHookEvent::Done {
+            reply: Some(reply.into()),
+        };
+        let err = |s: &Session| s.last_reply(pane).unwrap_err().to_string();
+        assert!(err(&s).contains("no turn has ended there"), "{}", err(&s));
+        assert!(s.last_reply(PaneId(99)).is_err());
+
+        hook(&mut s, pane, done("pong\nping"));
+        assert_eq!(s.last_reply(pane).unwrap(), ("pong\nping".into(), false));
+        hook(&mut s, pane, AgentHookEvent::Activity { detail: None });
+        assert_eq!(
+            s.last_reply(pane).unwrap().0,
+            "pong\nping",
+            "a turn under way leaves the last finished one's reply"
+        );
+        hook(&mut s, pane, AgentHookEvent::Done { reply: None });
+        assert!(err(&s).contains("ended without a reply"), "{}", err(&s));
+
+        // The cap falls inside an `é`, which goes whole.
+        hook(&mut s, pane, done(&format!("x{}", "é".repeat(REPLY_CAP))));
+        let (text, truncated) = s.last_reply(pane).unwrap();
+        assert!(truncated);
+        assert_eq!(text, format!("x{}", "é".repeat(REPLY_CAP / 2 - 1)));
+        hook(&mut s, pane, done(&"x".repeat(REPLY_CAP)));
+        assert!(!s.last_reply(pane).unwrap().1, "exactly the cap fits");
+    }
+
     #[test]
     fn hooks_name_the_conversation_and_a_later_one_replaces_it() {
         let (mut s, pane, _tmp) = session_with_pane();
@@ -2102,7 +2166,7 @@ mod tests {
         let working = AgentHookEvent::Activity { detail: None };
         let again = s.apply_agent_event(pane, working, Some("c1".into()));
         assert!(!again.unwrap().relisted, "the same conversation is no news");
-        s.apply_agent_event(pane, AgentHookEvent::Done, None);
+        s.apply_agent_event(pane, AgentHookEvent::Done { reply: None }, None);
         assert_eq!(
             conversation(&s).as_deref(),
             Some("c1"),
@@ -2219,7 +2283,7 @@ mod tests {
         let fix = Some("fix the sidebar".to_string());
         hook(&mut s, pane, prompt(fix.clone(), "p1"));
         assert_eq!(state_of(&s, pane), (Working, Some(Hook)));
-        hook(&mut s, pane, AgentHookEvent::Done);
+        hook(&mut s, pane, AgentHookEvent::Done { reply: None });
         assert_eq!(
             s.take_turns(workspace),
             vec![(
@@ -2238,7 +2302,7 @@ mod tests {
         let fix = Some("fix the sidebar".to_string());
         hook(&mut s, pane, prompt(fix, "p1"));
         s.set_agent(pane, None);
-        hook(&mut s, pane, AgentHookEvent::Done);
+        hook(&mut s, pane, AgentHookEvent::Done { reply: None });
         let noted = s.take_turns(workspace).remove(0).1;
         assert_eq!(
             noted.last(),
@@ -2365,7 +2429,7 @@ mod tests {
             "an Idle settles out of the surfaces"
         );
         assert_eq!(state_of(&s, pane), (Idle, None));
-        s.apply_agent_event(pane, AgentHookEvent::Done, None);
+        s.apply_agent_event(pane, AgentHookEvent::Done { reply: None }, None);
         s.pane_send(pane, b"x").unwrap();
         assert_eq!(
             state_of(&s, pane),

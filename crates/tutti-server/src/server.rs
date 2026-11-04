@@ -1080,7 +1080,20 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             unwrapped,
             since,
             last_output,
+            last_reply,
         } => {
+            if last_reply {
+                if since.is_some() || last_output {
+                    return Response::Error {
+                        message: "a read takes one of since, last_output and last_reply".into(),
+                    };
+                }
+                let reply = hub.session().last_reply(pane);
+                return match reply {
+                    Ok((text, truncated)) => Response::LastReply { text, truncated },
+                    Err(err) => error(err),
+                };
+            }
             // Bound first: a read can format the whole 10k-row ring, and the
             // session lock must not be held across it.
             let pty = hub.session().pty(pane);
@@ -3338,6 +3351,7 @@ mod tests {
             unwrapped: false,
             since: None,
             last_output: false,
+            last_reply: false,
         };
 
         for pane in [reading, drawing] {

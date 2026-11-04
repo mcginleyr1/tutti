@@ -29,10 +29,12 @@ pub const OPENCODE_PLUGIN: &str = include_str!("opencode_plugin.js");
 pub const OPENCODE_PLUGIN_MARKER: &str = "// tutti opencode plugin";
 
 /// Map one opencode bus event, as the plugin forwards it (`{type,
-/// properties}`), to a tutti `AgentHookEvent` and the root session's id, or
-/// `None` when irrelevant. Verified against opencode 1.18.5's event schemas:
+/// properties}`, and on a root session's idle the plugin's own `reply`), to a
+/// tutti `AgentHookEvent` and the root session's id, or `None` when
+/// irrelevant. Verified against opencode 1.18.5's event schemas:
 /// `session.status` carries `properties.status.type` (`busy` | `retry` |
-/// `idle`); `session.idle` and `session.error` end the turn; `permission.asked`
+/// `idle`); `session.idle` and `session.error` end the turn, an idle with the
+/// `reply` the plugin fetched (verified live); `permission.asked`
 /// names its `permission`, `question.asked` its `questions[].question`; a
 /// `*.replied` or `question.rejected` means you answered and the agent goes on.
 /// Every one names its `sessionID` (optional only on `session.error`), but
@@ -46,13 +48,17 @@ pub fn map_opencode_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)>
             .map(str::to_string)
     };
     let kind = v.get("type")?.as_str()?;
+    let idle = || AgentHookEvent::Done {
+        reply: text("/reply").filter(|reply| !reply.is_empty()),
+    };
     let event = match kind {
         "session.status" => match v.pointer("/properties/status/type")?.as_str()? {
             "busy" | "retry" => Some(AgentHookEvent::Activity { detail: None }),
-            "idle" => Some(AgentHookEvent::Done),
+            "idle" => Some(idle()),
             _ => None,
         },
-        "session.idle" | "session.error" => Some(AgentHookEvent::Done),
+        "session.idle" => Some(idle()),
+        "session.error" => Some(AgentHookEvent::Done { reply: None }),
         "permission.asked" => Some(AgentHookEvent::Blocked {
             message: text("/properties/permission"),
         }),
@@ -79,7 +85,8 @@ pub fn map_opencode_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)>
 /// `message` and `notification_type`; `UserPromptSubmit` carries the
 /// `prompt` and (Claude Code 2.1, verified live) the `prompt_id` every event
 /// of its turn shares — a message typed into a running turn keeps it; subagent
-/// events carry `agent_id`/`agent_type`.
+/// events carry `agent_id`/`agent_type`; `Stop` carries the turn's final
+/// message as `last_assistant_message` (verified live on 2.1.318).
 pub fn map_claude_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
     let event = match v.get("hook_event_name")?.as_str()? {
         // Blocked at once — the `permission_prompt` notification only comes
@@ -121,7 +128,9 @@ pub fn map_claude_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
                 message: v.get("message").and_then(Value::as_str).map(str::to_string),
             }),
         },
-        "Stop" => Some(AgentHookEvent::Done),
+        "Stop" => Some(AgentHookEvent::Done {
+            reply: text(v, "last_assistant_message"),
+        }),
         "UserPromptSubmit" => Some(AgentHookEvent::Prompt {
             text: v
                 .get("prompt")
@@ -147,13 +156,14 @@ pub fn map_claude_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
 /// observed live from codex-cli 0.166.0: the same `hook_event_name`,
 /// `session_id` (the UUID `codex resume` takes), `prompt`, and `tool_name`/
 /// `tool_input` (`Bash` with its `command`, a `PermissionRequest`'s
-/// `description` beside it) — so it maps as Claude's does, plus the two
-/// events Codex adds: `Interrupt` ends the turn, as no `Stop` follows an
-/// interrupted one, and `SubagentStart` opens a subagent row under its
-/// `agent_id`, which its `SubagentStop` names again.
+/// `description` beside it), `Stop`'s `last_assistant_message` — so it maps
+/// as Claude's does, plus the two events Codex adds: `Interrupt` ends the
+/// turn with no reply, as no `Stop` follows an interrupted one, and
+/// `SubagentStart` opens a subagent row under its `agent_id`, which its
+/// `SubagentStop` names again.
 pub fn map_codex_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
     let event = match v.get("hook_event_name")?.as_str()? {
-        "Interrupt" => AgentHookEvent::Done,
+        "Interrupt" => AgentHookEvent::Done { reply: None },
         "SubagentStart" => AgentHookEvent::SubagentStarted {
             id: subagent_id(v),
             desc: text(v, "agent_type").unwrap_or_else(|| "subagent".into()),
@@ -169,7 +179,9 @@ pub fn map_codex_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
 /// submitted `prompt`, a turn's start; `BeforeTool`/`AfterTool` the
 /// `tool_name`; `Notification` a `notification_type` and `message` — only a
 /// `ToolPermission` waits on you, so any other type is a report and sends
-/// nothing; `AfterAgent` ends the turn.
+/// nothing; `AfterAgent` ends the turn, its `prompt_response` the turn's text
+/// — every model response of the turn, joined, per Gemini CLI 0.66.0's source,
+/// or `[no response text]` for none (not verified live).
 pub fn map_gemini_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
     let event = match v.get("hook_event_name")?.as_str()? {
         "SessionStart" => AgentHookEvent::SessionStarted,
@@ -185,7 +197,9 @@ pub fn map_gemini_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
                 message: text(v, "message"),
             }
         }
-        "AfterAgent" => AgentHookEvent::Done,
+        "AfterAgent" => AgentHookEvent::Done {
+            reply: text(v, "prompt_response").filter(|reply| reply != "[no response text]"),
+        },
         _ => return None,
     };
     Some((event, text(v, "session_id")))
@@ -809,12 +823,43 @@ mod tests {
         assert_eq!(permission_decision(&ApprovalDecision::Pass), None);
     }
 
+    /// A `Stop` shaped as Claude Code 2.1.318 sent it live (ids and paths
+    /// made up) ends the turn with its final message, lines and all.
     #[test]
-    fn stop_becomes_done() {
+    fn stop_becomes_done_with_the_final_message() {
+        let stop = json!({
+            "session_id": "abc123",
+            "transcript_path": "/home/u/.claude/projects/-srv-api/abc123.jsonl",
+            "cwd": "/srv/api",
+            "prompt_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+            "permission_mode": "auto",
+            "effort": { "level": "high" },
+            "hook_event_name": "Stop",
+            "stop_hook_active": false,
+            "last_assistant_message": "pong\nping",
+            "background_tasks": [],
+            "session_crons": [],
+        });
         assert_eq!(
-            ev(r#"{ "hook_event_name": "Stop", "last_assistant_message": "all set" }"#),
-            Some(AgentHookEvent::Done)
+            map_claude_event(&stop),
+            Some((
+                AgentHookEvent::Done {
+                    reply: Some("pong\nping".into())
+                },
+                Some("abc123".into())
+            ))
         );
+        for none in [
+            r#"{ "hook_event_name": "Stop" }"#,
+            r#"{ "hook_event_name": "Stop", "last_assistant_message": "" }"#,
+            r#"{ "hook_event_name": "Stop", "last_assistant_message": null }"#,
+        ] {
+            assert_eq!(
+                ev(none),
+                Some(AgentHookEvent::Done { reply: None }),
+                "{none}"
+            );
+        }
     }
 
     #[test]
@@ -912,7 +957,7 @@ mod tests {
             "effort": { "level": "high" },
             "brand_new_field": [1, 2, 3]
         }"#);
-        assert_eq!(out, Some(AgentHookEvent::Done));
+        assert_eq!(out, Some(AgentHookEvent::Done { reply: None }));
     }
 
     #[test]
@@ -1121,7 +1166,7 @@ mod tests {
             oc(
                 r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":{"type":"idle"}}}"#
             ),
-            Some(AgentHookEvent::Done)
+            Some(AgentHookEvent::Done { reply: None })
         );
         assert_eq!(
             oc(r#"{"type":"session.status","properties":{"status":{"type":"later"}}}"#),
@@ -1134,14 +1179,43 @@ mod tests {
     fn opencode_idle_and_error_end_the_turn() {
         assert_eq!(
             oc(r#"{"type":"session.idle","properties":{"sessionID":"ses_1"}}"#),
-            Some(AgentHookEvent::Done)
+            Some(AgentHookEvent::Done { reply: None })
         );
         assert_eq!(
             oc(
                 r#"{"type":"session.error","properties":{"sessionID":"ses_1",
                 "error":{"name":"MessageAbortedError","data":{"message":"aborted"}}}}"#
             ),
-            Some(AgentHookEvent::Done)
+            Some(AgentHookEvent::Done { reply: None })
+        );
+    }
+
+    /// The plugin adds the turn's last assistant text to a root session's
+    /// idle as `reply`; an error carries none, whatever rides along.
+    #[test]
+    fn an_opencode_idle_carries_the_reply_the_plugin_fetched() {
+        let said = Some(AgentHookEvent::Done {
+            reply: Some("pong\nping".into()),
+        });
+        assert_eq!(
+            oc(
+                r#"{"type":"session.idle","properties":{"sessionID":"ses_1"},"reply":"pong\nping"}"#
+            ),
+            said
+        );
+        assert_eq!(
+            oc(
+                r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":{"type":"idle"}},"reply":"pong\nping"}"#
+            ),
+            said
+        );
+        assert_eq!(
+            oc(r#"{"type":"session.idle","properties":{"sessionID":"ses_1"},"reply":""}"#),
+            Some(AgentHookEvent::Done { reply: None })
+        );
+        assert_eq!(
+            oc(r#"{"type":"session.error","properties":{"sessionID":"ses_1"},"reply":"x"}"#),
+            Some(AgentHookEvent::Done { reply: None })
         );
     }
 
@@ -1261,6 +1335,11 @@ mod tests {
             OPENCODE_PLUGIN.contains(r#"url: "/permission/{requestID}/reply""#),
             "the plugin posts a held request's answer as opencode's reply"
         );
+        assert!(
+            OPENCODE_PLUGIN.contains("payload.reply = await reply(")
+                && OPENCODE_PLUGIN.contains("client.session.messages("),
+            "an idle carries the reply the plugin fetched, as the mapper reads it"
+        );
     }
 
     /// A Codex hook payload as codex-cli 0.166.0 sends it (observed live; ids
@@ -1328,21 +1407,26 @@ mod tests {
                 id.clone()
             ))
         );
-        let stop = json!({ "stop_hook_active": false, "last_assistant_message": "ok" });
+        let stop = json!({ "stop_hook_active": false, "last_assistant_message": "pong\nping" });
+        let said = AgentHookEvent::Done {
+            reply: Some("pong\nping".into()),
+        };
+        assert_eq!(codex("Stop", stop), Some((said, id.clone())));
         assert_eq!(
-            codex("Stop", stop),
-            Some((AgentHookEvent::Done, id.clone()))
+            codex("Stop", json!({ "last_assistant_message": null })),
+            Some((AgentHookEvent::Done { reply: None }, id.clone())),
+            "Codex names it `string | null`"
         );
         assert_eq!(codex("SessionEnd", json!({ "reason": "other" })), None);
     }
 
     /// An interrupted turn sends `Interrupt` and never `Stop` (observed
-    /// live), so it ends the turn.
+    /// live), so it ends the turn, with no reply.
     #[test]
     fn a_codex_interrupt_ends_the_turn() {
         assert_eq!(
             codex("Interrupt", json!({})).map(|(event, _)| event),
-            Some(AgentHookEvent::Done)
+            Some(AgentHookEvent::Done { reply: None })
         );
     }
 
@@ -1481,9 +1565,15 @@ mod tests {
         );
         let answered =
             json!({ "prompt": "fix it", "prompt_response": "done", "stop_hook_active": false });
+        let said = AgentHookEvent::Done {
+            reply: Some("done".into()),
+        };
+        assert_eq!(gemini("AfterAgent", answered), Some((said, id.clone())));
+        let silent = json!({ "prompt": "fix it", "prompt_response": "[no response text]" });
         assert_eq!(
-            gemini("AfterAgent", answered),
-            Some((AgentHookEvent::Done, id.clone()))
+            gemini("AfterAgent", silent),
+            Some((AgentHookEvent::Done { reply: None }, id.clone())),
+            "Gemini's stand-in for a turn with no text is no reply"
         );
         for quiet in [
             "SessionEnd",

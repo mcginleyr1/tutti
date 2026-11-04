@@ -11,7 +11,7 @@ use crate::state::{AgentState, StateSource};
 /// Response / Event shapes (including additive fields): the daemon reports it
 /// on attach and mismatched clients tell the user to restart the daemon —
 /// binaries upgrade on install, running daemons do not.
-pub const WIRE_REV: u32 = 12;
+pub const WIRE_REV: u32 = 13;
 
 /// The most notes the daemon's notification history keeps, the oldest going
 /// first. A client caps its copy the same, so the two agree.
@@ -197,6 +197,12 @@ pub enum Request {
         /// finished under shell integration. Never with `since`.
         #[serde(default)]
         last_output: bool,
+        /// Read the final message of the last turn the pane's agent hooks
+        /// ended instead, answered with `Response::LastReply`; an Error when
+        /// no hook reports the pane's turns, none has ended, or the last
+        /// ended with no message. Never with `since` or `last_output`.
+        #[serde(default)]
+        last_reply: bool,
     },
     /// Resize a pane's pty and grid to the attached client's rendered size.
     /// What clients older than `ViewSizes` send; it still applies directly.
@@ -469,8 +475,14 @@ pub enum AgentHookEvent {
         #[serde(default)]
         message: Option<String>,
     },
-    /// The agent finished responding.
-    Done,
+    /// The agent finished responding. `reply` is its final message as its
+    /// turn-end hook names it (Claude's and Codex's `last_assistant_message`,
+    /// Gemini's `prompt_response`, the text tutti's opencode plugin fetches);
+    /// `None` when the turn ended with none, as an interrupted one does.
+    Done {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply: Option<String>,
+    },
     /// The agent opened a conversation or switched to another (launch,
     /// resume, `/clear`). No state change: it names the conversation before
     /// the first tool use does, and follows the switch.
@@ -866,6 +878,13 @@ pub enum Response {
         exit: Option<i32>,
         truncated: bool,
     },
+    /// A `PaneRead { last_reply: true }` reply: the final message of the last
+    /// turn the pane's agent hooks ended, as the agent wrote it. `truncated`:
+    /// it ran past what the daemon keeps of one, and this is its beginning.
+    LastReply {
+        text: String,
+        truncated: bool,
+    },
     /// A `PaneFingerprint` reply: the pane's prompt fingerprint, 16 hex digits.
     Fingerprint {
         fingerprint: String,
@@ -1198,6 +1217,7 @@ mod tests {
             unwrapped: true,
             since: None,
             last_output: false,
+            last_reply: false,
         });
         roundtrip(&Request::PaneRead {
             pane: PaneId(2),
@@ -1205,6 +1225,7 @@ mod tests {
             unwrapped: false,
             since: Some(10_177),
             last_output: false,
+            last_reply: false,
         });
         roundtrip(&Request::PaneRead {
             pane: PaneId(2),
@@ -1212,6 +1233,15 @@ mod tests {
             unwrapped: true,
             since: None,
             last_output: true,
+            last_reply: false,
+        });
+        roundtrip(&Request::PaneRead {
+            pane: PaneId(2),
+            lines: None,
+            unwrapped: false,
+            since: None,
+            last_output: false,
+            last_reply: true,
         });
         roundtrip(&Request::PaneResize {
             pane: PaneId(2),
@@ -1303,8 +1333,15 @@ mod tests {
         });
         roundtrip(&Request::AgentEvent {
             pane: PaneId(3),
-            event: AgentHookEvent::Done,
+            event: AgentHookEvent::Done { reply: None },
             conversation: None,
+        });
+        roundtrip(&Request::AgentEvent {
+            pane: PaneId(3),
+            event: AgentHookEvent::Done {
+                reply: Some("pong\nping".into()),
+            },
+            conversation: Some("ses_1".into()),
         });
         roundtrip(&Request::AgentEvent {
             pane: PaneId(3),
@@ -1509,9 +1546,26 @@ mod tests {
     #[test]
     fn agent_hook_event_is_kind_tagged_snake_case() {
         assert_eq!(
-            serde_json::to_string(&AgentHookEvent::Done).unwrap(),
-            r#"{"kind":"done"}"#
+            serde_json::to_string(&AgentHookEvent::Done { reply: None }).unwrap(),
+            r#"{"kind":"done"}"#,
+            "a done with no reply is byte-for-byte the old unit variant"
         );
+        assert_eq!(
+            serde_json::to_string(&AgentHookEvent::Done {
+                reply: Some("pong".into())
+            })
+            .unwrap(),
+            r#"{"kind":"done","reply":"pong"}"#
+        );
+        // An older daemon, whose `Done` is a unit variant, still takes a
+        // done that carries a reply.
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum OldHookEvent {
+            Done,
+        }
+        let old: OldHookEvent = serde_json::from_str(r#"{"kind":"done","reply":"pong"}"#).unwrap();
+        assert_eq!(old, OldHookEvent::Done);
         assert_eq!(
             serde_json::to_string(&AgentHookEvent::SubagentStopped { id: "a".into() }).unwrap(),
             r#"{"kind":"subagent_stopped","id":"a"}"#
@@ -1788,6 +1842,10 @@ mod tests {
             lines: Vec::new(),
             exit: None,
             truncated: true,
+        });
+        roundtrip(&Response::LastReply {
+            text: "pong\nping".into(),
+            truncated: false,
         });
         roundtrip(&Response::Fingerprint {
             fingerprint: "af63dc4c8601ec8c".into(),
@@ -2150,9 +2208,10 @@ mod tests {
             event,
             Request::AgentEvent {
                 pane: PaneId(3),
-                event: AgentHookEvent::Done,
+                event: AgentHookEvent::Done { reply: None },
                 conversation: None,
-            }
+            },
+            "...and a done from before `reply` existed carries none"
         );
         // `pane_checkpoint_diff` without `n`/`stat` is the newest turn's full
         // diff; `pane_restore` without `force` respects the state guard.
@@ -2204,8 +2263,8 @@ mod tests {
                 expect: None,
             }
         );
-        // `pane_read` from before `since` and `last_output` existed reads
-        // everything, as Content.
+        // `pane_read` from before `since`, `last_output` and `last_reply`
+        // existed reads everything, as Content.
         let read: Request =
             serde_json::from_str(r#"{"type":"pane_read","pane":2,"lines":null,"unwrapped":false}"#)
                 .unwrap();
@@ -2217,6 +2276,7 @@ mod tests {
                 unwrapped: false,
                 since: None,
                 last_output: false,
+                last_reply: false,
             }
         );
         // `attach` from before `terminal` and `handoff` existed names no

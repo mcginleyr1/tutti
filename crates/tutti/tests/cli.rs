@@ -167,6 +167,68 @@ fn agent_event_claude_forwards_a_prompt_with_its_conversation() {
     assert!(output.stdout.is_empty() && output.stderr.is_empty());
 }
 
+/// A recorded Codex `Stop` (shaped as codex-cli 0.166.0 sent it, ids and
+/// paths made up), piped to `agent-event codex`, reaches the daemon as the
+/// turn's end carrying its final message — and prints nothing.
+#[test]
+fn agent_event_codex_forwards_a_stop_with_its_reply() {
+    let payload = r#"{"session_id":"01a1a704-0000-7000-8000-000000000001",
+        "turn_id":"01a1a708-0000-7000-8000-000000000002","transcript_path":"/tmp/rollout-1.jsonl",
+        "cwd":"/tmp","hook_event_name":"Stop","model":"a-model","permission_mode":"default",
+        "stop_hook_active":false,"last_assistant_message":"pong\nping"}"#;
+    let output = run_scenario_with(
+        "cxstop",
+        &["agent-event", "codex"],
+        &[("TUTTI_PANE", "7"), ("TUTTI_SESSION", "tutti")],
+        payload,
+        |req| {
+            assert_eq!(
+                *req,
+                Request::AgentEvent {
+                    pane: PaneId(7),
+                    event: AgentHookEvent::Done {
+                        reply: Some("pong\nping".into()),
+                    },
+                    conversation: Some("01a1a704-0000-7000-8000-000000000001".into()),
+                }
+            );
+        },
+        Response::Ok,
+    );
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty() && output.stderr.is_empty());
+}
+
+/// `pane read --last-reply` prints the agent's reply alone on stdout, a cut
+/// noted on stderr.
+#[test]
+fn pane_read_last_reply_prints_the_reply_alone() {
+    let output = run_scenario(
+        "lastreply",
+        &["pane", "read", "3", "--last-reply"],
+        |req| {
+            assert_eq!(
+                *req,
+                Request::PaneRead {
+                    pane: PaneId(3),
+                    lines: None,
+                    unwrapped: false,
+                    since: None,
+                    last_output: false,
+                    last_reply: true,
+                }
+            );
+        },
+        Response::LastReply {
+            text: "pong\nping\n".into(),
+            truncated: true,
+        },
+    );
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "pong\nping\n");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("this is its beginning"));
+}
+
 /// A Claude Code `PermissionRequest`, as the hooks reference records one.
 const PERMISSION_REQUEST: &str = r#"{"session_id":"abc123","transcript_path":"/tmp/t.jsonl",
     "cwd":"/srv/api","permission_mode":"default","hook_event_name":"PermissionRequest",
@@ -1792,6 +1854,7 @@ fn pane_read_prints_plain_lines() {
                     unwrapped: false,
                     since: None,
                     last_output: false,
+                    last_reply: false,
                 }
             );
         },
@@ -1820,6 +1883,7 @@ fn pane_read_since_prints_lines_then_the_cursor_on_stderr() {
                     unwrapped: false,
                     since: Some(40),
                     last_output: false,
+                    last_reply: false,
                 }
             );
         },
@@ -1860,6 +1924,7 @@ fn pane_read_last_output_prints_lines_then_the_exit_code_on_stderr() {
                     unwrapped: true,
                     since: None,
                     last_output: true,
+                    last_reply: false,
                 }
             );
         },

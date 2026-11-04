@@ -435,6 +435,11 @@ enum PaneAction {
         /// and its exit code on stderr. Needs `tutti shell-init` in the shell.
         #[arg(long, conflicts_with_all = ["since", "fingerprint"])]
         last_output: bool,
+        /// Print the final message of the agent's last finished turn, as its
+        /// hooks reported it (Claude Code, Codex, Gemini CLI, opencode), not
+        /// the screen. An error when no turn has ended with one.
+        #[arg(long, conflicts_with_all = ["lines", "unwrapped", "since", "fingerprint", "last_output"])]
+        last_reply: bool,
     },
     /// Answer one of the pane's held approvals — a permission request waiting
     /// on tutti under `approvals = "hold"`, the oldest unless `--id` names
@@ -1070,12 +1075,14 @@ fn to_request(command: Command) -> Result<Request> {
                 fingerprint: false,
                 since,
                 last_output,
+                last_reply,
             } => Request::PaneRead {
                 pane: PaneId(pane),
                 lines,
                 unwrapped,
                 since,
                 last_output,
+                last_reply,
             },
             PaneAction::Approve {
                 pane,
@@ -1904,6 +1911,16 @@ fn emit(response: Response, json: bool) -> i32 {
             }
             0
         }
+        // The cut goes to stderr so stdout stays the agent's text alone.
+        Response::LastReply { text, truncated } => {
+            println!("{}", text.trim_end());
+            if truncated {
+                eprintln!(
+                    "note: the reply ran past what tutti keeps of one; this is its beginning"
+                );
+            }
+            0
+        }
         Response::Fingerprint { fingerprint } => {
             println!("{fingerprint}");
             0
@@ -2546,6 +2563,7 @@ mod tests {
                 unwrapped: true,
                 since: None,
                 last_output: false,
+                last_reply: false,
             }
         );
         assert_eq!(
@@ -2556,6 +2574,7 @@ mod tests {
                 unwrapped: false,
                 since: None,
                 last_output: false,
+                last_reply: false,
             }
         );
         assert_eq!(
@@ -2587,6 +2606,7 @@ mod tests {
                 unwrapped: true,
                 since: Some(177),
                 last_output: false,
+                last_reply: false,
             }
         );
         assert!(
@@ -2613,10 +2633,41 @@ mod tests {
                 unwrapped: true,
                 since: None,
                 last_output: true,
+                last_reply: false,
             }
         );
         for other in [["--since", "0"].as_slice(), &["--fingerprint"]] {
             let args = ["tutti", "pane", "read", "5", "--last-output"];
+            assert!(
+                Cli::try_parse_from(args.iter().chain(other)).is_err(),
+                "{other:?}"
+            );
+        }
+    }
+
+    /// The last reply is the agent's text, not the screen's: no other read
+    /// flag shapes it.
+    #[test]
+    fn pane_read_last_reply_stands_alone() {
+        assert_eq!(
+            request_of(&["tutti", "pane", "read", "5", "--last-reply"]),
+            Request::PaneRead {
+                pane: PaneId(5),
+                lines: None,
+                unwrapped: false,
+                since: None,
+                last_output: false,
+                last_reply: true,
+            }
+        );
+        for other in [
+            ["--since", "0"].as_slice(),
+            &["--lines", "3"],
+            &["--unwrapped"],
+            &["--fingerprint"],
+            &["--last-output"],
+        ] {
+            let args = ["tutti", "pane", "read", "5", "--last-reply"];
             assert!(
                 Cli::try_parse_from(args.iter().chain(other)).is_err(),
                 "{other:?}"
