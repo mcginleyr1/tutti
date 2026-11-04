@@ -1667,6 +1667,12 @@ tutti watch                          # JSON-line snapshots of every pane's state
 tutti [attach]                       # bare `tutti` attaches; a fresh session asks where to start
 ```
 
+A verb gives up on a daemon that has not answered within 10 s (exit 1, `did
+not answer within 10s`), or within 3 minutes for one the daemon runs jj for:
+`workspace add`, `merge`, `update`, `diff` and `kill --discard`, `sandbox
+pull`, `pane checkpoint-diff` and `restore`. `pane wait` waits as long as its
+`--timeout`, and `watch` and attach as long as the daemon lives.
+
 `--json` on any verb emits the raw protocol response for scripting. A
 project's id works anywhere a workspace id does (`run --workspace`, `tab new
 --workspace`, `workspace diff`). Scripts written against the old spellings

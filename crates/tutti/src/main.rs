@@ -1427,10 +1427,7 @@ fn hold_approval(
         tool,
         summary,
     };
-    let reply = client
-        .request(&hold)
-        .with_context(|| format!("no answer within {}s", timeout.as_secs()))?;
-    match reply {
+    match client.request(&hold)? {
         Response::Approval { decision } => Ok(decision),
         other => bail!("unexpected reply to an approval hold: {other:?}"),
     }

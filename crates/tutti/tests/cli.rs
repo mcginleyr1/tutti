@@ -329,6 +329,8 @@ fn agent_event_claude_passes_an_unanswered_hold_on_after_its_timeout() {
         waited >= std::time::Duration::from_secs(1) && waited < std::time::Duration::from_secs(5),
         "{waited:?}"
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("did not answer within 1s"), "{stderr}");
     let _ = std::fs::remove_dir_all(&base);
     let _ = std::fs::remove_dir_all(&config);
 }

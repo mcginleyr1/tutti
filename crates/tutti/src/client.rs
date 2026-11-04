@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -39,7 +39,13 @@ impl Client {
         self.stream.set_write_timeout(Some(timeout))
     }
 
+    /// Send `request` and read its answer, giving up past the request's
+    /// `deadline`; a wait or an approval hold keeps the connection's own
+    /// timeout (`set_timeout`), none by default.
     pub fn request(&mut self, request: &Request) -> Result<Response> {
+        if let Some(deadline) = deadline(request) {
+            self.set_timeout(deadline)?;
+        }
         let json = serde_json::to_vec(request)?;
         self.stream.write_all(&Frame::Control(json).encode())?;
         self.stream.flush()?;
@@ -84,12 +90,38 @@ impl Client {
                 return Ok(frame);
             }
             let mut chunk = [0u8; 8192];
-            let n = self.stream.read(&mut chunk)?;
+            let n = match self.stream.read(&mut chunk) {
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    let waited = self.stream.read_timeout()?.unwrap_or_default();
+                    bail!("tutti-server did not answer within {}s", waited.as_secs());
+                }
+                read => read?,
+            };
             if n == 0 {
                 bail!("tutti-server closed the connection before replying");
             }
             self.buf.extend_from_slice(&chunk[..n]);
         }
+    }
+}
+
+/// How long the CLI waits on the daemon's answer to `request` before giving
+/// up on it: `None` for one that answers when something happens (a wait, an
+/// approval hold). The daemon answers anything else from memory at once, but
+/// what it runs jj for only within its jj runs' own caps (a merge's eight
+/// steps, 15 s apiece, the longest).
+fn deadline(request: &Request) -> Option<Duration> {
+    match request {
+        Request::PaneWait { .. } | Request::ApprovalHold { .. } => None,
+        Request::WorkspaceFork { .. }
+        | Request::SandboxPull { .. }
+        | Request::WorkspaceMerge { .. }
+        | Request::WorkspaceKill { discard: true, .. }
+        | Request::WorkspaceUpdate { .. }
+        | Request::WorkspaceDiff { .. }
+        | Request::PaneCheckpointDiff { .. }
+        | Request::PaneRestore { .. } => Some(Duration::from_secs(180)),
+        _ => Some(Duration::from_secs(10)),
     }
 }
 
@@ -190,4 +222,35 @@ const SIGTERM: i32 = 15;
 
 unsafe extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tutti_core::{PaneId, WaitFor, WorkspaceId};
+
+    /// A wait and a held approval answer when something happens, so only
+    /// their own timeouts bound them; the CLI gives up on any other request
+    /// the daemon leaves unanswered, later on one it runs jj for.
+    #[test]
+    fn only_a_wait_or_a_hold_waits_on_the_daemon_unbounded() {
+        let wait = Request::PaneWait {
+            pane: PaneId(1),
+            until: vec![WaitFor::Done],
+            next: true,
+            timeout_ms: None,
+        };
+        let hold = Request::ApprovalHold {
+            pane: PaneId(1),
+            conversation: None,
+            tool: "Bash".into(),
+            summary: "ls".into(),
+        };
+        assert_eq!((deadline(&wait), deadline(&hold)), (None, None));
+        let merge = Request::WorkspaceMerge {
+            id: WorkspaceId(1),
+            push: true,
+        };
+        assert!(deadline(&Request::PaneList).is_some_and(|d| d < deadline(&merge).unwrap()));
+    }
 }
