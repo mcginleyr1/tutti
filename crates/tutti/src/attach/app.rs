@@ -347,6 +347,9 @@ pub struct App {
     /// The root the resume harvest reads the agent tools' session stores under
     /// — the real home directory, pointed at a fixture tree in tests.
     resume_home: Option<PathBuf>,
+    /// The `PATH` the launcher finds installed agents on — the real one,
+    /// emptied in tests so their rows never depend on this machine.
+    pub(crate) launcher_path: Option<std::ffi::OsString>,
     /// Where the setup panel installs for the user — the real `$HOME` and
     /// `$XDG_CONFIG_HOME`, pointed at a fixture tree in tests.
     pub(crate) setup_dirs: Dirs,
@@ -538,6 +541,7 @@ impl App {
             launcher_sandbox: None,
             launcher_issue: None,
             resume_home: std::env::var_os("HOME").map(PathBuf::from),
+            launcher_path: std::env::var_os("PATH"),
             setup_dirs: Dirs::from_env(),
             setup_project: None,
             setup_plans: Vec::new(),
@@ -3018,7 +3022,7 @@ impl App {
         let rows = match self.launcher_sandbox {
             Some(_) => launcher::sandbox_rows(&registry),
             None => {
-                let mut rows = launcher::build_rows(&registry, std::env::var_os("PATH").as_deref());
+                let mut rows = launcher::build_rows(&registry, self.launcher_path.as_deref());
                 if let (Some(dir), Some(home)) = (&self.launcher_dir, self.resume_home.as_deref()) {
                     let stores = tutti_agents::Stores::from_env(home);
                     let sessions = tutti_agents::resume_sessions(dir, &stores, 3);
@@ -11049,17 +11053,11 @@ mod tests {
     fn launcher_quick_select_number_launches_the_shell_row() {
         let mut app = App::new();
         attached(&mut app);
+        // The shell row follows the installed agents: none on an empty PATH.
+        app.launcher_path = None;
         app.open_launcher(false, None, None);
-        // The shell row follows the installed agents; find it, whatever this
-        // machine has on PATH, and launch it by number.
-        let shell_number = app
-            .launcher_rows()
-            .iter()
-            .position(|r| matches!(r.kind, LaunchKind::Shell))
-            .unwrap()
-            + 1;
-        let digit = char::from_digit(shell_number as u32, 10).unwrap();
-        let out = app.on_key(plain(digit));
+        assert_eq!(app.launcher_rows()[0].kind, LaunchKind::Shell);
+        let out = app.on_key(plain('1'));
         assert_eq!(
             out,
             vec![control(&Request::PaneRun {

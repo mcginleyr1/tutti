@@ -3901,6 +3901,9 @@ mod tests {
     fn launcher_overlay_lists_the_run_choices() {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = app_with_pane(b"hi");
+        // An empty PATH: however many agents this machine has installed, none
+        // pushes the shell and command rows past the panel's foot.
+        app.launcher_path = None;
         app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
         app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
         assert_eq!(app.mode, Mode::Launcher);
