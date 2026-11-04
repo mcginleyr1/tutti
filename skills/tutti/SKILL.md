@@ -146,10 +146,11 @@ tutti pane read 7 --last-reply
 ```
 
 Exit 124: the timeout hit while the agent works on; wait for it as above, then
-read the reply. Exit 1 is an error: the pane is working or blocked (wait for
-it, or answer it, first; an agent you just started can read as working for a
-moment), it is gone, or its turn ended without a reply (interrupted, or
-failed). `ask` and `--last-reply` work for Claude Code,
+read the reply. Exit 1 is an error, and nothing more is coming from that
+turn: the pane is working or blocked (nothing was typed: wait for it, or
+answer it, first; an agent you just started can read as working for a
+moment), the agent exited, the pane is gone, or its turn ended without a
+reply (interrupted, or failed). `ask` and `--last-reply` work for Claude Code,
 Codex, Gemini CLI and opencode panes whose tutti hooks are installed; for any
 other agent, read its screen.
 

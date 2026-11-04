@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use tutti_core::{Frame, Request, Response, Tagged, socket_dir, socket_path};
+use tutti_core::{Frame, Request, Response, socket_dir, socket_path};
 
 /// A one-shot control-plane connection to `tutti-server`. Sends a single
 /// `Request` as a Control frame and reads Control frames until the matching
@@ -57,29 +57,6 @@ impl Client {
                 && let Ok(response) = serde_json::from_slice::<Response>(&bytes)
             {
                 return Ok(response);
-            }
-        }
-    }
-
-    /// Send `request` tagged `req` without reading its answer, so several go
-    /// out on this connection, whose frames the daemon takes in order.
-    pub fn send(&mut self, req: u64, request: &Request) -> Result<()> {
-        let tagged = Tagged {
-            req: Some(req),
-            body: request,
-        };
-        let json = serde_json::to_vec(&tagged)?;
-        self.stream.write_all(&Frame::Control(json).encode())?;
-        Ok(())
-    }
-
-    /// The next answer on this connection, and the `req` it echoes.
-    pub fn answer(&mut self) -> Result<(Option<u64>, Response)> {
-        loop {
-            if let Frame::Control(bytes) = self.read_frame()?
-                && let Ok(Tagged { req, body }) = serde_json::from_slice(&bytes)
-            {
-                return Ok((req, body));
             }
         }
     }
@@ -269,6 +246,7 @@ mod tests {
             until: vec![WaitFor::Done],
             next: true,
             timeout_ms: None,
+            reply_after: None,
         };
         let hold = Request::ApprovalHold {
             pane: PaneId(1),

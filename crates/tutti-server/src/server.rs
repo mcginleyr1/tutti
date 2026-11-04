@@ -70,6 +70,8 @@ const EXIT_GRACE: Duration = Duration::from_millis(250);
 enum PaneSignal {
     /// Its state moved — sent by `publish_transition`, the one funnel.
     Moved { from: AgentState, to: AgentState },
+    /// Its hooks reported a turn's end, a reply or none (`reply_after`).
+    Replied,
     /// Its child exited, whether or not that moved its state.
     Exited,
     /// It left the session: killed, its workspace killed, or ephemeral and done.
@@ -711,7 +713,8 @@ fn handle_frame(
                 until,
                 next,
                 timeout_ms,
-            }) => pane_wait(hub, &reply, pane, until, next, timeout_ms),
+                reply_after,
+            }) => pane_wait(hub, &reply, pane, until, next, timeout_ms, reply_after),
             Ok(Request::WorkspaceKill { id, discard }) => {
                 workspace_kill(hub, cid, &reply, id, discard)
             }
@@ -752,7 +755,7 @@ fn handle_frame(
             ),
         },
         Frame::Input { pane, bytes } => {
-            let _ = pane_input(hub, pane, &bytes);
+            let _ = pane_input(hub, pane, &bytes, false);
             ControlFlow::Continue(())
         }
         Frame::PaneSnapshot(_) | Frame::PaneDelta(_) | Frame::PaneRaw { .. } => {
@@ -1036,6 +1039,7 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             text,
             keys: key_names,
             expect,
+            between_turns,
         } => {
             let mut bytes = Vec::new();
             if let Some(text) = &text {
@@ -1055,13 +1059,21 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             // The guard's check and write share one session guard, so no other
             // send can slip between them.
             let r = match &expect {
-                Some(expect) => hub.session().pane_answer(pane, &bytes, expect),
-                None => pane_input(hub, pane, &bytes),
+                Some(_) if between_turns => {
+                    return Response::Error {
+                        message: "a send takes expect or between_turns, not both".into(),
+                    };
+                }
+                Some(expect) => hub
+                    .session()
+                    .pane_answer(pane, &bytes, expect)
+                    .map(|()| Response::Ok),
+                None if between_turns => {
+                    pane_input(hub, pane, &bytes, true).map(|replies| Response::Sent { replies })
+                }
+                None => pane_input(hub, pane, &bytes, false).map(|_| Response::Ok),
             };
-            match r {
-                Ok(()) => Response::Ok,
-                Err(err) => error(err),
-            }
+            r.unwrap_or_else(error)
         }
         Request::PaneFingerprint { pane } => {
             let pty = hub.session().pty(pane);
@@ -1256,15 +1268,22 @@ fn resize_split(hub: &Arc<Hub>, pane: PaneId, axis: Direction, delta: f32) -> Re
 
 /// Type `bytes` into `pane` (an `Input` frame or a plain `PaneSend`),
 /// rebroadcasting the view when that settled a finished program's report out
-/// of the agent surfaces (`Session::pane_send`).
-fn pane_input(hub: &Hub, pane: PaneId, bytes: &[u8]) -> Result<()> {
+/// of the agent surfaces (`Session::pane_send`). `between_turns` (an ask's
+/// send) first refuses, writing nothing, unless the agent is between turns,
+/// under the same session guard as the write. Returns the turn ends the
+/// pane's hooks have reported, for the ask's wait.
+fn pane_input(hub: &Hub, pane: PaneId, bytes: &[u8], between_turns: bool) -> Result<u64> {
     let mut session = hub.session();
+    if between_turns {
+        session.between_turns(pane)?;
+    }
     let view = session.pane_send(pane, bytes)?.then(|| session.view());
+    let replies = session.replies(pane).unwrap_or_default();
     drop(session);
     if let Some(view) = view {
         broadcast_event(hub, Event::LayoutChanged { workspaces: view });
     }
-    Ok(())
+    Ok(replies)
 }
 
 /// Set the ratio of the split separating `a` from `b` — a border drag — and
@@ -1634,6 +1653,9 @@ fn agent_event(
     if let Some(view) = view {
         broadcast_event(hub, Event::LayoutChanged { workspaces: view });
     }
+    if outcome.replied {
+        tell_waits(hub, pane, PaneSignal::Replied);
+    }
     if let Some((from, to)) = outcome.transition {
         publish_transition(hub, pane, from, to, said);
     }
@@ -1963,7 +1985,10 @@ fn workspace_diff(hub: &Arc<Hub>, reply: &Reply, id: WorkspaceId, stat: bool) ->
 /// it, so a human focusing a Done pane (Done → Idle) is never a fresh finish.
 /// The child exiting ends the wait (`wait_verdict`); so does the pane leaving.
 /// Its queue holds every move however far behind it falls, so it loses no
-/// edge. The task gives up silently once its client hangs up.
+/// edge. With `reply_after` it also answers once the pane's hooks have
+/// reported more turn ends than that — at once, or on the `Replied` that
+/// passes it — and never on a state an exit or the screen reached. The task
+/// gives up silently once its client hangs up.
 fn pane_wait(
     hub: &Arc<Hub>,
     reply: &Reply,
@@ -1971,6 +1996,7 @@ fn pane_wait(
     until: Vec<WaitFor>,
     next: bool,
     timeout_ms: Option<u64>,
+    reply_after: Option<u64>,
 ) -> ControlFlow<()> {
     let (queue, mut signals) = mpsc::unbounded_channel();
     {
@@ -1980,12 +2006,17 @@ fn pane_wait(
         waits.retain(|(_, tx)| !tx.is_closed());
         waits.push((pane, queue));
     }
-    let start = hub.session().pane(pane);
+    let (start, replies) = {
+        let session = hub.session();
+        (session.pane(pane), session.replies(pane))
+    };
     let hub = Arc::clone(hub);
     reply.spawn(|reply| async move {
         let gone = || Response::Error {
             message: format!("pane {pane} is gone"),
         };
+        let replied =
+            |replies: Option<u64>| reply_after.zip(replies).is_some_and(|(after, n)| n > after);
         let wait = async {
             if until.is_empty() {
                 return Response::Error {
@@ -1997,6 +2028,12 @@ fn pane_wait(
                     message: format!("no pane {pane}"),
                 };
             };
+            if replied(replies) {
+                return Response::Waited {
+                    pane: Box::new(info),
+                    timed_out: false,
+                };
+            }
             if let Some(answer) = wait_verdict(info, &until, !next) {
                 return answer;
             }
@@ -2016,6 +2053,19 @@ fn pane_wait(
                                 },
                                 None => gone(),
                             };
+                        }
+                        false
+                    }
+                    PaneSignal::Replied => {
+                        let (info, replies) = {
+                            let session = hub.session();
+                            (session.pane(pane), session.replies(pane))
+                        };
+                        if replied(replies) {
+                            return info.map_or_else(gone, |info| Response::Waited {
+                                pane: Box::new(info),
+                                timed_out: false,
+                            });
                         }
                         false
                     }
@@ -3234,6 +3284,7 @@ mod tests {
             text: Some("go\r".into()),
             keys: None,
             expect: None,
+            between_turns: false,
         };
         assert_eq!(peer.request(&go).await, Response::Ok);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -3344,6 +3395,7 @@ mod tests {
             text: Some(text.into()),
             keys: None,
             expect: None,
+            between_turns: false,
         };
         let read = |pane| Request::PaneRead {
             pane,
@@ -3446,7 +3498,7 @@ mod tests {
             let (tx, mut rx) = mpsc::channel(1);
             let until = vec![WaitFor::Done];
             let reply = Reply { tx, req: None };
-            assert!(pane_wait(&hub, &reply, pane, until, true, None).is_continue());
+            assert!(pane_wait(&hub, &reply, pane, until, true, None, None).is_continue());
             // One thread: the waiter's task runs only once this test awaits.
             publish_transition(&hub, pane, AgentState::Working, AgentState::Done, None);
             for i in 0..behind {
@@ -3486,7 +3538,7 @@ mod tests {
             let (tx, mut rx) = mpsc::channel(1);
             let reply = Reply { tx, req: None };
             let until = vec![WaitFor::Done];
-            assert!(pane_wait(&hub, &reply, pane, until, false, Some(0)).is_continue());
+            assert!(pane_wait(&hub, &reply, pane, until, false, Some(0), None).is_continue());
             tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
                 .expect("the wait times out at once")

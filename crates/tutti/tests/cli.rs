@@ -11,7 +11,7 @@ use std::thread;
 
 use tutti_core::{
     AgentHookEvent, AgentState, ApprovalDecision, Event, Frame, Note, NoteKind, PaneId, Request,
-    Response, Tagged, Toward, WatchPane, WorkspaceId, WorkspaceInfo, WorkspaceView,
+    Response, Toward, WatchPane, WorkspaceId, WorkspaceInfo, WorkspaceView,
 };
 
 fn unique_base(label: &str) -> PathBuf {
@@ -229,26 +229,12 @@ fn pane_read_last_reply_prints_the_reply_alone() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("this is its beginning"));
 }
 
-/// Read one request frame, with the `req` it is tagged with.
-fn read_tagged(stream: &mut UnixStream) -> (Option<u64>, Request) {
-    let mut buf = Vec::new();
-    loop {
-        if let Some((Frame::Control(bytes), _)) = Frame::decode(&buf).unwrap() {
-            let tagged: Tagged<Request> = serde_json::from_slice(&bytes).unwrap();
-            return (tagged.req, tagged.body);
-        }
-        let mut byte = [0u8; 1];
-        assert_eq!(stream.read(&mut byte).unwrap(), 1, "client closed early");
-        buf.push(byte[0]);
-    }
+fn answer(stream: &mut UnixStream, response: Response) {
+    let frame = Frame::Control(serde_json::to_vec(&response).unwrap());
+    stream.write_all(&frame.encode()).unwrap();
 }
 
-fn write_tagged(stream: &mut UnixStream, req: Option<u64>, body: Response) {
-    let json = serde_json::to_vec(&Tagged { req, body }).unwrap();
-    stream.write_all(&Frame::Control(json).encode()).unwrap();
-}
-
-/// A pane 7 in `state`, as `pane list` and a wait's answer carry it.
+/// A pane 7 in `state`, as a wait's answer carries it.
 fn pane_in(state: &str, approval: &str) -> tutti_core::PaneInfo {
     serde_json::from_str(&format!(
         r#"{{"id":7,"title":"codex","agent":null,"state":"{state}","exited":null{approval}}}"#
@@ -256,13 +242,13 @@ fn pane_in(state: &str, approval: &str) -> tutti_core::PaneInfo {
     .unwrap()
 }
 
-/// Run `tutti ask 7 <message> --timeout 60` against a fake daemon whose pane
-/// 7 is `listed`; the ask connection's wait answers with `waited`, and a
-/// read of the last reply with `reply`. Hands back the output and every
-/// request the ask connection made, with the gap between typing and enter.
+/// Run `tutti ask 7 <message> --timeout 60` against a fake daemon that
+/// answers the ask's send with `sent`, its wait — on a connection of its own
+/// — with `waited`, and the read of the last reply with `reply`. Hands back
+/// the output, every request made, and the gap between typing and enter.
 fn ask_scenario(
     label: &str,
-    listed: tutti_core::PaneInfo,
+    sent: Response,
     waited: tutti_core::PaneInfo,
     reply: Response,
 ) -> (Output, Vec<Request>, std::time::Duration) {
@@ -270,38 +256,30 @@ fn ask_scenario(
     let sock_dir = base.join("tutti");
     std::fs::create_dir_all(&sock_dir).unwrap();
     let listener = UnixListener::bind(sock_dir.join("tutti.sock")).unwrap();
-    let mid_turn = listed.state == AgentState::Working;
     let server = thread::spawn(move || {
-        let (mut first, _) = listener.accept().unwrap();
-        assert_eq!(read_request(&mut first), Request::PaneList);
-        let panes = Response::Panes {
-            panes: vec![listed],
-        };
-        first
-            .write_all(&Frame::Control(serde_json::to_vec(&panes).unwrap()).encode())
-            .unwrap();
-        if mid_turn {
-            return (Vec::new(), std::time::Duration::ZERO);
-        }
         let (mut ask, _) = listener.accept().unwrap();
-        let (wait_req, wait) = read_tagged(&mut ask);
-        let (typed_req, typed) = read_tagged(&mut ask);
+        let typed = read_request(&mut ask);
+        let refused = matches!(sent, Response::Error { .. });
+        answer(&mut ask, sent);
+        if refused {
+            return (vec![typed], std::time::Duration::ZERO);
+        }
         let at = std::time::Instant::now();
-        let (enter_req, enter) = read_tagged(&mut ask);
+        let enter = read_request(&mut ask);
         let gap = at.elapsed();
-        write_tagged(&mut ask, typed_req, Response::Ok);
-        write_tagged(&mut ask, enter_req, Response::Ok);
+        answer(&mut ask, Response::Ok);
+        let (mut waiter, _) = listener.accept().unwrap();
+        let wait = read_request(&mut waiter);
         let blocked = waited.state == AgentState::Blocked;
         let waited = Response::Waited {
             pane: Box::new(waited),
             timed_out: false,
         };
-        write_tagged(&mut ask, wait_req, waited);
-        let mut asked = vec![wait, typed, enter];
+        answer(&mut waiter, waited);
+        let mut asked = vec![typed, enter, wait];
         if !blocked {
-            let (read_req, read) = read_tagged(&mut ask);
-            write_tagged(&mut ask, read_req, reply);
-            asked.push(read);
+            asked.push(read_request(&mut ask));
+            answer(&mut ask, reply);
         }
         (asked, gap)
     });
@@ -317,15 +295,15 @@ fn ask_scenario(
     (output, asked, gap)
 }
 
-/// `ask` waits for the pane's next turn end on the connection it types on —
-/// the wait first, so it is in place before the keys land — types the
-/// message, presses enter a beat later, and prints the reply the turn left,
-/// alone on stdout.
+/// `ask` types the message as an ask's send, which the daemon guards and
+/// answers with the turn ends its hooks have reported; presses enter a beat
+/// later; waits for a block or a turn end past that count; and prints the
+/// reply the turn left, alone on stdout.
 #[test]
 fn ask_types_waits_and_prints_the_reply() {
     let (output, asked, gap) = ask_scenario(
         "ask",
-        pane_in("done", ""),
+        Response::Sent { replies: 4 },
         pane_in("done", ""),
         Response::LastReply {
             text: "pong".into(),
@@ -338,23 +316,26 @@ fn ask_types_waits_and_prints_the_reply() {
     assert_eq!(
         asked,
         [
-            Request::PaneWait {
-                pane,
-                until: vec![tutti_core::WaitFor::Done, tutti_core::WaitFor::Blocked],
-                next: true,
-                timeout_ms: Some(60_000),
-            },
             Request::PaneSend {
                 pane,
                 text: Some("reply with the word pong".into()),
                 keys: None,
                 expect: None,
+                between_turns: true,
             },
             Request::PaneSend {
                 pane,
                 text: None,
                 keys: Some("enter".into()),
                 expect: None,
+                between_turns: false,
+            },
+            Request::PaneWait {
+                pane,
+                until: vec![tutti_core::WaitFor::Blocked],
+                next: false,
+                timeout_ms: Some(60_000),
+                reply_after: Some(4),
             },
             Request::PaneRead {
                 pane,
@@ -373,13 +354,14 @@ fn ask_types_waits_and_prints_the_reply() {
 }
 
 /// An agent that blocks instead of answering exits 3, naming what it asks
-/// and how to go on; a working pane is refused before anything is typed.
+/// and how to go on; a send the daemon refuses ends the ask there, with no
+/// enter and no wait.
 #[test]
-fn ask_exits_3_on_a_block_and_refuses_a_working_pane() {
+fn ask_exits_3_on_a_block_and_stops_at_a_refused_send() {
     let held = r#","approval":{"id":4,"tool":"Bash","summary":"rm -rf build"}"#;
     let (output, asked, _) = ask_scenario(
         "askblock",
-        pane_in("idle", ""),
+        Response::Sent { replies: 0 },
         pane_in("blocked", held),
         Response::Ok,
     );
@@ -396,15 +378,13 @@ fn ask_exits_3_on_a_block_and_refuses_a_working_pane() {
     );
     assert_eq!(asked.len(), 3, "no reply is read: {asked:?}");
 
-    let (output, asked, _) = ask_scenario(
-        "askbusy",
-        pane_in("working", ""),
-        pane_in("done", ""),
-        Response::Ok,
-    );
+    let refused = Response::Error {
+        message: "pane 7 is working: wait for it first".into(),
+    };
+    let (output, asked, _) = ask_scenario("askbusy", refused, pane_in("done", ""), Response::Ok);
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("pane 7 is working: wait for it"));
-    assert!(asked.is_empty(), "nothing typed into a running turn");
+    assert_eq!(asked.len(), 1, "the refused send alone: {asked:?}");
 }
 
 /// A Claude Code `PermissionRequest`, as the hooks reference records one.
@@ -1259,6 +1239,7 @@ fn pane_wait_prints_the_state_and_exits_124_on_a_timeout() {
                     until: vec![WaitFor::Blocked, WaitFor::Done],
                     next: false,
                     timeout_ms: None,
+                    reply_after: None,
                 }
             );
         },

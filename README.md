@@ -1804,18 +1804,23 @@ b=$(tutti run -- codex --no-daemon)
 tutti ask "$b" "review crates/api/src/auth.rs and list the bugs you find" --timeout 600
 ```
 
-It refuses a pane that is working or blocked (keys typed there would join a
-running turn or answer a dialog; one just started can read as working for a
-moment while it draws), then types the message and
-presses enter (150 ms later: an agent can take text and an enter that land
-together as a paste), waits for that pane's next **done** or **blocked**, and
-prints the new reply as `--last-reply` would. It waits on the same connection
-it types on, the wait first, so even an instant turn cannot finish unseen. An
-agent that blocks instead exits 3, naming what it asks on stderr: answer it,
-then `tutti pane wait <pane> --next --until done,blocked` and `pane read
---last-reply`. `--timeout <secs>` bounds the wait and exits 124. A human talks
-to an agent by typing into its pane; the sidebar's `p` on a done agent shows
-its [last reply](#reading-a-done-agents-reply).
+The daemon types the message only while the agent is between turns — not
+working, blocked or exited — checked in the same step as the write, so it
+never joins a running turn or answers a dialog (one just started can read as
+working for a moment while it draws; a refused ask types nothing and exits 1).
+`ask` then presses enter (150 ms later: an agent can take text and an enter
+that land together as a paste) and waits for the next turn end the agent's
+hooks report, or a block. It counts turn ends from its own send, so a turn
+that ends before the wait starts still counts, and nothing else passes for
+one: neither a state read off the screen nor a Done the agent's exit left.
+It prints the new reply as `--last-reply` would; a turn that ended without
+one (interrupted, failed) is that error. An agent that exits instead is an
+error naming the exit (exit 1), never an older reply. An agent that blocks
+instead exits 3, naming what it asks on stderr: answer it, then `tutti pane
+wait <pane> --next --until done,blocked` and `pane read --last-reply`.
+`--timeout <secs>` bounds the wait and exits 124. A human talks to an agent
+by typing into its pane; the sidebar's `p` on a done agent shows its [last
+reply](#reading-a-done-agents-reply).
 
 ### Tailing a pane
 
@@ -2015,8 +2020,9 @@ tutti is alpha; PLAN.md tracks what is open.
   ask` and the sidebar's reply panel have nothing to show for any other
   agent. Gemini CLI's reply is wired from its docs and source and not yet run
   live; it is the whole turn's text, not only the last message. A turn
-  interrupted with Esc in Claude Code leaves the previous turn's reply in
-  place (it sends no Stop), and a daemon restart forgets every reply.
+  interrupted with Esc in Claude Code sends no Stop: it leaves the previous
+  turn's reply in place, and an `ask` waiting on it runs to its `--timeout`.
+  A daemon restart forgets every reply.
 - **Held approvals are Claude Code's, Codex's and opencode's only.** Codex's
   PermissionRequest hold is wired but not yet exercised live, and opencode
   shows its own dialog beside a held request (whichever answers first wins).

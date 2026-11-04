@@ -1080,6 +1080,7 @@ fn to_request(command: Command) -> Result<Request> {
                 text,
                 keys,
                 expect,
+                between_turns: false,
             },
             PaneAction::Read {
                 pane,
@@ -1203,6 +1204,7 @@ fn run_wait(
             until: until.clone(),
             next,
             timeout_ms,
+            reply_after: None,
         })?;
         let code = emit(response, json);
         if code != 0 {
@@ -1221,12 +1223,12 @@ const BLOCKED: i32 = 3;
 /// a submit from 30 ms apart.
 const ENTER_AFTER: Duration = Duration::from_millis(150);
 
-/// `ask`: refuse a pane that is gone, working or blocked — keys typed there
-/// would join a running turn or answer a dialog — then, on one connection —
-/// whose frames the daemon takes in order, so the wait is in place before the
-/// keys land — wait for the pane's next done or blocked, type the message,
-/// press enter `ENTER_AFTER` later, and print the reply the turn left. A
-/// refused send ends it there, and its wait with the connection.
+/// `ask`: type the message as an ask's send — the daemon types nothing unless
+/// the agent is between turns, checked in the same session guard, and names
+/// how many turn ends its hooks have reported — press enter `ENTER_AFTER`
+/// later, then wait for a block or for the next turn end the hooks report.
+/// The wait counts turn ends, so one before it starts still counts, and no
+/// exit or screen-read state passes for one. Print the reply that turn left.
 fn run_ask(
     session: &str,
     json: bool,
@@ -1242,57 +1244,43 @@ fn run_ask(
         .transpose()
         .context("invalid --timeout")?
         .map(|t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX));
-    let panes = match Client::connect_or_start(session)?.request(&Request::PaneList)? {
-        Response::Panes { panes } => panes,
-        other => bail!("unexpected reply to pane list: {other:?}"),
-    };
-    let info = panes
-        .iter()
-        .find(|p| p.id == pane)
-        .with_context(|| format!("no pane {pane}"))?;
-    if let Some(code) = info.exited {
-        bail!("pane {pane} has exited (code {code})");
-    }
-    match info.state {
-        AgentState::Working => bail!(
-            "pane {pane} is working: wait for it first (tutti pane wait {pane} --until done,blocked)"
-        ),
-        AgentState::Blocked => bail!("pane {pane} is blocked: answer its prompt first"),
-        _ => {}
-    }
     let mut client = Client::connect_or_start(session)?;
-    let until = vec![WaitFor::Done, WaitFor::Blocked];
-    client.send(
-        1,
-        &Request::PaneWait {
-            pane,
-            until,
-            next: true,
-            timeout_ms,
-        },
-    )?;
     let typed = Request::PaneSend {
         pane,
         text: Some(message),
         keys: None,
         expect: None,
+        between_turns: true,
     };
-    client.send(2, &typed)?;
+    let after = match client.request(&typed)? {
+        Response::Sent { replies } => replies,
+        refused @ Response::Error { .. } => return Ok(emit(refused, json)),
+        other => bail!(
+            "unexpected reply to an ask's send: {other:?} (a daemon older than this tutti \
+             typed it unguarded: restart it)"
+        ),
+    };
     std::thread::sleep(ENTER_AFTER);
     let enter = Request::PaneSend {
         pane,
         text: None,
         keys: Some("enter".into()),
         expect: None,
+        between_turns: false,
     };
-    client.send(3, &enter)?;
-    let waited = loop {
-        match client.answer()? {
-            (Some(1), waited) => break waited,
-            (_, Response::Ok) => {}
-            (_, refused) => return Ok(emit(refused, json)),
-        }
+    match client.request(&enter)? {
+        Response::Ok => {}
+        refused => return Ok(emit(refused, json)),
+    }
+    let wait = Request::PaneWait {
+        pane,
+        until: vec![WaitFor::Blocked],
+        next: false,
+        timeout_ms,
+        reply_after: Some(after),
     };
+    // A connection of its own: the sends left a deadline on this one.
+    let waited = Client::connect_or_start(session)?.request(&wait)?;
     match waited {
         Response::Waited {
             pane: info,
@@ -2097,8 +2085,8 @@ fn emit(response: Response, json: bool) -> i32 {
             0
         }
         // An approval hold's reply is consumed by `agent-event`, a view by
-        // `edit`, never here.
-        Response::Approval { .. } | Response::View { .. } => 0,
+        // `edit`, an ask's send by `ask`, never here.
+        Response::Approval { .. } | Response::View { .. } | Response::Sent { .. } => 0,
     }
 }
 
@@ -2598,6 +2586,7 @@ mod tests {
                 text: Some("hello".to_string()),
                 keys: None,
                 expect: None,
+                between_turns: false,
             }
         );
         assert_eq!(
@@ -2607,6 +2596,7 @@ mod tests {
                 text: None,
                 keys: Some("C-c Enter".to_string()),
                 expect: None,
+                between_turns: false,
             }
         );
         assert!(Cli::try_parse_from(["tutti", "pane", "send", "2"]).is_err());
@@ -2627,6 +2617,7 @@ mod tests {
                 text: None,
                 keys: Some("enter".into()),
                 expect: Some("9f3a".into()),
+                between_turns: false,
             }
         );
         // `--expect` guards a payload; it is not one.

@@ -214,6 +214,7 @@ fn wait_for(
         until: until.to_vec(),
         next,
         timeout_ms,
+        reply_after: None,
     }
 }
 
@@ -392,6 +393,172 @@ async fn a_turns_reply_is_read_back_once_its_wait_answers() {
     server.stop().await;
 }
 
+/// An ask's send: typed only while the pane's agent is between turns.
+fn ask_send(pane: PaneId, text: &str) -> Request {
+    Request::PaneSend {
+        pane,
+        text: Some(text.into()),
+        keys: None,
+        expect: None,
+        between_turns: true,
+    }
+}
+
+/// The turn ends the pane's hooks had reported when an ask's send landed.
+fn sent(response: Response) -> u64 {
+    match response {
+        Response::Sent { replies } => replies,
+        other => panic!("expected Sent, got {other:?}"),
+    }
+}
+
+/// An ask's wait: for a block, or a reported turn end past `after`.
+fn ask_wait(pane: PaneId, after: u64, timeout_ms: u64) -> Request {
+    Request::PaneWait {
+        pane,
+        until: vec![tutti_core::WaitFor::Blocked],
+        next: false,
+        timeout_ms: Some(timeout_ms),
+        reply_after: Some(after),
+    }
+}
+
+/// An ask's wait ends on the next turn end the hooks report, counted from
+/// its send, and on nothing else that looks like one:
+/// - a Stop whose turn start was never reported (Idle → Done, no fresh edge)
+///   still ends it, with its reply;
+/// - a turn end with no reply (Esc, an interrupt) ends it, and the read says
+///   so instead of handing back the turn before's;
+/// - one that lands before the wait starts still counts;
+/// - a block ends it as blocked.
+#[tokio::test]
+async fn an_ask_waits_for_the_next_reported_turn_end() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let mut waiter = server.connect().await;
+    let pane = run_sleeper(&mut control).await;
+    let read = || Request::PaneRead {
+        pane,
+        lines: None,
+        unwrapped: false,
+        since: None,
+        last_output: false,
+        last_reply: true,
+    };
+    let said = |text: &str| AgentHookEvent::Done {
+        reply: Some(text.into()),
+    };
+    hook(&mut control, pane, said("first")).await;
+    let focus = Request::PaneFocus { pane };
+    assert_eq!(control.request(focus).await, Response::Ok);
+
+    let after = sent(control.request(ask_send(pane, "x")).await);
+    assert_eq!(after, 1);
+    start_wait(&mut waiter, ask_wait(pane, after, 5_000)).await;
+    hook(&mut control, pane, said("second")).await;
+    assert_eq!(waited(waiter.response().await), (AgentState::Done, false));
+    let second = Response::LastReply {
+        text: "second".into(),
+        truncated: false,
+    };
+    assert_eq!(control.request(read()).await, second);
+
+    let after = sent(control.request(ask_send(pane, "x")).await);
+    start_wait(&mut waiter, ask_wait(pane, after, 5_000)).await;
+    hook(&mut control, pane, AgentHookEvent::Done { reply: None }).await;
+    assert_eq!(waited(waiter.response().await), (AgentState::Done, false));
+    let ended = error_message(control.request(read()).await);
+    assert!(ended.contains("ended without a reply"), "{ended}");
+
+    let after = sent(control.request(ask_send(pane, "x")).await);
+    hook(&mut control, pane, said("early")).await;
+    let early = waiter.request(ask_wait(pane, after, 5_000)).await;
+    assert_eq!(waited(early), (AgentState::Done, false), "answered at once");
+
+    let after = sent(control.request(ask_send(pane, "x")).await);
+    start_wait(&mut waiter, ask_wait(pane, after, 5_000)).await;
+    hook(
+        &mut control,
+        pane,
+        AgentHookEvent::Blocked { message: None },
+    )
+    .await;
+    assert_eq!(
+        waited(waiter.response().await),
+        (AgentState::Blocked, false)
+    );
+
+    server.stop().await;
+}
+
+/// An agent that exits mid-ask ends the ask's wait with an error naming the
+/// exit, though the exit moves the pane to Done and a reply from an earlier
+/// turn is there to read. A pane that is working, blocked or gone refuses
+/// the ask's send and types nothing.
+#[tokio::test]
+async fn an_ask_reports_an_exit_mid_turn_and_refuses_a_busy_pane() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let mut waiter = server.connect().await;
+    let enter = |pane| Request::PaneSend {
+        pane,
+        text: None,
+        keys: Some("enter".into()),
+        expect: None,
+        between_turns: false,
+    };
+
+    let pane = run_marker(
+        &mut control,
+        "read line; echo got-$line-; read code; exit 3",
+    )
+    .await;
+    let earlier = AgentHookEvent::Done {
+        reply: Some("earlier".into()),
+    };
+    hook(&mut control, pane, earlier).await;
+    hook(
+        &mut control,
+        pane,
+        AgentHookEvent::Activity { detail: None },
+    )
+    .await;
+    let busy = error_message(control.request(ask_send(pane, "typed")).await);
+    assert!(busy.contains("is working: wait for it first"), "{busy}");
+    assert_eq!(control.request(enter(pane)).await, Response::Ok);
+    assert!(
+        read_until(&mut control, pane, "got--").await,
+        "nothing was typed"
+    );
+    hook(
+        &mut control,
+        pane,
+        AgentHookEvent::Blocked { message: None },
+    )
+    .await;
+    let blocked = error_message(control.request(ask_send(pane, "y")).await);
+    assert!(blocked.contains("is blocked"), "{blocked}");
+
+    hook(&mut control, pane, AgentHookEvent::Done { reply: None }).await;
+    let after = sent(control.request(ask_send(pane, "3")).await);
+    start_wait(&mut waiter, ask_wait(pane, after, 5_000)).await;
+    hook(
+        &mut control,
+        pane,
+        AgentHookEvent::Activity { detail: None },
+    )
+    .await;
+    assert_eq!(control.request(enter(pane)).await, Response::Ok);
+    let exited = error_message(waiter.response().await);
+    assert!(exited.contains("exited with code 3"), "{exited}");
+    let gone = error_message(control.request(ask_send(pane, "x")).await);
+    assert!(gone.contains("has exited (code 3)"), "{gone}");
+    let missing = error_message(control.request(ask_send(PaneId(999), "x")).await);
+    assert!(missing.contains("no pane 999"), "{missing}");
+
+    server.stop().await;
+}
+
 /// `next` waits for a fresh transition: it ignores the state the pane is
 /// already in, and a human focusing a Done pane (Done → Idle) is no fresh
 /// finish — though it is exactly what `--until idle --next` waits for.
@@ -453,6 +620,7 @@ async fn a_child_exit_ends_a_wait() {
         text: Some(format!("{code}\n")),
         keys: None,
         expect: None,
+        between_turns: false,
     };
 
     let done = run_marker(&mut control, "read code; exit $code").await;
@@ -853,6 +1021,7 @@ async fn pane_send_echoes_into_grid() {
             text: Some("hello-echo\n".into()),
             keys: None,
             expect: None,
+            between_turns: false,
         })
         .await,
         Response::Ok
@@ -899,6 +1068,7 @@ async fn pane_read_since_tails_scrolled_output() {
             text: Some("\n".into()),
             keys: None,
             expect: None,
+            between_turns: false,
         })
         .await,
         Response::Ok
@@ -1011,6 +1181,7 @@ async fn a_split_starts_where_its_source_panes_shell_is() {
                 text: Some(format!("pwd -P > '{}'\n", out.display())),
                 keys: None,
                 expect: None,
+                between_turns: false,
             })
             .await;
         assert_eq!(sent, Response::Ok);
@@ -2205,6 +2376,7 @@ async fn a_2031_pane_hears_of_a_light_dark_flip() {
             text: Some("go\r".into()),
             keys: None,
             expect: None,
+            between_turns: false,
         };
         assert_eq!(control.request(go).await, Response::Ok);
     }
@@ -2295,6 +2467,7 @@ async fn a_pane_stream_that_never_reads_is_dropped() {
             text: Some(flood.into()),
             keys: None,
             expect: None,
+            between_turns: false,
         })
         .await;
     assert_eq!(sent, Response::Ok);
@@ -3167,6 +3340,7 @@ async fn an_exiting_pane_drops_its_held_approvals() {
         text: Some("\n".into()),
         keys: None,
         expect: None,
+        between_turns: false,
     };
     assert_eq!(control.request(enter).await, Response::Ok);
     assert!(
@@ -3445,6 +3619,7 @@ async fn the_history_caps_and_never_reuses_an_id() {
         ),
         keys: None,
         expect: None,
+        between_turns: false,
     };
     assert_eq!(conn.request(burst).await, Response::Ok);
     let history = timeout(DEADLINE, async {
@@ -3583,6 +3758,7 @@ async fn bells_land_once_and_never_from_the_pane_in_view() {
         text: Some("printf '\\a\\a\\a'; printf '\\033]9;storm\\007'\n".into()),
         keys: None,
         expect: None,
+        between_turns: false,
     };
     assert_eq!(control.request(bells).await, Response::Ok);
     let bell = noted(&mut viewer).await;
@@ -3612,6 +3788,7 @@ async fn bells_land_once_and_never_from_the_pane_in_view() {
         text: Some("printf '\\a'; printf '\\033]9;watched\\007'\n".into()),
         keys: None,
         expect: None,
+        between_turns: false,
     };
     assert_eq!(control.request(watched).await, Response::Ok);
     let note = noted(&mut viewer).await;
@@ -3753,6 +3930,7 @@ async fn hook_driven_pane_ignores_screen_classification() {
             text: Some("esc to interrupt\n".into()),
             keys: None,
             expect: None,
+            between_turns: false,
         })
         .await,
         Response::Ok
@@ -3795,6 +3973,7 @@ async fn a_dialog_answered_in_the_pane_ends_the_hooks_block() {
         text: Some(text),
         keys: None,
         expect: None,
+        between_turns: false,
     };
     assert_eq!(
         conn.request(send("Do you want to proceed?\n".into())).await,
@@ -3844,6 +4023,7 @@ async fn printf_osc(conn: &mut Conn, pane: PaneId, body: &str) {
             text: Some(format!("printf '\\033]{body}\\033\\\\'\n")),
             keys: None,
             expect: None,
+            between_turns: false,
         })
         .await;
     assert_eq!(sent, Response::Ok);
@@ -4110,6 +4290,7 @@ async fn agent_state_changes_working_then_blocked() {
                 text: Some("esc to interrupt\n".into()),
                 keys: None,
                 expect: None,
+                between_turns: false,
             })
             .await,
         Response::Ok
@@ -4123,6 +4304,7 @@ async fn agent_state_changes_working_then_blocked() {
                 text: Some("Do you want to continue?\n".into()),
                 keys: None,
                 expect: None,
+                between_turns: false,
             })
             .await,
         Response::Ok
@@ -4180,6 +4362,7 @@ fn guarded(pane: PaneId, text: &str, expect: &str) -> Request {
         text: Some(text.into()),
         keys: None,
         expect: Some(expect.into()),
+        between_turns: false,
     }
 }
 
@@ -4316,6 +4499,7 @@ async fn a_mirror_fingerprints_like_the_live_grid() {
                 text: Some("go\n".into()),
                 keys: None,
                 expect: None,
+                between_turns: false,
             })
             .await,
         Response::Ok

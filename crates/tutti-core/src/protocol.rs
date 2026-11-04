@@ -159,6 +159,14 @@ pub enum Request {
         /// wins. `None` is the plain unguarded send.
         #[serde(default)]
         expect: Option<String>,
+        /// Makes this an *ask*: the server writes only while `pane`'s agent is
+        /// between turns — not working, blocked or exited — checked and
+        /// written under one session lock, and answers `Response::Sent` with
+        /// how many turn ends its hooks have reported so far, for a
+        /// `PaneWait`'s `reply_after`. Otherwise Error, nothing written. Never
+        /// with `expect`.
+        #[serde(default)]
+        between_turns: bool,
     },
     /// The pane's current `prompt_fingerprint`, answered with
     /// `Response::Fingerprint` — what a script passes back as a guarded
@@ -181,6 +189,13 @@ pub enum Request {
         next: bool,
         #[serde(default)]
         timeout_ms: Option<u64>,
+        /// Also end the wait, `Waited`, once the pane's hooks have reported
+        /// more turn ends than this (a `Response::Sent`'s count) — at once if
+        /// they already have: its next reply, or a turn that ended without
+        /// one, is ready to read. Only a hook's turn end counts; a state
+        /// reached any other way, an exit's included, never does.
+        #[serde(default)]
+        reply_after: Option<u64>,
     },
     PaneRead {
         pane: PaneId,
@@ -878,6 +893,11 @@ pub enum Response {
         exit: Option<i32>,
         truncated: bool,
     },
+    /// A `PaneSend { between_turns: true }` was written: the turn ends the
+    /// pane's hooks had reported by then, a `PaneWait`'s `reply_after`.
+    Sent {
+        replies: u64,
+    },
     /// A `PaneRead { last_reply: true }` reply: the final message of the last
     /// turn the pane's agent hooks ended, as the agent wrote it. `truncated`:
     /// it ran past what the daemon keeps of one, and this is its beginning.
@@ -1197,12 +1217,21 @@ mod tests {
             text: Some("hello".into()),
             keys: None,
             expect: None,
+            between_turns: false,
         });
         roundtrip(&Request::PaneSend {
             pane: PaneId(2),
             text: None,
             keys: Some("enter".into()),
             expect: Some("af63dc4c8601ec8c".into()),
+            between_turns: false,
+        });
+        roundtrip(&Request::PaneSend {
+            pane: PaneId(2),
+            text: Some("reply with the word pong".into()),
+            keys: None,
+            expect: None,
+            between_turns: true,
         });
         roundtrip(&Request::PaneFingerprint { pane: PaneId(2) });
         roundtrip(&Request::PaneWait {
@@ -1210,6 +1239,14 @@ mod tests {
             until: vec![WaitFor::Blocked, WaitFor::Done],
             next: true,
             timeout_ms: Some(1500),
+            reply_after: None,
+        });
+        roundtrip(&Request::PaneWait {
+            pane: PaneId(2),
+            until: vec![WaitFor::Blocked],
+            next: false,
+            timeout_ms: None,
+            reply_after: Some(4),
         });
         roundtrip(&Request::PaneRead {
             pane: PaneId(2),
@@ -1847,6 +1884,7 @@ mod tests {
             text: "pong\nping".into(),
             truncated: false,
         });
+        roundtrip(&Response::Sent { replies: 4 });
         roundtrip(&Response::Fingerprint {
             fingerprint: "af63dc4c8601ec8c".into(),
         });
@@ -2250,7 +2288,8 @@ mod tests {
                 discard: false,
             }
         );
-        // `pane_send` from before `expect` existed is a plain, unguarded send.
+        // `pane_send` from before `expect` and `between_turns` existed is a
+        // plain, unguarded send.
         let send: Request =
             serde_json::from_str(r#"{"type":"pane_send","pane":2,"text":"y","keys":null}"#)
                 .unwrap();
@@ -2261,6 +2300,7 @@ mod tests {
                 text: Some("y".into()),
                 keys: None,
                 expect: None,
+                between_turns: false,
             }
         );
         // `pane_read` from before `since`, `last_output` and `last_reply`
@@ -2312,8 +2352,8 @@ mod tests {
                 dest: None,
             }
         );
-        // `pane_wait` without `next`/`timeout_ms` is level-triggered and
-        // unbounded.
+        // `pane_wait` without `next`/`timeout_ms`/`reply_after` is
+        // level-triggered, unbounded, and waits on states alone.
         let wait: Request =
             serde_json::from_str(r#"{"type":"pane_wait","pane":3,"until":["done"]}"#).unwrap();
         assert_eq!(
@@ -2323,6 +2363,7 @@ mod tests {
                 until: vec![WaitFor::Done],
                 next: false,
                 timeout_ms: None,
+                reply_after: None,
             }
         );
         // `sandbox_pull` without a name names the workspace after the sandbox.

@@ -118,10 +118,13 @@ struct PaneSlot {
     /// passed, its hook gone, or never held — with no sign since that the
     /// agent moved on: tutti's answer to another then leaves the pane blocked.
     passed: bool,
-    /// The final message of the last turn the pane's hooks ended — empty when
-    /// it ended with none, `None` before any has — cut to `REPLY_CAP`, and
-    /// whether it was. Never persisted: a restored agent has ended no turn.
-    reply: Option<(String, bool)>,
+    /// How many turn ends the pane's hooks have reported, those that carried
+    /// no reply included: what an ask waits to see pass (`reply_after`).
+    replies: u64,
+    /// The last of those turns' final message — empty when it had none —
+    /// cut to `REPLY_CAP`, and whether it was. Neither is persisted: a
+    /// restored agent has ended no turn.
+    reply: (String, bool),
 }
 
 #[derive(Default)]
@@ -867,6 +870,7 @@ impl Session {
         let subs = &mut slot.meta.subagents;
         let mut classified = None;
         let mut noted = false;
+        let mut replied = false;
         match event {
             AgentHookEvent::SubagentStarted { id, desc } => {
                 subs.push(SubagentInfo {
@@ -896,7 +900,9 @@ impl Session {
                 let mut text = reply.unwrap_or_default();
                 let truncated = text.len() > REPLY_CAP;
                 text.truncate(text.floor_char_boundary(REPLY_CAP));
-                slot.reply = Some((text, truncated));
+                slot.reply = (text, truncated);
+                slot.replies += 1;
+                replied = true;
                 classified = Some(Observation::Done);
                 slot.turns.stopped();
                 // The turn ended: sweep the finished subagents that were kept
@@ -920,6 +926,7 @@ impl Session {
             transition,
             relisted,
             noted,
+            replied,
         })
     }
 
@@ -930,16 +937,42 @@ impl Session {
             .panes
             .get(&pane)
             .with_context(|| format!("no pane {pane}"))?;
-        match &slot.reply {
-            Some((text, truncated)) if !text.is_empty() => Ok((text.clone(), *truncated)),
-            Some(_) => {
-                bail!("pane {pane}'s last turn ended without a reply (interrupted or failed)")
-            }
-            None => bail!(
+        if slot.replies == 0 {
+            bail!(
                 "pane {pane} has no reply: no turn has ended there through its agent's hooks \
                  (Claude Code, Codex, Gemini CLI and opencode report theirs once `tutti hooks \
                  <agent> --install` wires them)"
+            );
+        }
+        if slot.reply.0.is_empty() {
+            bail!("pane {pane}'s last turn ended without a reply (interrupted or failed)");
+        }
+        Ok(slot.reply.clone())
+    }
+
+    /// How many turn ends `pane`'s hooks have reported; `None` for an unknown
+    /// pane.
+    pub fn replies(&self, pane: PaneId) -> Option<u64> {
+        Some(self.panes.get(&pane)?.replies)
+    }
+
+    /// Refuse an ask's send unless `pane`'s agent is between turns — not
+    /// working, blocked or exited — so its message never joins a running turn
+    /// or answers a dialog. The caller writes under the same session guard.
+    pub fn between_turns(&self, pane: PaneId) -> Result<()> {
+        let slot = self
+            .panes
+            .get(&pane)
+            .with_context(|| format!("no pane {pane}"))?;
+        if let Some(code) = slot.meta.exited {
+            bail!("pane {pane} has exited (code {code})");
+        }
+        match slot.meta.state {
+            AgentState::Working => bail!(
+                "pane {pane} is working: wait for it first (tutti pane wait {pane} --until done,blocked)"
             ),
+            AgentState::Blocked => bail!("pane {pane} is blocked: answer its prompt first"),
+            _ => Ok(()),
         }
     }
 
@@ -1654,7 +1687,8 @@ impl Session {
                 herdr_seqs: HashMap::new(),
                 dialog: false,
                 passed: false,
-                reply: None,
+                replies: 0,
+                reply: (String::new(), false),
             },
         );
         Ok(id)
@@ -1671,6 +1705,8 @@ pub struct AgentEventOutcome {
     /// Whether the event closed a turn with no state move — a prompt ending
     /// an interrupted one — so its checkpoint waits for a change probe.
     pub noted: bool,
+    /// Whether the hooks reported a turn's end, so an ask's wait looks again.
+    pub replied: bool,
 }
 
 /// What `apply_report` changed, so the server broadcasts the right events.
@@ -2116,7 +2152,8 @@ mod tests {
     }
 
     /// Each turn's end replaces the last reply — one that ended with none
-    /// too — and a reply past `REPLY_CAP` keeps its beginning, cut on a char.
+    /// too — and counts, and a reply past `REPLY_CAP` keeps its beginning,
+    /// cut on a char.
     #[test]
     fn a_turn_end_keeps_its_reply_until_the_next_one() {
         let (mut s, pane, _tmp) = session_with_pane();
@@ -2126,6 +2163,7 @@ mod tests {
         let err = |s: &Session| s.last_reply(pane).unwrap_err().to_string();
         assert!(err(&s).contains("no turn has ended there"), "{}", err(&s));
         assert!(s.last_reply(PaneId(99)).is_err());
+        assert_eq!((s.replies(pane), s.replies(PaneId(99))), (Some(0), None));
 
         hook(&mut s, pane, done("pong\nping"));
         assert_eq!(s.last_reply(pane).unwrap(), ("pong\nping".into(), false));
@@ -2137,6 +2175,7 @@ mod tests {
         );
         hook(&mut s, pane, AgentHookEvent::Done { reply: None });
         assert!(err(&s).contains("ended without a reply"), "{}", err(&s));
+        assert_eq!(s.replies(pane), Some(2), "a turn end with no reply counts");
 
         // The cap falls inside an `é`, which goes whole.
         hook(&mut s, pane, done(&format!("x{}", "é".repeat(REPLY_CAP))));

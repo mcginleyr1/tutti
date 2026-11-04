@@ -2215,6 +2215,7 @@ impl App {
             text: Some(text),
             keys: None,
             expect: Some(prompt_fingerprint(&screen_rows(&state.term))),
+            between_turns: false,
         })]
     }
 
@@ -7189,6 +7190,7 @@ mod tests {
             text: Some(text.into()),
             keys: None,
             expect: Some(prompt_fingerprint(&rows)),
+            between_turns: false,
         })
     }
 
