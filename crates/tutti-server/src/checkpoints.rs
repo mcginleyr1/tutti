@@ -16,9 +16,9 @@ pub const KEEP: usize = 50;
 pub type Noted = (String, Option<String>);
 
 /// One pane's checkpoints plus what the next change probe must record for it.
-/// Saved as its list, numbering and head; what is in flight (the noted
-/// checkpoints, the running turn's prompt) belonged to a process that is gone
-/// by the time a save is restored.
+/// Saved as its list, numbering and head, and the prompt of the turn in
+/// flight, which a restore closes (`note_restart`); the noted checkpoints are
+/// not saved.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Turns {
     entries: Vec<Checkpoint>,
@@ -31,7 +31,8 @@ pub struct Turns {
     #[serde(skip)]
     pending: Vec<Noted>,
     /// The prompt that started the turn in flight, as a hook reported it.
-    #[serde(skip)]
+    /// Absent from saves made before it was kept.
+    #[serde(default)]
     prompt: Option<String>,
 }
 
@@ -66,6 +67,15 @@ impl Turns {
     /// checkpoint, so its first turn has a "before" to diff and restore to.
     pub fn note_start(&mut self) {
         self.pending.push(("start".into(), None));
+    }
+
+    /// Close the turn a stopped daemon left in flight, under its prompt: the
+    /// pane a restore brings back no longer runs the process that turn was
+    /// in, so where the pane starts again is where the turn ended.
+    pub fn note_restart(&mut self) {
+        if let Some(prompt) = self.prompt.take() {
+            self.pending.push(("restart".into(), Some(prompt)));
+        }
     }
 
     /// Hand the noted checkpoints to a probe about to snapshot, which records
@@ -215,6 +225,32 @@ mod tests {
             vec![("done".to_string(), None)],
             "a turn no prompt started has none"
         );
+    }
+
+    #[test]
+    fn a_turn_in_flight_keeps_its_prompt_through_a_save_and_a_restart_closes_it() {
+        let mut turns = Turns::default();
+        turns.record(None, "c1", "start", None, 1, &[]).unwrap();
+        turns.set_prompt(Some("fix the sidebar".into()));
+        turns.note_transition(Idle, Working);
+        let mut restored: Turns =
+            serde_json::from_slice(&serde_json::to_vec(&turns).unwrap()).unwrap();
+        assert!(
+            restored.take_pending().is_empty(),
+            "noted edges are not saved"
+        );
+        restored.note_restart();
+        restored.note_restart();
+        assert_eq!(
+            restored.take_pending(),
+            vec![("restart".to_string(), Some("fix the sidebar".to_string()))],
+            "the restart closes the turn once, under its prompt"
+        );
+        restored.note_transition(Working, Done);
+        assert_eq!(restored.take_pending(), vec![("done".to_string(), None)]);
+
+        let older: Turns = serde_json::from_str(r#"{"entries":[],"last":0,"head":null}"#).unwrap();
+        assert_eq!(older, Turns::default(), "a save from before the prompt");
     }
 
     #[test]

@@ -1036,8 +1036,8 @@ too — when tutti first detects the agent, or when the pane first enters workin
 When the pane in view has checkpoints, the changes panel grows a `turns`
 section under the files: the newest five, `#N age <turn> +A −B` — the turn
 reads as the first line of the prompt that started it when Claude Code's hooks
-reported one, else as what closed it: `done`, `blocked`, `start`, `before
-restore`. A turn that ends blocked keeps its prompt for the work after you
+reported one, else as what closed it: `done`, `blocked`, `start`, `restart`,
+`before restore`. A turn that ends blocked keeps its prompt for the work after you
 answer. The cursor walks
 from the last file on into the turns; `Enter` on a turn pages **that turn's
 diff** (from the checkpoint before it) in an ephemeral pager pane, and `r` asks
@@ -1052,7 +1052,9 @@ every restore reversible regardless.
 
 Known limits: checkpoints live in the daemon's memory (newest 50 per pane) and
 are saved with the layout, so a pane a restart restores keeps its list and
-numbering (see [Restoring after a restart](#restoring-after-a-restart)).
+numbering (see [Restoring after a restart](#restoring-after-a-restart)). A
+turn still running when the daemon stopped is closed where the restore brings
+its pane back, as a `restart` checkpoint listed under the turn's prompt.
 Several agents in one workspace share a working copy, so a pane's turn diff
 includes anything else that changed in that window (another agent's edits, your
 own). A turn interrupted with Esc sends no stop, so its edits land in the next

@@ -642,7 +642,9 @@ pub struct Checkpoint {
     /// Unix seconds when it was recorded.
     pub time: u64,
     /// What closed the turn: the state it ended in (`done`, `blocked`), `start`
-    /// for where the agent began, or `before restore`.
+    /// for where the agent began, `restart` for a turn the daemon stopped in
+    /// the middle of (closed where a restore brought its pane back), or
+    /// `before restore`.
     pub label: String,
     /// The first line of the prompt that started the turn, when a hook
     /// reported one — what the turn lists as, over `label`. `None` for

@@ -1340,10 +1340,11 @@ impl Session {
     /// under its old title, keeping its agent and conversation; every other one
     /// is a login shell in the workspace's directory. A saved command is never
     /// re-run — re-running `claude "fix the tests"` would re-issue the prompt.
-    /// Each pane's checkpoints carry over, numbering and head intact; a revived
-    /// agent notes its start, as a detected one does. A pane that fails to
-    /// spawn is dropped from its tree and named in `skipped`. The saved current
-    /// tab becomes current again.
+    /// Each pane's checkpoints carry over, numbering and head intact; a turn
+    /// left in flight is closed under its prompt (`Turns::note_restart`), and
+    /// a revived agent notes its start, as a detected one does. A pane that
+    /// fails to spawn is dropped from its tree and named in `skipped`. The
+    /// saved current tab becomes current again.
     pub fn restore(
         &mut self,
         saved: Saved,
@@ -1405,6 +1406,7 @@ impl Session {
                     out.panes.insert(pane.id, id);
                     if let Some(slot) = self.panes.get_mut(&id) {
                         slot.turns = pane.turns;
+                        slot.turns.note_restart();
                         if revived.is_some() {
                             slot.meta.conversation = pane.conversation;
                             slot.meta.issue = pane.issue;
@@ -2572,6 +2574,8 @@ mod tests {
         turns
             .record(Some("k1".into()), "k2", "done", fix, 2, &edit)
             .unwrap();
+        let busy = Some("add the tests".to_string());
+        s.apply_agent_event(agent, AgentHookEvent::Prompt { text: busy.clone() }, None);
         let logs = s.tab_new(Some(a)).unwrap();
         s.pane_run(Some(logs), sleep_cmd(), false, None).unwrap();
         s.tab_mut(logs).unwrap().name = "logs".into();
@@ -2654,8 +2658,9 @@ mod tests {
         assert_eq!(listed, [(1, None), (2, fix)]);
         assert_eq!(
             turns.take_pending(),
-            [("start".to_string(), None)],
-            "a revived agent notes where it starts, as a detected one does"
+            [("restart".to_string(), busy), ("start".to_string(), None)],
+            "the turn in flight closes under its prompt, then a revived agent \
+             notes where it starts, as a detected one does"
         );
         assert_eq!(
             turns.record(Some("k2".into()), "k3", "done", None, 3, &edit),

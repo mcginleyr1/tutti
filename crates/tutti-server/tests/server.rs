@@ -5758,6 +5758,51 @@ async fn hook(conn: &mut Conn, pane: PaneId, event: AgentHookEvent) {
     assert_eq!(conn.request(request).await, Response::Ok);
 }
 
+/// A turn still in flight when the daemon stops keeps its prompt: the restore
+/// closes it where its pane comes back, as a `restart` checkpoint listed under
+/// that prompt. Skips cleanly without `jj`.
+#[tokio::test]
+async fn a_turn_in_flight_at_a_restart_keeps_its_prompt() {
+    if !jj_on_path() {
+        eprintln!("skipping: jj is not on PATH");
+        return;
+    }
+    let (dir, state) = (jj_git_init("inflight"), fresh_dir("state"));
+    std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+    let server = TestServer::saving(Some(state.clone()));
+    let mut conn = server.connect().await;
+    workspace_id(
+        conn.request(Request::WorkspaceNew { dir: dir.clone() })
+            .await,
+    );
+    let pane = pane_id(conn.request(sleeper_in(None)).await);
+    let text = Some("rename the module".to_string());
+    hook(&mut conn, pane, AgentHookEvent::Prompt { text }).await;
+    wait_checkpoints(&mut conn, pane, 1).await;
+    std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+    server.stop().await;
+
+    let server = TestServer::saving(Some(state.clone()));
+    let mut conn = server.connect().await;
+    assert!(matches!(
+        conn.request(Request::SessionRestore { discard: false })
+            .await,
+        Response::SessionRestored { panes: 1, .. }
+    ));
+    let pane = pane_ids(&mut conn).await[0];
+    let turn = wait_checkpoints(&mut conn, pane, 2).await.remove(1);
+    assert_eq!(
+        (turn.n, turn.label.as_str(), turn.prompt.as_deref()),
+        (2, "restart", Some("rename the module"))
+    );
+    assert_eq!((turn.files, turn.insertions), (1, 1));
+
+    server.stop().await;
+    for dir in [dir, state] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 /// One agent turn, driven by hook events against a real jj repo: a prompt
 /// entering `Working` checkpoints where the agent started, leaving it
 /// checkpoints the turn with its stat and that prompt; the turn's diff is
