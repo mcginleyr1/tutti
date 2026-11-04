@@ -1105,11 +1105,12 @@ sidebar and carries the project's own branch/changes/stale line.
 **From the CLI.** `tutti workspace add <project> --name <name>` runs `jj
 workspace add` and places the checkout beside the project's repo
 (`<repo>-<name>`); `--dest <path>` chooses the directory instead (the TUI's
-`where:` step), and `-r <rev>` the revision it starts from. The name must be
-`[A-Za-z0-9_-]+`, since it becomes both a path component and a jj workspace
-name; the project must live under a `.jj` repo, and the destination must not
-already exist. `tutti workspace list` shows every entry with the PARENT it is
-nested under, `tutti project list` just the projects. Merge is scriptable too
+`where:` step), and `-r <rev>` the revision it starts from (one that names no
+commit is refused before anything is made). The name must be `[A-Za-z0-9_-]+`,
+since it becomes both a path component and a jj workspace name; the project
+must live under a `.jj` repo, and the destination must not already exist.
+`tutti workspace list` shows every entry with the PARENT it is nested under,
+`tutti project list` just the projects. Merge is scriptable too
 (`tutti workspace merge <id> [--push]`), keeping the "every TUI action is a CLI
 verb" invariant.
 

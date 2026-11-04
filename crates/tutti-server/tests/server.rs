@@ -4964,6 +4964,46 @@ async fn fork_name_collision_errors() {
     server.stop().await;
 }
 
+/// A `workspace add` whose `-r` names no commit — a missing revision, or a
+/// revset resolving to none — is refused before jj makes anything: no
+/// checkout on disk and no jj workspace, so the same name then works. Skips
+/// without `jj`.
+#[tokio::test]
+async fn fork_at_a_revision_naming_no_commit_leaves_nothing() {
+    let Some(origin) = init_jj_repo() else {
+        return;
+    };
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let ws = workspace_id(
+        conn.request(Request::WorkspaceNew {
+            dir: origin.clone(),
+        })
+        .await,
+    );
+    let fork = |revision: &str| Request::WorkspaceFork {
+        id: ws,
+        name: "feature".into(),
+        revision: Some(revision.into()),
+        dest: None,
+    };
+    let missing = error_message(conn.request(fork("no-such-rev")).await);
+    assert!(missing.contains("doesn't exist"), "{missing}");
+    let none = error_message(conn.request(fork("none()")).await);
+    assert!(none.contains("names no commit"), "{none}");
+    let dest = fork_sibling(&origin, "feature");
+    assert!(!dest.exists(), "a checkout was left at {}", dest.display());
+    let listed = jj_out(&origin, &["workspace", "list"]);
+    assert!(!listed.contains("feature:"), "{listed}");
+
+    workspace_id(conn.request(fork("root()")).await);
+    assert!(dest.join(".jj").exists());
+
+    let _ = std::fs::remove_dir_all(&origin);
+    let _ = std::fs::remove_dir_all(&dest);
+    server.stop().await;
+}
+
 /// An invalid fork name is rejected fail-fast, before any jj call (so this runs
 /// even without `jj` installed).
 #[tokio::test]

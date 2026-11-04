@@ -302,13 +302,20 @@ pub async fn restore(dir: &Path, commit: &str) -> Result<String, String> {
 /// Fork the jj repo rooted at `repo_root` into a new workspace at `dest`, named
 /// `name` (optionally checked out at `revision`). Runs `jj workspace add` from
 /// the repo root. `Ok(())` on success; the jj stderr (or a spawn/timeout error)
-/// otherwise. The caller has already verified `dest` does not exist.
+/// otherwise. The caller has already verified `dest` does not exist. A
+/// `revision` naming no commit is refused first: jj registers the workspace
+/// and makes its checkout before it resolves one, and would leave both behind.
 pub async fn fork(
     repo_root: &Path,
     dest: &Path,
     name: &str,
     revision: Option<&str>,
 ) -> Result<(), String> {
+    if let Some(rev) = revision
+        && log_template(repo_root, rev, "commit_id").await?.is_empty()
+    {
+        return Err(format!("revision {rev:?} names no commit"));
+    }
     let mut cmd = Command::new("jj");
     cmd.arg("--no-pager")
         .arg("workspace")
