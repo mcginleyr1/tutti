@@ -2366,7 +2366,8 @@ async fn an_accept_error_is_logged_and_retried() {
 
 /// Started detached, the daemon appends its stderr to `<session>.log` beside
 /// its socket, so crash notes outlive it — trimming a log grown past 4 MiB to
-/// its newest MiB, from a line start, as it starts.
+/// its newest MiB, from a line start, as it starts and again while it runs,
+/// its own lines landing after what it kept.
 #[tokio::test]
 async fn a_detached_daemon_logs_beside_its_socket() {
     let base = runtime_dir("log");
@@ -2398,6 +2399,35 @@ async fn a_detached_daemon_logs_beside_its_socket() {
         text.len()
     );
     assert!(text.starts_with("an old line\n") && text.contains("the newest old line\n"));
+
+    let mut grown = "a later line\n".repeat(400_000);
+    grown.push_str("the newest later line\n");
+    let mut appending = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+    std::io::Write::write_all(&mut appending, grown.as_bytes()).unwrap();
+    let trimmed = timeout(DEADLINE, async {
+        while std::fs::metadata(&log).unwrap().len() > 1 << 20 {
+            sleep(Duration::from_millis(50)).await;
+        }
+    });
+    assert!(
+        trimmed.await.is_ok(),
+        "the running daemon never trimmed its log"
+    );
+    let mut conn = connect_when_up(&stop.0).await;
+    conn.stream.write_all(&[1, 0, 0, 0, 0xff]).await.unwrap();
+    assert!(log_says(&log, "connection error").await);
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        text.len() < (1 << 20) + 4096,
+        "trimmed: {} bytes",
+        text.len()
+    );
+    let kept = text.split_once("the newest later line\n");
+    assert!(
+        text.starts_with("a later line\n")
+            && kept.is_some_and(|(_, after)| after.contains("connection error")),
+        "the daemon's line follows what was kept"
+    );
 
     drop(stop);
     let _ = std::fs::remove_dir_all(&base);

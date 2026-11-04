@@ -9,15 +9,18 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tutti_core::{log_path, socket_path, state_dir};
 use tutti_server::PaneSize;
 
-/// Once the log has grown past this, it is trimmed as the daemon starts...
+/// Once the log has grown past this, it is trimmed — as a daemon starts, and
+/// every `LOG_CHECK` while it runs...
 const LOG_CAP: u64 = 4 << 20;
 /// ...to its newest this many bytes.
 const LOG_KEEP: usize = 1 << 20;
+const LOG_CHECK: Duration = Duration::from_secs(1);
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -40,6 +43,22 @@ fn main() -> Result<()> {
         return daemonize(&session);
     }
 
+    let log = log_path(&session);
+    std::thread::Builder::new()
+        .name("tutti-log-trim".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(LOG_CHECK);
+                // Held so none of our own lines lands between the read and the
+                // rewrite, and is lost.
+                let _quiet = std::io::stderr().lock();
+                if let Err(err) = trim_log(&log) {
+                    eprintln!("tutti: no longer trimming the log: {err:#}");
+                    return;
+                }
+            }
+        })
+        .context("spawn the log trimmer")?;
     let path = socket_path(&session);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -65,8 +84,7 @@ fn daemonize(session: &str) -> Result<()> {
 }
 
 /// Open the session's log for the detached daemon's stderr — appended, so the
-/// panics and crash notes of earlier runs survive — first trimming it to its
-/// newest `LOG_KEEP` bytes, from a line start, once it outgrows `LOG_CAP`.
+/// panics and crash notes of earlier runs survive — trimmed first.
 fn open_log(path: &Path) -> Result<File> {
     let dir = path.parent().context("log path has no parent directory")?;
     std::fs::DirBuilder::new()
@@ -74,18 +92,26 @@ fn open_log(path: &Path) -> Result<File> {
         .mode(0o700)
         .create(dir)
         .with_context(|| format!("create {}", dir.display()))?;
+    trim_log(path)?;
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open log {}", path.display()))
+}
+
+/// Trim the session's log to its newest `LOG_KEEP` bytes, from a line start,
+/// once it outgrows `LOG_CAP`. The daemon appends to it, so its next line
+/// lands after what is kept.
+fn trim_log(path: &Path) -> Result<()> {
     if std::fs::metadata(path).is_ok_and(|meta| meta.len() > LOG_CAP) {
         let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-        let tail = &bytes[bytes.len() - LOG_KEEP..];
+        let tail = &bytes[bytes.len().saturating_sub(LOG_KEEP)..];
         let tail = tail
             .iter()
             .position(|&b| b == b'\n')
             .map_or(tail, |at| &tail[at + 1..]);
         std::fs::write(path, tail).with_context(|| format!("trim {}", path.display()))?;
     }
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("open log {}", path.display()))
+    Ok(())
 }

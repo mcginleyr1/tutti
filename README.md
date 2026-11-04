@@ -293,7 +293,8 @@ panic restores your terminal on its way out.
 The detached daemon appends its stderr — panics, crash notes — to
 `<session>.log` beside its socket (`$XDG_RUNTIME_DIR/tutti/`, else
 `/tmp/tutti-<uid>/`); `tutti server start` prints the path. A log past 4 MiB is
-trimmed to its newest MiB when the daemon starts.
+trimmed to its newest MiB when the daemon starts, and within a second of
+passing it while the daemon runs.
 
 ## TUI keys
 
