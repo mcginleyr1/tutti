@@ -1287,7 +1287,7 @@ fn focus_pane(hub: &Arc<Hub>, cid: u64, pane: PaneId) -> Response {
     if let Some(view) = view {
         broadcast_event(hub, Event::LayoutChanged { workspaces: view });
     }
-    publish_transition(hub, pane, from, to);
+    publish_transition(hub, pane, from, to, None);
     mark_read(hub, |n| n.pane == pane);
     let attached = match hub.clients().get_mut(&cid) {
         Some(client) => {
@@ -1383,13 +1383,21 @@ fn source_pane(hub: &Hub, from: Option<PaneId>) -> Result<PaneId> {
 /// notification history for free: broadcast `StateChanged`, signal the `pane
 /// wait`s, note the turn edge on the pane (leaving `Working` ends a turn;
 /// entering it with nothing recorded takes the baseline), and note one that
-/// wants attention — into `Blocked`, or `Working` → `Done` — in the history.
-/// The caller then refreshes the pane's workspace (batched per pass where it
-/// can): that probe's snapshot of `@` is what gets recorded. A no-op when
-/// `from == to`.
-fn publish_transition(hub: &Hub, pane: PaneId, from: AgentState, to: AgentState) {
+/// wants attention — into `Blocked`, or `Working` → `Done` — in the history,
+/// carrying what the move `said` (`(title, body)`: a hook's blocked message,
+/// a report's `msg`), so the two make one note. Returns whether it noted the
+/// move. The caller then refreshes the pane's workspace (batched per pass
+/// where it can): that probe's snapshot of `@` is what gets recorded. A no-op
+/// when `from == to`.
+fn publish_transition(
+    hub: &Hub,
+    pane: PaneId,
+    from: AgentState,
+    to: AgentState,
+    said: Option<(Option<String>, String)>,
+) -> bool {
     if from == to {
-        return;
+        return false;
     }
     hub.session().note_transition(pane, from, to);
     broadcast_event(hub, Event::StateChanged { pane, from, to });
@@ -1397,9 +1405,11 @@ fn publish_transition(hub: &Hub, pane: PaneId, from: AgentState, to: AgentState)
     let kind = match (from, to) {
         (_, AgentState::Blocked) => NoteKind::Blocked,
         (AgentState::Working, AgentState::Done) => NoteKind::Done,
-        _ => return,
+        _ => return false,
     };
-    add_note(hub, pane, kind, None, None);
+    let (title, body) = said.map_or((None, None), |(title, body)| (title, Some(body)));
+    add_note(hub, pane, kind, title, body);
+    true
 }
 
 /// Send `news` of `pane` to every `pane wait` on it, in order, dropping the
@@ -1527,12 +1537,13 @@ fn herdr_request(hub: &Arc<Hub>, request: herdr::Request) -> bool {
 
 /// Broadcast what a status report moved: the view first when the pane's
 /// agent-surface listing changed (so the client has the row before its
-/// state), the transition, and the report's `msg` as a notification. The
-/// session guard is dropped before any broadcast. A state move refreshes the
-/// workspace, as a hook's does: that probe records the turn's checkpoint, and
-/// entering `Working` must probe too, or a first turn's baseline would only be
-/// snapshotted at its end. Progress ticks within one state move nothing, so a
-/// progress bar never runs jj.
+/// state), the transition, and the report's `msg` as a notification — noted
+/// on the transition's own note when the move made one, so the two are one
+/// note. The session guard is dropped before any broadcast. A state move
+/// refreshes the workspace, as a hook's does: that probe records the turn's
+/// checkpoint, and entering `Working` must probe too, or a first turn's
+/// baseline would only be snapshotted at its end. Progress ticks within one
+/// state move nothing, so a progress bar never runs jj.
 fn publish_report(hub: &Arc<Hub>, pane: PaneId, outcome: ReportOutcome) {
     let view = {
         let mut session = hub.session();
@@ -1541,12 +1552,19 @@ fn publish_report(hub: &Arc<Hub>, pane: PaneId, outcome: ReportOutcome) {
     if let Some(view) = view {
         broadcast_event(hub, Event::LayoutChanged { workspaces: view });
     }
-    if let Some((from, to)) = outcome.transition {
-        publish_transition(hub, pane, from, to);
+    let noted = outcome
+        .transition
+        .is_some_and(|(from, to)| publish_transition(hub, pane, from, to, outcome.notify.clone()));
+    if outcome.transition.is_some() {
         refresh_pane_workspace(hub, pane);
     }
-    if let Some((title, body)) = outcome.notify {
-        pane_notification(hub, pane, title, Some(body));
+    match outcome.notify {
+        Some((title, body)) if noted => {
+            let body = Some(body);
+            broadcast_event(hub, Event::PaneNotification { pane, title, body });
+        }
+        Some((title, body)) => pane_notification(hub, pane, title, Some(body)),
+        None => {}
     }
 }
 
@@ -1554,16 +1572,21 @@ fn publish_report(hub: &Arc<Hub>, pane: PaneId, outcome: ReportOutcome) {
 /// subagent list and conversation, then broadcast what moved. A subagent-list
 /// or conversation change broadcasts the fresh view (`LayoutChanged`); a state
 /// move broadcasts `StateChanged` so a Blocked/Done still rings the client
-/// bell. Both can fire. A state move also refreshes the workspace's changes,
-/// which records the turn's checkpoint. An unknown pane is a silent `Ok` — the
-/// hook must never fail on tutti's side. The session guard is dropped before
-/// any broadcast (which re-locks `clients`).
+/// bell, and a blocked event's message rides on the move's note. Both can
+/// fire. A state move also refreshes the workspace's changes, which records
+/// the turn's checkpoint. An unknown pane is a silent `Ok` — the hook must
+/// never fail on tutti's side. The session guard is dropped before any
+/// broadcast (which re-locks `clients`).
 fn agent_event(
     hub: &Arc<Hub>,
     pane: PaneId,
     event: AgentHookEvent,
     conversation: Option<String>,
 ) -> Response {
+    let said = match &event {
+        AgentHookEvent::Blocked { message } => message.clone().map(|m| (None, m)),
+        _ => None,
+    };
     let mut session = hub.session();
     let Some(outcome) = session.apply_agent_event(pane, event, conversation) else {
         return Response::Ok;
@@ -1574,7 +1597,7 @@ fn agent_event(
         broadcast_event(hub, Event::LayoutChanged { workspaces: view });
     }
     if let Some((from, to)) = outcome.transition {
-        publish_transition(hub, pane, from, to);
+        publish_transition(hub, pane, from, to, said);
         refresh_pane_workspace(hub, pane);
     }
     Response::Ok
@@ -2492,7 +2515,7 @@ fn spawn_reaper(hub: &Arc<Hub>, pane: PaneId, pty: Arc<PtyPane>) {
         }
         let transition = hub.session().mark_exited(pane, code);
         if let Some((from, to)) = transition {
-            publish_transition(&hub, pane, from, to);
+            publish_transition(&hub, pane, from, to, None);
             broadcast_event(&hub, Event::PaneExited { pane, code });
             // Even when the state did not move (a Done pane exiting): a
             // waiter must learn the pane can move no more.
@@ -2918,7 +2941,7 @@ fn classify_pass(hub: &Arc<Hub>, last_gen: &mut HashMap<PaneId, u64>) {
     // one workspace triggers a single jj refresh, not one per pane.
     let mut workspaces: HashSet<WorkspaceId> = HashSet::new();
     for (pane, from, to) in changes {
-        publish_transition(hub, pane, from, to);
+        publish_transition(hub, pane, from, to, None);
         let workspace = hub.session().workspace_of_pane(pane);
         if let Some(workspace) = workspace {
             workspaces.insert(workspace);
@@ -3370,11 +3393,11 @@ mod tests {
             let reply = Reply { tx, req: None };
             assert!(pane_wait(&hub, &reply, pane, until, true, None).is_continue());
             // One thread: the waiter's task runs only once this test awaits.
-            publish_transition(&hub, pane, AgentState::Working, AgentState::Done);
+            publish_transition(&hub, pane, AgentState::Working, AgentState::Done, None);
             for i in 0..behind {
                 let (from, to) = (AgentState::Working, AgentState::Blocked);
                 let (from, to) = if i % 2 == 0 { (from, to) } else { (to, from) };
-                publish_transition(&hub, pane, from, to);
+                publish_transition(&hub, pane, from, to, None);
             }
             let bytes = tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await

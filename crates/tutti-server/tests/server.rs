@@ -3092,9 +3092,10 @@ async fn run_shell(conn: &mut Conn) -> PaneId {
 }
 
 /// A pane's desktop notification and its agent's attention transitions — into
-/// blocked, working to done — land in the history as they happen, each
-/// broadcast as `Noted` and keeping the pane's title and workspace name; a
-/// turn starting wants no attention. A later attach is handed the history.
+/// blocked, carrying the hook's message, and working to done — land in the
+/// history as they happen, each broadcast as `Noted` and keeping the pane's
+/// title and workspace name; a turn starting wants no attention. A later
+/// attach is handed the history.
 #[tokio::test]
 async fn notifications_and_attention_transitions_land_in_the_history() {
     let server = TestServer::start();
@@ -3124,13 +3125,20 @@ async fn notifications_and_attention_transitions_land_in_the_history() {
 
     for event in [
         AgentHookEvent::Activity { detail: None },
-        AgentHookEvent::Blocked { message: None },
+        AgentHookEvent::Blocked {
+            message: Some("Bash · rm -rf build".into()),
+        },
         AgentHookEvent::Activity { detail: None },
         AgentHookEvent::Done,
     ] {
         hook(&mut control, pane, event).await;
     }
-    assert_eq!(noted(&mut viewer).await.kind, NoteKind::Blocked);
+    let blocked = noted(&mut viewer).await;
+    assert_eq!(
+        (blocked.kind, blocked.title, blocked.body.as_deref()),
+        (NoteKind::Blocked, None, Some("Bash · rm -rf build")),
+        "the hook's message rides on its note"
+    );
     assert_eq!(noted(&mut viewer).await.kind, NoteKind::Done);
 
     let history = list_notes(&mut control, false).await;
@@ -3564,6 +3572,16 @@ async fn a_shell_panes_own_status_reports_drive_its_state() {
         notes,
         vec![(Some("build".to_string()), Some("Built".to_string()))],
         "only the 7501 msg notifies — no 9;4 report became a notification"
+    );
+    let history = list_notes(&mut control, false).await;
+    let history: Vec<_> = history
+        .iter()
+        .map(|n| (n.kind, n.title.as_deref(), n.body.as_deref()))
+        .collect();
+    assert_eq!(
+        history,
+        [(NoteKind::Done, Some("build"), Some("Built"))],
+        "the msg rides on the finish's own note: one note, not two"
     );
 
     // Typing past the finished report ends its claim, so the next one lands:

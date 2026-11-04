@@ -1081,7 +1081,10 @@ blocked message when it blocks it — at most once per 30 s per pane.
 **History.** The daemon keeps the newest 200 notes: every bell and desktop
 notification a pane raises (a herdr `notification.show` included), and every
 attention transition — an agent blocking, or finishing a turn (working →
-done). Each keeps the pane's title and workspace as they were, so it outlives
+done). A transition's note carries what came with it — a hook's blocked
+message (`Bash · rm -rf build`), or an OSC 7501 or herdr report's `msg` under
+its app — so a report that finishes a pane with a message makes one note, not
+two. Each keeps the pane's title and workspace as they were, so it outlives
 the pane. `Ctrl+B N` opens the **notifications panel**, newest first: an
 unread dot, the age, the pane, a dim `workspace · kind`, and the text. `j`/`k`
 move, `enter` jumps to the note's pane and marks its notes read, `r` marks

@@ -920,7 +920,10 @@ pub struct Note {
     pub workspace: String,
     pub kind: NoteKind,
     /// A notification's own title and body, as `Event::PaneNotification`
-    /// carries them; both `None` for a bell and a transition.
+    /// carries them. A transition carries what came with it: a hook's blocked
+    /// message as the body, an OSC 7501 or herdr report's `app` (or agent)
+    /// and `msg` as title and body. Both `None` for a bell and a bare
+    /// transition.
     pub title: Option<String>,
     pub body: Option<String>,
     pub read: bool,
@@ -944,11 +947,13 @@ impl Note {
 #[serde(rename_all = "snake_case")]
 pub enum NoteKind {
     Bell,
-    /// OSC 9 / 777, or an OSC 7501 report's `msg`.
+    /// OSC 9 / 777 / 99, a herdr `notification.show`, or a report's `msg`
+    /// that came with no move worth a note of its own.
     Notify,
-    /// The pane moved into `Blocked`.
+    /// The pane moved into `Blocked`, with the message that came with it.
     Blocked,
-    /// The pane moved from `Working` to `Done`.
+    /// The pane moved from `Working` to `Done`, with the `msg` that came
+    /// with it.
     Done,
 }
 
