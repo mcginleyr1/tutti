@@ -32,7 +32,8 @@ You need:
   [OpenCode](https://opencode.ai),
   [Crush](https://github.com/charmbracelet/crush), [Aider](https://aider.chat),
   [Goose](https://github.com/block/goose),
-  [Pi](https://github.com/badlogic/pi-mono), [Qwen
+  [Pi](https://github.com/badlogic/pi-mono), [Prime
+  Agent](https://github.com/PrimeIntellect-ai/prime-agent), [Qwen
   Code](https://github.com/QwenLM/qwen-code), [Cursor
   CLI](https://cursor.com/cli), [Copilot
   CLI](https://github.com/github/copilot-cli), [Amp](https://ampcode.com),

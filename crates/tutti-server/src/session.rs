@@ -2400,6 +2400,33 @@ mod tests {
         );
     }
 
+    /// Prime Agent reports as source `herdr:pi`, agent `prime-agent`, from a
+    /// process the registry detects as that same kind — never as Pi.
+    #[test]
+    fn prime_agents_herdr_claim_survives_its_own_detection() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let t0 = Instant::now();
+        let working = |seq| herdr::Report {
+            source: Some("herdr:pi".into()),
+            agent: Some("prime-agent".into()),
+            seq: Some(seq),
+            session: None,
+            act: herdr::Act::State(Some(Working), None),
+        };
+        let registry = tutti_agents::Registry::default();
+        let detect = |process| registry.match_process(process).map(|s| s.kind.clone());
+        s.apply_herdr(pane, working(1), t0);
+        s.set_agent(pane, detect("prime-agent"));
+        assert_eq!(
+            state_of(&s, pane),
+            (Working, Some(Hook)),
+            "detection caught up"
+        );
+        s.apply_herdr(pane, working(2), t0);
+        s.set_agent(pane, detect("pi"));
+        assert_eq!(state_of(&s, pane), (Working, None), "Pi is another agent");
+    }
+
     fn sub(id: &str, running: bool) -> SubagentInfo {
         SubagentInfo {
             id: id.into(),

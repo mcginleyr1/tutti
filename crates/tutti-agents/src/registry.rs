@@ -292,6 +292,20 @@ impl Default for Registry {
                 // "Interactive mode with initial prompt". (An argument leading
                 // with `@` is a file to include, not a message.)
                 guess("pi", "Pi", "https://github.com/badlogic/pi-mono", &["pi"]).prompted(&[]),
+                // Prime Agent began as a fork of Pi but runs as its own
+                // binary — its installer's `prime-agent` launcher execs
+                // `share/prime-agent/prime-agent` — so it never reads as Pi.
+                // It reports to herdr as agent `prime-agent`, the kind named
+                // here, so detection catching up keeps that claim. Docs (its
+                // README): a bare `prime-agent` opens the TUI and `--resume`
+                // takes a session; no first-message argument is documented,
+                // so none. Not run here.
+                guess(
+                    "prime-agent",
+                    "Prime Agent",
+                    "https://github.com/PrimeIntellect-ai/prime-agent",
+                    &["prime-agent"],
+                ),
                 // Docs (Qwen Code's settings reference): `--prompt-interactive`
                 // "Starts an interactive session with the provided prompt as the
                 // initial input". Not run here.
@@ -687,7 +701,7 @@ mod tests {
         ] {
             assert_eq!(argv(kind).expect(kind), expected);
         }
-        for kind in ["crush", "aider", "amp"] {
+        for kind in ["crush", "aider", "amp", "prime-agent"] {
             assert_eq!(argv(kind), None, "{kind}");
         }
         assert_eq!(
@@ -723,6 +737,7 @@ mod tests {
             ("crush", "crush"),
             ("opencode", "opencode"),
             ("pi", "pi"),
+            ("prime-agent", "prime-agent"),
             ("gemini", "gemini"),
             ("aider", "aider"),
             ("goose", "goose"),
