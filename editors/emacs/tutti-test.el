@@ -241,9 +241,9 @@ ANSWERS gives the control files for a call by its number, as in
                            (call-interactively #'tutti-agents-allow)
                            (call-interactively #'tutti-agents-deny)
                            (call-interactively #'tutti-agents-deny))))))
-                   '("[pane][approve][3]"
-                     "[pane][approve][3][--deny][--message][not on main]"
-                     "[pane][approve][3][--deny]")))
+                   '("[pane][approve][3][--id][1]"
+                     "[pane][approve][3][--id][1][--deny][--message][not on main]"
+                     "[pane][approve][3][--id][1][--deny]")))
     (should (equal (reverse asked)
                    '("Allow Bash · rm -rf build? "
                      "Deny Bash · rm -rf build, reason: "

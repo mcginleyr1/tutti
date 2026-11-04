@@ -219,21 +219,23 @@ The answer is sent as typed; \\[quoted-insert] RET adds an Enter."
       (user-error "Pane %s holds no approval" id)))
 
 (defun tutti-agents-allow (id)
-  "Allow the tool call the held approval in pane ID asks for."
+  "Allow the tool call the held approval in pane ID asks for.
+The answer names the approval shown, so another one held meanwhile is
+never the one answered."
   (interactive (list (tutti--id)) tutti-agents-mode)
   (let-alist (tutti--approval id)
     (when (y-or-n-p (format "Allow %s · %s? " .tool .summary))
-      (tutti--run "pane" "approve" id)
+      (tutti--run "pane" "approve" id "--id" (number-to-string .id))
       (message "Allowed %s" .tool))))
 
-(defun tutti-agents-deny (id reason)
-  "Deny the tool call the held approval in pane ID asks for.
+(defun tutti-agents-deny (id approval reason)
+  "Deny the tool call that approval APPROVAL, held in pane ID, asks for.
 REASON is what the agent is told; empty, tutti's default."
   (interactive (let ((id (tutti--id)))
                  (let-alist (tutti--approval id)
-                   (list id (read-string (format "Deny %s · %s, reason: " .tool .summary)))))
+                   (list id .id (read-string (format "Deny %s · %s, reason: " .tool .summary)))))
                tutti-agents-mode)
-  (apply #'tutti--run "pane" "approve" id "--deny"
+  (apply #'tutti--run "pane" "approve" id "--id" (number-to-string approval) "--deny"
          (unless (string-empty-p reason) (list "--message" reason)))
   (message "Denied"))
 

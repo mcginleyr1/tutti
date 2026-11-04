@@ -189,7 +189,7 @@ prints replaces the table. Plain shells are left out.
 | --- | --- |
 | `RET` | `tutti pane focus <id>`: the attached TUI jumps to the agent |
 | `p` | answer a blocked agent with tutti's guarded send (below) |
-| `y` | allow the agent's held approval (`tutti pane approve <id>`), after showing the tool and its input |
+| `y` | allow the agent's held approval (`tutti pane approve <pane> --id <approval>`), after showing the tool and its input |
 | `n` | deny it (`--deny`), reading a reason for the agent; leave it empty for tutti's default |
 | `g` | restart the watch |
 | `q` | bury the list; killing the buffer stops the watch |
@@ -201,7 +201,8 @@ window and reads the answer. The answer goes out with `pane send --text
 If the prompt changed in between, tutti refuses the send, writes nothing, and
 the reason appears in the echo area. `y` and `n` read the held approval from
 the watch's latest snapshot, which carries it beside the rest of the row, and
-refuse when the pane holds none.
+refuse when the pane holds none. They answer that approval by its id, so one
+the pane took on meanwhile is never answered in its place.
 
 `tutti-program` (default `"tutti"`) names the executable.
 
