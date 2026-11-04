@@ -1449,9 +1449,10 @@ stdin, maps it, and forwards it to the pane's daemon:
   `claude --resume <id>` and revived by a
   [restore](#restoring-after-a-restart); it follows `/clear` and `--resume`,
   and is dropped when the agent leaves the pane;
-- a **Task** (subagent) spawn adds a dim indented sub-row under the agent in the
-  sidebar — a shared spinner while it runs, a `·` once it finishes — and
-  **SubagentStop** completes it; finished sub-rows clear when the turn ends.
+- a subagent spawn (the **Agent** tool, **Task** before Claude Code 2.1) adds a
+  dim indented sub-row under the agent in the sidebar — a shared spinner while
+  it runs, a `·` once it finishes — and **SubagentStop** completes it;
+  finished sub-rows clear when the turn ends.
 
 `agent-event` is deliberately fail-safe: outside a tutti pane (no `TUTTI_PANE`),
 on a malformed or irrelevant event, when it cannot reach the daemon, or when

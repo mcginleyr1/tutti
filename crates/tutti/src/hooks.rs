@@ -72,8 +72,9 @@ pub fn map_opencode_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)>
 /// conversation's `session_id`, or `None` when the event is irrelevant (nothing
 /// is sent). Verified against the hooks reference: every event carries
 /// `hook_event_name` and `session_id` (a subagent's events carry its parent
-/// session's); tool events carry `tool_name`/`tool_input` (the `Task` tool's
-/// input has `description`/`title`), `PermissionRequest` among them, fired
+/// session's); tool events carry `tool_name`/`tool_input` (the subagent
+/// tool's input has `description`/`title`; it is `Agent` since Claude Code
+/// 2.1, verified live, `Task` before), `PermissionRequest` among them, fired
 /// the moment Claude would show a permission dialog; `Notification` carries
 /// `message` and `notification_type`; `UserPromptSubmit` carries the
 /// `prompt` and (Claude Code 2.1, verified live) the `prompt_id` every event
@@ -88,7 +89,7 @@ pub fn map_claude_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
                 message: Some(format!("{tool} · {summary}")),
             })
         }
-        "PreToolUse" if tool_name(v) == Some("Task") => {
+        "PreToolUse" if matches!(tool_name(v), Some("Agent" | "Task")) => {
             let desc = subagent_desc(v);
             Some(AgentHookEvent::SubagentStarted {
                 id: desc.clone(),
@@ -545,6 +546,34 @@ mod tests {
             Some(AgentHookEvent::SubagentStarted {
                 id: "build the core".into(),
                 desc: "build the core".into(),
+            })
+        );
+    }
+
+    /// Claude Code 2.1 calls its subagent tool `Agent` (payload shaped as
+    /// 2.1.318 sent it live); its `PostToolUse` stays a heartbeat.
+    #[test]
+    fn pre_tool_use_agent_becomes_subagent_started() {
+        let agent = |event: &str| {
+            ev(&json!({
+                "session_id": "abc123",
+                "hook_event_name": event,
+                "tool_name": "Agent",
+                "tool_input": { "description": "Touch a.txt", "prompt": "Run touch a.txt" },
+            })
+            .to_string())
+        };
+        assert_eq!(
+            agent("PreToolUse"),
+            Some(AgentHookEvent::SubagentStarted {
+                id: "Touch a.txt".into(),
+                desc: "Touch a.txt".into(),
+            })
+        );
+        assert_eq!(
+            agent("PostToolUse"),
+            Some(AgentHookEvent::Activity {
+                detail: Some("Agent".into())
             })
         );
     }
