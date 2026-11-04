@@ -1,6 +1,6 @@
 ---
 name: tutti
-description: Coordinate sub-agents from inside tutti, the terminal multiplexer for coding agents - start Claude Code (or any agent CLI) in new panes or isolated jj workspaces, wait until they finish or need input, read their screens, answer their prompts safely, review their diffs and per-turn checkpoints, and merge their work. Use when the TUTTI_PANE environment variable is set and you want to spawn, parallelize, wait on, check on, answer, review, merge, or clean up other agents, or hand them issues from the user's trackers.
+description: Coordinate sub-agents from inside tutti, the terminal multiplexer for coding agents - start Claude Code (or any agent CLI) in new panes or isolated jj workspaces, wait until they finish or need input, ask them something and get their reply, read their screens, answer their prompts safely, review their diffs and per-turn checkpoints, and merge their work. Use when the TUTTI_PANE environment variable is set and you want to spawn, parallelize, wait on, talk to, check on, answer, review, merge, or clean up other agents, or hand them issues from the user's trackers.
 ---
 
 # Coordinating sub-agents with tutti
@@ -125,6 +125,42 @@ tutti notes --unread
 Leave `notes read` and `notes clear` to your user: the history is theirs, and
 a note marked read takes its pane's 🔔 out of their sidebar.
 
+## Talk to an agent
+
+To ask another agent something and get its answer back, use `ask`. It types
+your message, presses enter, waits for the turn that starts, and prints only
+the agent's final reply on stdout: no screen to scrape.
+
+```sh
+tutti ask 7 "which files did you change, and why? two sentences" --timeout 600
+tutti ask 8 "review the diff in crates/api and list any bugs you find" --timeout 900
+```
+
+Exit 0: the reply is on stdout. Exit 3: the agent blocked on a prompt instead
+of answering, and stderr names it. Answer it (below), then wait for the turn
+to end and read the reply:
+
+```sh
+tutti pane wait 7 --next --until done,blocked --timeout 600
+tutti pane read 7 --last-reply
+```
+
+Exit 124: the timeout hit while the agent works on; wait for it as above, then
+read the reply. Exit 1 is an error: the pane is working or blocked (wait for
+it, or answer it, first; an agent you just started can read as working for a
+moment), it is gone, or its turn ended without a reply (interrupted, or
+failed). `ask` and `--last-reply` work for Claude Code,
+Codex, Gemini CLI and opencode panes whose tutti hooks are installed; for any
+other agent, read its screen.
+
+`--last-reply` alone reads what an agent said at the end of its last finished
+turn, without sending anything: after `tutti run` and a wait, it is the
+agent's answer, clean.
+
+```sh
+tutti pane read 7 --last-reply
+```
+
 ## Read their screens
 
 ```sh
@@ -181,7 +217,8 @@ tutti pane approve 7 --deny --message "not on main"    # refuse it, telling the 
 
 The same rule applies: approve only what your user would.
 
-To give a waiting agent a follow-up instruction, type it, then press enter:
+To give a done agent a follow-up instruction and get its answer, `tutti ask`
+it. To type one without waiting, type it, then press enter:
 
 ```sh
 tutti pane send 7 --text "also update the changelog"
@@ -246,7 +283,10 @@ id when its hooks report one (`claude --resume <id>` picks it up again).
 
 ## Rules
 
-- Never send keys to your own pane (`$TUTTI_PANE`), and never wait on it.
+- Never send keys to your own pane (`$TUTTI_PANE`), never wait on it, and
+  never `ask` it.
+- Talk to another agent with `tutti ask`, and read its answers with
+  `--last-reply`, not by scraping its screen.
 - Only kill panes and workspaces you created; the rest belong to your user or
   to other agents.
 - Read the notification history; never mark it read or clear it.

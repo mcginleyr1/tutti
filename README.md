@@ -130,7 +130,8 @@ cd ~/code/myproject && tutti
    working spinner, done green), and the cross-project **waiting** queue of
    everything blocked on you. `Enter` jumps to what you highlight; `p` on a
    blocked agent **peeks** at its prompt and lets you answer it in place,
-   without leaving your pane; `n` starts another agent in the selected project
+   without leaving your pane, and on a done one shows its last reply; `n`
+   starts another agent in the selected project
    (in its own tab), `d` shows its jj diff, `w` creates a nested workspace, `m`
    merges one back. See [Sidebar](#sidebar) and [Workspaces](#workspaces).
 
@@ -142,7 +143,9 @@ cd ~/code/myproject && tutti
    agents) work the panes without a screen: `tutti run -- claude "fix the
    tests"` prints the new pane's id, `tutti pane wait 7 --until done,blocked`
    blocks until that agent finishes or needs you, `tutti pane read 7` shows its
-   screen, and `tutti pane send 7 --text y` types into it. See
+   screen, and `tutti pane send 7 --text y` types into it. `tutti ask 7 "…"`
+   does the round trip in one call: it types the message, waits for the turn,
+   and prints the agent's reply, so one agent can talk to another. See
    [Orchestrating agents](#orchestrating-agents) and [CLI surface](#cli-surface).
 
 ### Stopping
@@ -912,7 +915,8 @@ cursor lands on the active project's row. Its keys — like the changes panel's
 the help overlay (every key), so the three never disagree. While focused,
 `j`/`k` (or the arrows) move the highlight across both sections, `Enter`
 jumps and hands focus back to the pane, `p` peeks at a blocked agent to answer
-it in place, and `esc` unfocuses (esc is the back key
+it in place (on a done agent it shows its [last reply](#reading-a-done-agents-reply)),
+and `esc` unfocuses (esc is the back key
 throughout). `w` opens **guided [workspace](#workspaces) creation** on the
 selected project (below); `n` starts a **new agent** (or shell/command) in the
 selected project: it jumps to that workspace and opens the launcher over it, and
@@ -1002,6 +1006,18 @@ fp=$(tutti pane read 3 --fingerprint)   # take the fingerprint first…
 tutti pane read 3 --lines 12            # …then read what it covers and decide
 tutti pane send 3 --text 1 --expect "$fp"  # refused if the prompt moved on
 ```
+
+### Reading a done agent's reply
+
+`p` on a **done** (or idle) agent's row opens a floating ` reply <agent> ·
+<workspace> ` panel with the final message of its last finished turn, as its
+hooks reported it — the text alone, without the agent's input box, spinners or
+wrapping — so you can see what each finished agent said without visiting it.
+It reads only: `esc` closes it, back on the row, and a click outside does too.
+The footer shows a `REPLY` chip while it is up. A pane with no reply to show
+(no hooks, no finished turn yet, or a turn that ended without one) flashes
+why instead. Scripts read the same with `tutti pane read <pane> --last-reply`
+(see [Talking to an agent](#talking-to-an-agent)).
 
 Taking the fingerprint *before* reading keeps it safe: if the screen changes in
 between, the fingerprint is the older one and the send is refused.
@@ -1483,7 +1499,9 @@ stdin, maps it, and forwards it to the pane's daemon:
   checkpoint in the [turns](#turns-review-and-undo-one-agent-turn) list —
   unless it carries the running turn's `prompt_id` (you typed more into that
   turn), and a prompt arriving while a turn is still open closes that one as
-  `interrupted` (Esc sends no Stop); **Stop** marks it **done**;
+  `interrupted` (Esc sends no Stop); **Stop** marks it **done**, handing tutti
+  the turn's final message (`last_assistant_message`), which `tutti pane read
+  --last-reply` and `tutti ask` print;
 - a **PermissionRequest** marks it **blocked** the moment Claude is about to
   ask, naming the tool and its input (`Bash · rm -rf build`); with `approvals =
   "hold"` the request waits for an answer from tutti instead of Claude's dialog
@@ -1547,7 +1565,9 @@ codex-cli 0.166.0):
 
 - a tool use keeps the agent **working**; a submitted prompt
   (**UserPromptSubmit**) starts a turn and labels its checkpoint; **Stop** —
-  or **Interrupt**, as an interrupted turn sends no Stop — marks it **done**;
+  or **Interrupt**, as an interrupted turn sends no Stop — marks it **done**,
+  Stop with the turn's final message (`last_assistant_message`) for `pane read
+  --last-reply` and `tutti ask`, Interrupt with none;
 - a **PermissionRequest** marks it **blocked**, naming the command (`Bash ·
   touch hello.txt`); with `approvals = "hold"` it is held as Claude's is, the
   answer going back as the decision object Codex's hooks reference documents
@@ -1591,7 +1611,10 @@ agent-event gemini`:
 
 - **BeforeAgent** (a submitted prompt) starts a turn and labels its
   checkpoint; **BeforeTool**/**AfterTool** keep it **working**; **AfterAgent**
-  marks it **done**;
+  marks it **done**, its `prompt_response` the turn's reply for `pane read
+  --last-reply` and `tutti ask` — every model response of the turn joined,
+  narration before a tool call included (per Gemini CLI 0.66.0's source; not
+  yet run live);
 - a **Notification** of type `ToolPermission` — a tool permission prompt —
   marks it **blocked** with its message, and the tool's run puts it back to
   working; any other type is a report and changes nothing;
@@ -1624,7 +1647,11 @@ Inside a tutti pane the plugin pipes each relevant opencode event to `tutti
 agent-event opencode` (outside one it does nothing):
 
 - `session.status` **busy**/**retry** keeps the agent **working**; **idle**
-  (and `session.idle`, `session.error`) marks it **done**;
+  (and `session.idle`, `session.error`) marks it **done**. On an idle the
+  plugin also reads the session's last message through opencode's own client
+  and, when it is the assistant's, sends its text as the turn's reply for
+  `pane read --last-reply` and `tutti ask` (a plugin installed before that
+  sends none: re-run `--install`);
 - `permission.asked` and `question.asked` mark it **blocked**; the matching
   `permission.replied` / `question.replied` / `question.rejected` puts it back
   to **working**. With `approvals = "hold"` a permission request also waits on
@@ -1725,7 +1752,8 @@ launcher on the same sandbox.
 ## Orchestrating agents
 
 Scripts and agents drive tutti through the same CLI, and two verbs make it an
-orchestrator.
+orchestrator; a third, `tutti ask`, lets one agent [talk to
+another](#talking-to-an-agent).
 
 `tutti run -- claude "fix the tests"` spawns the command in a fresh tab and
 prints only the new pane's id, so `p=$(tutti run -- claude "fix the tests")`
@@ -1757,6 +1785,38 @@ done
 tutti pane wait $panes --until done,blocked --timeout 3600   # one state per pane, in order
 ```
 
+### Talking to an agent
+
+`tutti pane read <pane> --last-reply` prints the final message of the agent's
+last finished turn as clean text: what its turn-end hook handed tutti
+(Claude Code's and Codex's `Stop`, Gemini CLI's `AfterAgent`, the opencode
+plugin's idle), never a scrape of its screen. The daemon keeps each pane's
+latest one (its first 64 KiB; a longer one notes the cut on stderr) until the
+next turn ends. With no hooks reporting the pane, no turn finished yet, or a
+last turn that ended without one (interrupted, or failed), it exits 1 saying
+which. `--json` gives `{"type":"last_reply","text":"…","truncated":false}`.
+
+`tutti ask <pane> <message>` is the whole round trip in one blocking call, so
+one agent can talk to another:
+
+```sh
+b=$(tutti run -- codex --no-daemon)
+tutti ask "$b" "review crates/api/src/auth.rs and list the bugs you find" --timeout 600
+```
+
+It refuses a pane that is working or blocked (keys typed there would join a
+running turn or answer a dialog; one just started can read as working for a
+moment while it draws), then types the message and
+presses enter (150 ms later: an agent can take text and an enter that land
+together as a paste), waits for that pane's next **done** or **blocked**, and
+prints the new reply as `--last-reply` would. It waits on the same connection
+it types on, the wait first, so even an instant turn cannot finish unseen. An
+agent that blocks instead exits 3, naming what it asks on stderr: answer it,
+then `tutti pane wait <pane> --next --until done,blocked` and `pane read
+--last-reply`. `--timeout <secs>` bounds the wait and exits 124. A human talks
+to an agent by typing into its pane; the sidebar's `p` on a done agent shows
+its [last reply](#reading-a-done-agents-reply).
+
 ### Tailing a pane
 
 `tutti pane read <pane> --since 0` prints everything the pane holds and, on
@@ -1780,8 +1840,9 @@ earlier daemon — is refused. `--json` gives
 tutti ships a Claude Code skill that teaches an agent running inside a tutti
 pane to herd its own sub-agents: start them (`tutti run`), give each an
 isolated jj workspace (`tutti workspace add`), wait on them (`tutti pane wait
---until done,blocked --timeout …`), read and tail their screens (`--since`),
-safely answer their prompts (`--fingerprint` / `--expect`) and held approvals
+--until done,blocked --timeout …`), talk to them and read their replies
+(`tutti ask`, `pane read --last-reply`), read and tail their screens
+(`--since`), safely answer their prompts (`--fingerprint` / `--expect`) and held approvals
 (`pane approve`), review their diffs and turns, and merge or clean up. It also
 hands tracker issues to agents (`tutti issue deploy`) and reads the
 notification history (`tutti notes --unread`). Its rules include never typing
@@ -1813,7 +1874,7 @@ workspace/tab/pane structure, or to the attached TUI's focus or terminal;
 bursts coalesce.
 
 ```json
-{"type":"snapshot","session":"tutti","wire_rev":12,"attached_terminal":"com.mitchellh.ghostty",
+{"type":"snapshot","session":"tutti","wire_rev":13,"attached_terminal":"com.mitchellh.ghostty",
  "panes":[{"id":3,"workspace":"smartnotch","dir":"/Users/me/develop/smartnotch","tab":"main",
            "title":"claude","agent":"claude","state":"blocked","source":"hook","exited":null,"focused":true,
            "user_vars":{},"cwd":"/Users/me/develop/smartnotch/src",
@@ -1873,6 +1934,7 @@ tutti workspace update <id>          # jj workspace update-stale (clears the sid
 tutti workspace diff <id> [--stat]   # the workspace's jj diff against trunk (jj is required; --json for raw lines)
 tutti tab new [--workspace <id>] | list [--workspace <id>] | select <id>
 tutti run [--workspace <id> | --dir <path>] [--title <t>] [--sandbox <profile>] -- <cmd...>  # a fresh tab; prints the bare pane id
+tutti ask <pane> <message> [--timeout <secs>]  # type the message + enter, wait for the turn, print the agent's reply; exit 3 if it blocks, 124 on timeout
 tutti pane run [--tab <id>] [--ephemeral] [--sandbox <profile>] -- <cmd...>
 tutti pane split <pane> right|down
 tutti pane list | kill <pane> | focus <pane>   # list: each pane with its workspace's id; focus: the attached TUI jumps to the pane
@@ -1881,10 +1943,11 @@ tutti pane resize --direction left|right|up|down [--amount <f>] [--from <pane>] 
 tutti pane attach <pane> [--inline]  # show one pane in this terminal, drawn by the terminal itself; prefix d detaches (never starts a daemon); --inline: on the primary screen, keeping its scrollback
 tutti pane rename <pane> <title>
 tutti pane send <pane> --text <s> | --keys <s> [--expect <fp>]   # --expect: answer a blocked agent, refused if its prompt moved on
-tutti pane read <pane> [--lines N] [--unwrapped] [--since <cursor> | --last-output] | --fingerprint
+tutti pane read <pane> [--lines N] [--unwrapped] [--since <cursor> | --last-output] | --fingerprint | --last-reply
                                      # --since: rows scrolled off since the cursor, then the screen; next cursor on stderr
                                      # --last-output: the last finished command's output; `exit: N` on stderr (needs shell-init)
                                      # --fingerprint: the prompt fingerprint --expect takes
+                                     # --last-reply: the agent's final message of its last finished turn, from its hooks
 tutti pane wait <pane>... [--until working|blocked|done|idle[,…]] [--next] [--timeout <secs>]  # block until each pane gets there; exit 124 on timeout
 tutti pane approve <pane> [--id <n>] [--deny] [--message <s>]  # answer the pane's oldest held approval, or the one --id names (approvals = "hold")
 tutti pane checkpoints <pane>        # the pane's per-turn checkpoints, newest first (n, age, stat, commit, label — the turn's prompt when known)
@@ -1911,8 +1974,8 @@ tutti [attach]                       # bare `tutti` attaches; a fresh session as
 A verb gives up on a daemon that has not answered within 10 s (exit 1, `did
 not answer within 10s`), or within 3 minutes for one the daemon runs jj for:
 `workspace add`, `merge`, `update`, `diff` and `kill --discard`, `sandbox
-pull`, `pane checkpoint-diff` and `restore`. `pane wait` waits as long as its
-`--timeout`, and `watch` and attach as long as the daemon lives.
+pull`, `pane checkpoint-diff` and `restore`. `pane wait` and `ask` wait as
+long as their `--timeout`, and `watch` and attach as long as the daemon lives.
 
 `--json` on any verb emits the raw protocol response for scripting. A
 project's id works anywhere a workspace id does (`run --workspace`, `tab new
@@ -1948,6 +2011,12 @@ tutti is alpha; PLAN.md tracks what is open.
   opencode report through their hooks, and agents that speak herdr's protocol
   (Crush) report on their own; the rest of the catalog is read from the
   screen, tuned live only for some.
+- **Replies come from the same four hooks.** `pane read --last-reply`, `tutti
+  ask` and the sidebar's reply panel have nothing to show for any other
+  agent. Gemini CLI's reply is wired from its docs and source and not yet run
+  live; it is the whole turn's text, not only the last message. A turn
+  interrupted with Esc in Claude Code leaves the previous turn's reply in
+  place (it sends no Stop), and a daemon restart forgets every reply.
 - **Held approvals are Claude Code's, Codex's and opencode's only.** Codex's
   PermissionRequest hold is wired but not yet exercised live, and opencode
   shows its own dialog beside a held request (whichever answers first wins).
