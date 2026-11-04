@@ -339,7 +339,15 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    scrollback offset). The reply is the rows since the cursor, then the screen,
    plus `truncated`; under the alternate screen, the committed rows then that
    screen. A resize reflows and may number kept rows afresh: a cursor sees
-   rows again, never skips one.
+   rows again, never skips one. ✅ `--last-reply` (wave 10, wire rev 13): the
+   final message of the pane's last finished turn, as its turn-end hook names
+   it — Claude's and Codex's `Stop` `last_assistant_message` (live on 2.1.318
+   and 0.166.0), Gemini's `AfterAgent` `prompt_response` (docs and 0.66.0
+   source; the whole turn's text), and opencode's last assistant message,
+   which tutti's plugin fetches with `client.session.messages` at idle (live
+   on 1.18.5) — carried on `AgentHookEvent::Done { reply }`, kept per pane
+   (64 KiB, never persisted). Never a scrape of the screen: no hooks, no
+   finished turn, or a turn that ended without one is an error saying which.
 3. **Composite verbs**: `tutti run --workspace <ws> -- claude "fix the tests"` =
    create pane, run agent, return pane id — one call for orchestrators. ✅
    `tutti run [--workspace <ws> | --dir <path>] [--sandbox <p>] [--title <t>] --
@@ -351,7 +359,20 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    The session's current tab stays put, so an attached TUI is not yanked and
    its prefix-`r` launches still land in the user's tab. A failed spawn rolls
    back its tab or mount. The human surface for the same thing is the sidebar's
-   `n` (an agent in a fresh tab).
+   `n` (an agent in a fresh tab). ✅ `tutti ask <pane> <message> [--timeout]`
+   (wave 10), for one agent to talk to another: the daemon types the message
+   only into a pane whose agent has reported through tutti's hooks since it
+   started, and only between turns — not working, blocked or exited —
+   checked under the same session guard as the write (`PaneSend {
+   between_turns }`, answered `Sent` with the pane's count of hook-reported
+   turn ends). `ask` presses enter 150 ms later (Codex 0.166.0 takes text and
+   an enter that land together as a paste) and waits for a block or for that
+   count to pass (`PaneWait { reply_after }`), so a turn end before the wait
+   still counts and no exit, screen state or Idle → Done edge passes for one.
+   It prints the reply; exit 3 when the agent blocks, 124 on timeout, 1 when
+   the agent exits or the turn ended without a reply. Claude asking Codex ran
+   live, and a Codex killed mid-ask reported its exit. The human surface is
+   the sidebar's `p` on a done agent: a read-only reply overlay.
 4. **Agent skill**: ship a `skills/tutti/SKILL.md` (Claude Code skill) documenting the
    CLI so any Claude instance inside a tutti pane can herd its own sub-agents.
    ✅ `skills/tutti/SKILL.md` ships the agent-facing CLI as a Claude Code skill:
@@ -807,7 +828,10 @@ In order; each lands its TUI path in the same wave as its verbs.
    - attach: `pane attach --inline`, `escape_time_ms`, and full kitty key
      reports, a held key's release staying with the pane it was pressed
      into (items 9 and 10 above).
-12. **Wave 10** — approved by the user, queued:
+12. **Wave 10** — approved by the user:
+   - ✅ agent-to-agent talk, wire rev 13: `pane read --last-reply`, `tutti
+     ask`, the sidebar's reply overlay, and the skill teaching `ask` (Phase 4
+     items 2 and 3);
    - a `pane attach` stream that falls behind is resynced with a fresh
      snapshot instead of closed;
    - `tutti attach --view`: no input, no size vote;
@@ -826,7 +850,18 @@ In order; each lands its TUI path in the same wave as its verbs.
   shows a number no key selects;
 - under a terminal without kitty's keyboard protocol, a pane that asked for
   releases, repeats or text gets presses only (its text derived from the
-  key).
+  key);
+- `pane_input` holds the session lock across `pty.write_input`, which blocks
+  until the pane's writer has written: a pane program that stops reading its
+  input stalls the whole daemon (predates wave 10);
+- `tutti ask` needs a pane its agent's hooks have reported through: Codex
+  sends SessionStart only with its first prompt and opencode's plugin nothing
+  before a turn, so a fresh Codex or opencode is refused until its first turn
+  (start them with a first message). A turn Claude's Esc interrupts sends no
+  Stop, so an `ask` on it runs to its timeout; a fresh pane can read as
+  working while it draws (refused until it settles) or `unknown` behind a
+  startup dialog (`ask` types into the dialog); replies are not kept across a
+  daemon restart.
 
 **Deliberately not done:** packaging and distribution (Phase 5) — the project
 is private, so install stays `cargo install --path` from a checkout.
@@ -855,9 +890,12 @@ is private, so install stays `cargo install --path` from a checkout.
   by fixtures, the writes only by stubs);
 - Codex: a held approval answered from tutti; SubagentStart/Stop rows; the
   ancestry guard dropping a shared-daemon hook (unit-tested only);
-- Gemini CLI's tool and permission events and `--resume`: they need the
-  user's Gemini login (SessionStart and a prompt's BeforeAgent → AfterAgent
-  ran live);
+- Gemini CLI's tool and permission events, `--resume`, and its `AfterAgent`
+  reply for `--last-reply`: they need the user's Gemini login (SessionStart
+  and a prompt's BeforeAgent → AfterAgent ran live);
+- `tutti ask` against a real blocked or slow agent (exit 3, exit 124), and an
+  opencode `session.error` or Codex `Interrupt` turn read with
+  `--last-reply`;
 - the first-message data for Goose, Qwen Code, Cursor, Copilot, Factory
   Droid, Augment and Amazon Q, from their docs only and unrun (Amazon Q's
   from a search excerpt of its reference page);
