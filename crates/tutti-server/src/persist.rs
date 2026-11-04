@@ -1,10 +1,12 @@
 //! Layout persistence: the session saved as it changes, so the next daemon can
 //! offer it back. The live save `<session>.json` is rewritten whenever the
-//! layout moves (and once more at a graceful shutdown); a starting daemon
-//! turns it into the pending offer `<session>.restore.json`, which an attach
-//! advertises and `SessionRestore` consumes or discards. A daemon never
-//! restores on its own, and never dies over a bad file: one that does not parse
-//! is logged and set aside as `<session>.restore.json.bad`.
+//! layout or the notification history moves (and once more at a graceful
+//! shutdown); a starting daemon turns it into the pending offer
+//! `<session>.restore.json`, takes its notification history back at once,
+//! and advertises the layout on attach for `SessionRestore` to consume or
+//! discard. A daemon never restores a layout on its own, and never dies over a
+//! bad file: one that does not parse is logged and set aside as
+//! `<session>.restore.json.bad`.
 
 use std::io::Write;
 use std::os::unix::fs::DirBuilderExt;
@@ -12,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
-use tutti_core::{AgentKind, IssueRef, Layout, PaneId, RestoreSummary, TabId};
+use tutti_core::{AgentKind, IssueRef, Layout, Note, PaneId, RestoreSummary, TabId};
 
 use crate::checkpoints::Turns;
 use crate::session::ForkMeta;
@@ -30,6 +32,22 @@ pub struct Saved {
     pub workspaces: Vec<SavedWorkspace>,
     /// The tab that was current.
     pub current_tab: Option<TabId>,
+    /// The notification history, oldest first, its notes naming panes by the
+    /// ids they had when saved. Absent from files saved before it was kept.
+    #[serde(default)]
+    pub notes: Vec<Note>,
+}
+
+impl Saved {
+    /// The highest pane id the save names, in its layout or its notes: a
+    /// daemon taking the save's notes hands out ids past it, so no new pane
+    /// is taken for one a note names.
+    pub fn last_pane(&self) -> PaneId {
+        let panes = self.workspaces.iter().flat_map(|w| &w.tabs);
+        let panes = panes.flat_map(|t| &t.panes).map(|p| p.id);
+        let noted = self.notes.iter().map(|n| n.pane);
+        panes.chain(noted).max().unwrap_or(PaneId(0))
+    }
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -213,7 +231,7 @@ fn write(path: &Path, bytes: Option<&[u8]>) -> bool {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use tutti_core::Direction;
+    use tutti_core::{Direction, NoteKind};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -261,7 +279,37 @@ mod tests {
                 }],
             }],
             current_tab: Some(TabId(4)),
+            notes: vec![Note {
+                id: 3,
+                time: 1,
+                pane: PaneId(12),
+                pane_title: "build".into(),
+                workspace: "api".into(),
+                kind: NoteKind::Done,
+                title: None,
+                body: None,
+                read: false,
+            }],
         }
+    }
+
+    #[test]
+    fn the_last_pane_counts_the_layout_and_the_notes() {
+        let mut saved = saved();
+        assert_eq!(saved.last_pane(), PaneId(12), "a gone pane's note");
+        saved.notes.clear();
+        assert_eq!(saved.last_pane(), PaneId(9));
+        saved.workspaces.clear();
+        assert_eq!(saved.last_pane(), PaneId(0));
+    }
+
+    #[test]
+    fn a_save_from_before_the_notes_reads_with_none() {
+        let mut older = serde_json::to_value(saved()).unwrap();
+        older.as_object_mut().unwrap().remove("notes");
+        let read: Saved = serde_json::from_value(older).unwrap();
+        assert_eq!(read.notes, []);
+        assert_eq!(read.workspaces, saved().workspaces);
     }
 
     #[test]

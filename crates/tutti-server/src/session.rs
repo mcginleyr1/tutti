@@ -1259,7 +1259,8 @@ impl Session {
     /// Exited and ephemeral panes are left out, and so are sandbox panes —
     /// their pods die with them. A tab left with no panes goes too; a
     /// workspace left with no tabs stays, a bare mount. `None` for an empty
-    /// session, which has nothing to offer back.
+    /// session, which has nothing to offer back. The notes are the caller's:
+    /// the session keeps none.
     pub fn snapshot(&self) -> Option<Saved> {
         if self.workspaces.is_empty() {
             return None;
@@ -1318,7 +1319,15 @@ impl Session {
             format: persist::FORMAT,
             workspaces,
             current_tab: self.current_tab,
+            notes: Vec::new(),
         })
+    }
+
+    /// Hand out pane ids past `last` from now on: the notes an earlier daemon
+    /// left name its panes by theirs, and a new pane must never answer for
+    /// one of them.
+    pub fn reserve_pane_ids(&mut self, last: PaneId) {
+        self.ids.pane = self.ids.pane.max(last.0);
     }
 
     /// Bring a saved session back. Each saved workspace is mounted with its
@@ -1376,7 +1385,6 @@ impl Session {
                     Some(tab) => tab,
                     None => self.tab_new(Some(workspace)).expect("the workspace exists"),
                 };
-                let mut ids = HashMap::new();
                 for pane in saved_tab.panes {
                     let revived = revive(&pane);
                     let (argv, title) = match &revived {
@@ -1394,8 +1402,7 @@ impl Session {
                             continue;
                         }
                     };
-                    ids.insert(pane.id, id);
-                    out.panes.push(id);
+                    out.panes.insert(pane.id, id);
                     if let Some(slot) = self.panes.get_mut(&id) {
                         slot.turns = pane.turns;
                         if revived.is_some() {
@@ -1409,10 +1416,10 @@ impl Session {
                     }
                 }
                 let entry = self.tab_mut(tab).expect("the tab exists");
-                entry.layout = rename_leaves(&saved_tab.layout, &ids);
+                entry.layout = rename_leaves(&saved_tab.layout, &out.panes);
                 entry.active_pane = saved_tab
                     .active_pane
-                    .and_then(|p| ids.get(&p).copied())
+                    .and_then(|p| out.panes.get(&p).copied())
                     .or_else(|| entry.layout.as_ref().map(|l| l.panes()[0]));
                 if let Some(name) = saved_tab.name {
                     entry.name = name;
@@ -1607,8 +1614,9 @@ pub struct Restored {
     /// Each workspace the saved ones landed in, mounted or joined — the ones
     /// to refresh.
     pub workspaces: Vec<WorkspaceId>,
-    /// The panes it spawned, each needing a reaper.
-    pub panes: Vec<PaneId>,
+    /// The panes it spawned, each needing a reaper, by the saved id each came
+    /// back from — what a note naming the saved one now points at.
+    pub panes: HashMap<PaneId, PaneId>,
     /// How many of those revived an agent's conversation.
     pub revived: usize,
     /// What could not come back, one line each.

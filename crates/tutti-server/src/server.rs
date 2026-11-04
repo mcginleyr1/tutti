@@ -36,7 +36,7 @@ use tutti_core::{
 use crate::herdr;
 use crate::jj;
 use crate::keys;
-use crate::persist::{self, SavedPane};
+use crate::persist::{self, Saved, SavedPane};
 use crate::pty::{Feed, PaneSize, PtyPane, Signal, StatusReport};
 use crate::session::{ReportOutcome, Restored, RunTarget, Session};
 
@@ -210,9 +210,23 @@ struct VcsMark {
 }
 
 impl Hub {
+    /// A hub for session `name`. The notification history the offer in
+    /// `state` holds comes back at once, and new panes take ids past every
+    /// one it names.
     fn new(size: PaneSize, name: String, state: Option<PathBuf>) -> Hub {
+        let mut session = Session::new(size, name.clone());
+        let offered = state
+            .as_deref()
+            .and_then(|dir| persist::read_offer(dir, &name));
+        let notes = offered.map_or_else(Notes::default, |saved| {
+            session.reserve_pane_ids(saved.last_pane());
+            Notes {
+                last: saved.notes.iter().map(|n| n.id).max().unwrap_or(0),
+                ring: saved.notes,
+            }
+        });
         Hub {
-            session: Mutex::new(Session::new(size, name.clone())),
+            session: Mutex::new(session),
             clients: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
             taps: Mutex::new(HashMap::new()),
@@ -224,7 +238,7 @@ impl Hub {
             vcs: Mutex::new(HashMap::new()),
             waits: Mutex::new(Vec::new()),
             state,
-            notes: Mutex::new(Notes::default()),
+            notes: Mutex::new(notes),
             approvals: Mutex::new(HashMap::new()),
         }
     }
@@ -312,7 +326,8 @@ pub async fn serve(
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "tutti".to_string());
     // Before the first request is read: a `server restore` that auto-started
-    // this daemon finds the offer already in place.
+    // this daemon finds the offer already in place, and its notification
+    // history is back (`Hub::new`).
     let state = state.filter(|dir| persist::offer_previous(dir, &name));
     let hub = Arc::new(Hub::new(size, name, state));
 
@@ -373,8 +388,7 @@ pub async fn serve(
             let mut last = None;
             loop {
                 interval.tick().await;
-                let saved = save_hub.session().snapshot();
-                persist::save_changed(&path, &mut last, saved.as_ref());
+                persist::save_changed(&path, &mut last, saved(&save_hub).as_ref());
             }
         })
     });
@@ -438,8 +452,7 @@ pub async fn serve(
         let _ = saver.await;
     }
     if let Some(dir) = &hub.state {
-        let saved = hub.session().snapshot();
-        persist::save(&persist::live_path(dir, &hub.name), saved.as_ref());
+        persist::save(&persist::live_path(dir, &hub.name), saved(&hub).as_ref());
     }
     hub.stopping.store(true, Ordering::SeqCst);
     hub.session().kill_all();
@@ -458,6 +471,16 @@ fn guarded<T>(pass: &str, run: impl FnOnce() -> T) -> Option<T> {
         eprintln!("tutti: the {pass} pass panicked; carrying on");
     }
     ran
+}
+
+/// The session as `persist` saves it, the notification history with it; each
+/// lock is taken on its own. `None` for an empty session, notes or not.
+fn saved(hub: &Hub) -> Option<Saved> {
+    let saved = hub.session().snapshot()?;
+    Some(Saved {
+        notes: hub.notes().ring.clone(),
+        ..saved
+    })
 }
 
 fn prepare_socket(path: &Path) -> Result<()> {
@@ -1719,7 +1742,9 @@ fn run_in_fresh_tab(
 /// session guard, so two clients racing to restore bring it back once. The
 /// fresh panes get their reapers, the clients one `LayoutChanged`, and each
 /// workspace it touched a change probe — which also records where each
-/// revived agent starts.
+/// revived agent starts. The notes the daemon took back from the offer at
+/// its start follow their panes to the ones that came back, and the clients
+/// get the history again.
 fn session_restore(hub: &Arc<Hub>, discard: bool) -> Response {
     let nothing = || Response::Error {
         message: "nothing to restore".into(),
@@ -1744,7 +1769,7 @@ fn session_restore(hub: &Arc<Hub>, discard: bool) -> Response {
     }
     let reapers: Vec<(PaneId, Arc<PtyPane>)> = restored
         .panes
-        .iter()
+        .values()
         .filter_map(|&pane| session.pty(pane).map(|pty| (pane, pty)))
         .collect();
     let view = (!restored.workspaces.is_empty()).then(|| session.view());
@@ -1754,6 +1779,20 @@ fn session_restore(hub: &Arc<Hub>, discard: bool) -> Response {
     }
     if let Some(view) = view {
         broadcast_event(hub, Event::LayoutChanged { workspaces: view });
+    }
+    let notes = {
+        let mut notes = hub.notes();
+        let mut moved = false;
+        for note in &mut notes.ring {
+            if let Some(&pane) = restored.panes.get(&note.pane) {
+                note.pane = pane;
+                moved = true;
+            }
+        }
+        moved.then(|| notes.ring.clone())
+    };
+    if let Some(notes) = notes {
+        broadcast_event(hub, Event::NotesChanged { notes });
     }
     for &workspace in &restored.workspaces {
         refresh_changes(hub, workspace);

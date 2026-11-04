@@ -151,9 +151,10 @@ daemon is per-session, so stopping one leaves the others running.
 
 Stopping loses nothing you arranged. The daemon saves its layout as it goes —
 every project and workspace, each tab's splits and their ratios, and each
-agent's conversation and turns — to `$XDG_STATE_HOME/tutti/<session>.json`
-(else `~/.local/state/tutti/`), rewriting it whenever the layout changes and
-once more as it stops. Pane contents are not saved.
+agent's conversation and turns — with the [notification
+history](#notifications), to `$XDG_STATE_HOME/tutti/<session>.json` (else
+`~/.local/state/tutti/`), rewriting it whenever either changes and once more
+as it stops. Pane contents are not saved.
 
 The next daemon never restores on its own: the first attach opens **restore
 last session?** (`3 projects · 7 panes · 2 agents to revive · saved 2h ago`).
@@ -170,8 +171,10 @@ restore [--discard]`.
 - Each pane's [turns](#turns-review-and-undo-one-agent-turn) come back too,
   numbering continued, and a revived agent stays linked to the
   [issue](#deploying-issues) it was deployed on.
-- Exited, ephemeral and sandbox panes are not saved, and neither is the
-  [notification history](#notifications).
+- Exited, ephemeral and sandbox panes are not saved.
+- The notification history comes back at once, before any restore, read
+  marks and all; a restore then points each note at the pane it came back
+  as. A note whose pane did not come back stays listed, dim.
 - A project whose directory is gone is skipped and named; one already mounted
   (a configured project) takes the restored tabs beside its own.
 - A save that cannot be read is set aside as `<session>.restore.json.bad` and
@@ -1092,8 +1095,9 @@ its pane's still-unread bell; any other note about a pane in view lands already
 read. Scripts and agents read the same history: `tutti notes [--unread]`
 (newest first: `ID AGE PANE TITLE WORKSPACE KIND UNREAD TEXT`; `--json` for
 the raw notes), `tutti notes read [--up-to <id>] [--pane <id>]`, and `tutti
-notes clear`. The history lives in the daemon's memory: a restarted daemon
-starts it empty.
+notes clear`. The history is saved with the layout, so a restarted daemon
+has it back (see [Restoring after a restart](#restoring-after-a-restart)); an
+empty session saves nothing, its history included.
 
 ### Workspaces
 
@@ -1714,8 +1718,6 @@ tutti is alpha; PLAN.md tracks what is open.
 - **Approvals are Claude Code's only**, one held per pane at a time.
 - **Trackers are read-only.** A deploy never comments on, assigns, or moves
   its issue.
-- **The notification history starts empty after a restart**: it lives in the
-  daemon's memory, unlike the layout.
 - **A pane's program that asked for key releases or the text of a key**
   (kitty's flags 2 and 16) gets presses only: the TUI asks your terminal for
   neither.

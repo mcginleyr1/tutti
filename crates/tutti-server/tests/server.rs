@@ -1396,6 +1396,91 @@ async fn discarding_the_offered_layout_deletes_it() {
     let _ = std::fs::remove_dir_all(state);
 }
 
+/// Poll the history until it holds `count` notes; it, then.
+async fn notes_landed(conn: &mut Conn, count: usize) -> Vec<Note> {
+    timeout(DEADLINE, async {
+        loop {
+            let notes = list_notes(conn, false).await;
+            if notes.len() == count {
+                return notes;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the notes never landed")
+}
+
+/// The notification history is saved with the layout, and a restarted daemon
+/// takes it back at once, before any restore: ids, texts and read marks as
+/// they were. Its new panes take ids past every one a note names; a restore
+/// points the notes of each pane that came back at the pane it came back as,
+/// and a gone pane's note keeps naming a pane nobody is.
+#[tokio::test]
+async fn a_restarted_daemon_takes_the_notification_history_back() {
+    let (state, dir) = (fresh_dir("state"), fresh_dir("noted"));
+    let server = TestServer::saving(Some(state.clone()));
+    let mut conn = server.connect().await;
+    workspace_id(
+        conn.request(Request::WorkspaceNew { dir: dir.clone() })
+            .await,
+    );
+    let shell = || Request::PaneRun {
+        tab: None,
+        cmd: vec!["/bin/sh".into()],
+        ephemeral: false,
+        sandbox: None,
+    };
+    let kept = pane_id(conn.request(shell()).await);
+    let gone = pane_id(conn.request(shell()).await);
+    printf_osc(&mut conn, kept, "9;kept").await;
+    notes_landed(&mut conn, 1).await;
+    printf_osc(&mut conn, gone, "9;gone").await;
+    notes_landed(&mut conn, 2).await;
+    let read = Request::NotesRead {
+        up_to: None,
+        pane: Some(kept),
+    };
+    assert_eq!(conn.request(read).await, Response::Ok);
+    let saved = list_notes(&mut conn, false).await;
+    assert_eq!(
+        conn.request(Request::PaneKill { pane: gone }).await,
+        Response::Ok
+    );
+    server.stop().await;
+
+    let server = TestServer::saving(Some(state.clone()));
+    let mut conn = server.connect().await;
+    assert_eq!(list_notes(&mut conn, false).await, saved);
+    let fresh = run_sleeper(&mut conn).await;
+    assert!(
+        fresh > kept && fresh > gone,
+        "a new pane never takes a noted id"
+    );
+    assert!(matches!(
+        conn.request(Request::SessionRestore { discard: false })
+            .await,
+        Response::SessionRestored { panes: 1, .. }
+    ));
+    let panes = pane_ids(&mut conn).await;
+    let revived = *panes.iter().find(|p| **p != fresh).unwrap();
+    let notes = list_notes(&mut conn, false).await;
+    let named: Vec<(Option<&str>, PaneId, bool)> = notes
+        .iter()
+        .map(|n| (n.body.as_deref(), n.pane, n.read))
+        .collect();
+    assert_eq!(
+        named,
+        [(Some("kept"), revived, true), (Some("gone"), gone, false)]
+    );
+    assert!(!panes.contains(&gone));
+
+    server.stop().await;
+    for dir in [state, dir] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 /// A `PaneResizeSplit` nudges the ratio of the focused pane's enclosing split
 /// and broadcasts the fresh view carrying the new ratio.
 #[tokio::test]
