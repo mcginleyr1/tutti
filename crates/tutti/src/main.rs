@@ -496,6 +496,12 @@ enum PaneAction {
     /// detaches; the prefix twice sends one. Never starts a daemon.
     Attach {
         pane: u64,
+        /// Draw on the primary screen, not the alternate one: what the pane
+        /// scrolls off goes into this terminal's scrollback (an editor's
+        /// terminal keeps its own), and its program's screen switches pass
+        /// through.
+        #[arg(long)]
+        inline: bool,
     },
     /// Block until each pane reaches a state (`done` unless `--until` says
     /// otherwise), printing each one's; exits 124 on `--timeout`.
@@ -629,7 +635,7 @@ fn run(cli: Cli) -> Result<i32> {
                 },
         }) => run_wait(&cli.session, cli.json, &panes, &until, next, timeout),
         Some(Command::Pane {
-            action: PaneAction::Attach { pane },
+            action: PaneAction::Attach { pane, inline },
         }) => {
             // Its own pane would echo its output back into itself forever.
             let own = std::env::var("TUTTI_SESSION").is_ok_and(|s| s == cli.session)
@@ -637,7 +643,7 @@ fn run(cli: Cli) -> Result<i32> {
             if own {
                 bail!("pane {pane} is the pane this runs in");
             }
-            tutti::attach::raw::run(&cli.session, PaneId(pane), Config::load()?.prefix)
+            tutti::attach::raw::run(&cli.session, PaneId(pane), Config::load()?.prefix, inline)
         }
         Some(Command::Sandbox {
             action: SandboxAction::Run { profile, name, cmd },

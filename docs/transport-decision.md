@@ -384,6 +384,23 @@ paste, cursor keys and keypad, cursor style and visibility, colours) and pops th
 it pushed. The cost: inside the CLI the pane has no native scrollback — the alternate
 screen keeps none.
 
+**`--inline`: the primary screen.** For an editor's terminal, which keeps scrollback
+of its own, `tutti pane attach --inline` takes no alternate screen. A program's switches
+then pass through raw — its alternate screen is the terminal's — and what the pane
+scrolls off lands in the terminal's scrollback. The mirror still follows the stream, for
+three things:
+- **Each snapshot** (attach, and each resize) goes out as the mirror's `snapshot()`,
+  both screens, less the same own modes, onto a cleared screen. On attach the lines on
+  screen down to the cursor's (a CPR, before raw mode) are first scrolled up into the
+  terminal's scrollback.
+- **A reset** is drawn the same way rather than passed on: `ESC c` would turn off the
+  terminal's 2031, and some terminals clear their scrollback on it.
+- **On exit** a program's alternate screen is left, the scroll region reset, and the
+  cursor put on the line under the primary screen's last text (or its cursor, if lower),
+  so the shell goes on below the pane.
+
+The pane's history from before the attach is not replayed: the snapshot carries none.
+
 ## Terminal queries: the daemon answers what it can
 
 A pane has no terminal of its own, and a TUI client never sees the raw bytes. So a

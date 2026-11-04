@@ -13,6 +13,16 @@
 //! screen, not the shell's. The daemon sends each switch or reset in a frame
 //! of its own, so no other byte goes with the redraw.
 //!
+//! `--inline` draws on the primary screen instead, for an editor's terminal
+//! (Neovim's `:terminal`, Emacs's vterm): what the pane scrolls off goes into
+//! that terminal's own scrollback, and the program's screen switches pass
+//! through, its alternate screen being free. The lines on screen go up into
+//! the scrollback before the pane is drawn, and on leaving, the cursor goes
+//! under the pane's last line. A snapshot — the first, and each resize's —
+//! draws both of the pane's screens from the mirror (`Terminal::snapshot`),
+//! and so does a reset, which never reaches the terminal: it would turn off
+//! the light/dark reports, and some terminals clear their scrollback on it.
+//!
 //! This terminal's keys stay plain: the daemon keeps the pane's keyboard
 //! protocols (kitty's, modifyOtherKeys) out of the stream, and the mirror's
 //! redraws leave them out too — the prefix is watched for in plain bytes,
@@ -31,7 +41,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use ratatui::crossterm::event::KeyEvent;
-use ratatui::crossterm::terminal;
+use ratatui::crossterm::{cursor, terminal};
 use rtty_vt::Terminal;
 use signal_hook::consts::SIGWINCH;
 use signal_hook::iterator::Signals;
@@ -42,23 +52,33 @@ use super::theme::host_colors;
 use crate::client;
 use crate::config::{Chord, Theme};
 
-/// Push the window title, take the alternate screen, and ask to hear of
-/// light/dark changes.
-const ENTER: &[u8] = b"\x1b[22;0t\x1b[?1049h\x1b[?2031h";
+/// Push the window title and ask to hear of light/dark changes; but for
+/// `--inline`, take the alternate screen first.
+const ENTER: &[u8] = b"\x1b[22;0t\x1b[?2031h";
+const ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049h";
 /// Turn off what the pane may have turned on in this terminal — mouse
 /// reporting, focus events, bracketed paste, application cursor and keypad, a
-/// cursor style, a hidden cursor, colours — and the light/dark reports, then
-/// leave the alternate screen and pop the title.
-const LEAVE: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\
-\x1b[?1004l\x1b[?2004l\x1b[?2031l\x1b[?1l\x1b>\x1b[0 q\x1b[?25h\x1b[m\x1b[?1049l\x1b[23;0t";
+/// cursor style, a hidden cursor, colours — and the light/dark reports; then
+/// leave the alternate screen, and pop the title.
+const MODES_OFF: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\
+\x1b[?1004l\x1b[?2004l\x1b[?2031l\x1b[?1l\x1b>\x1b[0 q\x1b[?25h\x1b[m";
+const LEAVE_ALTERNATE: &[u8] = b"\x1b[?1049l";
+const POP_TITLE: &[u8] = b"\x1b[23;0t";
+
+/// Whether the view is `--inline`, and whether the pane's program has this
+/// terminal's alternate screen up: what `restore`, a panic's included,
+/// leaves.
+static INLINE: AtomicBool = AtomicBool::new(false);
+static ALTERNATE: AtomicBool = AtomicBool::new(false);
 
 /// A mode-2031 terminal's light/dark reports, each with whether it says dark.
 const REPORTS: [(&[u8], bool); 2] = [(b"\x1b[?997;1n", true), (b"\x1b[?997;2n", false)];
 
 /// Show `pane` of `session` in this terminal until the prefix and `d` detach
 /// it, the pane exits (`[pane N exited: CODE]`), or the daemon goes away (an
-/// error). Never starts a daemon: with none running there is no pane to show.
-pub fn run(session: &str, pane: PaneId, prefix: Chord) -> Result<i32> {
+/// error) — on the alternate screen, or `inline` on the primary one. Never
+/// starts a daemon: with none running there is no pane to show.
+pub fn run(session: &str, pane: PaneId, prefix: Chord, inline: bool) -> Result<i32> {
     if !std::io::stdin().is_terminal() {
         bail!("pane attach needs a terminal on stdin");
     }
@@ -99,14 +119,33 @@ pub fn run(session: &str, pane: PaneId, prefix: Chord) -> Result<i32> {
         }
     };
 
+    // Inline, the lines on screen go up into the scrollback, up to the
+    // cursor's, so the pane's screen is drawn on a blank one and they stay.
+    let lift = if inline {
+        let (col, row) = cursor::position().context("reading the cursor position")?;
+        format!(
+            "\x1b[{rows};1H{}",
+            "\n".repeat(usize::from(row + u16::from(col > 0)))
+        )
+    } else {
+        String::new()
+    };
+
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
     let resizes = Signals::new([SIGWINCH]).context("watching for SIGWINCH")?;
     terminal::enable_raw_mode().context("entering raw mode")?;
+    INLINE.store(inline, Ordering::SeqCst);
     install_panic_hook();
     let detached = Arc::new(AtomicBool::new(false));
     spawn_keys(Keys::new(prefix), pane, &writer, &detached);
     spawn_resizes(resizes, pane, &writer);
-    let shown = emit(ENTER).and_then(|()| show(first, &mut stream, &mut buf));
+    let mut mirror = Terminal::new(24, 80, 0);
+    let enter = [ENTER, if inline { b"" } else { ALTERNATE_SCREEN }].concat();
+    let shown = emit(&enter)
+        .and_then(|()| show(first, &mut stream, &mut buf, &mut mirror, lift.into_bytes()));
+    if inline {
+        let _ = emit(&below(&mut mirror));
+    }
     restore();
     match shown? {
         Some(code) => println!("[pane {pane} exited: {code}]"),
@@ -117,10 +156,24 @@ pub fn run(session: &str, pane: PaneId, prefix: Chord) -> Result<i32> {
 }
 
 /// Draw the stream, `first` frame on, until the pane exits (its code) or the
-/// connection closes (`None`). A refusal on the way — the stream fell behind —
+/// connection closes (`None`), with `mirror` following it. `lift` goes out
+/// before the first snapshot. A refusal on the way — the stream fell behind —
 /// is the error.
-fn show(first: Frame, stream: &mut UnixStream, buf: &mut Vec<u8>) -> Result<Option<i32>> {
-    let mut mirror = Terminal::new(24, 80, 0);
+fn show(
+    first: Frame,
+    stream: &mut UnixStream,
+    buf: &mut Vec<u8>,
+    mirror: &mut Terminal,
+    mut lift: Vec<u8>,
+) -> Result<Option<i32>> {
+    let inline = INLINE.load(Ordering::SeqCst);
+    let view = |mirror: &Terminal| {
+        if inline {
+            strip(mirror.snapshot())
+        } else {
+            redraw(mirror)
+        }
+    };
     let mut last = 0;
     let mut frame = Some(first);
     loop {
@@ -133,13 +186,13 @@ fn show(first: Frame, stream: &mut UnixStream, buf: &mut Vec<u8>) -> Result<Opti
         };
         match next {
             Frame::PaneSnapshot(data) => {
-                mirror = Terminal::new(data.rows, data.cols, 0);
+                *mirror = Terminal::new(data.rows, data.cols, 0);
                 mirror.advance(&data.bytes);
                 mirror.take_events();
-                emit(&redraw(&mirror))?;
+                emit(&[std::mem::take(&mut lift), view(mirror)].concat())?;
             }
-            Frame::PaneRaw { bytes, .. } if feed(&mut mirror, &mut last, &bytes) => {
-                emit(&redraw(&mirror))?;
+            Frame::PaneRaw { bytes, .. } if feed(mirror, &mut last, &bytes, inline) => {
+                emit(&view(mirror))?;
             }
             Frame::PaneRaw { bytes, .. } => emit(&bytes)?,
             Frame::Control(json) => {
@@ -152,22 +205,23 @@ fn show(first: Frame, stream: &mut UnixStream, buf: &mut Vec<u8>) -> Result<Opti
             }
             _ => {}
         }
+        ALTERNATE.store(mirror.modes().alt_screen, Ordering::SeqCst);
     }
 }
 
-/// Feed one read of the pane's output to the mirror: true when it switched
-/// screens or reset the terminal, which this terminal must not be handed raw.
-/// A screen switch ends on `h` or `l`, so the mirror is checked after each —
-/// one read can switch there and back. `last` is the byte before this read,
-/// for an `ESC c` split across two.
-fn feed(mirror: &mut Terminal, last: &mut u8, bytes: &[u8]) -> bool {
+/// Feed one read of the pane's output to the mirror: true when it reset the
+/// terminal, or — but `inline` — switched screens, which this terminal must
+/// not be handed raw. A screen switch ends on `h` or `l`, so the mirror is
+/// checked after each — one read can switch there and back. `last` is the
+/// byte before this read, for an `ESC c` split across two.
+fn feed(mirror: &mut Terminal, last: &mut u8, bytes: &[u8], inline: bool) -> bool {
     let mut switched = false;
     for run in bytes.split_inclusive(|b| matches!(b, b'h' | b'l' | b'c')) {
         let alternate = mirror.modes().alt_screen;
         mirror.advance(run);
         let before = run.len().checked_sub(2).map_or(*last, |i| run[i]);
-        switched |=
-            alternate != mirror.modes().alt_screen || (before == 0x1b && run.ends_with(b"c"));
+        switched |= !inline && alternate != mirror.modes().alt_screen
+            || (before == 0x1b && run.ends_with(b"c"));
         *last = run[run.len() - 1];
     }
     mirror.take_events();
@@ -176,20 +230,29 @@ fn feed(mirror: &mut Terminal, last: &mut u8, bytes: &[u8]) -> bool {
 
 /// The mirror's screen, drawn whole on the alternate screen — taken again
 /// first, in case a reset the stream slipped past left it, and cleared — with
-/// its cursor and modes, but for what is this terminal's own: its keyboard
-/// protocols, and the light/dark reports `ENTER` asked for.
+/// its cursor and modes.
 fn redraw(mirror: &Terminal) -> Vec<u8> {
     let rows: Vec<u16> = (0..mirror.size().0).collect();
-    let redraw = String::from_utf8(mirror.redraw(&rows)).expect("rtty-vt writes UTF-8");
-    let mut out = String::from("\x1b[?1049h\x1b[0m\x1b[H\x1b[2J");
-    let mut rest = redraw.as_str();
+    [
+        b"\x1b[?1049h\x1b[0m\x1b[H\x1b[2J".as_slice(),
+        &strip(mirror.redraw(&rows)),
+    ]
+    .concat()
+}
+
+/// A mirror's drawing, but for what is this terminal's own: its keyboard
+/// protocols, and the light/dark reports `ENTER` asked for.
+fn strip(drawing: Vec<u8>) -> Vec<u8> {
+    let drawing = String::from_utf8(drawing).expect("rtty-vt writes UTF-8");
+    let mut out = String::new();
+    let mut rest = drawing.as_str();
     while let Some(at) = rest.find("\x1b[") {
         out.push_str(&rest[..at]);
         let end = rest[at + 2..]
             .find(|c| ('\x40'..='\x7e').contains(&c))
             .map_or(rest.len(), |i| at + i + 3);
         let seq = &rest[at..end];
-        let own = seq.starts_with("\x1b[=") && seq.ends_with('u')
+        let own = (seq.starts_with("\x1b[=") || seq.starts_with("\x1b[>")) && seq.ends_with('u')
             || seq.starts_with("\x1b[>4;") && seq.ends_with('m')
             || seq.starts_with("\x1b[?2031");
         if !own {
@@ -199,6 +262,25 @@ fn redraw(mirror: &Terminal) -> Vec<u8> {
     }
     out.push_str(rest);
     out.into_bytes()
+}
+
+/// Where an inline view leaves this terminal: the pane's alternate screen
+/// left, the scroll region whole, and the cursor on the line under the last
+/// of the primary screen's text or its cursor, whichever is lower.
+fn below(mirror: &mut Terminal) -> Vec<u8> {
+    let leave = if ALTERNATE.swap(false, Ordering::SeqCst) {
+        mirror.advance(LEAVE_ALTERNATE);
+        LEAVE_ALTERNATE
+    } else {
+        b""
+    };
+    let rows = mirror.size().0;
+    let last = (0..rows)
+        .rev()
+        .find(|&r| !mirror.screen_row(r).text().trim_end().is_empty())
+        .unwrap_or(0)
+        .max(mirror.cursor_position().0);
+    [leave, format!("\x1b[r\x1b[{};1H\r\n", last + 1).as_bytes()].concat()
 }
 
 /// The keys typed into the pane, watched for the prefix chord's bytes — the
@@ -387,9 +469,13 @@ fn emit(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Hand the terminal back as it was. Safe to run twice.
+/// Hand the terminal back as it was: the modes off, the alternate screen left
+/// — inline, only if the pane's program has it up — and the title popped.
+/// Safe to run twice.
 fn restore() {
-    let _ = emit(LEAVE);
+    let alternate = !INLINE.load(Ordering::SeqCst) || ALTERNATE.swap(false, Ordering::SeqCst);
+    let leave = if alternate { LEAVE_ALTERNATE } else { b"" };
+    let _ = emit(&[MODES_OFF, leave, POP_TITLE].concat());
     let _ = terminal::disable_raw_mode();
 }
 
@@ -528,7 +614,7 @@ mod tests {
         let switched = reads
             .iter()
             .map(|read| {
-                let switched = feed(mirror, &mut last, read);
+                let switched = feed(mirror, &mut last, read, false);
                 terminal.advance(&if switched {
                     redraw(mirror)
                 } else {
@@ -591,6 +677,63 @@ mod tests {
         assert!(terminal.contents().starts_with("vim"));
         let text = String::from_utf8(bytes).unwrap();
         assert!(!text.contains("\x1b[=") && !text.contains("\x1b[>4;") && !text.contains("2031"));
+    }
+
+    /// Inline, on the primary screen: the lines on screen go up into the
+    /// terminal's scrollback before the pane is drawn, and so do the pane's
+    /// own as it scrolls; the program's alternate screen is the terminal's,
+    /// passed through; a reset is drawn from the mirror, and keeps the
+    /// light/dark reports on; leaving puts the cursor under the pane's text.
+    #[test]
+    fn inline_keeps_the_scrollback_and_passes_screen_switches_through() {
+        let history = |term: &Terminal| -> Vec<String> {
+            term.rows(term.oldest_row(), term.screen_top())
+                .map(|(_, row)| row.text().trim_end().to_string())
+                .collect()
+        };
+        let mut terminal = Terminal::new(4, 20, 100);
+        terminal.advance(b"\x1b[?2031h$ old\r\n$ tutti pane attach\r\n");
+        let mut mirror = Terminal::new(4, 20, 0);
+        mirror.advance(b"$ ls\r\nfile\r\n$ ");
+        // What `run` lifts: the cursor stood at the start of row 2.
+        terminal.advance(b"\x1b[4;1H\n\n");
+        terminal.advance(&strip(mirror.snapshot()));
+        assert_eq!(history(&terminal), ["$ old", "$ tutti pane attach"]);
+        assert_eq!(screen(&terminal), screen(&mirror));
+
+        let mut last = 0;
+        for read in [
+            &b"vim\r\n"[..],
+            b"\x1b[?1049h",
+            b"\x1b[H\x1b[2Jediting",
+            b"\x1b[?1049l",
+            b"one\r\ntwo\r\nthree\r\n$ ",
+            b"\x1bc",
+            b"after",
+        ] {
+            let redrawn = feed(&mut mirror, &mut last, read, true);
+            assert_eq!(redrawn, read == b"\x1bc", "{read:?}");
+            terminal.advance(&if redrawn {
+                strip(mirror.snapshot())
+            } else {
+                read.to_vec()
+            });
+            assert_eq!(screen(&terminal), screen(&mirror), "after {read:?}");
+            assert_eq!(terminal.modes().alt_screen, mirror.modes().alt_screen);
+        }
+        assert_eq!(
+            history(&terminal)[..5],
+            ["$ old", "$ tutti pane attach", "$ ls", "file", "$ vim"],
+            "the pane's lines scrolled into the terminal's own scrollback"
+        );
+        assert!(terminal.modes().color_scheme_reports, "the reset kept 2031");
+
+        mirror.advance(b"\x1b[?1049hless");
+        terminal.advance(b"\x1b[?1049hless");
+        ALTERNATE.store(true, Ordering::SeqCst);
+        terminal.advance(&below(&mut mirror));
+        assert!(!terminal.modes().alt_screen && !ALTERNATE.load(Ordering::SeqCst));
+        assert_eq!(terminal.cursor_position(), (1, 0), "under `after`");
     }
 
     /// A read that goes there and back, a switch cut across two reads, and a
