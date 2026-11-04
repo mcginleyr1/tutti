@@ -3246,7 +3246,7 @@ impl App {
         if self.issues_deploy_here() {
             return vec![self.follow(&run, FollowUp::Deployed)];
         }
-        let name = issues::workspace_name(issue);
+        let name = issues::workspace_name(&issue.source, &issue.id);
         self.set_status(format!("creating workspace {name}…"));
         let fork = Request::WorkspaceFork {
             id: project,

@@ -805,6 +805,9 @@ enum RawIssues {
         repo: Option<String>,
         search: Option<String>,
         limit: Option<u32>,
+        comment: Option<bool>,
+        assign: Option<String>,
+        label: Option<String>,
     },
     Linear {
         name: String,
@@ -813,6 +816,8 @@ enum RawIssues {
         team: Option<String>,
         filter: Option<serde_json::Map<String, serde_json::Value>>,
         limit: Option<u32>,
+        comment: Option<bool>,
+        state: Option<String>,
     },
     Command {
         name: String,
@@ -825,23 +830,29 @@ impl RawIssues {
     /// Validate into a source: a name usable as a CLI argument, a command
     /// naming a program (`~` expanded), and a limit of at least one — 50 by
     /// default, Linear's own page size. Linear's key defaults to
-    /// `LINEAR_API_KEY`.
+    /// `LINEAR_API_KEY`. Write-back is off unless asked for.
     fn into_source(self, home: Option<&Path>) -> Result<issues::Source> {
         let limit = |limit: Option<u32>| limit.unwrap_or(50);
-        let (name, prompt, kind) = match self {
+        let (name, prompt, comment, kind) = match self {
             RawIssues::Github {
                 name,
                 prompt,
                 repo,
                 search,
                 limit: n,
+                comment,
+                assign,
+                label,
             } => (
                 name,
                 prompt,
+                comment,
                 Kind::Github {
                     repo,
                     search,
                     limit: limit(n),
+                    assign,
+                    label,
                 },
             ),
             RawIssues::Linear {
@@ -851,14 +862,18 @@ impl RawIssues {
                 team,
                 filter,
                 limit: n,
+                comment,
+                state,
             } => (
                 name,
                 prompt,
+                comment,
                 Kind::Linear {
                     api_key_env: api_key_env.unwrap_or_else(|| "LINEAR_API_KEY".into()),
                     team,
                     filter,
                     limit: limit(n),
+                    state,
                 },
             ),
             RawIssues::Command {
@@ -869,7 +884,7 @@ impl RawIssues {
                 if let Some(program) = command.first_mut() {
                     *program = expand_home(program, home).to_string_lossy().into_owned();
                 }
-                (name, prompt, Kind::Command(command))
+                (name, prompt, None, Kind::Command(command))
             }
         };
         if !valid_name(&name) {
@@ -888,6 +903,7 @@ impl RawIssues {
             name,
             kind,
             prompt: prompt.unwrap_or_else(|| issues::DEFAULT_PROMPT.into()),
+            comment: comment.unwrap_or(false),
         })
     }
 }
@@ -1359,12 +1375,17 @@ repo = "acme/web"
 search = "label:agent"
 limit = 10
 prompt = "Fix {id}: {title}"
+comment = true
+assign = "@me"
+label = "agent:working"
 
 [[issues]]
 name = "linear"
 kind = "linear"
 team = "ENG"
 filter = { priority = { lte = 2 } }
+comment = true
+state = "In Progress"
 
 [[issues]]
 name = "jira"
@@ -1378,6 +1399,7 @@ command = ["~/bin/jira-issues", "--json"]
             name: name.into(),
             kind,
             prompt: prompt.into(),
+            comment: false,
         };
         assert_eq!(
             cfg.issues,
@@ -1388,30 +1410,41 @@ command = ["~/bin/jira-issues", "--json"]
                         repo: None,
                         search: None,
                         limit: 50,
+                        assign: None,
+                        label: None,
                     },
                     issues::DEFAULT_PROMPT,
                 ),
-                source(
-                    "web",
-                    Kind::Github {
-                        repo: Some("acme/web".into()),
-                        search: Some("label:agent".into()),
-                        limit: 10,
-                    },
-                    "Fix {id}: {title}",
-                ),
-                source(
-                    "linear",
-                    Kind::Linear {
-                        api_key_env: "LINEAR_API_KEY".into(),
-                        team: Some("ENG".into()),
-                        filter: serde_json::json!({"priority": {"lte": 2}})
-                            .as_object()
-                            .cloned(),
-                        limit: 50,
-                    },
-                    issues::DEFAULT_PROMPT,
-                ),
+                issues::Source {
+                    comment: true,
+                    ..source(
+                        "web",
+                        Kind::Github {
+                            repo: Some("acme/web".into()),
+                            search: Some("label:agent".into()),
+                            limit: 10,
+                            assign: Some("@me".into()),
+                            label: Some("agent:working".into()),
+                        },
+                        "Fix {id}: {title}",
+                    )
+                },
+                issues::Source {
+                    comment: true,
+                    ..source(
+                        "linear",
+                        Kind::Linear {
+                            api_key_env: "LINEAR_API_KEY".into(),
+                            team: Some("ENG".into()),
+                            filter: serde_json::json!({"priority": {"lte": 2}})
+                                .as_object()
+                                .cloned(),
+                            limit: 50,
+                            state: Some("In Progress".into()),
+                        },
+                        issues::DEFAULT_PROMPT,
+                    )
+                },
                 source(
                     "jira",
                     Kind::Command(vec![format!("{home}/bin/jira-issues"), "--json".into()]),
@@ -1458,6 +1491,18 @@ command = ["~/bin/jira-issues", "--json"]
             (
                 "[[issues]]\nname = \"l\"\nkind = \"linear\"\nfilter = \"mine\"\n",
                 "expected a map",
+            ),
+            (
+                "[[issues]]\nname = \"j\"\nkind = \"command\"\ncommand = [\"x\"]\ncomment = true\n",
+                "unknown field `comment`",
+            ),
+            (
+                "[[issues]]\nname = \"gh\"\nkind = \"github\"\nstate = \"Done\"\n",
+                "unknown field `state`",
+            ),
+            (
+                "[[issues]]\nname = \"l\"\nkind = \"linear\"\nassign = \"@me\"\n",
+                "unknown field `assign`",
             ),
             (
                 "[[issues]]\nname = \"a\"\nkind = \"github\"\n\n[[issues]]\nname = \"a\"\nkind = \"linear\"\n",

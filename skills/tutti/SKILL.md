@@ -87,8 +87,10 @@ workspace named after the issue (`gh-123`) under the project open at your
 working directory (`--project` names another; one that is not a jj repo gets a
 fresh tab instead), and starts `claude` there (`--agent` picks another) with
 the issue as its first message. From then on it is a sub-agent like any other.
-tutti only reads trackers: it never comments on, assigns, or closes an issue,
-so report the outcome to your user.
+A source your user opted in may get a comment naming where the agent runs, an
+assignee, a label or a new state; exit 1 after the pane id means that
+write-back failed while the agent runs on. tutti never closes an issue, so
+report the outcome to your user.
 
 ## Wait for them
 

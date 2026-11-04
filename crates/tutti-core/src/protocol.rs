@@ -621,7 +621,7 @@ pub struct PaneInfo {
 
 /// The tracker issue a pane was deployed on: the configured source it came
 /// from, its id there (`123`, `ENG-42`), its title, and its link when the
-/// tracker has one. Display only — tutti never writes back to a tracker.
+/// tracker has one. Display only: any write-back is the deploying client's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssueRef {
     pub source: String,

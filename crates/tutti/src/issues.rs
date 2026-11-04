@@ -2,9 +2,9 @@
 //! GitHub through the user's own `gh`, Linear's GraphQL API through `curl`
 //! with a personal API key from the environment, or any tracker through a
 //! command printing JSON — and deploying one launches an agent on it with the
-//! issue as its prompt. Every fetch runs client-side, in the project's
+//! issue as its prompt. Every tracker call runs client-side, in the project's
 //! directory with the user's environment: the daemon never talks to a
-//! tracker, and nothing here writes to one.
+//! tracker. A source that opts in hears back from a deploy (`write_back`).
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use tutti_core::IssueRef;
+use tutti_core::{IssueRef, PaneId};
 
 /// The prompt a deployed agent gets unless its source names another.
 pub const DEFAULT_PROMPT: &str =
@@ -28,10 +28,16 @@ const LINEAR_LIST: &str = "query($filter: IssueFilter, $first: Int) { issues(fil
      nodes { name } } } } }";
 const LINEAR_ISSUE: &str = "query($id: String!) { issue(id: $id) { identifier title description \
      url labels { nodes { name } } } }";
+const LINEAR_COMMENT: &str = "mutation($id: String!, $body: String!) { commentCreate(input: { \
+     issueId: $id, body: $body }) { success } }";
+const LINEAR_STATES: &str =
+    "query($id: String!) { issue(id: $id) { id team { states { nodes { id name } } } } }";
+const LINEAR_MOVE: &str = "mutation($id: String!, $stateId: String!) { issueUpdate(id: $id, \
+     input: { stateId: $stateId }) { success } }";
 const GH_FIELDS: &str = "number,title,body,url,labels";
 
-/// One configured tracker: where its issues come from, and the prompt an
-/// agent deployed on one gets.
+/// One configured tracker: where its issues come from, the prompt an agent
+/// deployed on one gets, and whether a deploy comments on it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Source {
     /// What the issues panel and `--source` call it, `[A-Za-z0-9_-]+`.
@@ -40,25 +46,49 @@ pub struct Source {
     /// The deployed agent's first message, with `{id}`, `{title}`, `{body}`
     /// and `{url}` filled in.
     pub prompt: String,
+    /// Whether a deploy comments on its issue where the agent runs
+    /// (`deployed_comment`). Never on a command source.
+    pub comment: bool,
+}
+
+impl Source {
+    /// Whether a deploy from here writes anything back (`write_back`).
+    pub fn writes_back(&self) -> bool {
+        self.comment
+            || matches!(
+                &self.kind,
+                Kind::Github {
+                    assign: Some(_),
+                    ..
+                } | Kind::Github { label: Some(_), .. }
+                    | Kind::Linear { state: Some(_), .. }
+            )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Kind {
     /// GitHub through `gh`: `repo` (`owner/name`), else the one the project's
-    /// git remote names, narrowed by a `gh` `search`.
+    /// git remote names, narrowed by a `gh` `search`. A deploy assigns the
+    /// issue to `assign` (a login, `@me`) and adds `label`, when set.
     Github {
         repo: Option<String>,
         search: Option<String>,
         limit: u32,
+        assign: Option<String>,
+        label: Option<String>,
     },
     /// Linear's API with the personal API key in the environment variable
     /// `api_key_env`: issues matching `filter` (an `IssueFilter`), else the
-    /// viewer's assigned ones not yet done — within team `team` when set.
+    /// viewer's assigned ones not yet done — within team `team` when set. A
+    /// deploy moves the issue to its team's workflow state named `state`,
+    /// when set.
     Linear {
         api_key_env: String,
         team: Option<String>,
         filter: Option<Map<String, Value>>,
         limit: u32,
+        state: Option<String>,
     },
     /// Any tracker: this argv prints a JSON array of `{id, title, body?,
     /// url?, labels?}`.
@@ -98,6 +128,7 @@ pub fn list(source: &Source, dir: &Path) -> Result<Vec<Issue>> {
             repo,
             search,
             limit,
+            ..
         } => {
             let limit = limit.to_string();
             let args = [
@@ -124,6 +155,7 @@ pub fn list(source: &Source, dir: &Path) -> Result<Vec<Issue>> {
             team,
             filter,
             limit,
+            ..
         } => {
             let variables = json!({
                 "filter": linear_filter(filter.as_ref(), team.as_deref()),
@@ -172,6 +204,98 @@ pub fn fetch(source: &Source, id: &str, dir: &Path) -> Result<Issue> {
             .find(|issue| issue.id == id)
             .with_context(|| format!("{} lists no issue {id}", source.name)),
     }
+}
+
+/// Tell issue `id` of `source` it was deployed, as far as the source opts in:
+/// leave `comment` on it, then on GitHub assign and label it, on Linear move
+/// it to a workflow state. Runs in the project directory `dir`, as a fetch
+/// does; the first refusal ends it.
+pub fn write_back(source: &Source, id: &str, comment: &str, dir: &Path) -> Result<()> {
+    match &source.kind {
+        Kind::Github {
+            repo,
+            assign,
+            label,
+            ..
+        } => {
+            if source.comment {
+                let args = ["issue", "comment", id, "--body", comment];
+                capture(&mut gh(&args, repo.as_deref(), dir), None)?;
+            }
+            let mut edit = vec!["issue", "edit", id];
+            if let Some(assign) = assign {
+                edit.extend(["--add-assignee", assign]);
+            }
+            if let Some(label) = label {
+                edit.extend(["--add-label", label]);
+            }
+            if edit.len() > 3 {
+                capture(&mut gh(&edit, repo.as_deref(), dir), None)?;
+            }
+        }
+        Kind::Linear {
+            api_key_env, state, ..
+        } => {
+            if source.comment {
+                let data = linear(
+                    api_key_env,
+                    LINEAR_COMMENT,
+                    json!({"id": id, "body": comment}),
+                )?;
+                if data["commentCreate"]["success"] != true {
+                    bail!("Linear did not comment on {id}");
+                }
+            }
+            if let Some(state) = state {
+                #[derive(Deserialize)]
+                struct State {
+                    id: String,
+                    name: String,
+                }
+                let data = linear(api_key_env, LINEAR_STATES, json!({ "id": id }))?;
+                let issue = &data["issue"];
+                let states: Vec<State> =
+                    serde_json::from_value(issue["team"]["states"]["nodes"].clone())
+                        .context("parsing Linear's workflow states")?;
+                let to = states.iter().find(|s| s.name == *state).with_context(|| {
+                    let names: Vec<&str> = states.iter().map(|s| s.name.as_str()).collect();
+                    format!(
+                        "{id}'s team has no state {state:?} (it has {})",
+                        names.join(", ")
+                    )
+                })?;
+                let moved = json!({"id": issue["id"], "stateId": to.id});
+                let data = linear(api_key_env, LINEAR_MOVE, moved)?;
+                if data["issueUpdate"]["success"] != true {
+                    bail!("Linear did not move {id} to {state:?}");
+                }
+            }
+        }
+        Kind::Command(_) => {}
+    }
+    Ok(())
+}
+
+/// The comment a deploy leaves on its issue: which agent took it and where
+/// it runs — the workspace made for it in `project`, or the project itself
+/// when deployed there; the pane and session `tutti pane focus` finds it
+/// by; and the branch a sandbox pushes its work to.
+pub fn deployed_comment(
+    agent: &str,
+    project: &str,
+    workspace: Option<&str>,
+    pane: PaneId,
+    session: &str,
+    branch: Option<&str>,
+) -> String {
+    let place = match workspace {
+        Some(workspace) => format!("workspace `{workspace}` of project `{project}`"),
+        None => format!("project `{project}`"),
+    };
+    let branch = branch.map_or(String::new(), |b| format!(", pushing to branch `{b}`"));
+    format!(
+        "tutti deployed {agent} on this issue: {place}, pane {pane} of session `{session}`{branch}."
+    )
 }
 
 /// The longest argument Linux's exec takes, its NUL included (MAX_ARG_STRLEN,
@@ -236,11 +360,11 @@ pub fn prompt(template: &str, issue: &Issue) -> String {
     out.trim().to_string()
 }
 
-/// The jj workspace an issue deploys into: its id lowercased, every other
-/// character a `-` (`ENG-42` → `eng-42`) — and, for an id that does not lead
-/// with a letter, its source's name in front (`gh-123`), since a bare number
-/// names nothing.
-pub fn workspace_name(issue: &Issue) -> String {
+/// The jj workspace issue `id` of `source` deploys into: the id lowercased,
+/// every other character a `-` (`ENG-42` → `eng-42`) — and, for an id that
+/// does not lead with a letter, the source's name in front (`gh-123`), since a
+/// bare number names nothing.
+pub fn workspace_name(source: &str, id: &str) -> String {
     let clean = |s: &str| -> String {
         s.chars()
             .map(|c| match c {
@@ -250,10 +374,10 @@ pub fn workspace_name(issue: &Issue) -> String {
             })
             .collect()
     };
-    if issue.id.starts_with(|c: char| c.is_ascii_alphabetic()) {
-        clean(&issue.id)
+    if id.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        clean(id)
     } else {
-        format!("{}-{}", clean(&issue.source), clean(&issue.id))
+        format!("{}-{}", clean(source), clean(id))
     }
 }
 
@@ -484,6 +608,7 @@ mod tests {
             name: "jira".into(),
             kind: Kind::Command(vec!["/bin/sh".into(), "-c".into(), script.into()]),
             prompt: DEFAULT_PROMPT.into(),
+            comment: false,
         }
     }
 
@@ -683,11 +808,73 @@ mod tests {
     }
 
     #[test]
+    fn a_deploy_comment_names_where_its_agent_runs() {
+        assert_eq!(
+            deployed_comment("claude", "api", Some("gh-123"), PaneId(7), "tutti", None),
+            "tutti deployed claude on this issue: workspace `gh-123` of project `api`, \
+             pane 7 of session `tutti`."
+        );
+        assert_eq!(
+            deployed_comment(
+                "codex",
+                "api",
+                None,
+                PaneId(3),
+                "work",
+                Some("tutti/codex-3")
+            ),
+            "tutti deployed codex on this issue: project `api`, pane 3 of session `work`, \
+             pushing to branch `tutti/codex-3`."
+        );
+    }
+
+    /// Write-back is opt-in, piece by piece: a comment, a GitHub assignee or
+    /// label, a Linear state. A source asking none writes nothing.
+    #[test]
+    fn only_a_source_that_opts_in_writes_back() {
+        let github = |assign: Option<&str>, label: Option<&str>| Kind::Github {
+            repo: None,
+            search: None,
+            limit: 50,
+            assign: assign.map(String::from),
+            label: label.map(String::from),
+        };
+        let linear = |state: Option<&str>| Kind::Linear {
+            api_key_env: "LINEAR_API_KEY".into(),
+            team: None,
+            filter: None,
+            limit: 50,
+            state: state.map(String::from),
+        };
+        let source = |kind: Kind, comment: bool| Source {
+            kind,
+            comment,
+            ..command_source("true")
+        };
+        for (kind, writes) in [
+            (github(None, None), false),
+            (github(Some("@me"), None), true),
+            (github(None, Some("agent")), true),
+            (linear(None), false),
+            (linear(Some("In Progress")), true),
+        ] {
+            assert_eq!(
+                source(kind.clone(), false).writes_back(),
+                writes,
+                "{kind:?}"
+            );
+            assert!(source(kind, true).writes_back(), "a comment writes back");
+        }
+        let quiet = source(github(None, None), false);
+        write_back(&quiet, "1", "never sent", Path::new("/nonexistent")).unwrap();
+    }
+
+    #[test]
     fn workspace_names_derive_from_the_id() {
-        assert_eq!(workspace_name(&issue("gh", "123")), "gh-123");
-        assert_eq!(workspace_name(&issue("linear", "ENG-42")), "eng-42");
-        assert_eq!(workspace_name(&issue("jira", "PROJ 7/x")), "proj-7-x");
-        assert_eq!(workspace_name(&issue("Work_GH", "9")), "work_gh-9");
+        assert_eq!(workspace_name("gh", "123"), "gh-123");
+        assert_eq!(workspace_name("linear", "ENG-42"), "eng-42");
+        assert_eq!(workspace_name("jira", "PROJ 7/x"), "proj-7-x");
+        assert_eq!(workspace_name("Work_GH", "9"), "work_gh-9");
     }
 
     #[test]

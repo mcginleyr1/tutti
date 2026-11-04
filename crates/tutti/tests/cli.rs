@@ -670,7 +670,8 @@ fn serve_requests(
 }
 
 /// What a fake daemon answers an `issue deploy`: project 1 is `api` at
-/// `dir`, a workspace fork makes workspace 2, and the run lands in pane 7.
+/// `dir`, a workspace fork makes workspace 2, and the run lands in pane 7,
+/// whose sandbox is `claude-7-x`.
 fn answer_deploy(dir: PathBuf) -> impl Fn(&Request) -> Response + Send + 'static {
     move |request| match request {
         Request::WorkspaceList => Response::Workspaces {
@@ -687,8 +688,175 @@ fn answer_deploy(dir: PathBuf) -> impl Fn(&Request) -> Response + Send + 'static
             tab: tutti_core::TabId(1),
             pane: PaneId(7),
         },
+        Request::PaneList => Response::Panes {
+            panes: vec![
+                serde_json::from_str(
+                    r#"{"id":7,"title":"claude","agent":null,"state":"unknown","exited":null,
+                        "sandbox_name":"claude-7-x"}"#,
+                )
+                .unwrap(),
+            ],
+        },
         other => panic!("a deploy asked {other:?}"),
     }
+}
+
+/// A deploy writes back to its tracker as far as its source opts in, through
+/// the same tools a fetch uses, in the project's directory: on GitHub `gh`
+/// comments where the agent runs — a sandbox deploy names the branch it
+/// pushes to — then assigns and labels the issue; on Linear `curl` comments
+/// and moves the issue to the named state, the key only ever on its stdin. A
+/// source asking for nothing writes nothing, and a refused write-back exits 1
+/// after the agent is running.
+#[test]
+fn issue_deploy_writes_back_through_stub_gh_and_curl() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = unique_base("writeback");
+    let project = base.join("api");
+    let bin = base.join("bin");
+    let log = base.join("log");
+    for dir in [&project.join(".jj"), &bin, &log, &base.join("tutti")] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let gh = format!(
+        "#!/bin/sh\n{{ basename \"$(pwd)\"; printf '%s\\n' \"$@\" --; }} >> {log}/gh\n\
+         [ \"$2\" = view ] && printf '{{\"number\":123,\"title\":\"Fix the login\",\
+         \"body\":\"It loops.\",\"url\":\"https://github.com/acme/api/issues/123\"}}'\n\
+         exit 0\n",
+        log = log.display()
+    );
+    let curl = format!(
+        "#!/bin/sh\ninput=$(cat)\n\
+         {{ printf '%s\\n' \"$@\" --; }} >> {log}/curl.args\n\
+         printf '%s\\n--\\n' \"$input\" >> {log}/curl.stdin\n\
+         case \"$input\" in\n\
+         *commentCreate*) printf '{{\"data\":{{\"commentCreate\":{{\"success\":true}}}}}}' ;;\n\
+         *issueUpdate*) printf '{{\"data\":{{\"issueUpdate\":{{\"success\":true}}}}}}' ;;\n\
+         *states*) printf '{{\"data\":{{\"issue\":{{\"id\":\"uuid-42\",\"team\":{{\"states\":\
+         {{\"nodes\":[{{\"id\":\"st-1\",\"name\":\"Todo\"}},{{\"id\":\"st-2\",\"name\":\"In Progress\"}}]}}}}}}}}}}' ;;\n\
+         *) printf '{{\"data\":{{\"issue\":{{\"identifier\":\"ENG-42\",\"title\":\"Fix the login\",\
+         \"description\":null,\"url\":\"https://linear.app/acme/issue/ENG-42\",\"labels\":{{\"nodes\":[]}}}}}}}}' ;;\n\
+         esac\n",
+        log = log.display()
+    );
+    for (name, script) in [("gh", gh), ("curl", curl)] {
+        std::fs::write(bin.join(name), script).unwrap();
+        std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(
+        base.join("tutti/config.toml"),
+        "[[issues]]\nname = \"gh\"\nkind = \"github\"\ncomment = true\nassign = \"@me\"\n\
+         label = \"agent\"\n\n\
+         [[issues]]\nname = \"quiet\"\nkind = \"github\"\n\n\
+         [[issues]]\nname = \"linear\"\nkind = \"linear\"\napi_key_env = \"TUTTI_TEST_KEY\"\n\
+         comment = true\nstate = \"In Progress\"\n\n\
+         [[issues]]\nname = \"shipped\"\nkind = \"linear\"\napi_key_env = \"TUTTI_TEST_KEY\"\n\
+         state = \"Shipped\"\n\n\
+         [[sandboxes]]\nname = \"orb\"\nimage = \"agent:1\"\n",
+    )
+    .unwrap();
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let deploy = |args: &[&str], n: usize| {
+        let listener = UnixListener::bind(base.join("tutti/tutti.sock")).unwrap();
+        let server = serve_requests(listener, n, answer_deploy(project.clone()));
+        let output = Command::new(env!("CARGO_BIN_EXE_tutti"))
+            .args(["issue", "deploy"])
+            .args(args)
+            .args(["--project", "1"])
+            .env("XDG_RUNTIME_DIR", &base)
+            .env("XDG_CONFIG_HOME", &base)
+            .env("PATH", &path)
+            .env("TUTTI_TEST_KEY", "lin_api_secret")
+            .env_remove("TUTTI_SESSION")
+            .env_remove("TUTTI_PANE")
+            .output()
+            .unwrap();
+        std::fs::remove_file(base.join("tutti/tutti.sock")).unwrap();
+        (output, server.join().unwrap())
+    };
+    let read = |name: &str| std::fs::read_to_string(log.join(name)).unwrap_or_default();
+
+    let (output, requests) = deploy(&["gh", "123", "--sandbox", "orb"], 4);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(requests[3], Request::PaneList, "for the sandbox's branch");
+    assert_eq!(
+        read("gh"),
+        "api\nissue\nview\n123\n--json\nnumber,title,body,url,labels\n--\n\
+         api\nissue\ncomment\n123\n--body\n\
+         tutti deployed claude on this issue: workspace `gh-123` of project `api`, \
+         pane 7 of session `tutti`, pushing to branch `tutti/claude-7-x`.\n--\n\
+         api\nissue\nedit\n123\n--add-assignee\n@me\n--add-label\nagent\n--\n"
+    );
+
+    std::fs::remove_file(log.join("gh")).unwrap();
+    let (output, requests) = deploy(&["quiet", "123"], 3);
+    assert!(output.status.success());
+    assert!(matches!(requests[2], Request::Run { .. }));
+    assert_eq!(
+        read("gh"),
+        "api\nissue\nview\n123\n--json\nnumber,title,body,url,labels\n--\n",
+        "a source asking for nothing writes nothing"
+    );
+
+    let (output, _) = deploy(&["linear", "ENG-42", "--agent", "codex", "--here"], 2);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let args = read("curl.args");
+    assert!(!args.contains("lin_api_secret"), "the key never rides argv");
+    assert_eq!(
+        args.matches("--config\n-\nhttps://api.linear.app/graphql\n--\n")
+            .count(),
+        4
+    );
+    let calls: Vec<serde_json::Value> = read("curl.stdin")
+        .split("\n--\n")
+        .filter(|call| !call.is_empty())
+        .map(|call| {
+            assert!(call.contains("header = \"Authorization: lin_api_secret\""));
+            let data = call.split("data = \"").nth(1).unwrap().trim_end();
+            let data = data.strip_suffix('"').unwrap();
+            serde_json::from_str(&data.replace("\\\"", "\"").replace("\\\\", "\\")).unwrap()
+        })
+        .collect();
+    assert_eq!(calls.len(), 4, "fetch, comment, states, move");
+    assert!(
+        calls[1]["query"]
+            .as_str()
+            .unwrap()
+            .contains("commentCreate")
+    );
+    assert_eq!(
+        calls[1]["variables"],
+        serde_json::json!({
+            "id": "ENG-42",
+            "body": "tutti deployed codex on this issue: project `api`, pane 7 of session `tutti`.",
+        })
+    );
+    assert!(calls[2]["query"].as_str().unwrap().contains("states"));
+    assert_eq!(calls[2]["variables"], serde_json::json!({"id": "ENG-42"}));
+    assert!(calls[3]["query"].as_str().unwrap().contains("issueUpdate"));
+    assert_eq!(
+        calls[3]["variables"],
+        serde_json::json!({"id": "uuid-42", "stateId": "st-2"}),
+        "moved by the issue's own id to the state named"
+    );
+
+    let (output, requests) = deploy(&["shipped", "ENG-42", "--here"], 2);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(matches!(requests[1], Request::Run { .. }), "the agent ran");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "error: shipped: writing back to ENG-42: ENG-42's team has no state \"Shipped\" \
+         (it has Todo, In Progress)\n"
+    );
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// An issue whose prompt is past what Linux's exec takes in one argument

@@ -724,6 +724,9 @@ kind = "github"           # through your own `gh` (it is the auth)
 repo = "acme/api"         # default: the repo the project's git remote names
 search = "label:agent"    # a `gh issue list --search` query
 limit = 50                # default 50
+comment = true            # a deploy comments where its agent runs (default false)
+assign = "@me"            # ...assigns the issue to this login
+label = "agent"           # ...and adds this label
 
 [[issues]]
 name = "linear"
@@ -732,6 +735,8 @@ api_key_env = "LINEAR_API_KEY"  # where your personal API key is (the default)
 team = "ENG"              # only this team's issues
 # filter = { priority = { lte = 2 } }  # an IssueFilter; replaces the default
                           # (your assigned issues not completed, canceled or duplicate)
+comment = true            # a deploy comments where its agent runs (default false)
+state = "In Progress"     # ...and moves the issue to this workflow state
 
 [[issues]]
 name = "jira"
@@ -1219,7 +1224,26 @@ The agent's sidebar row and pane title carry the issue id (`claude #123`),
 `tutti --json pane list` and [`tutti watch`](#watching-state-from-other-tools)
 carry its link (`issue: {source, id, title, url}`), and a
 [restore](#restoring-after-a-restart) that revives the agent keeps it.
-tutti only reads trackers: it never comments on, assigns, or moves an issue.
+
+**Write-back** is off until a source asks for it, piece by piece, and runs
+once the agent is running, through the same `gh` or `curl` (key on stdin) the
+fetch used:
+
+- `comment = true` (GitHub or Linear) leaves a comment naming where the agent
+  runs, and in a sandbox the branch it pushes to (`tutti/<name>`) — never a
+  path on your machine:
+
+  > tutti deployed claude on this issue: workspace `gh-123` of project `api`,
+  > pane 7 of session `tutti`.
+- On GitHub, `assign` adds an assignee (`@me` is you) and `label` a label
+  (`gh issue edit --add-assignee/--add-label`).
+- On Linear, `state` moves the issue to the workflow state of that name in its
+  team; a name the team lacks fails, listing the ones it has.
+
+A refused write-back leaves the agent running: `tutti issue deploy` names the
+failure on stderr after the pane id and exits 1. tutti never closes an issue:
+GitHub closes one itself when a commit saying `Fixes #123` reaches the default
+branch, which a source's `prompt` can ask the agent to write.
 
 Scripts get the same. `tutti issue list [--source <name>]` fetches in the
 current directory and prints a table of `SOURCE ID TITLE LABELS URL` (`--json`
@@ -1690,7 +1714,7 @@ tutti pane restore <pane> <N> [--force]         # restore the working copy to tu
 tutti sandbox run <profile> [--name <name>] -- <cmd...>  # provision, kubectl exec, delete — what a --sandbox pane runs (the daemon names it)
 tutti sandbox pull <pane> [--name <name>]  # fetch a sandbox's pushed tutti/<name> branch into a workspace under its project
 tutti issue list [--source <name>]   # every configured tracker's open issues (--json for scripts)
-tutti issue deploy <source> <id> [--agent claude] [--project <id>] [--here] [--sandbox <profile>]  # an agent on the issue, in its own workspace; prints the pane id
+tutti issue deploy <source> <id> [--agent claude] [--project <id>] [--here] [--sandbox <profile>]  # an agent on the issue, in its own workspace; prints the pane id, then writes back as the source opts in
 tutti notes [--unread]               # the notification history, newest first
 tutti notes read [--up-to <id>] [--pane <id>] | clear  # mark notes read (all, or narrowed) / empty the history
 tutti hooks claude|opencode [--raw]  # print the Claude Code hooks snippet / the opencode plugin
@@ -1746,8 +1770,9 @@ tutti is alpha; PLAN.md tracks what is open.
   own; Codex, Gemini and the rest of the catalog are read from the screen,
   tuned live only for some.
 - **Approvals are Claude Code's only**, one held per pane at a time.
-- **Trackers are read-only.** A deploy never comments on, assigns, or moves
-  its issue.
+- **Write-back stops at the deploy.** A source can have a deploy comment on,
+  assign, label or move its issue, but tutti never closes it, and a command
+  source (any other tracker) is read-only.
 - **A pane's program that asked for key releases or the text of a key**
   (kitty's flags 2 and 16) gets presses only: the TUI asks your terminal for
   neither.

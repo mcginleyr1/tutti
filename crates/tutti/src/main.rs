@@ -101,7 +101,7 @@ enum Command {
         action: SandboxAction,
     },
     /// List tracker issues (`[[issues]]` in the config) and deploy one to an
-    /// agent. Read-only toward the trackers.
+    /// agent, writing back to the tracker only as far as its source opts in.
     Issue {
         #[command(subcommand)]
         action: IssueAction,
@@ -242,7 +242,9 @@ enum IssueAction {
     /// Launch an agent on an issue, the issue as its prompt and the pane
     /// linked back to it: in a new jj workspace named after the issue under
     /// the project, or a fresh tab of the project itself with `--here` (or
-    /// when the project is not a jj repo). Prints the new pane's id.
+    /// when the project is not a jj repo). Prints the new pane's id, then
+    /// writes back as the source opts in (`comment`, `assign`, `label`,
+    /// `state`), exiting 1 if the tracker refuses.
     Deploy {
         /// The configured source.
         source: String,
@@ -1159,7 +1161,9 @@ fn run_wait(
 /// `issue list` and `issue deploy`. A listing talks to the trackers alone,
 /// from the current directory; a deploy fetches the issue in its project's
 /// directory, then asks the daemon for a workspace named after it (unless
-/// `--here`, or a project outside jj) and the run there.
+/// `--here`, or a project outside jj) and the run there, then writes back to
+/// the tracker as far as its source opts in — a refusal there exits 1, the
+/// agent running all the same.
 fn run_issue(action: IssueAction, session: &str, json: bool) -> Result<i32> {
     let config = Config::load()?;
     match action {
@@ -1227,30 +1231,67 @@ fn run_issue(action: IssueAction, session: &str, json: bool) -> Result<i32> {
             let issue = issues::fetch(source, &id, &project.dir)?;
             let prompt = issues::prompt(&source.prompt, &issue);
             let cmd = on(&issues::fit_arg(prompt, sandbox.is_some())?)?;
-            let workspace = if here || !project.dir.ancestors().any(|d| d.join(".jj").exists()) {
-                project.id
-            } else {
-                match client.request(&Request::WorkspaceFork {
+            let into = (!here && project.dir.ancestors().any(|d| d.join(".jj").exists()))
+                .then(|| issues::workspace_name(&issue.source, &issue.id));
+            let workspace = match &into {
+                None => project.id,
+                Some(name) => match client.request(&Request::WorkspaceFork {
                     id: project.id,
-                    name: issues::workspace_name(&issue),
+                    name: name.clone(),
                     revision: None,
                     dest: None,
                 })? {
                     Response::WorkspaceCreated { id } => id,
                     Response::Error { message } => bail!("{message}"),
                     other => bail!("unexpected reply to workspace add: {other:?}"),
-                }
+                },
             };
             let response = client.request(&Request::Run {
                 workspace: Some(workspace),
                 dir: None,
                 cmd,
-                sandbox,
+                sandbox: sandbox.clone(),
                 title: None,
                 issue: Some(issue.link()),
                 from: None,
             })?;
-            Ok(emit(response, json))
+            let ran = match response {
+                Response::Ran { pane, .. } => Some(pane),
+                _ => None,
+            };
+            let code = emit(response, json);
+            let Some(pane) = ran.filter(|_| source.writes_back()) else {
+                return Ok(code);
+            };
+            // The branch a sandbox pushes to is named for it by the daemon.
+            let branch = match sandbox {
+                None => None,
+                Some(_) => match client.request(&Request::PaneList)? {
+                    Response::Panes { panes } => panes
+                        .into_iter()
+                        .find(|p| p.id == pane)
+                        .and_then(|p| p.sandbox_name)
+                        .map(|name| tutti_core::sandbox_branch(&name)),
+                    other => bail!("unexpected reply to pane list: {other:?}"),
+                },
+            };
+            let comment = issues::deployed_comment(
+                &agent,
+                &project.name,
+                into.as_deref(),
+                pane,
+                session,
+                branch.as_deref(),
+            );
+            if let Err(e) = issues::write_back(source, &issue.id, &comment, &project.dir) {
+                eprintln!(
+                    "error: {}: writing back to {}: {e:#}",
+                    source.name,
+                    issues::label(&issue.id)
+                );
+                return Ok(1);
+            }
+            Ok(code)
         }
     }
 }
