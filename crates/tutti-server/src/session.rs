@@ -602,7 +602,7 @@ impl Session {
                         focused: focused == Some(slot.meta.id),
                         user_vars: slot.meta.user_vars.clone(),
                         cwd: slot.pty.cwd(),
-                        approval: slot.meta.approval.clone(),
+                        approval: slot.meta.approvals.first().cloned(),
                         issue: slot.meta.issue.clone(),
                     })
             })
@@ -892,31 +892,28 @@ impl Session {
         })
     }
 
-    /// Hold a permission request on `pane` for an answer from tutti: the
-    /// pending approval its view carries, under a fresh id an answer must
+    /// Hold a permission request on `pane` for an answer from tutti: a
+    /// pending approval its view carries, queued behind any it holds already
+    /// (parallel subagents ask at once), under a fresh id an answer must
     /// name. `None` — the request goes straight on to Claude's own dialog —
-    /// for an unknown pane, or one already holding an approval (parallel
-    /// subagents can ask at once; one is held at a time).
+    /// for an unknown pane.
     pub fn hold_approval(&mut self, pane: PaneId, tool: String, summary: String) -> Option<u64> {
-        let slot = self
-            .panes
-            .get_mut(&pane)
-            .filter(|s| s.meta.approval.is_none())?;
+        let slot = self.panes.get_mut(&pane)?;
         let id = self.ids.approval();
-        slot.meta.approval = Some(PendingApproval { id, tool, summary });
+        slot.meta
+            .approvals
+            .push(PendingApproval { id, tool, summary });
         Some(id)
     }
 
-    /// End `pane`'s pending approval if it is `id` (whichever it is, when
-    /// `None`) — answered, or its hook gone — returning the id it held.
-    pub fn take_approval(&mut self, pane: PaneId, id: Option<u64>) -> Option<u64> {
-        let slot = self.panes.get_mut(&pane)?;
-        let held = slot.meta.approval.as_ref()?.id;
-        if id.is_some_and(|id| id != held) {
-            return None;
-        }
-        slot.meta.approval = None;
-        Some(held)
+    /// End `pane`'s pending approval `id` (its oldest, when `None`) —
+    /// answered, or its hook gone — returning the id ended and whether the
+    /// pane still holds others.
+    pub fn take_approval(&mut self, pane: PaneId, id: Option<u64>) -> Option<(u64, bool)> {
+        let held = &mut self.panes.get_mut(&pane)?.meta.approvals;
+        let at = held.iter().position(|a| id.is_none_or(|id| id == a.id))?;
+        let taken = held.remove(at).id;
+        Some((taken, !held.is_empty()))
     }
 
     /// Record the agent kind detected for a pane. Returns whether it changed. A
@@ -1557,6 +1554,7 @@ impl Session {
                     subagents: Vec::new(),
                     checkpoints: Vec::new(),
                     approval: None,
+                    approvals: Vec::new(),
                     source: None,
                     sandbox: None,
                     issue: None,
@@ -1652,6 +1650,7 @@ fn pane_info(slot: &PaneSlot) -> PaneInfo {
     let mut info = PaneInfo {
         checkpoints: slot.turns.entries().to_vec(),
         cwd: slot.pty.cwd(),
+        approval: slot.meta.approvals.first().cloned(),
         ..slot.meta.clone()
     };
     if info.agent.is_none() {
@@ -2019,40 +2018,58 @@ mod tests {
     }
 
     #[test]
-    fn a_pane_holds_one_approval_until_it_is_taken_by_id() {
+    fn a_pane_holds_every_approval_in_order_until_each_is_taken() {
         let (mut s, pane, _tmp) = session_with_pane();
-        let held = |s: &Session| info(s, pane).approval;
+        let held = |s: &Session| {
+            let info = info(s, pane);
+            (info.approval, info.approvals)
+        };
+        let bash = |id| PendingApproval {
+            id,
+            tool: "Bash".into(),
+            summary: "rm -rf build".into(),
+        };
+        let edit = |id| PendingApproval {
+            id,
+            tool: "Edit".into(),
+            summary: "src/main.rs".into(),
+        };
         let first = s
             .hold_approval(pane, "Bash".into(), "rm -rf build".into())
             .unwrap();
-        assert_eq!(
-            held(&s),
-            Some(PendingApproval {
-                id: first,
-                tool: "Bash".into(),
-                summary: "rm -rf build".into(),
-            })
-        );
-        assert_eq!(
-            s.hold_approval(pane, "Edit".into(), "src/main.rs".into()),
-            None,
-            "one is held at a time: a second goes on to Claude's dialog"
-        );
-        assert_eq!(s.take_approval(pane, Some(first + 1)), None, "a stale id");
-        assert!(held(&s).is_some(), "takes nothing");
-        assert_eq!(s.take_approval(pane, Some(first)), Some(first));
-        assert_eq!(held(&s), None);
-        assert_eq!(s.take_approval(pane, None), None, "nothing left to take");
-
         let second = s
             .hold_approval(pane, "Edit".into(), "src/main.rs".into())
             .unwrap();
-        assert!(second > first, "an id is never reused");
+        assert!(second > first, "ids count up");
+        assert_eq!(
+            held(&s),
+            (Some(bash(first)), vec![bash(first), edit(second)]),
+            "a parallel request queues behind the first, which older clients see"
+        );
+        assert_eq!(s.take_approval(pane, Some(second + 1)), None, "a stale id");
+        assert_eq!(held(&s).1.len(), 2, "takes nothing");
+        assert_eq!(
+            s.take_approval(pane, Some(second)),
+            Some((second, true)),
+            "the second is answered first; the first still waits"
+        );
+        assert_eq!(held(&s), (Some(bash(first)), vec![bash(first)]));
+        assert_eq!(s.take_approval(pane, None), Some((first, false)));
+        assert_eq!(held(&s), (None, Vec::new()));
+        assert_eq!(s.take_approval(pane, None), None, "nothing left to take");
+
+        let third = s
+            .hold_approval(pane, "Edit".into(), "src/main.rs".into())
+            .unwrap();
+        let fourth = s
+            .hold_approval(pane, "Bash".into(), "rm -rf build".into())
+            .unwrap();
         assert_eq!(
             s.take_approval(pane, None),
-            Some(second),
-            "`None` takes whichever is held"
+            Some((third, true)),
+            "`None` takes the oldest"
         );
+        assert!(fourth > third, "an id is never reused");
         assert_eq!(
             s.hold_approval(PaneId(99), "Bash".into(), "ls".into()),
             None,

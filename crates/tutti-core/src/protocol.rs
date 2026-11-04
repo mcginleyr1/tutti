@@ -318,9 +318,10 @@ pub enum Request {
     /// the request's `AgentEvent`, so the pane blocks just the same. `tool`
     /// is what would run, `summary` its input on one line. Answered with
     /// `Response::Approval` once an `ApprovalAnswer` names it, or at once with
-    /// `Pass` — Claude's own dialog — when no client is attached to answer,
-    /// the pane is unknown, or it already holds one. The approval lives as
-    /// long as this connection: hanging up drops it.
+    /// `Pass` — Claude's own dialog — when no client is attached to answer or
+    /// the pane is unknown. A pane holds every request its agent raises (its
+    /// subagents ask in parallel), queued behind the ones before. The
+    /// approval lives as long as this connection: hanging up drops it.
     ApprovalHold {
         pane: PaneId,
         #[serde(default)]
@@ -328,8 +329,8 @@ pub enum Request {
         tool: String,
         summary: String,
     },
-    /// Answer `pane`'s held approval: `id` names the one the sender looked at
-    /// (`PaneInfo::approval`), `None` whichever the pane holds. Error when the
+    /// Answer one of `pane`'s held approvals: `id` names the one the sender
+    /// looked at (`PaneInfo::approvals`), `None` the oldest. Error when the
     /// pane holds no such approval — it was answered, or its hook gave up.
     ApprovalAnswer {
         pane: PaneId,
@@ -573,11 +574,15 @@ pub struct PaneInfo {
     /// servers.
     #[serde(default)]
     pub checkpoints: Vec<Checkpoint>,
-    /// The permission request the pane's agent holds for an answer from
-    /// tutti (`approvals = "hold"`), until it is answered or its hook gives
-    /// up. `None` without one and from older servers.
+    /// The oldest of `approvals`, for clients from before a pane held more
+    /// than one. `None` without one and from older servers.
     #[serde(default)]
     pub approval: Option<PendingApproval>,
+    /// The permission requests the pane's agent holds for an answer from
+    /// tutti (`approvals = "hold"`), oldest first, each until it is answered
+    /// or its hook gives up. Empty without one and from older servers.
+    #[serde(default)]
+    pub approvals: Vec<PendingApproval>,
     /// What set `state`: a hook, the pane's own program report (OSC 7501 /
     /// 9;4), the screen classifier, or output activity. `None` until something
     /// has, and after a claim ends. Defaults `None` for older servers.
@@ -695,8 +700,8 @@ pub struct WatchPane {
     /// As `PaneInfo::cwd`.
     #[serde(default)]
     pub cwd: Option<String>,
-    /// As `PaneInfo::approval`: the permission request the pane's agent holds
-    /// for an answer, `None` without one.
+    /// As `PaneInfo::approval`: the oldest permission request the pane's
+    /// agent holds for an answer, `None` without one.
     #[serde(default)]
     pub approval: Option<PendingApproval>,
     /// As `PaneInfo::issue`: the tracker issue the pane's agent was deployed
@@ -1609,6 +1614,7 @@ mod tests {
                     subagents: Vec::new(),
                     checkpoints: vec![sample_checkpoint()],
                     approval: None,
+                    approvals: Vec::new(),
                     source: None,
                     sandbox: None,
                     issue: None,
@@ -1661,6 +1667,18 @@ mod tests {
                     tool: "Bash".into(),
                     summary: "rm -rf build".into(),
                 }),
+                approvals: vec![
+                    PendingApproval {
+                        id: 7,
+                        tool: "Bash".into(),
+                        summary: "rm -rf build".into(),
+                    },
+                    PendingApproval {
+                        id: 9,
+                        tool: "Edit".into(),
+                        summary: "src/main.rs".into(),
+                    },
+                ],
                 source: Some(StateSource::Hook),
                 sandbox: Some("gke".into()),
                 issue: Some(Box::new(sample_issue())),
@@ -1681,6 +1699,7 @@ mod tests {
                 subagents: Vec::new(),
                 checkpoints: Vec::new(),
                 approval: None,
+                approvals: Vec::new(),
                 source: Some(StateSource::Program),
                 sandbox: None,
                 issue: None,
@@ -2069,6 +2088,7 @@ mod tests {
         assert!(pane.user_vars.is_empty(), "and before `user_vars`, none");
         assert_eq!(pane.cwd, None, "and before `cwd`, no report");
         assert_eq!(pane.approval, None, "and before `approval`, nothing held");
+        assert!(pane.approvals.is_empty(), "nor before `approvals`");
         assert_eq!(pane.workspace, None, "and before `workspace`, unnamed");
         // A watcher's pane from before `user_vars`, `cwd`, `approval` and
         // `issue` existed has none of them.

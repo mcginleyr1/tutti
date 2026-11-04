@@ -169,11 +169,13 @@ and nothing is typed. Taking the fingerprint before reading keeps that safe.
 sure they would approve, and ask them about the rest.
 
 When your user runs tutti with `approvals = "hold"`, a Claude permission
-request waits in tutti instead of Claude's own dialog, and `tutti pane list
---json` shows it as the pane's `approval` (tool and summary). Answer it with:
+request waits in tutti, and `tutti pane list --json` lists the
+pane's held requests, oldest first, as `approvals` (id, tool and summary) —
+several when its subagents ask at once. Answer each on its own:
 
 ```sh
-tutti pane approve 7                                   # allow the held tool call
+tutti pane approve 7                                   # allow the oldest held tool call
+tutti pane approve 7 --id 12                           # allow the one with id 12
 tutti pane approve 7 --deny --message "not on main"    # refuse it, telling the agent why
 ```
 

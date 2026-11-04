@@ -2931,8 +2931,7 @@ async fn a_hook_hanging_up_drops_its_approval() {
 }
 
 /// An answer lands only on the approval it names: a stale id is refused, as
-/// is any answer once nothing is held, while `None` answers whichever is. A
-/// second request while one is held goes straight on to Claude's dialog.
+/// is any answer once nothing is held, while `None` answers the oldest.
 #[tokio::test]
 async fn a_stale_approval_answer_is_refused() {
     let server = TestServer::start();
@@ -2943,22 +2942,12 @@ async fn a_stale_approval_answer_is_refused() {
     let mut hook = server.connect().await;
     hook.send(&hold(pane)).await;
     assert!(wait_pane(&mut control, pane, |p| p.approval.is_some()).await);
-    let mut second = server.connect().await;
-    assert_eq!(
-        approval(second.request(hold(pane)).await),
-        ApprovalDecision::Pass,
-        "one is held at a time"
-    );
     let answer = |id| Request::ApprovalAnswer {
         pane,
         id,
         decision: ApprovalDecision::Allow,
     };
-    let held = match control.request(Request::PaneList).await {
-        Response::Panes { panes } => panes.into_iter().find(|p| p.id == pane).unwrap().approval,
-        other => panic!("expected Panes, got {other:?}"),
-    }
-    .unwrap();
+    let held = held_approvals(&mut control, pane).await.remove(0);
     let stale = control.request(answer(Some(held.id + 1))).await;
     assert_eq!(
         error_message(stale),
@@ -2972,6 +2961,108 @@ async fn a_stale_approval_answer_is_refused() {
     assert_eq!(
         error_message(none),
         format!("pane {pane} has no pending approval")
+    );
+
+    server.stop().await;
+}
+
+/// The approvals `pane` holds, oldest first, from a fresh `pane list`.
+async fn held_approvals(conn: &mut Conn, pane: PaneId) -> Vec<PendingApproval> {
+    match conn.request(Request::PaneList).await {
+        Response::Panes { panes } => panes.into_iter().find(|p| p.id == pane).unwrap().approvals,
+        other => panic!("expected Panes, got {other:?}"),
+    }
+}
+
+/// Parallel subagents ask at once: the pane holds every request, oldest
+/// first, and each is answered on its own. The pane stays blocked while any
+/// still waits on you; a hook hanging up (its own timeout) drops only its
+/// own request; the last answer sets the agent going.
+#[tokio::test]
+async fn a_pane_holds_parallel_approvals_each_answered_on_its_own() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let pane = run_sleeper(&mut control).await;
+    let _viewer = attached_viewer(&server).await;
+
+    let mut hooks = Vec::new();
+    for summary in ["touch a.txt", "touch b.txt", "touch c.txt"] {
+        let mut hook = server.connect().await;
+        hook.send(&Request::ApprovalHold {
+            pane,
+            conversation: None,
+            tool: "Bash".into(),
+            summary: summary.into(),
+        })
+        .await;
+        hooks.push(hook);
+        let count = hooks.len();
+        assert!(wait_pane(&mut control, pane, |p| p.approvals.len() == count).await);
+    }
+    let held = held_approvals(&mut control, pane).await;
+    assert_eq!(
+        held.iter().map(|a| a.summary.as_str()).collect::<Vec<_>>(),
+        ["touch a.txt", "touch b.txt", "touch c.txt"],
+        "in the order they came"
+    );
+    assert!(held.windows(2).all(|w| w[0].id < w[1].id));
+
+    let answer = |id, decision| Request::ApprovalAnswer {
+        pane,
+        id: Some(id),
+        decision,
+    };
+    assert_eq!(
+        control
+            .request(answer(held[1].id, ApprovalDecision::Allow))
+            .await,
+        Response::Ok
+    );
+    assert_eq!(approval(hooks[1].response().await), ApprovalDecision::Allow);
+    let waiting = |p: &PaneInfo| p.approvals.len() == 2 && p.state == AgentState::Blocked;
+    assert!(
+        wait_pane(&mut control, pane, waiting).await,
+        "the others still wait on you"
+    );
+
+    drop(hooks.remove(2));
+    assert!(
+        wait_pane(&mut control, pane, |p| p.approvals.len() == 1).await,
+        "a hook giving up drops its own request only"
+    );
+    assert_eq!(held_approvals(&mut control, pane).await[0].id, held[0].id);
+    assert_eq!(
+        control
+            .request(answer(held[0].id, ApprovalDecision::Pass))
+            .await,
+        Response::Ok
+    );
+    assert_eq!(approval(hooks[0].response().await), ApprovalDecision::Pass);
+    assert!(
+        wait_pane(&mut control, pane, |p| p.approvals.is_empty()
+            && p.state == AgentState::Blocked)
+        .await,
+        "a pass leaves the last one to Claude's dialog"
+    );
+
+    let mut last = server.connect().await;
+    last.send(&hold(pane)).await;
+    assert!(wait_pane(&mut control, pane, |p| p.approvals.len() == 1).await);
+    let deny = ApprovalDecision::Deny { message: None };
+    assert_eq!(
+        control
+            .request(Request::ApprovalAnswer {
+                pane,
+                id: None,
+                decision: deny.clone(),
+            })
+            .await,
+        Response::Ok
+    );
+    assert_eq!(approval(last.response().await), deny);
+    assert!(
+        wait_state(&mut control, pane, AgentState::Working).await,
+        "the last answer sets the agent going"
     );
 
     server.stop().await;

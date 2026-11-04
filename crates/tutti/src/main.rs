@@ -436,11 +436,15 @@ enum PaneAction {
         #[arg(long, conflicts_with_all = ["since", "fingerprint"])]
         last_output: bool,
     },
-    /// Answer the pane's held approval — a Claude permission request waiting
-    /// on tutti under `approvals = "hold"`: allow the tool call, or `--deny`
-    /// it.
+    /// Answer one of the pane's held approvals — a permission request waiting
+    /// on tutti under `approvals = "hold"`, the oldest unless `--id` names
+    /// another (`pane list --json` lists them): allow the tool call, or
+    /// `--deny` it.
     Approve {
         pane: u64,
+        /// The approval to answer, by its id.
+        #[arg(long)]
+        id: Option<u64>,
         /// Refuse the tool call instead.
         #[arg(long)]
         deny: bool,
@@ -1069,11 +1073,12 @@ fn to_request(command: Command) -> Result<Request> {
             },
             PaneAction::Approve {
                 pane,
+                id,
                 deny,
                 message,
             } => Request::ApprovalAnswer {
                 pane: PaneId(pane),
-                id: None,
+                id,
                 decision: if deny {
                     ApprovalDecision::Deny { message }
                 } else {
@@ -2499,6 +2504,15 @@ mod tests {
         assert!(
             Cli::try_parse_from(["tutti", "pane", "approve", "3", "--message", "why"]).is_err(),
             "a reason is a denial's"
+        );
+        assert_eq!(
+            request_of(&["tutti", "pane", "approve", "3", "--id", "9"]),
+            Request::ApprovalAnswer {
+                pane: PaneId(3),
+                id: Some(9),
+                decision: ApprovalDecision::Allow,
+            },
+            "one of several the pane holds"
         );
     }
 

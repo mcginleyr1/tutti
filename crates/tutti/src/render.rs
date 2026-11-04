@@ -313,6 +313,7 @@ mod tests {
             subagents: Vec::new(),
             checkpoints: Vec::new(),
             approval: None,
+            approvals: Vec::new(),
             source: None,
             sandbox: None,
             issue: None,

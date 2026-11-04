@@ -2344,6 +2344,7 @@ fn placeholder_title(pane: PaneId) -> PaneInfo {
         subagents: Vec::new(),
         checkpoints: Vec::new(),
         approval: None,
+        approvals: Vec::new(),
         source: None,
         sandbox: None,
         issue: None,
@@ -3157,6 +3158,7 @@ mod tests {
             subagents: Vec::new(),
             checkpoints: Vec::new(),
             approval: None,
+            approvals: Vec::new(),
             source: None,
             sandbox: None,
             issue: None,
@@ -3180,6 +3182,7 @@ mod tests {
             subagents: Vec::new(),
             checkpoints: Vec::new(),
             approval: None,
+            approvals: Vec::new(),
             source: None,
             sandbox: None,
             issue: None,
@@ -3218,6 +3221,7 @@ mod tests {
             subagents: Vec::new(),
             checkpoints: Vec::new(),
             approval: None,
+            approvals: Vec::new(),
             source: None,
             sandbox: None,
             issue: None,
@@ -3241,6 +3245,7 @@ mod tests {
             subagents: Vec::new(),
             checkpoints: Vec::new(),
             approval: None,
+            approvals: Vec::new(),
             source: None,
             sandbox: None,
             issue: None,
@@ -4129,11 +4134,11 @@ mod tests {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = app_two_workspaces();
         let mut view = app.workspaces.clone();
-        view[1].tabs[0].panes[0].approval = Some(tutti_core::PendingApproval {
+        view[1].tabs[0].panes[0].approvals = vec![tutti_core::PendingApproval {
             id: 7,
             tool: "Bash".into(),
             summary: "rm -rf build".into(),
-        });
+        }];
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&tutti_core::Event::LayoutChanged { workspaces: view }).unwrap(),
         ));
@@ -4879,6 +4884,7 @@ mod tests {
             subagents: Vec::new(),
             checkpoints: Vec::new(),
             approval: None,
+            approvals: Vec::new(),
             source: None,
             sandbox: None,
             issue: None,

@@ -17,9 +17,9 @@ use ratatui::text::Span;
 use rtty_vt::Terminal;
 use tutti_core::{
     AgentKind, AgentState, ApprovalDecision, Checkpoint, DIFF_RANGE, Direction, Event, FileStat,
-    Frame as WireFrame, Layout, NOTES_CAP, Note, NoteKind, PaneDims, PaneId, PaneInfo, Request,
-    Response, RestoreSummary, TabId, TabView, Tagged, Toward, WorkspaceId, WorkspaceView,
-    prompt_fingerprint, prompt_rows,
+    Frame as WireFrame, Layout, NOTES_CAP, Note, NoteKind, PaneDims, PaneId, PaneInfo,
+    PendingApproval, Request, Response, RestoreSummary, TabId, TabView, Tagged, Toward,
+    WorkspaceId, WorkspaceView, prompt_fingerprint, prompt_rows,
 };
 
 use tutti_agents::Registry;
@@ -378,9 +378,9 @@ pub struct App {
     /// The peek or approval overlay from the last size sync, for mouse
     /// hit-testing. `None` while neither is open.
     peek_rect: Option<Rect>,
-    /// The approval the approval overlay last opened for: it opens once per
-    /// approval — never again after that one is answered or dismissed — and
-    /// an answer names it.
+    /// The approval the approval overlay last opened for — the one it shows
+    /// and an answer names. Ids count up, so it opens by itself once per
+    /// approval: never on one older than this, answered or dismissed.
     approval_shown: Option<u64>,
     /// The mode the approval overlay hands back to on closing: the sidebar it
     /// was opened from, or the terminal of the pane it opened over.
@@ -848,7 +848,7 @@ impl App {
         // An approval overlay closes with its approval — answered from here or
         // anywhere else, passed on, timed out — or its pane.
         if let Mode::Approval(pane) = self.mode
-            && self.approval_id(pane) != self.approval_shown
+            && self.shown_approval(pane).is_none()
         {
             self.mode = self.approval_back;
         }
@@ -2106,9 +2106,10 @@ impl App {
         Some((pane, popup, region.end - shown..region.end))
     }
 
-    /// The id of the approval `pane` holds, if any.
-    fn approval_id(&self, pane: PaneId) -> Option<u64> {
-        self.panes.get(&pane)?.info.approval.as_ref().map(|a| a.id)
+    /// The approval the overlay shows, while `pane` still holds it.
+    fn shown_approval(&self, pane: PaneId) -> Option<&PendingApproval> {
+        let held = &self.panes.get(&pane)?.info.approvals;
+        held.iter().find(|a| Some(a.id) == self.approval_shown)
     }
 
     /// Open the approval overlay on `pane`'s approval `id`, handing the keys
@@ -2122,16 +2123,19 @@ impl App {
     }
 
     /// Open the approval overlay over the focused pane when it holds an
-    /// approval the overlay has not opened for yet — the pane in view is
-    /// asking, as Claude's own dialog would — but only from the terminal: a
-    /// panel, prompt or overlay in use is never cut into.
+    /// approval newer than any the overlay opened for — the pane in view is
+    /// asking, as Claude's own dialog would; the oldest such first — but only
+    /// from the terminal: a panel, prompt or overlay in use is never cut into.
     fn open_focused_approval(&mut self) {
         let Some(pane) = self.focused.filter(|_| self.mode == Mode::Terminal) else {
             return;
         };
-        if let Some(id) = self
-            .approval_id(pane)
-            .filter(|id| Some(*id) != self.approval_shown)
+        let held = self.panes.get(&pane).map(|s| &s.info.approvals);
+        if let Some(id) = held
+            .into_iter()
+            .flatten()
+            .map(|a| a.id)
+            .find(|id| Some(*id) > self.approval_shown)
         {
             self.open_approval(pane, id, Mode::Terminal);
             self.approval_opened = Some(Instant::now());
@@ -2178,7 +2182,7 @@ impl App {
             return None;
         };
         let state = self.panes.get(&pane)?;
-        let approval = state.info.approval.as_ref()?;
+        let approval = self.shown_approval(pane)?;
         let width = (state.term.size().1 + 2)
             .max(PEEK_MIN_WIDTH)
             .min(area.width);
@@ -5477,6 +5481,7 @@ fn placeholder_info(pane: PaneId) -> PaneInfo {
         subagents: Vec::new(),
         checkpoints: Vec::new(),
         approval: None,
+        approvals: Vec::new(),
         source: None,
         sandbox: None,
         issue: None,
@@ -6867,7 +6872,7 @@ mod tests {
         focus_sidebar(&mut app);
         let waiting = app
             .sidebar()
-            .index_of(sidebar::EntryIdent::Waiting(PaneId(3)));
+            .index_of(sidebar::EntryIdent::Waiting(PaneId(3), None));
         for _ in 0..waiting.expect("pane 3 waits in the queue") {
             app.on_key(plain('j'));
         }
@@ -6993,7 +6998,7 @@ mod tests {
                 app.sidebar().entry_at_row((r - sidebar.y) as usize)
                     == app
                         .sidebar()
-                        .index_of(sidebar::EntryIdent::Waiting(PaneId(3)))
+                        .index_of(sidebar::EntryIdent::Waiting(PaneId(3), None))
             })
             .unwrap();
         app.on_mouse(MouseEventKind::Down(MouseButton::Right), sidebar.x + 2, row);
@@ -7043,14 +7048,20 @@ mod tests {
 
     // ---- approval overlay -------------------------------------------------
 
-    /// `view_two_workspaces`, blocked pane 3 holding approval `id` when given.
-    fn view_holding(id: Option<u64>) -> Vec<WorkspaceView> {
+    /// `view_two_workspaces`, blocked pane 3 holding approvals `ids`, oldest
+    /// first, each running `touch <id>`.
+    fn view_holding(ids: &[u64]) -> Vec<WorkspaceView> {
         let mut view = view_two_workspaces();
-        view[1].tabs[0].panes[1].approval = id.map(|id| tutti_core::PendingApproval {
-            id,
-            tool: "Bash".into(),
-            summary: "rm -rf build".into(),
-        });
+        let pane = &mut view[1].tabs[0].panes[1];
+        pane.approvals = ids
+            .iter()
+            .map(|&id| PendingApproval {
+                id,
+                tool: "Bash".into(),
+                summary: format!("touch {id}"),
+            })
+            .collect();
+        pane.approval = pane.approvals.first().cloned();
         view
     }
 
@@ -7073,16 +7084,81 @@ mod tests {
     /// waiting row, and `p` pressed there.
     fn approval_fixture() -> App {
         let mut app = App::new();
-        attach_with(&mut app, view_holding(Some(7)));
+        attach_with(&mut app, view_holding(&[7]));
         focus_sidebar(&mut app);
         let waiting = app
             .sidebar()
-            .index_of(sidebar::EntryIdent::Waiting(PaneId(3)));
+            .index_of(sidebar::EntryIdent::Waiting(PaneId(3), Some(7)));
         for _ in 0..waiting.expect("pane 3 waits in the queue") {
             app.on_key(plain('j'));
         }
         assert_eq!(app.on_key(plain('p')), Vec::new(), "opening sends nothing");
         app
+    }
+
+    /// The overlay's input row: the held tool call's.
+    fn approval_shown_input(app: &App) -> String {
+        let (_, _, rows) = app.approval_popup(Rect::new(0, 0, 100, 24)).unwrap();
+        rows[1].clone()
+    }
+
+    /// A pane holding several approvals queues a row for each, and each is
+    /// answered on its own: from the queue, the cursor lands on the pane's
+    /// next row once one is answered; over the focused pane, the next opens
+    /// by itself — the oldest first, never one already shown.
+    #[test]
+    fn a_pane_holding_several_approvals_answers_each_on_its_own() {
+        let mut app = App::new();
+        attach_with(&mut app, view_holding(&[7, 9]));
+        focus_sidebar(&mut app);
+        let queue = app.sidebar();
+        let first = queue.index_of(sidebar::EntryIdent::Waiting(PaneId(3), Some(7)));
+        let second = queue.index_of(sidebar::EntryIdent::Waiting(PaneId(3), Some(9)));
+        assert_eq!(second, first.map(|i| i + 1), "one row each, in order");
+        for _ in 0..second.unwrap() {
+            app.on_key(plain('j'));
+        }
+        app.on_key(plain('p'));
+        assert_eq!(approval_shown_input(&app), "touch 9", "the row's own");
+        assert_eq!(
+            app.on_key(plain('n')),
+            answer(9, ApprovalDecision::Deny { message: None })
+        );
+        layout_changed(&mut app, view_holding(&[7]));
+        assert_eq!(
+            app.sidebar().ident_at(app.sidebar_selected()),
+            Some(sidebar::EntryIdent::Waiting(PaneId(3), Some(7))),
+            "the cursor falls to the pane's next row in the queue"
+        );
+        app.on_key(plain('p'));
+        assert_eq!(app.on_key(plain('y')), answer(7, ApprovalDecision::Allow));
+
+        let mut app = App::new();
+        attach_with(&mut app, view_holding(&[]));
+        app.active_tab = Some(TabId(2));
+        app.focused = Some(PaneId(3));
+        app.focus_change();
+        layout_changed(&mut app, view_holding(&[7, 9]));
+        assert_eq!(app.mode, Mode::Approval(PaneId(3)));
+        assert_eq!(approval_shown_input(&app), "touch 7", "the oldest first");
+        app.approval_opened = None;
+        assert_eq!(app.on_key(plain('y')), answer(7, ApprovalDecision::Allow));
+        layout_changed(&mut app, view_holding(&[9]));
+        assert_eq!(
+            app.mode,
+            Mode::Approval(PaneId(3)),
+            "the next opens by itself"
+        );
+        assert_eq!(approval_shown_input(&app), "touch 9");
+        app.approval_opened = None;
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        layout_changed(&mut app, view_holding(&[7, 9]));
+        app.focus_change();
+        assert_eq!(
+            app.mode,
+            Mode::Terminal,
+            "an answer still in flight never reopens it, nor does an older one"
+        );
     }
 
     #[test]
@@ -7114,7 +7190,7 @@ mod tests {
     fn the_approval_overlay_closes_itself_once_its_approval_ends() {
         // Answered from another client, passed on, timed out — or the pane
         // gone with it.
-        for after in [view_holding(None), view_one_pane()] {
+        for after in [view_holding(&[]), view_one_pane()] {
             let mut app = approval_fixture();
             state_changed(&mut app, PaneId(2), AgentState::Working, AgentState::Done);
             assert_eq!(
@@ -7133,11 +7209,11 @@ mod tests {
     #[test]
     fn the_focused_panes_approval_opens_over_it_once() {
         let mut app = App::new();
-        attach_with(&mut app, view_holding(None));
+        attach_with(&mut app, view_holding(&[]));
         app.active_tab = Some(TabId(2));
         app.focused = Some(PaneId(3));
         app.focus_change();
-        layout_changed(&mut app, view_holding(Some(7)));
+        layout_changed(&mut app, view_holding(&[7]));
         assert_eq!(app.mode, Mode::Approval(PaneId(3)), "the pane in view asks");
         assert!(!app.sidebar_focused());
 
@@ -7146,7 +7222,7 @@ mod tests {
         let click = MouseEventKind::Down(MouseButton::Left);
         assert_eq!(app.on_mouse(click, 99, 23), Vec::new());
         assert_eq!(app.mode, Mode::Terminal, "back on the pane");
-        layout_changed(&mut app, view_holding(Some(7)));
+        layout_changed(&mut app, view_holding(&[7]));
         app.focus_change();
         assert_eq!(
             app.mode,
@@ -7154,7 +7230,7 @@ mod tests {
             "a dismissed approval stays dismissed"
         );
 
-        layout_changed(&mut app, view_holding(Some(8)));
+        layout_changed(&mut app, view_holding(&[8]));
         assert_eq!(app.mode, Mode::Approval(PaneId(3)), "the next one opens it");
         assert!(
             app.on_key(plain('y')).is_empty(),
@@ -7166,7 +7242,7 @@ mod tests {
             .map(|at| at - APPROVAL_GRACE - Duration::from_millis(1));
         assert_eq!(app.on_key(plain('y')), answer(8, ApprovalDecision::Allow));
         assert_eq!(app.mode, Mode::Terminal);
-        layout_changed(&mut app, view_holding(Some(8)));
+        layout_changed(&mut app, view_holding(&[8]));
         assert_eq!(
             app.mode,
             Mode::Terminal,
@@ -7180,13 +7256,13 @@ mod tests {
     #[test]
     fn an_approval_never_cuts_into_a_panel_in_use() {
         let mut app = App::new();
-        attach_with(&mut app, view_holding(None));
+        attach_with(&mut app, view_holding(&[]));
         app.active_tab = Some(TabId(2));
         app.focused = Some(PaneId(3));
         app.on_key(ctrl('b'));
         app.on_key(plain('?'));
         assert_eq!(app.mode, Mode::Help);
-        layout_changed(&mut app, view_holding(Some(7)));
+        layout_changed(&mut app, view_holding(&[7]));
         app.focus_change();
         assert_eq!(app.mode, Mode::Help, "the help stays up");
         app.on_key(plain('q'));
@@ -7198,7 +7274,7 @@ mod tests {
         );
 
         let mut app = App::new();
-        attach_with(&mut app, view_holding(Some(7)));
+        attach_with(&mut app, view_holding(&[7]));
         app.focus_change();
         assert_eq!(app.mode, Mode::Terminal, "pane 1 is in view, pane 3 asks");
         focus_sidebar(&mut app);
@@ -8471,7 +8547,7 @@ mod tests {
         // daemon refuses the answer, naming no request of ours.
         let waiting = app
             .sidebar()
-            .index_of(sidebar::EntryIdent::Waiting(PaneId(3)))
+            .index_of(sidebar::EntryIdent::Waiting(PaneId(3), None))
             .unwrap();
         for _ in app.sidebar_selected()..waiting {
             app.on_key(plain('j'));

@@ -1632,9 +1632,10 @@ fn agent_event(
 /// as the request's own hook event would block it — so whoever that move
 /// wakes (a `pane wait`) finds an approval to answer. A spawned task then
 /// holds the reply until an answer comes down the approval's channel or the
-/// hook hangs up; either way the approval leaves the pane. With no client
-/// attached nobody could answer: the reply is `Pass` at once, as it is for an
-/// unknown pane or one already holding an approval.
+/// hook hangs up; either way the approval leaves the pane, and the pane's
+/// other approvals wait on, each until its own answer or hang-up. With no
+/// client attached nobody could answer: the reply is `Pass` at once, as it
+/// is for an unknown pane.
 fn approval_hold(
     hub: &Arc<Hub>,
     cid: u64,
@@ -1687,14 +1688,15 @@ fn approval_hold(
     ControlFlow::Continue(())
 }
 
-/// Answer `pane`'s held approval — `id`'s, or whichever it holds when `None`:
-/// end it, send the decision down its channel to the hook holding the
+/// Answer one of `pane`'s held approvals — `id`'s, or its oldest when
+/// `None`: end it, send the decision down its channel to the hook holding the
 /// request (one that has just hung up hears nothing, which is fine), and
 /// broadcast the view without it. An allow or a deny sets the agent going
 /// again — the tool runs, or the model hears the refusal — and Claude sends
 /// no hook until that tool is done, so the pane moves to Working here rather
-/// than sitting Blocked through it; a pass hands the request to Claude's own
-/// dialog, still blocked. Error when the pane holds no such approval.
+/// than sitting Blocked through it, unless another approval still waits on
+/// you; a pass hands the request to Claude's own dialog, still blocked.
+/// Error when the pane holds no such approval.
 fn approval_answer(
     hub: &Arc<Hub>,
     pane: PaneId,
@@ -1702,7 +1704,7 @@ fn approval_answer(
     decision: ApprovalDecision,
 ) -> Response {
     let mut session = hub.session();
-    let Some(held) = session.take_approval(pane, id) else {
+    let Some((held, waiting)) = session.take_approval(pane, id) else {
         let which = id.map_or_else(String::new, |id| format!(" #{id}"));
         return Response::Error {
             message: format!("pane {pane} has no pending approval{which}"),
@@ -1710,7 +1712,7 @@ fn approval_answer(
     };
     let view = session.view();
     drop(session);
-    let resumes = !matches!(decision, ApprovalDecision::Pass);
+    let resumes = !waiting && !matches!(decision, ApprovalDecision::Pass);
     let answer = hub.approvals().remove(&held);
     if let Some(answer) = answer {
         let _ = answer.send(decision);

@@ -28,12 +28,13 @@ pub enum Section {
 
 /// A selectable row's stable identity, independent of its position. The waiting
 /// copy of an agent is distinct from its tree row so a cursor in the queue
-/// re-anchors to the queue, not to the first duplicate, across rebuilds.
+/// re-anchors to the queue, not to the first duplicate, across rebuilds; a
+/// pane queues once per approval it holds, each row named by its approval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryIdent {
     Workspace(WorkspaceId),
     Agent(PaneId),
-    Waiting(PaneId),
+    Waiting(PaneId, Option<u64>),
 }
 
 /// Agent counts by attention-worthy state — the roll-up chips on a project row
@@ -135,8 +136,9 @@ pub struct AgentRow {
     /// `entry_at_row` accounts for them. Always empty on waiting-section rows,
     /// which stay two rows tall.
     pub subagents: Vec<SubagentInfo>,
-    /// The pane's held approval: it queues the pane — first — whatever its
-    /// state, and its waiting row names what would run.
+    /// A held approval of the pane's — on a waiting row the one it queues
+    /// for, ahead of every row without one, whatever the pane's state; on a
+    /// tree row the oldest. The row names what would run.
     pub approval: Option<PendingApproval>,
 }
 
@@ -184,14 +186,26 @@ impl Sidebar {
     pub fn ident_at(&self, idx: usize) -> Option<EntryIdent> {
         Some(match self.entries.get(idx)? {
             SidebarEntry::Workspace(w) => EntryIdent::Workspace(w.id),
-            SidebarEntry::Agent(a) if idx >= self.tree_count => EntryIdent::Waiting(a.pane),
+            SidebarEntry::Agent(a) if idx >= self.tree_count => {
+                EntryIdent::Waiting(a.pane, a.approval.as_ref().map(|p| p.id))
+            }
             SidebarEntry::Agent(a) => EntryIdent::Agent(a.pane),
         })
     }
 
-    /// The index currently holding `ident`, if the entry is still in the view.
+    /// The index currently holding `ident`, if the entry is still in the view
+    /// — for a waiting row whose approval was answered, the pane's next row in
+    /// the queue.
     pub fn index_of(&self, ident: EntryIdent) -> Option<usize> {
-        (0..self.entries.len()).find(|&i| self.ident_at(i) == Some(ident))
+        let find = |want: &dyn Fn(EntryIdent) -> bool| {
+            (0..self.entries.len()).find(|&i| self.ident_at(i).is_some_and(want))
+        };
+        find(&|i| i == ident).or_else(|| match ident {
+            EntryIdent::Waiting(pane, _) => {
+                find(&|i| matches!(i, EntryIdent::Waiting(p, _) if p == pane))
+            }
+            _ => None,
+        })
     }
 
     /// Whether entry `idx` is currently visible (its section is expanded).
@@ -268,8 +282,9 @@ impl Sidebar {
 /// Agents keep pane order — positional stability over urgency, so a state
 /// change never reshuffles the tree under the cursor; attention order lives in
 /// the waiting section, which gathers blocked and done agents across every
-/// project — any holding an approval first, whatever its state, then blocked —
-/// subagents stripped so each row stays two rows tall.
+/// project — first a row per held approval, in the order they came, whatever
+/// the pane's state, then blocked — subagents stripped so each row stays two
+/// rows tall.
 pub fn build(workspaces: &[WorkspaceView], active_tab: Option<TabId>) -> Sidebar {
     let present: std::collections::HashSet<_> = workspaces.iter().map(|w| w.id).collect();
     // A workspace nests only when its parent is actually present; a child whose
@@ -347,7 +362,7 @@ pub fn build(workspaces: &[WorkspaceView], active_tab: Option<TabId>) -> Sidebar
                         guide: None,
                         depth,
                         subagents: pane.subagents.clone(),
-                        approval: pane.approval.clone(),
+                        approval: pane.approvals.first().cloned(),
                     })
                 })
             })
@@ -384,32 +399,39 @@ pub fn build(workspaces: &[WorkspaceView], active_tab: Option<TabId>) -> Sidebar
         .iter()
         .flat_map(|w| {
             w.tabs.iter().flat_map(move |tab| {
-                tab.panes.iter().filter_map(move |pane| {
-                    pane.agent
-                        .as_ref()
-                        .filter(|_| {
-                            matches!(pane.state, AgentState::Blocked | AgentState::Done)
-                                || pane.approval.is_some()
-                        })
-                        .map(|agent| AgentRow {
-                            pane: pane.id,
-                            tab: tab.id,
-                            title: pane.title.clone(),
-                            state: pane.state,
-                            kind: kind_label(agent, pane),
-                            issue: pane.issue.as_ref().map(|i| i.id.clone()),
-                            project: project_of(w),
-                            project_name: name_of(project_of(w)),
-                            guide: None,
-                            depth: 0,
-                            subagents: Vec::new(),
-                            approval: pane.approval.clone(),
-                        })
+                let agents = tab
+                    .panes
+                    .iter()
+                    .filter_map(|pane| Some((pane, pane.agent.as_ref()?)));
+                agents.flat_map(move |(pane, agent)| {
+                    let queued: Vec<Option<PendingApproval>> = match &pane.approvals[..] {
+                        [] if matches!(pane.state, AgentState::Blocked | AgentState::Done) => {
+                            vec![None]
+                        }
+                        held => held.iter().cloned().map(Some).collect(),
+                    };
+                    queued.into_iter().map(move |approval| AgentRow {
+                        pane: pane.id,
+                        tab: tab.id,
+                        title: pane.title.clone(),
+                        state: pane.state,
+                        kind: kind_label(agent, pane),
+                        issue: pane.issue.as_ref().map(|i| i.id.clone()),
+                        project: project_of(w),
+                        project_name: name_of(project_of(w)),
+                        guide: None,
+                        depth: 0,
+                        subagents: Vec::new(),
+                        approval,
+                    })
                 })
             })
         })
         .collect();
-    waiting.sort_by_key(|a| (a.approval.is_none(), state_rank(a.state), a.pane.0));
+    waiting.sort_by_key(|a| {
+        let approval = a.approval.as_ref().map(|p| p.id);
+        (approval.is_none(), approval, state_rank(a.state), a.pane.0)
+    });
     entries.extend(waiting.into_iter().map(SidebarEntry::Agent));
 
     Sidebar {
@@ -589,25 +611,41 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_held_approval_queues_its_pane_first_whatever_its_state() {
-        let mut view = two_workspace_view();
-        // api's agent holds an approval while a parallel subagent keeps it
-        // working.
-        view[0].tabs[0].panes[0].approval = Some(PendingApproval {
-            id: 7,
+    fn held(id: u64, summary: &str) -> PendingApproval {
+        PendingApproval {
+            id,
             tool: "Bash".into(),
-            summary: "rm -rf build".into(),
-        });
+            summary: summary.into(),
+        }
+    }
+
+    /// Each held approval queues on its own row, in the order the requests
+    /// came across every pane, ahead of the blocked and done rows — whatever
+    /// the holding pane's state — and the tree row offers the oldest.
+    #[test]
+    fn each_held_approval_queues_first_in_the_order_it_came() {
+        let mut view = two_workspace_view();
+        // api's agent holds two while its parallel subagents keep it working;
+        // pane 4, blocked, holds one that came between them.
+        view[0].tabs[0].panes[0].approvals = vec![held(7, "touch a.txt"), held(9, "touch c.txt")];
+        view[1].tabs[0].panes[1].approvals = vec![held(8, "touch b.txt")];
         let sidebar = build(&view, Some(TabId(2)));
-        let waiting: Vec<(u64, bool)> = sidebar.entries[sidebar.tree_count..]
+        let waiting: Vec<(u64, Option<u64>)> = sidebar.entries[sidebar.tree_count..]
             .iter()
             .map(|e| match e {
-                SidebarEntry::Agent(a) => (a.pane.0, a.approval.is_some()),
+                SidebarEntry::Agent(a) => (a.pane.0, a.approval.as_ref().map(|p| p.id)),
                 _ => panic!("expected waiting agent rows"),
             })
             .collect();
-        assert_eq!(waiting, vec![(1, true), (4, false), (3, false)]);
+        assert_eq!(
+            waiting,
+            vec![(1, Some(7)), (4, Some(8)), (1, Some(9)), (3, None)],
+            "pane 4 queues once per approval, never again for its state"
+        );
+        let SidebarEntry::Agent(tree) = &sidebar.entries[1] else {
+            panic!("expected api's agent row");
+        };
+        assert_eq!(tree.approval, Some(held(7, "touch a.txt")));
     }
 
     #[test]
@@ -618,9 +656,12 @@ mod tests {
             Some(EntryIdent::Workspace(WorkspaceId(1)))
         );
         assert_eq!(sidebar.ident_at(4), Some(EntryIdent::Agent(PaneId(4))));
-        assert_eq!(sidebar.ident_at(5), Some(EntryIdent::Waiting(PaneId(4))));
         assert_eq!(
-            sidebar.index_of(EntryIdent::Waiting(PaneId(4))),
+            sidebar.ident_at(5),
+            Some(EntryIdent::Waiting(PaneId(4), None))
+        );
+        assert_eq!(
+            sidebar.index_of(EntryIdent::Waiting(PaneId(4), None)),
             Some(5),
             "the waiting copy resolves to the queue, not the tree row"
         );

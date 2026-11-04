@@ -834,9 +834,9 @@ pops in the accent colour. Two stacked sections:
 - **waiting** — the cross-project attention queue: every **blocked** or
   **done** agent from *every* project, blocked first, each over a dim
   `project · kind` line naming where it lives (subagent rows stay in the
-  tree). An agent holding a [permission request](#held-approvals) leads the
-  queue whatever its state, its row reading the tool and its input (`Bash ·
-  rm -rf build`). `Enter` (or a click) jumps to the agent itself, so a stuck
+  tree). Each [permission request](#held-approvals) an agent holds leads the
+  queue on a row of its own, in the order they came, whatever the agent's
+  state, the row reading the tool and its input (`Bash · rm -rf build`). `Enter` (or a click) jumps to the agent itself, so a stuck
   agent two projects away is never invisible and always one keystroke away —
   and `p` answers it without going there at all
   ([below](#answering-from-the-queue)).
@@ -967,7 +967,11 @@ dialog, which you answer in the pane or through a peek. Set `approvals =
 keeping Claude's dialog back:
 
 - The agent's waiting row reads `Bash · rm -rf build`, and a held approval
-  leads the queue whatever the pane's state.
+  leads the queue whatever the pane's state. A pane holds every request its
+  agent raises — parallel subagents ask at once — each on a waiting row of
+  its own, in the order they came, answered on its own and waiting out its
+  own `approval_timeout_secs`. The pane stays blocked until the last is
+  answered.
 - `p` on that row (its tree row too), or a right-click, opens an **approval**
   overlay framed and placed like the peek: the tool over its input, line
   breaks shown as `⏎`, long input cut with `…` past 500 characters. `y` allows
@@ -975,20 +979,22 @@ keeping Claude's dialog back:
   which then appears in the pane. The footer shows an `APPROVE` chip; a click
   outside closes the overlay without answering.
 - When the pane you are looking at is the one asking, the overlay opens over
-  it by itself, the way Claude's dialog would, and ignores keys for its first
-  800 ms, so a `y` or `n` already on its way into the pane can't answer it. It
-  never opens over a panel, prompt or overlay you are using, and it closes
-  itself once the approval ends — answered from another client or the CLI,
-  timed out, or the pane gone.
-- Scripts and agents answer with `tutti pane approve <pane> [--deny]
-  [--message <reason>]`. The reason is what Claude is told; it defaults to "the
-  user denied this in tutti". `tutti --json pane list` shows a held approval as
-  `approval: {id, tool, summary}`.
+  it by itself, the way Claude's dialog would — the oldest request first, the
+  next once that one is answered — and ignores keys for its first 800 ms, so
+  a `y` or `n` already on its way into the pane can't answer it. It never
+  opens over a panel, prompt or overlay you are using, and it closes itself
+  once the approval ends — answered from another client or the CLI, timed
+  out, or the pane gone.
+- Scripts and agents answer with `tutti pane approve <pane> [--id <n>]
+  [--deny] [--message <reason>]`: the oldest request, or the one `--id`
+  names. The reason is what Claude is told; it defaults to "the user denied
+  this in tutti". `tutti --json pane list` lists a pane's held requests,
+  oldest first, as `approvals: [{id, tool, summary}]` (and the oldest alone
+  as `approval`, for older scripts).
 
 A held request falls through to Claude's own dialog — the hook printing
-nothing and exiting 0 — when no TUI is attached to answer it, when the pane
-already holds one (parallel subagents ask one at a time), on `esc`, and when
-nobody answers within `approval_timeout_secs` (default 120, at most 599:
+nothing and exiting 0 — when no TUI is attached to answer it, on `esc`, and
+when nobody answers within `approval_timeout_secs` (default 120, at most 599:
 Claude stops a hook at 600 s). The hook never fails a Claude session. An allow
 or a deny from tutti sets the pane **working** at once — the tool runs, or the
 agent hears the refusal. Answered in Claude's own dialog instead, the pane
@@ -1751,9 +1757,10 @@ bursts coalesce.
   [Editors in panes](#editors-in-panes)).
 - `cwd` is the directory the pane's shell last reported (OSC 7, see [Shell
   integration](#shell-integration)), `null` before a report.
-- `approval` is the permission request the pane's agent holds for an answer
-  (see [Held approvals](#held-approvals)) — its `id`, `tool` and one-line
-  `summary` — `null` without one; answer it with `tutti pane approve <pane>`.
+- `approval` is the oldest permission request the pane's agent holds for an
+  answer (see [Held approvals](#held-approvals)) — its `id`, `tool` and
+  one-line `summary` — `null` without one; answer it with `tutti pane approve
+  <pane>` (`--id` for another of them; `pane list --json` lists them all).
 - `issue` is the tracker issue the pane's agent was
   [deployed on](#deploying-issues) — `{source, id, title, url}`, `url` `null`
   when the tracker gave none — or `null` for every other pane.
@@ -1800,7 +1807,7 @@ tutti pane read <pane> [--lines N] [--unwrapped] [--since <cursor> | --last-outp
                                      # --last-output: the last finished command's output; `exit: N` on stderr (needs shell-init)
                                      # --fingerprint: the prompt fingerprint --expect takes
 tutti pane wait <pane>... [--until working|blocked|done|idle[,…]] [--next] [--timeout <secs>]  # block until each pane gets there; exit 124 on timeout
-tutti pane approve <pane> [--deny] [--message <s>]  # answer the pane's held approval (approvals = "hold")
+tutti pane approve <pane> [--id <n>] [--deny] [--message <s>]  # answer the pane's oldest held approval, or the one --id names (approvals = "hold")
 tutti pane checkpoints <pane>        # the pane's per-turn checkpoints, newest first (n, age, stat, commit, label — the turn's prompt when known)
 tutti pane checkpoint-diff <pane> [N] [--stat]  # one turn's diff (default: the newest)
 tutti pane restore <pane> <N> [--force]         # restore the working copy to turn N (--force mid-turn)
@@ -1862,7 +1869,7 @@ tutti is alpha; PLAN.md tracks what is open.
   their hooks, and agents that speak herdr's protocol (Crush) report on their
   own; Codex, Gemini and the rest of the catalog are read from the screen,
   tuned live only for some.
-- **Approvals are Claude Code's only**, one held per pane at a time.
+- **Approvals are Claude Code's only.**
 - **Write-back stops at the deploy.** A source can have a deploy comment on,
   assign, label or move its issue, but tutti never closes it, and a command
   source (any other tracker) is read-only.
