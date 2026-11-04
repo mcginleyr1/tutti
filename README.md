@@ -281,9 +281,11 @@ the prefix in plain bytes and a detach could not be sure to turn them off.
 
 Beyond disambiguated keys, the TUI asks your kitty terminal for what the
 focused pane's program pushed, and passes it on:
-- **Repeats and releases** (flag 2; Neovim 0.12 asks for them). A release
-  goes to the pane that had the key's press, even after the focus moved, and
-  never one whose press was tutti's: the prefix, a direct key.
+- **Repeats and releases** (flag 2; Neovim 0.12 asks for them). A key held
+  down stays with the pane it was pressed into: its repeats and release go
+  there even after the focus moved, and your terminal keeps reporting
+  releases until it is let go. A release never reaches a pane whose press was
+  tutti's: the prefix, a direct key.
 - **Every key as an escape code** (flag 8): text keys, Enter, Tab and
   Backspace, a lone modifier, the lock keys' bits. tutti asks for the text
   too while this is on, so a prompt still types what a dead key or an input

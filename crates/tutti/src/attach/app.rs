@@ -278,8 +278,10 @@ pub struct App {
     /// The pane a press went to (its program reports the mouse): its drag
     /// and release go there too, wherever the pointer is.
     mouse_grab: Option<PaneId>,
-    /// The pane each key held down went to (`held`): its release goes there
-    /// too, and a release whose press was tutti's goes nowhere.
+    /// The pane each key held down was pressed into (`held`), for the keys
+    /// whose release its program asked for: the key's repeats and release go
+    /// there too, wherever the focus went. A release whose press was tutti's
+    /// goes nowhere.
     pressed: HashMap<KeyCode, PaneId>,
     status: Option<(String, Instant)>,
     /// The visible set last sent as `ViewSizes` — each shown pane at its
@@ -763,7 +765,9 @@ impl App {
     /// keys and their alternates always, and what the focused pane's program
     /// asked for beyond — repeats and releases (2), and every key an escape
     /// code (8) with its text (16), which a prompt needs too: it is what a
-    /// dead key or an input method made.
+    /// dead key or an input method made. Releases stay on while a key a
+    /// program waits to hear released is held (`pressed`), wherever the
+    /// focus went.
     pub fn key_flags(&self) -> u8 {
         let pane = self.keyboard().kitty;
         let all = if pane & input::ALL_AS_ESCAPES != 0 {
@@ -771,7 +775,12 @@ impl App {
         } else {
             0
         };
-        input::DISAMBIGUATE | input::ALTERNATES | (pane & input::EVENTS) | all
+        let held = if self.pressed.is_empty() {
+            0
+        } else {
+            input::EVENTS
+        };
+        input::DISAMBIGUATE | input::ALTERNATES | (pane & input::EVENTS) | held | all
     }
 
     /// Whether a bell is pending (a non-focused pane just blocked or finished),
@@ -1252,27 +1261,41 @@ impl App {
     // ---- keyboard -------------------------------------------------------
 
     /// A key from the terminal, with what kitty's protocol said of it. A
-    /// press or a repeat does what `on_key` does with it. What only a pane's
-    /// program takes goes only to a pane: a release to the pane that had its
-    /// press, a lone modifier to the focused one — each if its program
-    /// asked for such reports — and never to tutti's own keys.
+    /// press does what `on_key` does with it. A key pressed into a pane that
+    /// asked to hear it released (`pressed`) stays that pane's: its repeats
+    /// and its release go there, whatever the focus or mode since. Any other
+    /// repeat is a press; any other release goes nowhere, and a lone
+    /// modifier only to the focused pane — never to tutti's own keys.
     pub fn on_typed(&mut self, key: KeyEvent, report: Option<&Report>) -> Vec<WireFrame> {
-        if key.kind == KeyEventKind::Release {
-            let Some(pane) = self.pressed.remove(&held(key, report)) else {
-                return Vec::new();
-            };
-            let keyboard = self.panes.get(&pane).filter(|s| s.info.exited.is_none());
-            return keyboard
-                .and_then(|s| input::encode_key(key, report, input::Keyboard::of(&s.term)))
-                .map(|bytes| vec![WireFrame::Input { pane, bytes }])
-                .unwrap_or_default();
+        let id = held(key, report);
+        match (key.kind, self.pressed.get(&id).copied()) {
+            (KeyEventKind::Release, owner) => {
+                self.pressed.remove(&id);
+                owner.map_or_else(Vec::new, |pane| self.typed_into(pane, key, report))
+            }
+            (KeyEventKind::Repeat, Some(pane)) => self.typed_into(pane, key, report),
+            (kind, _) => {
+                if kind == KeyEventKind::Press {
+                    self.pressed.remove(&id);
+                }
+                match self.mode {
+                    Mode::Terminal => self.on_key_terminal(key, report),
+                    _ if matches!(key.code, KeyCode::Modifier(_)) => Vec::new(),
+                    _ => self.on_key(key),
+                }
+            }
         }
-        self.pressed.remove(&held(key, report));
-        match self.mode {
-            Mode::Terminal => self.on_key_terminal(key, report),
-            _ if matches!(key.code, KeyCode::Modifier(_)) => Vec::new(),
-            _ => self.on_key(key),
-        }
+    }
+
+    /// `key` typed into `pane` as its program asked for its keys: nothing
+    /// into an exited pane.
+    fn typed_into(&self, pane: PaneId, key: KeyEvent, report: Option<&Report>) -> Vec<WireFrame> {
+        self.panes
+            .get(&pane)
+            .filter(|s| s.info.exited.is_none())
+            .and_then(|s| input::encode_key(key, report, input::Keyboard::of(&s.term)))
+            .map(|bytes| vec![WireFrame::Input { pane, bytes }])
+            .unwrap_or_default()
     }
 
     /// Handle a key press, returning frames to send to the server.
@@ -1388,10 +1411,18 @@ impl App {
                 _ => {}
             }
         }
-        let bytes = input::encode_key(key, report, self.keyboard());
-        match (self.focused, bytes) {
+        let keyboard = self.keyboard();
+        match (self.focused, input::encode_key(key, report, keyboard)) {
             (Some(pane), Some(bytes)) => {
-                self.pressed.insert(held(key, report), pane);
+                let release = KeyEvent {
+                    kind: KeyEventKind::Release,
+                    ..key
+                };
+                if key.kind == KeyEventKind::Press
+                    && input::encode_key(release, report, keyboard).is_some()
+                {
+                    self.pressed.insert(held(key, report), pane);
+                }
                 vec![WireFrame::Input { pane, bytes }]
             }
             // No pane to type into: honor the dashboard's advertised key so
@@ -5828,6 +5859,36 @@ mod tests {
         );
         assert!(typed_in(&mut app, b"\x1b[53:37;2:3u\x1b[57441;1:3u").is_empty());
         assert_eq!(app.mode, Mode::Terminal);
+    }
+
+    /// A key pressed into a pane that hears releases stays that pane's while
+    /// held: its repeats and release reach it after the focus moved, and in
+    /// another mode, and the terminal keeps reporting releases until the last
+    /// is in. A key the pane hears no release of holds nothing, and a repeat
+    /// no pane holds is a press where the focus is.
+    #[test]
+    fn a_held_key_stays_with_its_pane_and_keeps_releases_on() {
+        let mut app = App::new();
+        kitty_panes(&mut app, b"\x1b[>3u", b"");
+        let one = |s: &str| vec![(PaneId(1), s.to_string())];
+        assert_eq!(typed_in(&mut app, b"\x1b[97;5u"), one("\x1b[97;5u"));
+        app.focused = Some(PaneId(2));
+        assert_eq!(app.key_flags(), 1 | 2 | 4, "Ctrl+A is held in pane 1");
+        assert_eq!(typed_in(&mut app, b"\x1b[97;5:2u"), one("\x1b[97;5:2u"));
+        app.mode = Mode::Sidebar;
+        assert_eq!(typed_in(&mut app, b"\x1b[97;5:2u"), one("\x1b[97;5:2u"));
+        assert_eq!(typed_in(&mut app, b"\x1b[97;5:3u"), one("\x1b[97;5:3u"));
+        assert_eq!(app.key_flags(), 1 | 4, "pane 2 asked for no releases");
+        app.mode = Mode::Terminal;
+
+        app.focused = Some(PaneId(1));
+        assert_eq!(typed_in(&mut app, b"x"), one("x"));
+        app.focused = Some(PaneId(2));
+        assert_eq!(app.key_flags(), 1 | 4, "pane 1 hears no release of text");
+        assert_eq!(
+            typed_in(&mut app, b"\x1b[120;1:2u"),
+            [(PaneId(2), "x".to_string())]
+        );
     }
 
     /// A paste reaches the focused pane whole — inside the paste marks once

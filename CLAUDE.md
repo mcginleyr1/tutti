@@ -107,7 +107,9 @@ cargo fmt --check
     `CSI … u` says beyond them (the unshifted code, alternates, raw modifier
     bits, text) rides beside them in a `reader::Report`, for the panes only.
   - **Releases and lone modifiers are never tutti's keys** (`App::on_typed`):
-    a release goes only to the pane its press went to (`App::pressed`).
+    a key pressed into a pane that hears releases is that pane's until
+    released (`App::pressed`) — repeats included — and `key_flags` keeps
+    event types on meanwhile. Only a fresh press sets the owner.
 - **Shutdown order** (`serve`, server.rs): abort *and await* the layout saver,
   write the final save, then `kill_all`. A save after `kill_all` — or a saver
   tick racing the final write — records a layout with every pane gone. An empty

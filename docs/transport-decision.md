@@ -484,8 +484,10 @@ every key after a 997 report; crossterm now only draws.
 - **What a key keeps:** a key in its `CSI … u` form carries a `Report` beside its
   `KeyEvent` — the code, unshifted, the shifted and base-layout keys, the modifier bits as
   sent and the text — which the encoder passes on as far as the pane's program asked. A
-  release goes to the pane its press went to, and nowhere when the press was tutti's; a
-  lone modifier never acts as a key of tutti's.
+  key pressed into a pane that hears releases stays that pane's (`App::pressed`): its
+  repeats and release go there whatever the focus or mode since, and event types stay on
+  in the terminal until the last such key is released. A release goes nowhere when the
+  press was tutti's; a lone modifier never acts as a key of tutti's.
 
 The ESC wait:
 - **Lone ESC:** an `ESC` at the end of a read waits the escape time (`escape_time_ms`,
