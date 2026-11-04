@@ -327,7 +327,11 @@ rate, and fans one diff out to every client.
 **Wire.** `{"type":"pane_attach","pane":N,"rows":R,"cols":C}` opens the stream. The
 daemon answers with a `PaneSnapshot` (kind `0x02`, `seq` 0) of the screen at its size,
 then one `PaneRaw` frame per pty read — kind `0x05`, `[u64 pane_id][bytes]`, the bytes
-as the child wrote them but for what the daemon answers itself (below). A resize sends a
+as the child wrote them but for what the daemon answers itself (below). With
+`"history":H` (wire rev 14), up to H of the newest rows of the pane's primary scrollback
+come before that first snapshot, as `PaneRaw` frames of logical lines (rtty-vt's
+`Terminal::history`, from the same hold as the snapshot) for the client's terminal to
+print into its own scrollback; no later snapshot brings any. A resize sends a
 fresh `PaneSnapshot` at the new size, in
 stream order: a terminal reflows its screen its own way, and the snapshot puts it level
 with the grid before the program's redraw lands. The client types with `Input` frames,

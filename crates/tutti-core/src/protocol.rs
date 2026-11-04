@@ -11,7 +11,7 @@ use crate::state::{AgentState, StateSource};
 /// Response / Event shapes (including additive fields): the daemon reports it
 /// on attach and mismatched clients tell the user to restart the daemon —
 /// binaries upgrade on install, running daemons do not.
-pub const WIRE_REV: u32 = 13;
+pub const WIRE_REV: u32 = 14;
 
 /// The most notes the daemon's notification history keeps, the oldest going
 /// first. A client caps its copy the same, so the two agree.
@@ -432,10 +432,17 @@ pub enum Request {
     /// streams on from there. The child exiting ends the stream with
     /// `Event::PaneExited`, and the daemon then closes it. Error for an
     /// unknown pane, or on a connection already streaming one.
+    ///
+    /// `history`: up to that many of the newest rows of the pane's primary
+    /// scrollback come first, before the first snapshot only, as `PaneRaw`
+    /// frames: its logical lines, for the terminal to print into its own
+    /// scrollback (`pane attach --inline`).
     PaneAttach {
         pane: PaneId,
         rows: u16,
         cols: u16,
+        #[serde(default)]
+        history: u32,
     },
     /// The colours of the terminal a client shows panes on, which the daemon
     /// answers its panes' colour queries with — OSC 10/11/12 and mode 2031's
@@ -1457,6 +1464,7 @@ mod tests {
             pane: PaneId(3),
             rows: 24,
             cols: 80,
+            history: 1000,
         });
         roundtrip(&Request::HostColors(sample_colors()));
         roundtrip(&Request::HostColors(HostColors {
@@ -2060,9 +2068,10 @@ mod tests {
                 pane: PaneId(3),
                 rows: 24,
                 cols: 80,
+                history: 0,
             })
             .unwrap(),
-            r#"{"type":"pane_attach","pane":3,"rows":24,"cols":80}"#
+            r#"{"type":"pane_attach","pane":3,"rows":24,"cols":80,"history":0}"#
         );
         assert_eq!(
             serde_json::to_string(&Event::StateChanged {
@@ -2161,6 +2170,18 @@ mod tests {
                 cmd: vec!["sh".into()],
                 ephemeral: false,
                 sandbox: None,
+            }
+        );
+        // `pane_attach` without `history` replays none.
+        let attach: Request =
+            serde_json::from_str(r#"{"type":"pane_attach","pane":3,"rows":24,"cols":80}"#).unwrap();
+        assert_eq!(
+            attach,
+            Request::PaneAttach {
+                pane: PaneId(3),
+                rows: 24,
+                cols: 80,
+                history: 0,
             }
         );
         // `workspace_diff` without `stat` defaults to the full diff.

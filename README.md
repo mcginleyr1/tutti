@@ -253,12 +253,20 @@ starts itself.
 `tutti pane attach --inline <pane>` draws on the primary screen instead, for
 an editor's terminal (Neovim's `:terminal`, Emacs's vterm or eat), which then
 keeps its native scrollback:
-- **On attach,** the lines on your screen, down to the cursor's, go up into
-  the scrollback, and the pane's screen is drawn in their place. The pane's
-  history from before the attach is not replayed; `tutti pane read` has it.
+- **On attach,** the pane's history from before the attach is printed first,
+  under your shell's lines: up to `--history ROWS` (default 1000; 0 for
+  none) of its newest scrollback lines, in their colours and links, each
+  soft-wrapped line whole for your terminal to wrap at its own width. Then
+  the lines on your screen, down to the cursor's, go up into the scrollback,
+  and the pane's screen is drawn in their place. The history is the pane's
+  primary screen's, even while a program has its alternate screen up: it
+  lands above the pane's shell, where that program's exit leaves you. Only
+  the attach prints it — a resize or a reset never again — so a second
+  attach in the same terminal prints it a second time.
 - **While attached,** what the pane scrolls off goes into your terminal's
-  scrollback, and a program's own alternate screen is your terminal's: its
-  switches pass straight through.
+  scrollback — but for what a terminal that cannot keep up skips — and a
+  program's own alternate screen is your terminal's: its switches pass
+  straight through.
 - **On a resize,** the pane's screen is drawn again as the daemon reflowed it;
   what your terminal's own reflow moved into its scrollback stays there.
 - **A reset** (`ESC c`) is drawn from the copy rather than passed through: it
@@ -1971,7 +1979,7 @@ tutti pane split <pane> right|down
 tutti pane list | kill <pane> | focus <pane>   # list: each pane with its workspace's id; focus: the attached TUI jumps to the pane
 tutti pane focus --direction left|right|up|down [--from <pane>] [--wrap]  # focus the pane beside one (default: this pane, else the TUI's) and print it; at the TUI's focused pane's left/right edge the TUI moves on (sidebar, panel, tab), exit 0; else `no pane <dir> of <id>`, exit 1
 tutti pane resize --direction left|right|up|down [--amount <f>] [--from <pane>]  # move its split's border that way, as Alt+h/j/k/l (default step 0.05 of the split)
-tutti pane attach <pane> [--inline]  # show one pane in this terminal, drawn by the terminal itself; prefix d detaches (never starts a daemon); --inline: on the primary screen, keeping its scrollback
+tutti pane attach <pane> [--inline [--history <rows>]]  # show one pane in this terminal, drawn by the terminal itself; prefix d detaches (never starts a daemon); --inline: on the primary screen, keeping its scrollback, after the pane's newest 1000 (--history) scrollback lines
 tutti pane rename <pane> <title>
 tutti pane send <pane> --text <s> | --keys <s> [--expect <fp>]   # --expect: answer a blocked agent, refused if its prompt moved on; refused too once 64 sends wait on a program that stopped reading its input
 tutti pane read <pane> [--lines N] [--unwrapped] [--since <cursor> | --last-output] | --fingerprint | --last-reply

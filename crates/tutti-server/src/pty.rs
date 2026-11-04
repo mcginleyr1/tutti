@@ -146,13 +146,16 @@ pub struct Look {
 }
 
 /// What a tap (`PtyPane::tap`) is handed, under the parser lock and in
-/// stream order: a snapshot of the screen to start from, at its size, then
-/// each read's bytes as the child wrote them, less the queries the daemon
-/// answered and the sequences it owns (`verdict`) — a tap's own terminal
-/// would answer or take them again — a switch of screens or a reset handed
-/// on its own between the bytes around it; and after a resize, a fresh
-/// snapshot at the new size.
+/// stream order: the history it asked for, then a snapshot of the screen to
+/// start from, at its size, then each read's bytes as the child wrote them,
+/// less the queries the daemon answered and the sequences it owns
+/// (`verdict`) — a tap's own terminal would answer or take them again — a
+/// switch of screens or a reset handed on its own between the bytes around
+/// it; and after a resize, a fresh snapshot at the new size.
 pub enum Feed<'a> {
+    /// The newest rows of the primary scrollback, as `Terminal::history`
+    /// prints them: once, before the first snapshot.
+    History(Vec<u8>),
     Snapshot(PaneSize, Vec<u8>),
     Raw(&'a [u8]),
 }
@@ -978,14 +981,20 @@ impl PtyPane {
 
     /// Stream the pane's raw output to `tap`, as subscriber `id`, until
     /// `untap` or the pane's end. Under one hold of the parser lock it is
-    /// handed a snapshot of the screen as it stands and joins the reader,
-    /// which hands it each read in the same hold that parses it — so nothing
-    /// is lost or repeated between the two.
-    pub fn tap(&self, id: u64, tap: Tap) {
+    /// handed up to `history` of the newest scrollback rows, then a snapshot
+    /// of the screen as it stands, and joins the reader, which hands it each
+    /// read in the same hold that parses it — so nothing is lost or repeated
+    /// between the three.
+    pub fn tap(&self, id: u64, history: u32, tap: Tap) {
         let mut tap = Some(tap);
         self.with(|term| {
             let (rows, cols) = term.vt.size();
             if let Some(mut tap) = tap.take() {
+                let top = term.vt.screen_top();
+                let past = term.vt.history(top.saturating_sub(history.into()), top);
+                if !past.is_empty() {
+                    tap(Feed::History(past));
+                }
                 tap(Feed::Snapshot(
                     PaneSize::new(rows, cols),
                     term.vt.snapshot(),
@@ -2903,7 +2912,7 @@ mod tests {
         let pane = PtyPane::spawn(spec, PaneSize::new(24, 80)).unwrap();
         wait_for(|| lock(&pane.term).vt.screen_top() > 1000, "no output");
         let (tx, rx) = std::sync::mpsc::channel();
-        pane.tap(7, recorder(tx, |_| false));
+        pane.tap(7, 0, recorder(tx, |_| false));
         wait_for(
             || pane.output_receiver().has_changed().is_err(),
             "the output never ended",
@@ -2948,12 +2957,40 @@ mod tests {
     ) -> Tap {
         Box::new(move |feed| {
             let (fed, behind) = match feed {
+                Feed::History(bytes) => ((None, bytes), false),
                 Feed::Snapshot(size, bytes) => ((Some(size), bytes), false),
                 Feed::Raw(bytes) => ((None, bytes.to_vec()), behind(bytes)),
             };
             let _ = tx.send(fed);
             behind
         })
+    }
+
+    /// A tap that asks for history is handed the newest rows of the
+    /// scrollback first — all it holds, when it asks for more — from the
+    /// hold its snapshot comes from, so the rows run on into the screen.
+    #[test]
+    fn a_tap_gets_the_history_it_asks_for_before_its_snapshot() {
+        let spec = PtySpec {
+            args: vec!["-c".into(), "seq 1 100; read stay".into()],
+            ..PtySpec::new("/bin/sh")
+        };
+        let pane = PtyPane::spawn(spec, PaneSize::new(5, 20)).unwrap();
+        wait_for(|| pane.contents().contains("100"), "no output");
+        let lines = |numbers: std::ops::RangeInclusive<u32>| -> Vec<u8> {
+            numbers
+                .map(|n| format!("{n}\r\n"))
+                .collect::<String>()
+                .into_bytes()
+        };
+        for (id, history, want) in [(7, 10, lines(87..=96)), (8, 1000, lines(1..=96))] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            pane.tap(id, history, recorder(tx, |_| false));
+            assert_eq!(rx.recv().unwrap(), (None, want), "{history} rows");
+            let (size, snapshot) = rx.recv().unwrap();
+            assert_eq!(size, Some(PaneSize::new(5, 20)));
+            assert_eq!(client(5, 20, &snapshot).contents(), "97\n98\n99\n100");
+        }
     }
 
     /// A tap that falls behind is handed a fresh snapshot, which covers the
@@ -2971,7 +3008,7 @@ mod tests {
         };
         let pane = PtyPane::spawn(spec, PaneSize::new(5, 20)).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        pane.tap(7, recorder(tx, |read| read.starts_with(b"before")));
+        pane.tap(7, 0, recorder(tx, |read| read.starts_with(b"before")));
         pane.write_input(b"go\r").unwrap();
         wait_for(|| pane.contents().contains("after"), "no output");
         let mut terminal = Terminal::new(5, 20, 0);

@@ -16,12 +16,14 @@
 //! `--inline` draws on the primary screen instead, for an editor's terminal
 //! (Neovim's `:terminal`, Emacs's vterm): what the pane scrolls off goes into
 //! that terminal's own scrollback, and the program's screen switches pass
-//! through, its alternate screen being free. The lines on screen go up into
-//! the scrollback before the pane is drawn, and on leaving, the cursor goes
-//! under the pane's last line. A snapshot — the first, and each resize's —
-//! draws both of the pane's screens from the mirror (`Terminal::snapshot`),
-//! and so does a reset, which never reaches the terminal: it would turn off
-//! the light/dark reports, and some terminals clear their scrollback on it.
+//! through, its alternate screen being free. The pane's history from before
+//! the attach is printed first, as lines the terminal wraps itself, then the
+//! lines on screen go up into the scrollback before the pane is drawn, and on
+//! leaving, the cursor goes under the pane's last line. A snapshot — the
+//! first, and each resize's — draws both of the pane's screens from the
+//! mirror (`Terminal::snapshot`), and so does a reset, which never reaches
+//! the terminal: it would turn off the light/dark reports, and some terminals
+//! clear their scrollback on it. Only the first brings history.
 //!
 //! This terminal's keys stay plain: the daemon keeps the pane's keyboard
 //! protocols (kitty's, modifyOtherKeys) out of the stream, and the mirror's
@@ -78,9 +80,15 @@ const REPORTS: [(&[u8], bool); 2] = [(b"\x1b[?997;1n", true), (b"\x1b[?997;2n", 
 /// Show `pane` of `session` in this terminal until the config's prefix and
 /// `d` detach it, the pane exits (`[pane N exited: CODE]`), or the daemon
 /// goes away (an error) — on the alternate screen, or `inline` on the
-/// primary one. Never starts a daemon: with none running there is no pane to
-/// show.
-pub fn run(session: &str, pane: PaneId, config: &Config, inline: bool) -> Result<i32> {
+/// primary one, after up to `history` of the pane's newest scrollback lines.
+/// Never starts a daemon: with none running there is no pane to show.
+pub fn run(
+    session: &str,
+    pane: PaneId,
+    config: &Config,
+    inline: bool,
+    history: u32,
+) -> Result<i32> {
     if !std::io::stdin().is_terminal() {
         bail!("pane attach needs a terminal on stdin");
     }
@@ -98,11 +106,18 @@ pub fn run(session: &str, pane: PaneId, config: &Config, inline: bool) -> Result
         stream.write_all(&control(&Request::HostColors(colors)))?;
     }
     let (cols, rows) = terminal::size().context("reading the terminal size")?;
-    let attach = Request::PaneAttach { pane, rows, cols };
+    let attach = Request::PaneAttach {
+        pane,
+        rows,
+        cols,
+        history,
+    };
     stream.write_all(&control(&attach))?;
     // A refusal — no such pane — lands before the terminal is touched; the
-    // colours' `Ok` is passed over.
+    // colours' `Ok` is passed over, and the history, the raw frames before
+    // the first snapshot, gathered.
     let mut buf = Vec::new();
+    let mut past = Vec::new();
     let first = loop {
         let frame =
             read_frame(&mut stream, &mut buf)?.context("tutti-server closed the connection")?;
@@ -110,22 +125,30 @@ pub fn run(session: &str, pane: PaneId, config: &Config, inline: bool) -> Result
             Frame::Control(json) => serde_json::from_slice(json).ok(),
             _ => None,
         };
-        match reply {
-            Some(Response::Ok) => continue,
-            Some(Response::Error { message }) if message.starts_with("bad request") => {
+        match (reply, frame) {
+            (Some(Response::Ok), _) => {}
+            (Some(Response::Error { message }), _) if message.starts_with("bad request") => {
                 bail!(
                     "the daemon cannot stream a pane ({message}); restart it: `tutti server stop`"
                 )
             }
-            Some(Response::Error { message }) => bail!(message),
-            _ => break frame,
+            (Some(Response::Error { message }), _) => bail!(message),
+            (_, Frame::PaneRaw { bytes, .. }) => past.extend(bytes),
+            (_, frame) => break frame,
         }
     };
 
     // Inline, the lines on screen go up into the scrollback, up to the
     // cursor's, so the pane's screen is drawn on a blank one and they stay.
+    // The pane's history goes before, printed from the cursor's line on, so
+    // it scrolls up after them.
     let lift = if inline {
-        let (col, row) = cursor::position().context("reading the cursor position")?;
+        let mut at = cursor::position().context("reading the cursor position")?;
+        if !past.is_empty() {
+            emit(&[if at.0 > 0 { b"\r\n".as_slice() } else { b"" }, &past].concat())?;
+            at = cursor::position().context("reading the cursor position")?;
+        }
+        let (col, row) = at;
         format!(
             "\x1b[{rows};1H{}",
             "\n".repeat(usize::from(row + u16::from(col > 0)))

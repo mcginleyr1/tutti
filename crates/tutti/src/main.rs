@@ -526,6 +526,10 @@ enum PaneAction {
         /// through.
         #[arg(long)]
         inline: bool,
+        /// Inline, print up to this many of the pane's newest scrollback
+        /// lines first, into this terminal's scrollback; 0 for none.
+        #[arg(long, value_name = "ROWS", default_value_t = 1000, requires = "inline")]
+        history: u32,
     },
     /// Block until each pane reaches a state (`done` unless `--until` says
     /// otherwise), printing each one's; exits 124 on `--timeout`.
@@ -668,7 +672,12 @@ fn run(cli: Cli) -> Result<i32> {
                 },
         }) => run_wait(&cli.session, cli.json, &panes, &until, next, timeout),
         Some(Command::Pane {
-            action: PaneAction::Attach { pane, inline },
+            action:
+                PaneAction::Attach {
+                    pane,
+                    inline,
+                    history,
+                },
         }) => {
             // Its own pane would echo its output back into itself forever.
             let own = std::env::var("TUTTI_SESSION").is_ok_and(|s| s == cli.session)
@@ -676,7 +685,14 @@ fn run(cli: Cli) -> Result<i32> {
             if own {
                 bail!("pane {pane} is the pane this runs in");
             }
-            tutti::attach::raw::run(&cli.session, PaneId(pane), &Config::load()?, inline)
+            let history = if inline { history } else { 0 };
+            tutti::attach::raw::run(
+                &cli.session,
+                PaneId(pane),
+                &Config::load()?,
+                inline,
+                history,
+            )
         }
         Some(Command::Sandbox {
             action: SandboxAction::Run { profile, name, cmd },
@@ -3205,6 +3221,31 @@ mod tests {
                 .command,
             Some(Command::Attach { view: true })
         ));
+        let attach = |args: &[&str]| {
+            Cli::try_parse_from([["tutti", "pane", "attach", "3"].as_slice(), args].concat())
+                .map(|cli| cli.command)
+        };
+        assert!(matches!(
+            attach(&[]),
+            Ok(Some(Command::Pane {
+                action: PaneAction::Attach {
+                    inline: false,
+                    history: 1000,
+                    ..
+                }
+            }))
+        ));
+        assert!(matches!(
+            attach(&["--inline", "--history", "0"]),
+            Ok(Some(Command::Pane {
+                action: PaneAction::Attach {
+                    inline: true,
+                    history: 0,
+                    ..
+                }
+            }))
+        ));
+        assert!(attach(&["--history", "5"]).is_err(), "only inline");
         let cli = Cli::try_parse_from(["tutti", "watch", "-s", "work"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Watch)));
         assert_eq!(cli.session, "work");

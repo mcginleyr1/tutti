@@ -29,8 +29,9 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tutti_agents::{ProcessTree, Registry};
 use tutti_core::{
     AgentHookEvent, AgentKind, AgentState, ApprovalDecision, Checkpoint, Direction, Event, Frame,
-    IssueRef, NOTES_CAP, Note, NoteKind, Observation, PaneData, PaneDims, PaneId, PaneInfo,
-    Request, Response, StateEvent, Tagged, Toward, WaitFor, WorkspaceId, prompt_fingerprint,
+    IssueRef, MAX_FRAME_LEN, NOTES_CAP, Note, NoteKind, Observation, PaneData, PaneDims, PaneId,
+    PaneInfo, Request, Response, StateEvent, Tagged, Toward, WaitFor, WorkspaceId,
+    prompt_fingerprint,
 };
 
 use crate::herdr;
@@ -732,9 +733,19 @@ fn handle_frame(
                 send_reply(hub, cid, tx, reply.encode(&Response::Ok))
             }
             Ok(Request::ViewSizes { panes }) => view_sizes(hub, cid, &reply, panes),
-            Ok(Request::PaneAttach { pane, rows, cols }) => {
-                pane_attach(hub, cid, &reply, stream, PaneDims { pane, rows, cols })
-            }
+            Ok(Request::PaneAttach {
+                pane,
+                rows,
+                cols,
+                history,
+            }) => pane_attach(
+                hub,
+                cid,
+                &reply,
+                stream,
+                PaneDims { pane, rows, cols },
+                history,
+            ),
             Ok(Request::Watch) => {
                 hub.watchers().insert(
                     cid,
@@ -918,6 +929,8 @@ fn arbitrate(hub: &Hub, panes: impl IntoIterator<Item = PaneId>) {
 /// reader never waits on a tap: one whose connection leaves more than
 /// `STREAM_BACKLOG` of the pane's output queued drops it all for a fresh
 /// snapshot, and a slow terminal skips ahead to the pane's screen. The
+/// `history` rows asked for go first, in frames short of the frame bound,
+/// and widen the backlog by their size: a long history is never behind. The
 /// child exiting is told once its last output is queued — unless the daemon
 /// is stopping, which killed it.
 fn pane_attach(
@@ -926,6 +939,7 @@ fn pane_attach(
     reply: &Reply,
     stream: &mut Option<(oneshot::Sender<()>, Arc<Outbox>)>,
     dims: PaneDims,
+    history: u32,
 ) -> ControlFlow<()> {
     let refuse = |message: String| {
         send_reply(
@@ -945,31 +959,42 @@ fn pane_attach(
     };
     hub.taps().insert(cid, dims);
     arbitrate(hub, [pane]);
+    let mut backlog = STREAM_BACKLOG;
     pty.tap(
         cid,
+        history,
         Box::new(move |feed| {
             // Named, so the tap owns `kick` and drops it with itself.
             let _owned = &kick;
             let mut queued = outbox.queued();
-            let frame = match feed {
-                Feed::Raw(_) if queued.len() > STREAM_BACKLOG => {
+            let raw = |bytes: &[u8]| {
+                Frame::PaneRaw {
+                    pane,
+                    bytes: bytes.to_vec(),
+                }
+                .encode()
+            };
+            let frames = match feed {
+                Feed::Raw(_) if queued.len() > backlog => {
                     queued.clear();
                     outbox.resynced.store(true, Ordering::Relaxed);
                     return true;
                 }
-                Feed::Raw(bytes) => Frame::PaneRaw {
-                    pane,
-                    bytes: bytes.to_vec(),
-                },
+                Feed::Raw(bytes) => raw(bytes),
+                Feed::History(bytes) => {
+                    backlog += bytes.len();
+                    bytes.chunks(MAX_FRAME_LEN / 2).flat_map(raw).collect()
+                }
                 Feed::Snapshot(size, bytes) => Frame::PaneSnapshot(PaneData {
                     pane,
                     rows: size.rows,
                     cols: size.cols,
                     seq: 0,
                     bytes,
-                }),
+                })
+                .encode(),
             };
-            queued.extend(frame.encode());
+            queued.extend(frames);
             outbox.ready.notify_one();
             false
         }),

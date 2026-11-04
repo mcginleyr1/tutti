@@ -2150,7 +2150,67 @@ async fn stream_until(
 }
 
 fn pane_attach(pane: PaneId, rows: u16, cols: u16) -> Request {
-    Request::PaneAttach { pane, rows, cols }
+    Request::PaneAttach {
+        pane,
+        rows,
+        cols,
+        history: 0,
+    }
+}
+
+/// A stream that asks for history gets the newest rows of the scrollback
+/// first — above the screen as its size vote left it — as lines to print,
+/// then the snapshot; a resize's snapshot brings none again.
+#[tokio::test]
+async fn a_pane_stream_starts_with_the_history_it_asks_for() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let pane = run_marker(&mut control, "seq 1 100; read stay").await;
+    assert!(read_until(&mut control, pane, "100").await);
+    let mut stream = server.connect().await;
+    stream
+        .send(&Request::PaneAttach {
+            pane,
+            rows: 5,
+            cols: 20,
+            history: 10,
+        })
+        .await;
+    let mut history = Vec::new();
+    let snapshot = loop {
+        match stream.read_frame().await {
+            Frame::PaneRaw { bytes, .. } => history.extend(bytes),
+            Frame::PaneSnapshot(data) => break data,
+            other => panic!("a pane stream got {other:?}"),
+        }
+    };
+    let want: String = (87..=96).map(|n| format!("{n}\r\n")).collect();
+    assert_eq!(String::from_utf8(history).unwrap(), want);
+    let mut terminal = Terminal::new(snapshot.rows, snapshot.cols, 0);
+    terminal.advance(&snapshot.bytes);
+    assert_eq!(terminal.contents(), "97\n98\n99\n100");
+
+    stream
+        .send(&Request::ViewSizes {
+            panes: vec![PaneDims {
+                pane,
+                rows: 6,
+                cols: 20,
+            }],
+        })
+        .await;
+    loop {
+        match stream.read_frame().await {
+            Frame::PaneSnapshot(data) => {
+                assert_eq!((data.rows, data.cols), (6, 20));
+                break;
+            }
+            Frame::Control(_) => {}
+            other => panic!("a resize brought {other:?} before its snapshot"),
+        }
+    }
+
+    server.stop().await;
 }
 
 /// A pane stream opens on a snapshot of the screen, then carries the pane's
