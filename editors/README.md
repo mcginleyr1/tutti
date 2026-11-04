@@ -200,7 +200,8 @@ window and reads the answer. The answer goes out with `pane send --text
 <answer> --expect <fingerprint>`, exactly as typed (`C-q RET` adds an Enter).
 If the prompt changed in between, tutti refuses the send, writes nothing, and
 the reason appears in the echo area. `y` and `n` read the held approval from
-`tutti --json pane list`, and refuse when the pane holds none.
+the watch's latest snapshot, which carries it beside the rest of the row, and
+refuse when the pane holds none.
 
 `tutti-program` (default `"tutti"`) names the executable.
 

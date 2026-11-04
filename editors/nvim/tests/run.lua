@@ -171,10 +171,13 @@ end)
 
 test(':TuttiAgents picks an agent from the first watch snapshot', function()
   answer(1, {
-    out = '{"type":"snapshot","session":"tutti","wire_rev":9,"attached_terminal":null,"panes":['
-      .. '{"id":3,"workspace":"api","dir":"/w/api","tab":"main","title":"claude","agent":"claude","state":"blocked","source":"hook","exited":null,"focused":false},'
-      .. '{"id":4,"workspace":"web","dir":"/w/web","tab":"main","title":"zsh","agent":null,"state":"unknown","source":null,"exited":null,"focused":true},'
-      .. '{"id":5,"workspace":"web","dir":"/w/web","tab":"logs","title":"codex","agent":"codex","state":"working","source":"screen","exited":null,"focused":false}]}',
+    out = '{"type":"snapshot","session":"tutti","wire_rev":12,"attached_terminal":null,"panes":['
+      .. '{"id":3,"workspace":"api","dir":"/w/api","tab":"main","title":"claude","agent":"claude","state":"blocked","source":"hook","exited":null,"focused":false,'
+      .. '"user_vars":{},"cwd":"/w/api","approval":{"id":1,"tool":"Bash","summary":"rm -rf build"}},'
+      .. '{"id":4,"workspace":"web","dir":"/w/web","tab":"main","title":"zsh","agent":null,"state":"unknown","source":null,"exited":null,"focused":true,'
+      .. '"user_vars":{},"cwd":null,"approval":null},'
+      .. '{"id":5,"workspace":"web","dir":"/w/web","tab":"logs","title":"codex","agent":"codex","state":"working","source":"screen","exited":null,"focused":false,'
+      .. '"user_vars":{},"cwd":null,"approval":null}]}',
     sleep = 3,
   })
   local shown, choose

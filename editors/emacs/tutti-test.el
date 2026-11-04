@@ -18,10 +18,13 @@
   (expand-file-name "../tests/tutti" (file-name-directory (or load-file-name buffer-file-name))))
 
 (defconst tutti-test--snapshot
-  (concat "{\"type\":\"snapshot\",\"session\":\"tutti\",\"wire_rev\":9,\"attached_terminal\":null,\"panes\":["
-          "{\"id\":3,\"workspace\":\"api\",\"dir\":\"/w/api\",\"tab\":\"main\",\"title\":\"claude\",\"agent\":\"claude\",\"state\":\"blocked\",\"source\":\"hook\",\"exited\":null,\"focused\":false},"
-          "{\"id\":4,\"workspace\":\"web\",\"dir\":\"/w/web\",\"tab\":\"main\",\"title\":\"zsh\",\"agent\":null,\"state\":\"unknown\",\"source\":null,\"exited\":null,\"focused\":true},"
-          "{\"id\":5,\"workspace\":\"web\",\"dir\":\"/w/web\",\"tab\":\"logs\",\"title\":\"codex\",\"agent\":\"codex\",\"state\":\"working\",\"source\":\"screen\",\"exited\":null,\"focused\":false}]}"))
+  (concat "{\"type\":\"snapshot\",\"session\":\"tutti\",\"wire_rev\":12,\"attached_terminal\":null,\"panes\":["
+          "{\"id\":3,\"workspace\":\"api\",\"dir\":\"/w/api\",\"tab\":\"main\",\"title\":\"claude\",\"agent\":\"claude\",\"state\":\"blocked\",\"source\":\"hook\",\"exited\":null,\"focused\":false,"
+          "\"user_vars\":{},\"cwd\":\"/w/api\",\"approval\":{\"id\":1,\"tool\":\"Bash\",\"summary\":\"rm -rf build\"}},"
+          "{\"id\":4,\"workspace\":\"web\",\"dir\":\"/w/web\",\"tab\":\"main\",\"title\":\"zsh\",\"agent\":null,\"state\":\"unknown\",\"source\":null,\"exited\":null,\"focused\":true,"
+          "\"user_vars\":{},\"cwd\":null,\"approval\":null},"
+          "{\"id\":5,\"workspace\":\"web\",\"dir\":\"/w/web\",\"tab\":\"logs\",\"title\":\"codex\",\"agent\":\"codex\",\"state\":\"working\",\"source\":\"screen\",\"exited\":null,\"focused\":false,"
+          "\"user_vars\":{},\"cwd\":null,\"approval\":null}]}"))
 
 (defun tutti-test--calls (answers thunk)
   "Call THUNK in pane 7 with the stub as `tutti-program'; the stub's calls.
@@ -212,41 +215,48 @@ ANSWERS gives the control files for a call by its number, as in
        (should (equal (should-error (tutti-agents-answer "3") :type 'user-error)
                       '(user-error "error: the prompt moved on; nothing was sent")))))))
 
-(defconst tutti-test--held
-  (concat "{\"type\":\"panes\",\"panes\":["
-          "{\"id\":3,\"title\":\"claude\",\"agent\":\"claude\",\"state\":\"blocked\",\"exited\":null,"
-          "\"approval\":{\"id\":1,\"tool\":\"Bash\",\"summary\":\"rm -rf build\"}},"
-          "{\"id\":4,\"title\":\"zsh\",\"agent\":null,\"state\":\"unknown\",\"exited\":null}]}\n"))
+(defun tutti-test--watched (thunk)
+  "Call THUNK in an agents buffer whose watch printed `tutti-test--snapshot'."
+  (with-temp-buffer
+    (tutti-agents-mode)
+    (let ((process (make-pipe-process :name "tutti-test" :buffer (current-buffer) :noquery t)))
+      (unwind-protect
+          (progn
+            (tutti--watch-filter process (concat tutti-test--snapshot "\n"))
+            (funcall thunk))
+        (delete-process process)))))
 
 (ert-deftest tutti-agents-allow-and-deny-a-held-approval ()
   (let (asked)
     (should (equal (tutti-test--calls
-                    `((1 ("out" . ,tutti-test--held))
-                      (3 ("out" . ,tutti-test--held))
-                      (5 ("out" . ,tutti-test--held)))
+                    nil
                     (lambda ()
-                      (cl-letf (((symbol-function 'y-or-n-p) (lambda (prompt) (push prompt asked) t))
-                                ((symbol-function 'tabulated-list-get-id) (lambda () 3))
-                                ((symbol-function 'read-string)
-                                 (let ((reasons '("not on main" "")))
-                                   (lambda (prompt &rest _) (push prompt asked) (pop reasons)))))
-                        (call-interactively #'tutti-agents-allow)
-                        (call-interactively #'tutti-agents-deny)
-                        (call-interactively #'tutti-agents-deny))))
-                   '("[--json][pane][list]" "[pane][approve][3]"
-                     "[--json][pane][list]" "[pane][approve][3][--deny][--message][not on main]"
-                     "[--json][pane][list]" "[pane][approve][3][--deny]")))
+                      (tutti-test--watched
+                       (lambda ()
+                         (cl-letf (((symbol-function 'y-or-n-p) (lambda (prompt) (push prompt asked) t))
+                                   ((symbol-function 'tabulated-list-get-id) (lambda () 3))
+                                   ((symbol-function 'read-string)
+                                    (let ((reasons '("not on main" "")))
+                                      (lambda (prompt &rest _) (push prompt asked) (pop reasons)))))
+                           (call-interactively #'tutti-agents-allow)
+                           (call-interactively #'tutti-agents-deny)
+                           (call-interactively #'tutti-agents-deny))))))
+                   '("[pane][approve][3]"
+                     "[pane][approve][3][--deny][--message][not on main]"
+                     "[pane][approve][3][--deny]")))
     (should (equal (reverse asked)
                    '("Allow Bash · rm -rf build? "
                      "Deny Bash · rm -rf build, reason: "
                      "Deny Bash · rm -rf build, reason: ")))))
 
 (ert-deftest tutti-agents-approval-needs-one-held ()
-  (tutti-test--calls
-   `((1 ("out" . ,tutti-test--held)))
-   (lambda ()
-     (should (equal (should-error (tutti-agents-allow "4") :type 'user-error)
-                    '(user-error "Pane 4 holds no approval"))))))
+  (should-not (tutti-test--calls
+               nil
+               (lambda ()
+                 (tutti-test--watched
+                  (lambda ()
+                    (should (equal (should-error (tutti-agents-allow "5") :type 'user-error)
+                                   '(user-error "Pane 5 holds no approval")))))))))
 
 (provide 'tutti-test)
 ;;; tutti-test.el ends here

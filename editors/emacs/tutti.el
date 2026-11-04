@@ -131,6 +131,9 @@ A failure is a `user-error' carrying what tutti said."
   "STRING parsed as JSON, objects as alists and null as nil."
   (json-parse-string string :object-type 'alist :null-object nil))
 
+(defvar-local tutti--agents nil
+  "The agent panes of the latest `tutti watch' snapshot, as alists.")
+
 (defun tutti--entry (pane)
   "PANE, an object from a `tutti watch' snapshot, as a `tabulated-list' entry."
   (let-alist pane
@@ -153,10 +156,9 @@ the last."
               ((not snapshot) (process-put process 'said line))
               ((buffer-live-p (process-buffer process))
                (with-current-buffer (process-buffer process)
-                 (setq tabulated-list-entries
-                       (mapcar #'tutti--entry
-                               (seq-filter (lambda (pane) (alist-get 'agent pane))
-                                           (alist-get 'panes snapshot))))
+                 (setq tutti--agents (seq-filter (lambda (pane) (alist-get 'agent pane))
+                                                 (alist-get 'panes snapshot))
+                       tabulated-list-entries (mapcar #'tutti--entry tutti--agents))
                  (tabulated-list-print t))))))))
 
 (defun tutti--watch-sentinel (process event)
@@ -210,10 +212,10 @@ The answer is sent as typed; \\[quoted-insert] RET adds an Enter."
         (delete-window window)))))
 
 (defun tutti--approval (id)
-  "The approval pane ID holds, from `tutti --json pane list'."
+  "The approval pane ID holds, from the latest `tutti watch' snapshot."
   (or (alist-get 'approval
                  (seq-find (lambda (pane) (equal (number-to-string (alist-get 'id pane)) id))
-                           (alist-get 'panes (tutti--json (tutti--run "--json" "pane" "list")))))
+                           tutti--agents))
       (user-error "Pane %s holds no approval" id)))
 
 (defun tutti-agents-allow (id)
