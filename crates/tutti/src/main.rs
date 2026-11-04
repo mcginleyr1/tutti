@@ -1225,7 +1225,8 @@ fn run_issue(action: IssueAction, session: &str, json: bool) -> Result<i32> {
             let mut client = Client::connect_or_start(session)?;
             let project = deploy_project(&mut client, project)?;
             let issue = issues::fetch(source, &id, &project.dir)?;
-            let cmd = on(&issues::prompt(&source.prompt, &issue))?;
+            let prompt = issues::prompt(&source.prompt, &issue);
+            let cmd = on(&issues::fit_arg(prompt, sandbox.is_some())?)?;
             let workspace = if here || !project.dir.ancestors().any(|d| d.join(".jj").exists()) {
                 project.id
             } else {

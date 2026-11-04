@@ -649,6 +649,131 @@ fn issue_list_prints_what_a_command_source_lists() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// A fake daemon on `listener` for one connection: each of its first `n`
+/// requests gets `answer`'s reply. Hands back the requests.
+fn serve_requests(
+    listener: UnixListener,
+    n: usize,
+    answer: impl Fn(&Request) -> Response + Send + 'static,
+) -> thread::JoinHandle<Vec<Request>> {
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        (0..n)
+            .map(|_| {
+                let request = read_request(&mut stream);
+                let reply = Frame::Control(serde_json::to_vec(&answer(&request)).unwrap());
+                stream.write_all(&reply.encode()).unwrap();
+                request
+            })
+            .collect()
+    })
+}
+
+/// What a fake daemon answers an `issue deploy`: project 1 is `api` at
+/// `dir`, a workspace fork makes workspace 2, and the run lands in pane 7.
+fn answer_deploy(dir: PathBuf) -> impl Fn(&Request) -> Response + Send + 'static {
+    move |request| match request {
+        Request::WorkspaceList => Response::Workspaces {
+            workspaces: vec![WorkspaceInfo {
+                id: WorkspaceId(1),
+                name: "api".into(),
+                dir: dir.clone(),
+                parent: None,
+            }],
+        },
+        Request::WorkspaceFork { .. } => Response::WorkspaceCreated { id: WorkspaceId(2) },
+        Request::Run { workspace, .. } => Response::Ran {
+            workspace: workspace.unwrap(),
+            tab: tutti_core::TabId(1),
+            pane: PaneId(7),
+        },
+        other => panic!("a deploy asked {other:?}"),
+    }
+}
+
+/// An issue whose prompt is past what Linux's exec takes in one argument
+/// deploys with every argument under it: the prompt goes to a file only the
+/// user can read, which a short message names. A sandbox deploy, whose agent
+/// can't read that file, is refused before anything runs.
+#[test]
+fn a_prompt_too_long_for_one_argument_deploys_through_a_file() {
+    use std::os::unix::fs::PermissionsExt;
+    use tutti::issues::MAX_ARG;
+    let base = unique_base("longprompt");
+    let project = base.join("api");
+    let tmp = base.join("tmp");
+    for dir in [&project, &tmp, &base.join("tutti")] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let script = base.join("jira-issues");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf '[{\"id\":\"PROJ-7\",\"title\":\"Long\",\"body\":\"'\n\
+         head -c 200000 /dev/zero | tr '\\0' a\nprintf '\"}]'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        base.join("tutti/config.toml"),
+        format!(
+            "[[issues]]\nname = \"jira\"\nkind = \"command\"\ncommand = [\"{}\"]\n\n\
+             [[sandboxes]]\nname = \"orb\"\nimage = \"agent:1\"\n",
+            script.display()
+        ),
+    )
+    .unwrap();
+    let deploy = |extra: &[&str], n: usize| {
+        let listener = UnixListener::bind(base.join("tutti/tutti.sock")).unwrap();
+        let server = serve_requests(listener, n, answer_deploy(project.clone()));
+        let output = Command::new(env!("CARGO_BIN_EXE_tutti"))
+            .args(["issue", "deploy", "jira", "PROJ-7", "--project", "1"])
+            .args(extra)
+            .env("XDG_RUNTIME_DIR", &base)
+            .env("XDG_CONFIG_HOME", &base)
+            .env("TMPDIR", &tmp)
+            .env_remove("TUTTI_SESSION")
+            .env_remove("TUTTI_PANE")
+            .output()
+            .unwrap();
+        std::fs::remove_file(base.join("tutti/tutti.sock")).unwrap();
+        (output, server.join().unwrap())
+    };
+
+    let (output, requests) = deploy(&[], 2);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let Request::Run { cmd, .. } = &requests[1] else {
+        panic!("expected a run, got {:?}", requests[1]);
+    };
+    assert_eq!(cmd[0], "claude");
+    assert!(cmd.iter().all(|arg| arg.len() < 1024), "{cmd:?}");
+    let file = std::fs::read_dir(&tmp)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(cmd[1].contains(&*file.to_string_lossy()), "{cmd:?}");
+    let prompt = std::fs::read_to_string(&file).unwrap();
+    assert!(prompt.len() > MAX_ARG && prompt.starts_with("Work on this issue"));
+    assert!(prompt.contains(&"a".repeat(200_000)));
+    let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+
+    let (refused, requests) = deploy(&["--sandbox", "orb"], 1);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("too long for a command line"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(requests, [Request::WorkspaceList], "nothing ran");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// `pane wait` prints the state that ended the wait, and exits 124 — with a
 /// note on stderr — when the daemon answers that it timed out.
 #[test]

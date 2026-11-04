@@ -1207,6 +1207,14 @@ by the id, title, body and link; set `prompt` per source to change it (`{id}`,
 project itself instead; a project that isn't a jj repo always does. The footer
 chip reads `ISSUES`.
 
+A message too long for one command-line argument — Linux takes 128 KiB —
+goes to a file only you can read, in your temp directory, and the agent's
+first message names that file instead, for it to read as it reads any file
+(it may ask to: the file lies outside the project). tutti leaves the file for
+the agent to come back to; the OS's temp cleanup takes it. A sandbox's agent
+can't read this machine's files, so a sandbox deploy of such an issue is
+refused.
+
 The agent's sidebar row and pane title carry the issue id (`claude #123`),
 `tutti --json pane list` and [`tutti watch`](#watching-state-from-other-tools)
 carry its link (`issue: {source, id, title, url}`), and a

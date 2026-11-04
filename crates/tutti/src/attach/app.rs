@@ -3147,7 +3147,7 @@ impl App {
         };
         match kind {
             LaunchKind::Agent(cmd) | LaunchKind::Resume(cmd) => match self.launcher_issue.take() {
-                Some((issue, _)) => self.deploy_frames(&issue, cmd),
+                Some((issue, prompt)) => self.deploy_frames(&issue, prompt, cmd),
                 None => self.launch_frames(cmd),
             },
             LaunchKind::Shell => self.launch_shell_and_close(),
@@ -3208,15 +3208,32 @@ impl App {
     }
 
     /// Close the launcher and deploy `issue` on `cmd` — the picked agent
-    /// already on its prompt: a `Run` in a fresh tab of the panel's project
-    /// when deploying here, else a workspace named for the issue first, the
-    /// `Run` following its `WorkspaceCreated`. The `Ran` jumps to the agent.
-    fn deploy_frames(&mut self, issue: &Issue, cmd: Vec<String>) -> Vec<WireFrame> {
+    /// already on `prompt`, its last argument, which a file carries when it is
+    /// too long for one (`issues::fit_arg`): a `Run` in a fresh tab of the
+    /// panel's project when deploying here, else a workspace named for the
+    /// issue first, the `Run` following its `WorkspaceCreated`. The `Ran`
+    /// jumps to the agent.
+    fn deploy_frames(
+        &mut self,
+        issue: &Issue,
+        prompt: String,
+        mut cmd: Vec<String>,
+    ) -> Vec<WireFrame> {
         let sandbox = self.launcher_profile().map(String::from);
         self.close_launcher();
         let Some(project) = self.issues_project else {
             return Vec::new();
         };
+        match issues::fit_arg(prompt, sandbox.is_some()) {
+            Ok(prompt) => {
+                cmd.pop();
+                cmd.push(prompt);
+            }
+            Err(e) => {
+                self.set_status(format!("{e:#}"));
+                return Vec::new();
+            }
+        }
         let run = Request::Run {
             workspace: Some(project),
             dir: None,
@@ -11556,6 +11573,50 @@ mod tests {
         let late = Response::WorkspaceCreated { id: WorkspaceId(3) };
         assert!(app.handle_response(Some(1), late).is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An issue whose prompt is too long for one argument deploys through the
+    /// file `issues::fit_arg` writes — and never into a sandbox, whose agent
+    /// can't read it.
+    #[test]
+    fn a_prompt_too_long_for_one_argument_deploys_through_a_file_never_a_sandbox() {
+        let mut app = issues_panel(Path::new("/tmp/w"));
+        let mut long = gh_issue("7", "Long");
+        long.body = "a".repeat(issues::MAX_ARG);
+        app.issues_loaded(app.issues_generation, 0, Ok(vec![long]));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(out.is_empty(), "nothing runs");
+        assert!(
+            app.transient()
+                .is_some_and(|s| s.contains("too long for a command line")),
+            "{:?}",
+            app.transient()
+        );
+
+        app.mode = Mode::Issues;
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let (issue, prompt) = app.launcher_issue.take().unwrap();
+        let out = app.deploy_frames(
+            &issue,
+            prompt.clone(),
+            vec!["claude".into(), prompt.clone()],
+        );
+        let [WireFrame::Control(sent)] = &out[..] else {
+            panic!("expected one run, got {out:?}");
+        };
+        let sent: serde_json::Value = serde_json::from_slice(sent).unwrap();
+        assert_eq!(sent["type"], "run");
+        let message = sent["cmd"][1].as_str().unwrap();
+        assert!(message.len() < 1024, "{message}");
+        let path = message
+            .split("in the file ")
+            .nth(1)
+            .and_then(|rest| rest.split(". Read").next())
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), prompt);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

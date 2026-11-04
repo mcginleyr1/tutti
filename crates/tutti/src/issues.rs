@@ -6,9 +6,12 @@
 //! directory with the user's environment: the daemon never talks to a
 //! tracker, and nothing here writes to one.
 
+use std::fs::OpenOptions;
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -169,6 +172,41 @@ pub fn fetch(source: &Source, id: &str, dir: &Path) -> Result<Issue> {
             .find(|issue| issue.id == id)
             .with_context(|| format!("{} lists no issue {id}", source.name)),
     }
+}
+
+/// The longest argument Linux's exec takes, its NUL included (MAX_ARG_STRLEN,
+/// 32 pages). A first message that long rides a file instead.
+pub const MAX_ARG: usize = 128 * 1024;
+
+/// `prompt` as it can ride an agent's command line: itself while it fits one
+/// argument (`MAX_ARG`). Past that it goes to a file only the user can read,
+/// and a message naming the file takes its place, for the agent to read as it
+/// reads any file — refused in a sandbox, whose agent can't see this machine.
+pub fn fit_arg(prompt: String, sandbox: bool) -> Result<String> {
+    if prompt.len() < MAX_ARG {
+        return Ok(prompt);
+    }
+    if sandbox {
+        bail!(
+            "the issue's prompt is {} bytes, too long for a command line ({MAX_ARG}), and a sandbox can't read it from a file here",
+            prompt.len()
+        );
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let path = std::env::temp_dir().join(format!("tutti-prompt-{}-{nanos}.md", std::process::id()));
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .and_then(|mut file| file.write_all(prompt.as_bytes()))
+        .with_context(|| format!("writing the prompt to {}", path.display()))?;
+    Ok(format!(
+        "Your task is too long for a command line, so it is in the file {}. Read that file and do what it says.",
+        path.display()
+    ))
 }
 
 /// `template` with `{id}`, `{title}`, `{body}` and `{url}` filled in from
@@ -616,6 +654,32 @@ mod tests {
             prompt("fix {id}: {unknown}", &deployed),
             "fix ENG-42: {unknown}"
         );
+    }
+
+    /// A prompt one argument can carry rides as itself. One that long goes to
+    /// a file only the user can read, named by a message a fraction its size;
+    /// a sandbox, which can't read this machine's files, refuses it.
+    #[test]
+    fn a_prompt_too_long_for_one_argument_rides_a_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let fits = "x".repeat(MAX_ARG - 1);
+        assert_eq!(fit_arg(fits.clone(), true).unwrap(), fits);
+
+        let long = "é".repeat(MAX_ARG / 2);
+        let message = fit_arg(long.clone(), false).unwrap();
+        assert!(message.len() < 1024, "{message}");
+        let path = message
+            .split("in the file ")
+            .nth(1)
+            .and_then(|rest| rest.split(". Read").next())
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), long);
+        let mode = std::fs::metadata(path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_file(path).unwrap();
+
+        let refused = fit_arg(long, true).unwrap_err().to_string();
+        assert!(refused.contains("too long for a command line"), "{refused}");
     }
 
     #[test]
