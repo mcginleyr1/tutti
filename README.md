@@ -223,11 +223,13 @@ the terminal's alternate screen, and your shell's screen comes back on exit,
 the terminal's modes restored. A program in the pane that uses an alternate
 screen of its own (vim, less) is redrawn from a local copy of the pane on each
 switch, so leaving it brings back the pane's shell. The stream votes in the
-pane's size like an attached client and follows the window's size. It ends
-with `[pane N exited: CODE]` (exit 0) when the pane's program exits, and with
-an error (exit 1) when the daemon goes away or the terminal cannot keep up with
-the pane's output. It never starts a daemon, and refuses the pane it is run
-from.
+pane's size like an attached client and follows the window's size. A terminal
+that cannot keep up with the pane's output — a megabyte of it queued — skips
+ahead: the daemon drops what is queued for it and sends the pane's screen
+afresh, and the stream goes on from there. It ends with `[pane N exited:
+CODE]` (exit 0) when the pane's program exits, and with an error (exit 1) when
+the daemon goes away. It never starts a daemon, and refuses the pane it is
+run from.
 
 What the alternate screen costs: the pane has no native scrollback in that
 terminal. Nothing else is lost to the redraws: the daemon hands a stream each

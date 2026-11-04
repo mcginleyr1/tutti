@@ -157,7 +157,9 @@ pub enum Feed<'a> {
     Raw(&'a [u8]),
 }
 
-/// A subscriber to a pane's raw output. Returning false unsubscribes it.
+/// A subscriber to a pane's raw output. Returning true from a read says it
+/// fell behind and dropped what it held: it is handed a fresh snapshot, which
+/// covers the rest of that read.
 pub type Tap = Box<dyn FnMut(Feed<'_>) -> bool + Send>;
 
 /// What one read comes to.
@@ -242,8 +244,9 @@ impl Term {
         self.synced = None;
         self.held.clear();
         let (size, snapshot) = (PaneSize::new(rows, cols), self.vt.snapshot());
-        self.taps
-            .retain_mut(|(_, tap)| tap(Feed::Snapshot(size, snapshot.clone())));
+        for (_, tap) in &mut self.taps {
+            tap(Feed::Snapshot(size, snapshot.clone()));
+        }
     }
 
     /// Take the host terminal's colours, which the colour queries are
@@ -965,26 +968,29 @@ impl PtyPane {
             term.vt.resize(rows, cols);
             if !term.taps.is_empty() {
                 let snapshot = term.vt.snapshot();
-                term.taps
-                    .retain_mut(|(_, tap)| tap(Feed::Snapshot(size, snapshot.clone())));
+                for (_, tap) in &mut term.taps {
+                    tap(Feed::Snapshot(size, snapshot.clone()));
+                }
             }
         });
         *lock(&self.size) = size;
         Ok(())
     }
 
-    /// Stream the pane's raw output to `tap`, as subscriber `id`. Under one
-    /// hold of the parser lock it is handed a snapshot of the screen as it
-    /// stands and joins the reader, which hands it each read in the same
-    /// hold that parses it — so nothing is lost or repeated between the two.
+    /// Stream the pane's raw output to `tap`, as subscriber `id`, until
+    /// `untap` or the pane's end. Under one hold of the parser lock it is
+    /// handed a snapshot of the screen as it stands and joins the reader,
+    /// which hands it each read in the same hold that parses it — so nothing
+    /// is lost or repeated between the two.
     pub fn tap(&self, id: u64, tap: Tap) {
         let mut tap = Some(tap);
         self.with(|term| {
             let (rows, cols) = term.vt.size();
-            let snapshot = term.vt.snapshot();
-            if let Some(mut tap) = tap.take()
-                && tap(Feed::Snapshot(PaneSize::new(rows, cols), snapshot))
-            {
+            if let Some(mut tap) = tap.take() {
+                tap(Feed::Snapshot(
+                    PaneSize::new(rows, cols),
+                    term.vt.snapshot(),
+                ));
                 term.taps.push((id, tap));
             }
         });
@@ -1264,13 +1270,19 @@ fn read_loop(
                         answers,
                         signals,
                     } = term.process(&buf[..n]);
-                    let mut from = 0;
-                    for to in cuts.into_iter().chain([raw.len()]) {
-                        let piece = &raw[from..to];
-                        if !piece.is_empty() {
-                            term.taps.retain_mut(|(_, tap)| tap(Feed::Raw(piece)));
+                    // A tap behind is handed the screen as this read left it,
+                    // and none of the read's pieces after.
+                    let Term { vt, taps, .. } = &mut *term;
+                    for (_, tap) in taps {
+                        let mut from = 0;
+                        for to in cuts.iter().copied().chain([raw.len()]) {
+                            if from < to && tap(Feed::Raw(&raw[from..to])) {
+                                let (rows, cols) = vt.size();
+                                tap(Feed::Snapshot(PaneSize::new(rows, cols), vt.snapshot()));
+                                break;
+                            }
+                            from = to;
                         }
-                        from = to;
                     }
                     (answers, signals)
                 }));
@@ -2885,16 +2897,7 @@ mod tests {
         let pane = PtyPane::spawn(spec, PaneSize::new(24, 80)).unwrap();
         wait_for(|| lock(&pane.term).vt.screen_top() > 1000, "no output");
         let (tx, rx) = std::sync::mpsc::channel();
-        pane.tap(
-            7,
-            Box::new(move |feed| {
-                let fed = match feed {
-                    Feed::Snapshot(size, bytes) => (Some(size), bytes),
-                    Feed::Raw(bytes) => (None, bytes.to_vec()),
-                };
-                tx.send(fed).is_ok()
-            }),
-        );
+        pane.tap(7, recorder(tx, |_| false));
         wait_for(
             || pane.output_receiver().has_changed().is_err(),
             "the output never ended",
@@ -2929,6 +2932,55 @@ mod tests {
         assert_eq!(client(10, 40, &snapshot).contents(), pane.contents());
         pane.untap(7);
         assert!(rx.recv().is_err(), "an untapped tap is dropped");
+    }
+
+    /// A tap that sends each feed down `tx` — a snapshot with its size — and
+    /// says it is behind on the reads `behind` picks.
+    fn recorder(
+        tx: std::sync::mpsc::Sender<(Option<PaneSize>, Vec<u8>)>,
+        behind: impl Fn(&[u8]) -> bool + Send + 'static,
+    ) -> Tap {
+        Box::new(move |feed| {
+            let (fed, behind) = match feed {
+                Feed::Snapshot(size, bytes) => ((Some(size), bytes), false),
+                Feed::Raw(bytes) => ((None, bytes.to_vec()), behind(bytes)),
+            };
+            let _ = tx.send(fed);
+            behind
+        })
+    }
+
+    /// A tap that falls behind is handed a fresh snapshot, which covers the
+    /// rest of the read it fell behind on: a terminal fed it, then what
+    /// follows, ends level with the pane — though that read switched
+    /// screens after.
+    #[test]
+    fn a_tap_behind_gets_a_snapshot_for_the_rest_of_its_read() {
+        let spec = PtySpec {
+            args: vec![
+                "-c".into(),
+                "read go; printf 'before\\033[?1049hafter'; read stay".into(),
+            ],
+            ..PtySpec::new("/bin/sh")
+        };
+        let pane = PtyPane::spawn(spec, PaneSize::new(5, 20)).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        pane.tap(7, recorder(tx, |read| read.starts_with(b"before")));
+        pane.write_input(b"go\r").unwrap();
+        wait_for(|| pane.contents().contains("after"), "no output");
+        let mut terminal = Terminal::new(5, 20, 0);
+        let mut snapshots = 0;
+        while let Ok((size, bytes)) = rx.recv_timeout(Duration::from_millis(200)) {
+            if let Some(size) = size {
+                terminal = Terminal::new(size.rows, size.cols, 0);
+                snapshots += 1;
+            }
+            terminal.advance(&bytes);
+        }
+        assert_eq!(snapshots, 2, "the first, then the one it fell behind for");
+        let live = lock(&pane.term);
+        level(&terminal, &client(5, 20, &live.vt.snapshot()), "level");
+        assert!(terminal.modes().alt_screen);
     }
 
     /// Poll `done` for up to three seconds.

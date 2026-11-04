@@ -2458,58 +2458,63 @@ async fn a_screen_switching_read_loses_nothing_on_a_stream() {
 }
 
 /// A stream that stops reading never stalls its pane or anyone else: once
-/// its queue backs up it is dropped — its vote with it — and, read at last,
-/// it holds its backlog, then the Error it was dropped with, then the end.
+/// it is a backlog behind, what is queued for it is dropped for a fresh
+/// snapshot. Read at last, it skips ahead to the pane's screen, and streams
+/// on from there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_pane_stream_that_never_reads_is_dropped() {
+async fn a_pane_stream_that_stops_reading_skips_ahead_to_the_screen() {
     let server = TestServer::start();
     let mut control = server.connect().await;
-    let pane = run_marker(&mut control, "exec /bin/sh").await;
-    let mut wide = server.connect().await;
-    attach(&mut wide).await;
-    view(&mut wide, &[(pane, 24, 80)]).await;
-    snapshot_at(&mut wide, pane, 24, 80).await;
+    // 6 MB of output: six times the backlog, and the socket's few KiB on
+    // top — and no more, so a loaded machine still writes it inside the
+    // deadline.
+    let script = "stty -echo; read go; head -c 6000000 /dev/zero | tr '\\0' x; echo; \
+                  echo flood-$((6*7)); read more; echo still-$((1+1)); sleep 30";
+    let pane = run_marker(&mut control, script).await;
     let mut stuck = server.connect().await;
     stuck.send(&pane_attach(pane, 10, 40)).await;
-    snapshot_at(&mut wide, pane, 10, 40).await;
-
-    // 6 MB of output: three times what the stream's 256-frame queue holds
-    // even at a full 8 KiB a read, and the socket's few KiB on top — and no
-    // more, so a loaded machine still drains it inside the deadline.
-    let flood = "head -c 6000000 /dev/zero | tr '\\0' x; echo; echo flood-$((6*7))\r";
-    let sent = control
-        .request(Request::PaneSend {
+    stuck
+        .write_frame(&Frame::Input {
             pane,
-            text: Some(flood.into()),
-            keys: None,
-            expect: None,
-            between_turns: false,
+            bytes: b"go\r".to_vec(),
         })
         .await;
-    assert_eq!(sent, Response::Ok);
-    snapshot_at(&mut wide, pane, 24, 80).await;
     assert!(read_until(&mut control, pane, "flood-42").await);
+    // Full rows of `x`, eight of them on screen, then the marker.
+    let screen = format!("{}\nflood-42", "x".repeat(8 * 40));
 
-    let mut last = None;
+    let (mut terminal, mut snapshots, mut raw) = (Terminal::new(10, 40, 0), 0, 0);
     timeout(DEADLINE, async {
-        loop {
-            while let Some((frame, used)) = Frame::decode(&stuck.buf).unwrap() {
-                stuck.buf.drain(..used);
-                if let Frame::Control(json) = frame {
-                    last = Some(json);
+        while terminal.contents() != screen {
+            match stuck.read_frame().await {
+                Frame::PaneSnapshot(data) => {
+                    terminal = Terminal::new(data.rows, data.cols, 0);
+                    terminal.advance(&data.bytes);
+                    snapshots += 1;
                 }
-            }
-            let mut chunk = [0u8; 65536];
-            match stuck.stream.read(&mut chunk).await.unwrap() {
-                0 => return,
-                n => stuck.buf.extend_from_slice(&chunk[..n]),
+                Frame::PaneRaw { bytes, .. } => {
+                    terminal.advance(&bytes);
+                    raw += bytes.len();
+                }
+                other => panic!("a pane stream got {other:?}"),
             }
         }
     })
     .await
-    .expect("the dropped stream never closed");
-    let message = error_message(serde_json::from_slice(&last.unwrap()).unwrap());
-    assert!(message.contains("fell behind"), "{message}");
+    .expect("the stream never reached the pane's screen");
+    assert!(snapshots > 1, "it was resynced");
+    assert!(raw < 3_000_000, "it skipped the backlog: {raw} bytes");
+
+    stuck
+        .write_frame(&Frame::Input {
+            pane,
+            bytes: b"more\r".to_vec(),
+        })
+        .await;
+    stream_until(&mut stuck, &mut terminal, |screen| {
+        screen.contents().ends_with("flood-42\nstill-2")
+    })
+    .await;
 
     server.stop().await;
 }

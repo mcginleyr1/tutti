@@ -427,10 +427,11 @@ pub enum Request {
     /// sends a fresh snapshot at the new size, in the same order. `rows` and
     /// `cols` are this connection's vote in the pane's size, as an attached
     /// client's `ViewSizes` is; a later `ViewSizes` naming the pane moves it.
-    /// `Input` frames type into the pane. The child exiting ends the stream
-    /// with `Event::PaneExited`, a connection that falls behind it with an
-    /// Error, and either way the daemon then closes it. Error for an unknown
-    /// pane, or on a connection already streaming one.
+    /// `Input` frames type into the pane. A connection that falls behind the
+    /// stream has what is queued for it dropped for a fresh snapshot, and
+    /// streams on from there. The child exiting ends the stream with
+    /// `Event::PaneExited`, and the daemon then closes it. Error for an
+    /// unknown pane, or on a connection already streaming one.
     PaneAttach {
         pane: PaneId,
         rows: u16,

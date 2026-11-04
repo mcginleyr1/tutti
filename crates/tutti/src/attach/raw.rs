@@ -166,8 +166,7 @@ pub fn run(session: &str, pane: PaneId, config: &Config, inline: bool) -> Result
 
 /// Draw the stream, `first` frame on, until the pane exits (its code) or the
 /// connection closes (`None`), with `mirror` following it. `lift` goes out
-/// before the first snapshot. A refusal on the way — the stream fell behind —
-/// is the error.
+/// before the first snapshot. A refusal on the way is the error.
 fn show(
     first: Frame,
     stream: &mut UnixStream,

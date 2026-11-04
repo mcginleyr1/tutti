@@ -167,7 +167,10 @@ cargo fmt --all --check
   client's terminal, into the pane; an unanswered one must reach it. A switch
   of screens goes to a tap alone (`Processed::cuts`): `pane attach` redraws a
   frame that switches. A tap runs on the reader thread under that lock: it
-  never blocks, waits or takes another lock — it `try_send`s.
+  never blocks or waits, and the one lock it takes is its connection's
+  `Outbox` (server.rs), a leaf the writer holds only to take what is queued.
+  A tap past its backlog asks for a fresh snapshot instead of waiting, and
+  leaves its log line to the writer: a stalled stderr would stall the pane.
 - **A command's end (OSC 133;D) turns off the modes the command left on**
   (rtty-vt's `set_command_end_reset`, on in `Term::new`; the taps hear of it
   through `LEFT_ON_TAPS`, `Term::drain`, pty.rs):

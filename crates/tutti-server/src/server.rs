@@ -24,7 +24,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 use tutti_agents::{ProcessTree, Registry};
 use tutti_core::{
@@ -64,6 +64,10 @@ const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 /// reach the pty's end — so the child's last output goes out before the exit
 /// does. A grandchild holding the pty open never lets it.
 const EXIT_GRACE: Duration = Duration::from_millis(250);
+/// How much of a pane's output a pane stream's connection may leave queued
+/// (`Outbox`): past it, the stream is behind, and what is queued goes for a
+/// fresh snapshot.
+const STREAM_BACKLOG: usize = 1 << 20;
 
 /// One pane's news, sent to every `pane wait` on it (`tell_waits`).
 #[derive(Debug, Clone, Copy)]
@@ -107,6 +111,24 @@ struct Watcher {
     writer: tokio::task::AbortHandle,
     /// The encoded snapshot last sent, so an unchanged session sends nothing.
     last: Vec<u8>,
+}
+
+/// A pane stream's frames on their way out (`pane_attach`): its tap adds to
+/// them under the pane's parser lock, the connection's writer takes them all
+/// at once — so what is still queued is the tap's to drop. `resynced`: the
+/// tap dropped some since the writer last took them, for the writer to log
+/// — a tap never writes the log itself, under the lock.
+#[derive(Default)]
+struct Outbox {
+    queued: Mutex<Vec<u8>>,
+    ready: Notify,
+    resynced: AtomicBool,
+}
+
+impl Outbox {
+    fn queued(&self) -> MutexGuard<'_, Vec<u8>> {
+        self.queued.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// Where a request's answer goes: the requester's own queue, tagged with the
@@ -534,11 +556,13 @@ async fn handle_conn(hub: Arc<Hub>, stream: tokio::net::UnixStream) -> Result<()
     let (mut read_half, write_half) = stream.into_split();
     let (tx, rx) = mpsc::channel::<Vec<u8>>(CLIENT_QUEUE_CAP);
     let (hangup, hung_up) = oneshot::channel::<()>();
-    let writer = tokio::spawn(writer_loop(write_half, rx, hung_up));
+    let outbox = Arc::new(Outbox::default());
+    let writer = tokio::spawn(writer_loop(write_half, rx, hung_up, Arc::clone(&outbox)));
     let abort = writer.abort_handle();
-    // Handed to a pane stream's tap (`pane_attach`), whose end drops it.
+    // Handed to a pane stream's tap (`pane_attach`) with the outbox, whose
+    // end drops it.
     let (kick, mut kicked) = oneshot::channel::<()>();
-    let mut kick = Some(kick);
+    let mut stream = Some((kick, outbox));
 
     let mut buf = Vec::new();
     let mut wedged = false;
@@ -555,7 +579,7 @@ async fn handle_conn(hub: Arc<Hub>, stream: tokio::net::UnixStream) -> Result<()
         match read {
             Ok(Some(frame)) => {
                 let handled = catch_unwind(AssertUnwindSafe(|| {
-                    handle_frame(&hub, cid, &tx, &abort, &mut kick, frame)
+                    handle_frame(&hub, cid, &tx, &abort, &mut stream, frame)
                 }));
                 match handled {
                     Ok(ControlFlow::Continue(())) => {}
@@ -589,20 +613,31 @@ async fn handle_conn(hub: Arc<Hub>, stream: tokio::net::UnixStream) -> Result<()
 /// peer hang up the queue closes — what is already queued still drains — so a
 /// task still holding a reply sender (a `pane wait`, which may block for
 /// hours) sees `closed()` and gives up, instead of keeping this writer, and
-/// with it the connection, alive.
+/// with it the connection, alive. A pane stream's frames (`outbox`) go out
+/// before each of the queue's: a stream's end follows its last output. A
+/// stream resynced while a write stalled is logged once, as the stall ends.
 async fn writer_loop(
     mut half: OwnedWriteHalf,
     mut rx: mpsc::Receiver<Vec<u8>>,
     mut hung_up: oneshot::Receiver<()>,
+    outbox: Arc<Outbox>,
 ) {
     loop {
         let bytes = tokio::select! {
+            () = outbox.ready.notified() => Some(Vec::new()),
             bytes = rx.recv() => bytes,
             _ = &mut hung_up, if !rx.is_closed() => {
                 rx.close();
                 continue;
             }
         };
+        let stream = std::mem::take(&mut *outbox.queued());
+        if outbox.resynced.swap(false, Ordering::Relaxed) {
+            eprintln!("tutti: a pane stream fell behind; it skips ahead to a fresh snapshot");
+        }
+        if half.write_all(&stream).await.is_err() {
+            break;
+        }
         let Some(bytes) = bytes else { break };
         if half.write_all(&bytes).await.is_err() {
             break;
@@ -630,7 +665,7 @@ fn handle_frame(
     cid: u64,
     tx: &mpsc::Sender<Vec<u8>>,
     writer: &tokio::task::AbortHandle,
-    kick: &mut Option<oneshot::Sender<()>>,
+    stream: &mut Option<(oneshot::Sender<()>, Arc<Outbox>)>,
     frame: Frame,
 ) -> ControlFlow<()> {
     #[cfg(test)]
@@ -698,7 +733,7 @@ fn handle_frame(
             }
             Ok(Request::ViewSizes { panes }) => view_sizes(hub, cid, &reply, panes),
             Ok(Request::PaneAttach { pane, rows, cols }) => {
-                pane_attach(hub, cid, &reply, kick, PaneDims { pane, rows, cols })
+                pane_attach(hub, cid, &reply, stream, PaneDims { pane, rows, cols })
             }
             Ok(Request::Watch) => {
                 hub.watchers().insert(
@@ -877,17 +912,19 @@ fn arbitrate(hub: &Hub, panes: impl IntoIterator<Item = PaneId>) {
 /// `PaneAttach`: stream a pane raw to this connection through a tap
 /// (`PtyPane::tap`), voting `dims` for its size as an attached client's view
 /// does. The vote goes in first, so the snapshot comes at the size it
-/// settles. The tap owns `kick`, so its end — behind, untapped, or gone with
-/// its pane — ends the connection's read loop, which drains what is queued
-/// and closes. A tap is behind when its queue is all but full: the reader
-/// never waits on it, and the slot left carries the Error it ends with. The
+/// settles. The tap queues its frames in the connection's `Outbox` and owns
+/// `kick`, so its end — untapped, or gone with its pane — ends the
+/// connection's read loop, which drains what is queued and closes. The
+/// reader never waits on a tap: one whose connection leaves more than
+/// `STREAM_BACKLOG` of the pane's output queued drops it all for a fresh
+/// snapshot, and a slow terminal skips ahead to the pane's screen. The
 /// child exiting is told once its last output is queued — unless the daemon
 /// is stopping, which killed it.
 fn pane_attach(
     hub: &Arc<Hub>,
     cid: u64,
     reply: &Reply,
-    kick: &mut Option<oneshot::Sender<()>>,
+    stream: &mut Option<(oneshot::Sender<()>, Arc<Outbox>)>,
     dims: PaneDims,
 ) -> ControlFlow<()> {
     let refuse = |message: String| {
@@ -903,26 +940,27 @@ fn pane_attach(
     let Some(pty) = pty else {
         return refuse(format!("no pane {pane}"));
     };
-    let Some(kick) = kick.take() else {
+    let Some((kick, outbox)) = stream.take() else {
         return refuse("this connection already streams a pane".into());
     };
     hub.taps().insert(cid, dims);
     arbitrate(hub, [pane]);
-    let tx = reply.tx.clone();
-    let mut behind = reply.encode(&Response::Error {
-        message: format!("fell behind pane {pane}'s output"),
-    });
     pty.tap(
         cid,
         Box::new(move |feed| {
             // Named, so the tap owns `kick` and drops it with itself.
             let _owned = &kick;
-            if tx.capacity() < 2 {
-                eprintln!("tutti: a stream of pane {pane} fell behind; dropping it");
-                let _ = tx.try_send(std::mem::take(&mut behind));
-                return false;
-            }
+            let mut queued = outbox.queued();
             let frame = match feed {
+                Feed::Raw(_) if queued.len() > STREAM_BACKLOG => {
+                    queued.clear();
+                    outbox.resynced.store(true, Ordering::Relaxed);
+                    return true;
+                }
+                Feed::Raw(bytes) => Frame::PaneRaw {
+                    pane,
+                    bytes: bytes.to_vec(),
+                },
                 Feed::Snapshot(size, bytes) => Frame::PaneSnapshot(PaneData {
                     pane,
                     rows: size.rows,
@@ -930,12 +968,10 @@ fn pane_attach(
                     seq: 0,
                     bytes,
                 }),
-                Feed::Raw(bytes) => Frame::PaneRaw {
-                    pane,
-                    bytes: bytes.to_vec(),
-                },
             };
-            tx.try_send(frame.encode()).is_ok()
+            queued.extend(frame.encode());
+            outbox.ready.notify_one();
+            false
         }),
     );
     let (hub, tx) = (Arc::clone(hub), reply.tx.clone());
@@ -3698,15 +3734,18 @@ mod tests {
 
     /// A peer hanging up closes the reply queue once what was queued drains,
     /// so a task still holding a sender — a pane wait — sees `closed()`
-    /// rather than keeping the writer alive.
+    /// rather than keeping the writer alive. A pane stream's frames queued
+    /// before a reply go out before it.
     #[tokio::test]
     async fn a_hangup_drains_the_reply_queue_then_closes_it() {
         let (server, mut peer) = tokio::net::UnixStream::pair().unwrap();
         let (_read, write) = server.into_split();
         let (tx, rx) = mpsc::channel(4);
         let (hangup, hung_up) = oneshot::channel();
-        let writer = tokio::spawn(writer_loop(write, rx, hung_up));
+        let outbox = Arc::new(Outbox::default());
+        let writer = tokio::spawn(writer_loop(write, rx, hung_up, Arc::clone(&outbox)));
         let waiter = tx.clone();
+        outbox.queued().extend_from_slice(b"streamed, ");
         tx.send(b"queued".to_vec()).await.unwrap();
         drop((tx, hangup));
         let deadline = Duration::from_secs(5);
@@ -3719,6 +3758,9 @@ mod tests {
             .unwrap();
         let mut written = Vec::new();
         peer.read_to_end(&mut written).await.unwrap();
-        assert_eq!(written, b"queued", "what was queued still drained");
+        assert_eq!(
+            written, b"streamed, queued",
+            "what was queued still drained"
+        );
     }
 }

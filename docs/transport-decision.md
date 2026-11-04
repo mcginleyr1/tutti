@@ -332,9 +332,12 @@ fresh `PaneSnapshot` at the new size, in
 stream order: a terminal reflows its screen its own way, and the snapshot puts it level
 with the grid before the program's redraw lands. The client types with `Input` frames,
 moves its size vote with `ViewSizes` naming the pane, and detaches by closing the socket
-(or `detach`). The stream ends with `Event::PaneExited` once the child's last output is
-queued (up to 250 ms is spent letting the reader drain the pty first), or with an
-`Error` when the client falls behind; either way the daemon then closes the connection.
+(or `detach`). A client that falls behind — more than 1 MiB of the pane's output queued
+for it — has what is queued dropped and a fresh `PaneSnapshot` sent in its place, taken
+in the hold that parsed the read it fell behind on, and streams on after it: a slow
+terminal skips ahead to the pane's screen. The stream ends with `Event::PaneExited` once
+the child's last output is queued (up to 250 ms is spent letting the reader drain the pty
+first), and the daemon then closes the connection.
 A daemon that stops just closes it: its own shutdown killed the pane, which did not exit.
 A stream is not an attached client: it gets no events, answers no held approval, and is
 no watcher's attached terminal — but it votes in its pane's size like one (smallest
@@ -344,8 +347,9 @@ viewer wins), and leaving re-arbitrates.
 and, in the same hold, hands the bytes to every subscribed tap. `pane_attach` takes the
 snapshot and subscribes within one hold of that lock, so the snapshot covers exactly the
 reads before it and the stream exactly the reads after — none lost, none repeated. Both
-go out on the connection's single outbound queue, and the socket keeps the order. A
-resize's snapshot is taken in the same hold that resizes the grid.
+go out through the connection's stream outbox, which its writer empties ahead of each
+reply, and the socket keeps the order. A resize's snapshot is taken in the same hold that
+resizes the grid.
 
 The snapshot is the engine's `snapshot()`: both screens while the alternate one is up
 (the primary first, then the switch, so the terminal holds the pane's primary screen
