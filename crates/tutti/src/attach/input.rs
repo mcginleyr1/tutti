@@ -1,10 +1,12 @@
-//! Translate crossterm key presses into the raw bytes a pty expects, as the
+//! Translate crossterm key events into the raw bytes a pty expects, as the
 //! pane asked for them: kitty's keyboard protocol, xterm's modifyOtherKeys,
 //! or plain xterm keys. The whole terminal-mode keymap lives here so the
 //! escape sequences can be unit-tested without a real terminal.
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use rtty_vt::{MouseEncoding, Terminal};
+
+use super::reader::Report;
 
 /// How a pane asked for its keys, read off its terminal: kitty's keyboard
 /// flags, xterm's modifyOtherKeys level and the cursor-key mode (DECCKM).
@@ -26,28 +28,51 @@ impl Keyboard {
     }
 }
 
-/// The kitty flags the encoder honours: escape codes for what plain keys
-/// leave ambiguous, a shifted key's alternate, and escape codes for every
-/// key. Event types (2) and associated text (16) need what the TUI does not
-/// get from its own terminal: presses are all a pane hears.
-const DISAMBIGUATE: u8 = 1;
-const ALTERNATES: u8 = 4;
-const ALL_AS_ESCAPES: u8 = 8;
+/// Kitty's keyboard flags: escape codes for what plain keys leave
+/// ambiguous, repeats and releases, a key's alternates, every key an escape
+/// code, and the text a key typed.
+pub const DISAMBIGUATE: u8 = 1;
+pub const EVENTS: u8 = 2;
+pub const ALTERNATES: u8 = 4;
+pub const ALL_AS_ESCAPES: u8 = 8;
+pub const TEXT: u8 = 16;
 
 const SHIFT: KeyModifiers = KeyModifiers::SHIFT;
 
-/// The bytes a terminal would send for `key` to a program that asked for
-/// its keys as `keyboard` says, or `None` when the key has no pty encoding
-/// (bare modifier presses, unmapped function keys). What a protocol leaves
-/// alone — kitty's functional keys, the keys modifyOtherKeys keeps plain —
-/// goes as plain xterm keys do.
-pub fn encode_key(key: KeyEvent, keyboard: Keyboard) -> Option<Vec<u8>> {
-    let protocol = if keyboard.kitty & (DISAMBIGUATE | ALL_AS_ESCAPES) != 0 {
-        kitty(key, keyboard.kitty)
-    } else if keyboard.modify_other_keys > 0 {
-        modify_other_keys(key, keyboard.modify_other_keys)
-    } else {
-        None
+/// Kitty's modifier bits for Shift, Alt, Ctrl, Super, Hyper and Meta, and
+/// for the locks, Caps Lock and Num Lock.
+const BITS: [(KeyModifiers, u32); 6] = [
+    (SHIFT, 1),
+    (KeyModifiers::ALT, 2),
+    (KeyModifiers::CONTROL, 4),
+    (KeyModifiers::SUPER, 8),
+    (KeyModifiers::HYPER, 16),
+    (KeyModifiers::META, 32),
+];
+const LOCK_BITS: [(KeyEventState, u32); 2] = [
+    (KeyEventState::CAPS_LOCK, 64),
+    (KeyEventState::NUM_LOCK, 128),
+];
+const LOCKS: u32 = 64 | 128;
+
+/// The bytes a terminal would send for `key` — a press, a repeat or a
+/// release — to a program that asked for its keys as `keyboard` says, or
+/// `None` when it sends none: a release or a lone modifier to a program that
+/// did not ask for them, a key with no pty encoding. `report` is what the
+/// TUI's own terminal said of the key in kitty's protocol, passed on as far
+/// as the program asked for. What a protocol leaves alone — kitty's
+/// functional keys, the keys modifyOtherKeys keeps plain — goes as plain
+/// xterm keys do; a repeat outside kitty's event types as a press.
+pub fn encode_key(key: KeyEvent, report: Option<&Report>, keyboard: Keyboard) -> Option<Vec<u8>> {
+    if keyboard.kitty & (DISAMBIGUATE | ALL_AS_ESCAPES) != 0 {
+        return kitty(key, report, keyboard);
+    }
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    let protocol = match keyboard.modify_other_keys {
+        0 => None,
+        level => modify_other_keys(key, level),
     };
     protocol.or_else(|| plain(key, keyboard.cursor_keys))
 }
@@ -62,56 +87,124 @@ fn text_key(key: KeyEvent) -> Option<(char, KeyModifiers)> {
     }
 }
 
-/// Kitty's `CSI key ; modifiers u` for a text key, Esc, Enter, Tab or
-/// Backspace; `None` for one that goes as it plainly would — text with no
-/// modifier but Shift, or an unmodified Enter, Tab or Backspace, unless
-/// every key is to be an escape code — and for the functional keys, whose
-/// xterm forms kitty keeps. The key is the unshifted one, its shifted form
-/// the alternate when asked for.
-fn kitty(key: KeyEvent, flags: u8) -> Option<Vec<u8>> {
+/// Kitty's report of `key` to a program that pushed `keyboard.kitty`:
+/// `CSI code[:shifted[:base]] ; mods[:event] [; text] u`, the key as the
+/// TUI's terminal reported it (`report`), else as `key` says (`derive`). But
+/// for:
+/// - **What goes as plain keys do,** unless every key is to be an escape
+///   code (8): text with no modifier but Shift, and an unmodified Enter,
+///   Tab or Backspace — their releases then not at all.
+/// - **A lone modifier,** which goes only under 8, as do the lock bits.
+/// - **The functional keys** (arrows, F1…), in their xterm forms.
+///
+/// The event type goes only under 2 (a repeat otherwise a press, a release
+/// nothing), the shifted and base keys only under 4, the text only under
+/// 16 with 8.
+fn kitty(key: KeyEvent, report: Option<&Report>, keyboard: Keyboard) -> Option<Vec<u8>> {
+    let flags = keyboard.kitty;
     let all = flags & ALL_AS_ESCAPES != 0;
-    let (code, mods) = match key.code {
-        KeyCode::Char(_) => {
-            let (c, mods) = text_key(key)?;
-            if !all && (mods - SHIFT).is_empty() {
-                return None;
-            }
-            (u32::from(c.to_ascii_lowercase()), mods)
-        }
-        KeyCode::Esc => (27, key.modifiers),
-        KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace if !all && key.modifiers.is_empty() => {
+    let event = match (key.kind, flags & EVENTS != 0) {
+        (KeyEventKind::Release, false) => return None,
+        (KeyEventKind::Repeat, true) => ":2",
+        (KeyEventKind::Release, true) => ":3",
+        _ => "",
+    };
+    let shown = if all { 63 | LOCKS } else { 63 };
+    let Some(report) = report.cloned().or_else(|| derive(key)) else {
+        let param = 1 + (bits(key) & shown);
+        return xterm_key(key.code, keyboard.cursor_keys, param, event);
+    };
+    let mods = report.mods & shown;
+    let text_key = matches!(key.code, KeyCode::Char(_)) && (key.modifiers - SHIFT).is_empty();
+    if !all {
+        if matches!(key.code, KeyCode::Modifier(_)) {
             return None;
         }
-        KeyCode::Enter => (13, key.modifiers),
-        KeyCode::Tab => (9, key.modifiers),
-        KeyCode::BackTab => (9, key.modifiers | SHIFT),
-        KeyCode::Backspace => (127, key.modifiers),
-        _ => return None,
-    };
-    let shifted = match key.code {
-        KeyCode::Char(c) if flags & ALTERNATES != 0 && mods.contains(SHIFT) => {
-            format!(":{}", u32::from(c.to_ascii_uppercase()))
+        if text_key || matches!(report.code, 9 | 13 | 127) && mods == 0 {
+            return match key.kind {
+                KeyEventKind::Release => None,
+                _ if report.text.is_empty() => plain(key, keyboard.cursor_keys),
+                _ => Some(report.text.into_bytes()),
+            };
         }
+    }
+    let shifted = match report.shifted {
+        shifted if shifted != 0 && mods & 1 != 0 => shifted.to_string(),
         _ => String::new(),
     };
-    let param = 1 + [
-        (SHIFT, 1),
-        (KeyModifiers::ALT, 2),
-        (KeyModifiers::CONTROL, 4),
-        (KeyModifiers::SUPER, 8),
-        (KeyModifiers::HYPER, 16),
-        (KeyModifiers::META, 32),
-    ]
-    .into_iter()
-    .filter(|&(modifier, _)| mods.contains(modifier))
-    .map(|(_, bit)| bit)
-    .sum::<u32>();
-    let mods = if param == 1 {
+    let alternates = match (flags & ALTERNATES != 0, report.base) {
+        (false, _) => String::new(),
+        (true, 0) if shifted.is_empty() => String::new(),
+        (true, 0) => format!(":{shifted}"),
+        (true, base) => format!(":{shifted}:{base}"),
+    };
+    let text = match (flags & TEXT != 0 && all, key.kind, key.code) {
+        (false, _, _) | (_, KeyEventKind::Release, _) => String::new(),
+        _ if !report.text.is_empty() => report.text,
+        (_, _, KeyCode::Char(c)) if text_key => c.to_string(),
+        _ => String::new(),
+    };
+    let text: Vec<String> = text
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| u32::from(c).to_string())
+        .collect();
+    let mods = match (1 + mods, event, text.is_empty()) {
+        (1, "", true) => String::new(),
+        (1, "", false) => ";".into(),
+        (param, event, _) => format!(";{param}{event}"),
+    };
+    let text = if text.is_empty() {
         String::new()
     } else {
-        format!(";{param}")
+        format!(";{}", text.join(":"))
     };
-    Some(format!("\x1b[{code}{shifted}{mods}u").into_bytes())
+    Some(format!("\x1b[{}{alternates}{mods}{text}u", report.code).into_bytes())
+}
+
+/// What kitty's protocol says of a key the TUI's terminal did not report in
+/// it: a text key's code is its unshifted character, the shifted one its
+/// alternate; Esc, Enter, Tab and Backspace have codes of their own. The
+/// functional keys have none (`None`): they go in their xterm forms.
+fn derive(key: KeyEvent) -> Option<Report> {
+    let mut mods = bits(key);
+    let (code, shifted) = match key.code {
+        KeyCode::Char(c) => {
+            if c.is_ascii_uppercase() {
+                mods |= 1;
+            }
+            let shifted = u32::from(c.to_ascii_uppercase()) * (mods & 1);
+            (u32::from(c.to_ascii_lowercase()), shifted)
+        }
+        KeyCode::Esc => (27, 0),
+        KeyCode::Enter => (13, 0),
+        KeyCode::Tab => (9, 0),
+        KeyCode::BackTab => {
+            mods |= 1;
+            (9, 0)
+        }
+        KeyCode::Backspace => (127, 0),
+        _ => return None,
+    };
+    Some(Report {
+        code,
+        shifted,
+        mods,
+        ..Report::default()
+    })
+}
+
+/// Kitty's modifier bits for `key`, the locks included.
+fn bits(key: KeyEvent) -> u32 {
+    let held = BITS
+        .iter()
+        .filter(|(modifier, _)| key.modifiers.contains(*modifier))
+        .map(|(_, bit)| bit);
+    let locked = LOCK_BITS
+        .iter()
+        .filter(|(lock, _)| key.state.contains(*lock))
+        .map(|(_, bit)| bit);
+    held.chain(locked).sum()
 }
 
 /// xterm's `CSI 27 ; modifiers ; key ~` for a modified text key, Enter,
@@ -151,12 +244,6 @@ fn plain(key: KeyEvent, cursor_keys: bool) -> Option<Vec<u8>> {
     let m = key.modifiers;
     let ctrl = m.contains(KeyModifiers::CONTROL);
     let alt = m.contains(KeyModifiers::ALT);
-    let param = modifier_param(m);
-    let cursor = |final_byte: u8| match (cursor_keys, param) {
-        (true, 1) => vec![0x1b, b'O', final_byte],
-        _ => csi_final(final_byte, param),
-    };
-
     let bytes = match key.code {
         KeyCode::Char(c) => encode_char(c, ctrl, alt),
         KeyCode::Enter => vec![b'\r'],
@@ -164,20 +251,45 @@ fn plain(key: KeyEvent, cursor_keys: bool) -> Option<Vec<u8>> {
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Esc => vec![0x1b],
-        KeyCode::Up => cursor(b'A'),
-        KeyCode::Down => cursor(b'B'),
-        KeyCode::Right => cursor(b'C'),
-        KeyCode::Left => cursor(b'D'),
-        KeyCode::Home => cursor(b'H'),
-        KeyCode::End => cursor(b'F'),
-        KeyCode::Insert => csi_tilde(2, param),
-        KeyCode::Delete => csi_tilde(3, param),
-        KeyCode::PageUp => csi_tilde(5, param),
-        KeyCode::PageDown => csi_tilde(6, param),
-        KeyCode::F(n) => function_key(n, param)?,
-        _ => return None,
+        code => return xterm_key(code, cursor_keys, modifier_param(m), ""),
     };
     Some(bytes)
+}
+
+/// xterm's form of a cursor, editing or function key: `CSI final` or `CSI
+/// n ~` alone, else with its modifier `param` and kitty's `event` type —
+/// `CSI 1 ; param event final`, `CSI n ; param event ~`. Unmodified, the
+/// cursor keys and Home and End take `SS3 final` under `cursor_keys`, and F1
+/// to F4 always; F3 with an event type is `CSI 13 ~`, as kitty sends it, a
+/// `CSI … R` being a cursor report.
+fn xterm_key(code: KeyCode, cursor_keys: bool, param: u32, event: &str) -> Option<Vec<u8>> {
+    let bare = param == 1 && event.is_empty();
+    let letter = |c: char, ss3: bool| match (bare, ss3) {
+        (true, true) => format!("\x1bO{c}"),
+        (true, false) => format!("\x1b[{c}"),
+        (false, _) => format!("\x1b[1;{param}{event}{c}"),
+    };
+    let tilde = |n: u8| match bare {
+        true => format!("\x1b[{n}~"),
+        false => format!("\x1b[{n};{param}{event}~"),
+    };
+    let bytes = match code {
+        KeyCode::Up => letter('A', cursor_keys),
+        KeyCode::Down => letter('B', cursor_keys),
+        KeyCode::Right => letter('C', cursor_keys),
+        KeyCode::Left => letter('D', cursor_keys),
+        KeyCode::Home => letter('H', cursor_keys),
+        KeyCode::End => letter('F', cursor_keys),
+        KeyCode::Insert => tilde(2),
+        KeyCode::Delete => tilde(3),
+        KeyCode::PageUp => tilde(5),
+        KeyCode::PageDown => tilde(6),
+        KeyCode::F(3) if !event.is_empty() => tilde(13),
+        KeyCode::F(n @ 1..=4) => letter(char::from(b'P' + n - 1), true),
+        KeyCode::F(n @ 5..=12) => tilde([15, 17, 18, 19, 20, 21, 23, 24][usize::from(n - 5)]),
+        _ => return None,
+    };
+    Some(bytes.into_bytes())
 }
 
 fn encode_char(c: char, ctrl: bool, alt: bool) -> Vec<u8> {
@@ -210,24 +322,6 @@ fn modifier_param(m: KeyModifiers) -> u32 {
     1 + u32::from(m.contains(KeyModifiers::SHIFT))
         + 2 * u32::from(m.contains(KeyModifiers::ALT))
         + 4 * u32::from(m.contains(KeyModifiers::CONTROL))
-}
-
-/// `ESC [ final` unmodified, else `ESC [ 1 ; param final` (arrows, Home, End).
-fn csi_final(final_byte: u8, param: u32) -> Vec<u8> {
-    if param == 1 {
-        vec![0x1b, b'[', final_byte]
-    } else {
-        format!("\x1b[1;{param}{}", final_byte as char).into_bytes()
-    }
-}
-
-/// `ESC [ num ~` unmodified, else `ESC [ num ; param ~` (Ins/Del/PgUp/PgDn/Fn).
-fn csi_tilde(num: u32, param: u32) -> Vec<u8> {
-    if param == 1 {
-        format!("\x1b[{num}~").into_bytes()
-    } else {
-        format!("\x1b[{num};{param}~").into_bytes()
-    }
 }
 
 /// The wheel-tick bytes for a program that enabled mouse reporting: buttons
@@ -291,29 +385,6 @@ pub fn encode_wheel_arrows(application_cursor: bool, up: bool, n: usize) -> Vec<
     seq.repeat(n)
 }
 
-fn function_key(n: u8, param: u32) -> Option<Vec<u8>> {
-    let bytes = match n {
-        1..=4 => {
-            let final_byte = b'P' + (n - 1);
-            if param == 1 {
-                vec![0x1b, b'O', final_byte]
-            } else {
-                format!("\x1b[1;{param}{}", final_byte as char).into_bytes()
-            }
-        }
-        5 => csi_tilde(15, param),
-        6 => csi_tilde(17, param),
-        7 => csi_tilde(18, param),
-        8 => csi_tilde(19, param),
-        9 => csi_tilde(20, param),
-        10 => csi_tilde(21, param),
-        11 => csi_tilde(23, param),
-        12 => csi_tilde(24, param),
-        _ => return None,
-    };
-    Some(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,11 +396,17 @@ mod tests {
         KeyEvent::new(code, mods)
     }
     fn legacy(key: KeyEvent) -> Option<Vec<u8>> {
-        encode_key(key, Keyboard::default())
+        encode_key(key, None, Keyboard::default())
     }
     fn with(keyboard: Keyboard) -> impl Fn(KeyCode, KeyModifiers) -> String {
         move |code, mods| {
-            String::from_utf8(encode_key(keym(code, mods), keyboard).unwrap()).unwrap()
+            String::from_utf8(encode_key(keym(code, mods), None, keyboard).unwrap()).unwrap()
+        }
+    }
+    fn kitty_flags(kitty: u8) -> Keyboard {
+        Keyboard {
+            kitty,
+            ..Keyboard::default()
         }
     }
     const NONE: KeyModifiers = KeyModifiers::NONE;
@@ -381,6 +458,105 @@ mod tests {
         assert_eq!(kitty(KeyCode::Char('A'), SHIFT), "\x1b[97:65;2u");
         assert_eq!(kitty(KeyCode::Enter, NONE), "\x1b[13u");
         assert_eq!(kitty(KeyCode::Char('é'), NONE), "\x1b[233u");
+    }
+
+    /// Event types (2): a repeat and a release carry theirs, the modifiers
+    /// then written out, a functional key's in its xterm form. Text keys and
+    /// an unmodified Enter, Tab or Backspace have none — a repeat goes as a
+    /// press, a release not at all — unless every key is an escape code
+    /// (8). Without 2, or kitty's protocol, a release is nothing and a
+    /// repeat a press.
+    #[test]
+    fn kitty_event_types_reach_a_program_that_asked() {
+        let event = |kind, code, mods, flags| {
+            let key = KeyEvent::new_with_kind_and_state(code, mods, kind, KeyEventState::NONE);
+            encode_key(key, None, kitty_flags(flags)).map(|b| String::from_utf8(b).unwrap())
+        };
+        use KeyEventKind::{Release, Repeat};
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(event(Release, KeyCode::Esc, NONE, 3), some("\x1b[27;1:3u"));
+        assert_eq!(
+            event(Repeat, KeyCode::Char('a'), CTRL, 3),
+            some("\x1b[97;5:2u")
+        );
+        assert_eq!(event(Release, KeyCode::Up, NONE, 3), some("\x1b[1;1:3A"));
+        assert_eq!(event(Release, KeyCode::F(3), NONE, 3), some("\x1b[13;1:3~"));
+        assert_eq!(
+            event(Repeat, KeyCode::Delete, SHIFT, 3),
+            some("\x1b[3;2:2~")
+        );
+        assert_eq!(event(Release, KeyCode::Char('a'), NONE, 3), None);
+        assert_eq!(event(Repeat, KeyCode::Char('a'), NONE, 3), some("a"));
+        assert_eq!(event(Release, KeyCode::Enter, NONE, 3), None);
+        assert_eq!(
+            event(Release, KeyCode::Char('a'), NONE, 10),
+            some("\x1b[97;1:3u")
+        );
+        assert_eq!(
+            event(Release, KeyCode::Enter, NONE, 10),
+            some("\x1b[13;1:3u")
+        );
+        assert_eq!(event(Release, KeyCode::Esc, NONE, 1), None);
+        assert_eq!(event(Repeat, KeyCode::Esc, NONE, 1), some("\x1b[27u"));
+        assert_eq!(event(Release, KeyCode::Char('a'), NONE, 0), None);
+        assert_eq!(event(Repeat, KeyCode::Char('a'), NONE, 0), some("a"));
+    }
+
+    /// A key as the TUI's own kitty terminal reported it reaches a program
+    /// as far as it asked: every key an escape code (8) with its text (16),
+    /// a lone modifier, the lock bits, the shifted and base-layout keys (4),
+    /// composed text. A program that asked for less gets less, down to the
+    /// bytes a plain terminal sends.
+    #[test]
+    fn kitty_reports_pass_on_what_the_program_asked_for() {
+        use crate::attach::reader::{Decoder, Input};
+        let pass = |bytes: &[u8], flags: u8| match Decoder::default().feed(bytes).as_slice() {
+            [Input::Key(key, report)] => encode_key(*key, report.as_ref(), kitty_flags(flags))
+                .map(|b| String::from_utf8(b).unwrap()),
+            inputs => panic!("{bytes:?}: {inputs:?}"),
+        };
+        let some = |s: &str| Some(s.to_string());
+        let all = DISAMBIGUATE | EVENTS | ALTERNATES | ALL_AS_ESCAPES | TEXT;
+        for (sent, flags, want) in [
+            // Shift+a, and its text.
+            (&b"\x1b[97:65;2;65u"[..], all, some("\x1b[97:65;2;65u")),
+            (b"\x1b[97:65;2;65u", ALL_AS_ESCAPES, some("\x1b[97;2u")),
+            (
+                b"\x1b[97:65;2;65u",
+                ALL_AS_ESCAPES | TEXT,
+                some("\x1b[97;2;65u"),
+            ),
+            (b"\x1b[97:65;2;65u", DISAMBIGUATE, some("A")),
+            // Plain text from a plain terminal, every key an escape code.
+            (b"a", all, some("\x1b[97;;97u")),
+            (
+                b"\x1b[49:33;2;33u",
+                DISAMBIGUATE | ALL_AS_ESCAPES,
+                some("\x1b[49;2u"),
+            ),
+            (b"\x1b[49:33;2;33u", DISAMBIGUATE, some("!")),
+            // A lone modifier, pressed and released.
+            (b"\x1b[57441;2u", all, some("\x1b[57441;2u")),
+            (b"\x1b[57441;1:3u", all, some("\x1b[57441;1:3u")),
+            (b"\x1b[57441;2u", DISAMBIGUATE | EVENTS, None),
+            // Caps Lock: its bit, and the text it made.
+            (b"\x1b[97;65;65u", all, some("\x1b[97;65;65u")),
+            (b"\x1b[97;65;65u", DISAMBIGUATE, some("A")),
+            (b"\x1b[27;65u", DISAMBIGUATE, some("\x1b[27u")),
+            // Ctrl+С on a Cyrillic layout: the base-layout key.
+            (b"\x1b[1089::99;5u", all, some("\x1b[1089::99;5u")),
+            (b"\x1b[1089::99;5u", DISAMBIGUATE, some("\x1b[1089;5u")),
+            // Text with no key, as an input method makes it.
+            (b"\x1b[0;;101:769u", all, some("\x1b[0;;101:769u")),
+            (b"\x1b[0;;101:769u", DISAMBIGUATE, some("e\u{301}")),
+            // The keypad: Enter is a key of its own, a digit is text.
+            (b"\x1b[57414u", DISAMBIGUATE, some("\x1b[57414u")),
+            (b"\x1b[57414u", 0, some("\r")),
+            (b"\x1b[57399;;48u", DISAMBIGUATE, some("0")),
+            (b"\x1b[57399;;48u", all, some("\x1b[57399;;48u")),
+        ] {
+            assert_eq!(pass(sent, flags), want, "{sent:?} under {flags}");
+        }
     }
 
     /// modifyOtherKeys 2 spells out every chord with a modifier, Ctrl+I

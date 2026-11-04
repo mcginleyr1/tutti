@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use ratatui::crossterm::event::{
     DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, KeyEventKind,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use signal_hook::consts::{SIGTSTP, SIGWINCH};
@@ -88,7 +88,7 @@ pub fn run(
     // protocol.
     let modes = Modes {
         mouse: config.mouse,
-        keys: false,
+        keys: 0,
         rtty: rtty.is_some(),
         scheme,
     };
@@ -133,12 +133,13 @@ pub fn run(
 
 /// What the TUI turns on in its terminal beyond raw mode and the alternate
 /// screen: mouse capture, kitty's keyboard flags where the terminal speaks
-/// the protocol, the claim on rtty's keys in rtty, light/dark reports on the
-/// `terminal` theme — and focus reports and bracketed paste.
+/// the protocol (`keys`, the flags in force, 0 for none pushed), the claim
+/// on rtty's keys in rtty, light/dark reports on the `terminal` theme — and
+/// focus reports and bracketed paste.
 #[derive(Clone, Copy)]
 struct Modes {
     mouse: bool,
-    keys: bool,
+    keys: u8,
     rtty: bool,
     scheme: bool,
 }
@@ -170,8 +171,9 @@ static RTTY_CLAIMED: AtomicBool = AtomicBool::new(false);
 /// - Focus reports: the terminal's focus, for the panes that ask to hear of
 ///   theirs.
 /// - Kitty's keyboard flags, on the terminal's own stack: it then tells keys
-///   apart that plain bytes cannot — Ctrl+I from Tab, Esc from Alt — for the
-///   panes that asked for them (`input::encode_key`).
+///   apart that plain bytes cannot — Ctrl+I from Tab, Esc from Alt — and
+///   reports what the focused pane's program asked for beyond
+///   (`App::key_flags`), for the panes that asked (`input::encode_key`).
 /// - rtty's keys: rtty's `keys = "tutti"` Ctrl/Alt+h/j/k/l then reach tutti,
 ///   which hands a move past its own edge back to rtty (`rtty`).
 /// - Light/dark reports (2031), so the TUI follows the terminal's flips.
@@ -185,8 +187,8 @@ fn enter(modes: Modes) {
     if modes.scheme {
         emit_terminal(b"\x1b[?2031h");
     }
-    if modes.keys {
-        push_keys();
+    if modes.keys != 0 {
+        push_keys(modes.keys);
     }
     if modes.rtty {
         emit_terminal(rtty::CLAIM);
@@ -194,13 +196,11 @@ fn enter(modes: Modes) {
     }
 }
 
-/// Push kitty's keyboard flags on the terminal's own stack, for `leave` to
+/// Push kitty's keyboard `flags` on the terminal's own stack, for `leave` to
 /// pop.
-fn push_keys() {
-    let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS;
-    let pushed = execute!(io::stdout(), PushKeyboardEnhancementFlags(flags)).is_ok();
-    KEYS_PUSHED.store(pushed, Ordering::SeqCst);
+fn push_keys(flags: u8) {
+    emit_terminal(format!("\x1b[>{flags}u").as_bytes());
+    KEYS_PUSHED.store(true, Ordering::SeqCst);
 }
 
 /// Hand back what the TUI changed in the terminal beyond what
@@ -336,6 +336,12 @@ fn event_loop(
             cursor_shape = app.cursor_shape();
             emit_terminal(format!("\x1b[{cursor_shape} q").as_bytes());
         }
+        // The terminal's kitty flags follow what the focused pane's program
+        // asked for, set on the entry the TUI pushed.
+        if tty.modes.keys != 0 && app.key_flags() != tty.modes.keys {
+            tty.modes.keys = app.key_flags();
+            emit_terminal(format!("\x1b[={};1u", tty.modes.keys).as_bytes());
+        }
 
         // Wait on the terminal: its next read, or the tick — or, while the
         // start of a sequence is held, what is left of the escape time,
@@ -364,11 +370,11 @@ fn event_loop(
         let mut told = None;
         for input in inputs {
             match input {
-                Input::Key(key) if key.kind != KeyEventKind::Release => {
-                    for frame in app.on_key(key) {
+                Input::Key(key, report) => {
+                    for frame in app.on_typed(key, report.as_ref()) {
                         conn.send(&frame)?;
                     }
-                    dirty = true;
+                    dirty |= key.kind != KeyEventKind::Release;
                 }
                 Input::Mouse(mouse) => {
                     for frame in app.on_mouse_event(mouse) {
@@ -383,9 +389,9 @@ fn event_loop(
                     dirty = true;
                 }
                 Input::Focus(focused) => app.host_focus(focused),
-                Input::KeyboardFlags(_) if !tty.modes.keys => {
-                    tty.modes.keys = true;
-                    push_keys();
+                Input::KeyboardFlags(_) if tty.modes.keys == 0 => {
+                    tty.modes.keys = app.key_flags();
+                    push_keys(tty.modes.keys);
                 }
                 // The terminal turned light or dark: the chrome follows at
                 // once, and the panes once its colours are in.

@@ -279,6 +279,21 @@ its encoding, but only those your terminal can tell apart. `pane attach` keeps
 plain keys: the protocols never reach your terminal there, as it watches for
 the prefix in plain bytes and a detach could not be sure to turn them off.
 
+Beyond disambiguated keys, the TUI asks your kitty terminal for what the
+focused pane's program pushed, and passes it on:
+- **Repeats and releases** (flag 2; Neovim 0.12 asks for them). A release
+  goes to the pane that had the key's press, even after the focus moved, and
+  never one whose press was tutti's: the prefix, a direct key.
+- **Every key as an escape code** (flag 8): text keys, Enter, Tab and
+  Backspace, a lone modifier, the lock keys' bits. tutti asks for the text
+  too while this is on, so a prompt still types what a dead key or an input
+  method made.
+- **The text a key typed** (flag 16), as your terminal reported it.
+
+A program that asked for less gets less, down to plain keys. tutti's own keys
+work as before whatever is on: a lone modifier is never a key of tutti's, and
+a release never ends the prefix.
+
 The TUI reports your terminal's colours when it attaches. On the `dark` and
 `light` themes it reports the theme's own pane ground and text instead, since
 panes are painted over them. The TUI and `tutti pane attach` both follow your
@@ -1936,9 +1951,9 @@ tutti is alpha; PLAN.md tracks what is open.
 - **Write-back stops at the deploy.** A source can have a deploy comment on,
   assign, label or move its issue, but tutti never closes it, and a command
   source (any other tracker) is read-only.
-- **A pane's program that asked for key releases or the text of a key**
-  (kitty's flags 2 and 16) gets presses only: the TUI asks your terminal for
-  neither.
+- **Key releases, repeats and text need a kitty terminal.** Under a terminal
+  without kitty's protocol, a pane's program that asked for them (flags 2
+  and 16) gets presses only, and its text derived from the key.
 - **The TUI follows light/dark only on terminals that report it** (mode
   2031). On one that doesn't, reattach after switching the OS theme.
 - **In rtty, an editor's move off tutti's edge always reads as made.** The

@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
 use ratatui::text::Span;
@@ -28,7 +28,7 @@ use super::input;
 use super::launcher::{self, LaunchKind, LauncherRow};
 use super::layout::{Boundary, boundaries, pane_rects};
 use super::navigate;
-use super::reader::{Decoder, Input};
+use super::reader::{Decoder, Input, Report};
 use super::rtty::Handoff;
 use super::sidebar::{self, Sidebar, SidebarEntry};
 use crate::config::{
@@ -278,6 +278,9 @@ pub struct App {
     /// The pane a press went to (its program reports the mouse): its drag
     /// and release go there too, wherever the pointer is.
     mouse_grab: Option<PaneId>,
+    /// The pane each key held down went to (`held`): its release goes there
+    /// too, and a release whose press was tutti's goes nowhere.
+    pressed: HashMap<KeyCode, PaneId>,
     status: Option<(String, Instant)>,
     /// The visible set last sent as `ViewSizes` — each shown pane at its
     /// rendered size — so a draw that moved nothing sends nothing.
@@ -523,6 +526,7 @@ impl App {
             boundaries: Vec::new(),
             border_drag: None,
             mouse_grab: None,
+            pressed: HashMap::new(),
             status: None,
             view_sent: Vec::new(),
             focus_sent: None,
@@ -753,6 +757,21 @@ impl App {
             .filter(|s| s.scroll.is_none())
             .and_then(|s| s.term.cursor_style())
             .map_or(0, |style| style.decscusr())
+    }
+
+    /// Kitty's keyboard flags the TUI wants of its terminal: disambiguated
+    /// keys and their alternates always, and what the focused pane's program
+    /// asked for beyond — repeats and releases (2), and every key an escape
+    /// code (8) with its text (16), which a prompt needs too: it is what a
+    /// dead key or an input method made.
+    pub fn key_flags(&self) -> u8 {
+        let pane = self.keyboard().kitty;
+        let all = if pane & input::ALL_AS_ESCAPES != 0 {
+            input::ALL_AS_ESCAPES | input::TEXT
+        } else {
+            0
+        };
+        input::DISAMBIGUATE | input::ALTERNATES | (pane & input::EVENTS) | all
     }
 
     /// Whether a bell is pending (a non-focused pane just blocked or finished),
@@ -1232,10 +1251,34 @@ impl App {
 
     // ---- keyboard -------------------------------------------------------
 
+    /// A key from the terminal, with what kitty's protocol said of it. A
+    /// press or a repeat does what `on_key` does with it. What only a pane's
+    /// program takes goes only to a pane: a release to the pane that had its
+    /// press, a lone modifier to the focused one — each if its program
+    /// asked for such reports — and never to tutti's own keys.
+    pub fn on_typed(&mut self, key: KeyEvent, report: Option<&Report>) -> Vec<WireFrame> {
+        if key.kind == KeyEventKind::Release {
+            let Some(pane) = self.pressed.remove(&held(key, report)) else {
+                return Vec::new();
+            };
+            let keyboard = self.panes.get(&pane).filter(|s| s.info.exited.is_none());
+            return keyboard
+                .and_then(|s| input::encode_key(key, report, input::Keyboard::of(&s.term)))
+                .map(|bytes| vec![WireFrame::Input { pane, bytes }])
+                .unwrap_or_default();
+        }
+        self.pressed.remove(&held(key, report));
+        match self.mode {
+            Mode::Terminal => self.on_key_terminal(key, report),
+            _ if matches!(key.code, KeyCode::Modifier(_)) => Vec::new(),
+            _ => self.on_key(key),
+        }
+    }
+
     /// Handle a key press, returning frames to send to the server.
     pub fn on_key(&mut self, key: KeyEvent) -> Vec<WireFrame> {
         match self.mode {
-            Mode::Terminal => self.on_key_terminal(key),
+            Mode::Terminal => self.on_key_terminal(key, None),
             Mode::Prefix => self.on_key_prefix(key),
             Mode::ConfirmKill(pane) => self.on_key_confirm(key, pane),
             Mode::ConfirmKillWorkspace(id) => self.on_key_confirm_workspace(key, id),
@@ -1297,13 +1340,13 @@ impl App {
         inputs
             .into_iter()
             .flat_map(|input| match input {
-                Input::Key(key) => self.on_key(key),
+                Input::Key(key, _) => self.on_key(key),
                 _ => Vec::new(),
             })
             .collect()
     }
 
-    fn on_key_terminal(&mut self, key: KeyEvent) -> Vec<WireFrame> {
+    fn on_key_terminal(&mut self, key: KeyEvent, report: Option<&Report>) -> Vec<WireFrame> {
         if self.enter_prefix(key) {
             return Vec::new();
         }
@@ -1345,8 +1388,12 @@ impl App {
                 _ => {}
             }
         }
-        match (self.focused, input::encode_key(key, self.keyboard())) {
-            (Some(pane), Some(bytes)) => vec![WireFrame::Input { pane, bytes }],
+        let bytes = input::encode_key(key, report, self.keyboard());
+        match (self.focused, bytes) {
+            (Some(pane), Some(bytes)) => {
+                self.pressed.insert(held(key, report), pane);
+                vec![WireFrame::Input { pane, bytes }]
+            }
             // No pane to type into: honor the dashboard's advertised key so
             // `a → add a project` works without focusing the sidebar first.
             (None, _) if key.code == KeyCode::Char('a') && key.modifiers.is_empty() => {
@@ -1405,7 +1452,7 @@ impl App {
         }
         // The prefix pressed twice forwards the literal prefix chord to the pane.
         if self.config.prefix.matches(key) {
-            return match (self.focused, input::encode_key(key, self.keyboard())) {
+            return match (self.focused, input::encode_key(key, None, self.keyboard())) {
                 (Some(pane), Some(bytes)) => vec![WireFrame::Input { pane, bytes }],
                 _ => Vec::new(),
             };
@@ -2075,7 +2122,7 @@ impl App {
         // Answer keys are text the guarded send types: plain, as a prompt
         // takes them whatever keyboard protocol its program asked for.
         let text = answer
-            .then(|| input::encode_key(key, input::Keyboard::default()))
+            .then(|| input::encode_key(key, None, input::Keyboard::default()))
             .flatten()
             .and_then(|bytes| String::from_utf8(bytes).ok());
         let (Some(text), Some(state)) = (text, self.panes.get(&pane)) else {
@@ -5067,6 +5114,16 @@ fn inner_size(rect: Rect) -> (u16, u16) {
     )
 }
 
+/// What a key's press and its release have in common: kitty's code for the
+/// key, when the terminal said it, else the key, a letter unshifted.
+fn held(key: KeyEvent, report: Option<&Report>) -> KeyCode {
+    match (report.and_then(|r| char::from_u32(r.code)), key.code) {
+        (Some(code), _) => KeyCode::Char(code),
+        (None, KeyCode::Char(c)) => KeyCode::Char(c.to_ascii_lowercase()),
+        (None, code) => code,
+    }
+}
+
 pub(crate) fn control(request: &Request) -> WireFrame {
     WireFrame::Control(serde_json::to_vec(request).expect("serialize request"))
 }
@@ -5668,6 +5725,109 @@ mod tests {
         assert_eq!(typed(&mut app), b"\t");
         app.handle_frame(snapshot(b"\x1b[>1u"));
         assert_eq!(typed(&mut app), b"\x1b[105;5u");
+    }
+
+    /// Two panes, each with the kitty flags its program pushed.
+    fn kitty_panes(app: &mut App, first: &[u8], second: &[u8]) {
+        attach_with(app, view_two_panes());
+        for (pane, bytes) in [(1, first), (2, second)] {
+            app.handle_frame(WireFrame::PaneSnapshot(PaneData {
+                pane: PaneId(pane),
+                rows: 24,
+                cols: 80,
+                seq: 0,
+                bytes: bytes.to_vec(),
+            }));
+        }
+        app.focused = Some(PaneId(1));
+    }
+
+    /// What the terminal sent, as the TUI's reader decodes it.
+    fn typed_in(app: &mut App, bytes: &[u8]) -> Vec<(PaneId, String)> {
+        Decoder::default()
+            .feed(bytes)
+            .into_iter()
+            .flat_map(|input| match input {
+                Input::Key(key, report) => app.on_typed(key, report.as_ref()),
+                input => panic!("{input:?}"),
+            })
+            .filter_map(|frame| match frame {
+                WireFrame::Input { pane, bytes } => Some((pane, String::from_utf8(bytes).unwrap())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The TUI asks its terminal for what the focused pane's program asked
+    /// for beyond disambiguated keys and their alternates: event types, and
+    /// every key an escape code — with the text, always, for a prompt.
+    #[test]
+    fn the_terminals_kitty_flags_follow_the_focused_panes_program() {
+        let mut app = App::new();
+        kitty_panes(&mut app, b"\x1b[>3u", b"\x1b[>11u");
+        assert_eq!(app.key_flags(), 1 | 2 | 4, "nvim's 1|2");
+        app.focused = Some(PaneId(2));
+        assert_eq!(app.key_flags(), 1 | 2 | 4 | 8 | 16);
+        kitty_panes(&mut app, b"", b"\x1b[>16u");
+        assert_eq!(app.key_flags(), 1 | 4);
+        app.focused = Some(PaneId(2));
+        assert_eq!(app.key_flags(), 1 | 4, "text means nothing without 8");
+    }
+
+    /// A release goes to the pane that had its press, as its program asked
+    /// for it — after a move of the focus too — and never one whose press
+    /// was tutti's: the prefix, a direct chord. A repeat is a press; a lone
+    /// modifier reaches only a program that asked for every key, and never
+    /// ends the prefix.
+    #[test]
+    fn releases_go_where_their_press_went_and_never_from_tuttis_keys() {
+        let mut app = App::new();
+        kitty_panes(&mut app, b"\x1b[>3u", b"\x1b[>27u");
+        let one = |s: &str| vec![(PaneId(1), s.to_string())];
+        assert_eq!(typed_in(&mut app, b"\x1b[27u"), one("\x1b[27u"));
+        assert_eq!(typed_in(&mut app, b"\x1b[27;1:2u"), one("\x1b[27;1:2u"));
+        assert_eq!(typed_in(&mut app, b"\x1b[27;1:3u"), one("\x1b[27;1:3u"));
+        assert!(
+            typed_in(&mut app, b"\x1b[27;1:3u").is_empty(),
+            "released once"
+        );
+        assert_eq!(
+            typed_in(&mut app, b"a\x1b[57441;2u"),
+            one("a"),
+            "no lone Shift for 1|2"
+        );
+
+        // Ctrl+A held while the focus moves: its release follows the press.
+        assert_eq!(typed_in(&mut app, b"\x1b[97;5u"), one("\x1b[97;5u"));
+        assert!(
+            typed_in(&mut app, b"\x1b[108;3u").is_empty(),
+            "Alt+L is tutti's"
+        );
+        app.focused = Some(PaneId(2));
+        assert!(typed_in(&mut app, b"\x1b[108;3:3u").is_empty());
+        assert_eq!(typed_in(&mut app, b"\x1b[97;5:3u"), one("\x1b[97;5:3u"));
+        assert_eq!(
+            typed_in(&mut app, b"\x1b[57441;2u\x1b[97:65;2;65u\x1b[57441;1:3u"),
+            [
+                (PaneId(2), "\x1b[57441;2u".to_string()),
+                (PaneId(2), "\x1b[97;2;65u".to_string()),
+                (PaneId(2), "\x1b[57441;1:3u".to_string()),
+            ]
+        );
+
+        // The prefix, its release, a lone Shift, then `%`: a split, and the
+        // pane hears none of it.
+        assert!(typed_in(&mut app, b"\x1b[98;5u\x1b[98;5:3u").is_empty());
+        assert_eq!(app.mode, Mode::Prefix);
+        assert!(typed_in(&mut app, b"\x1b[57441;2u").is_empty());
+        assert_eq!(app.mode, Mode::Prefix, "a lone modifier is no prefix key");
+        let split = app.on_typed(KeyEvent::new(KeyCode::Char('%'), KeyModifiers::NONE), None);
+        assert!(
+            split.iter().all(|f| !matches!(f, WireFrame::Input { .. })) && !split.is_empty(),
+            "{split:?}"
+        );
+        assert!(typed_in(&mut app, b"\x1b[53:37;2:3u\x1b[57441;1:3u").is_empty());
+        assert_eq!(app.mode, Mode::Terminal);
     }
 
     /// A paste reaches the focused pane whole — inside the paste marks once

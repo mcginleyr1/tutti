@@ -85,7 +85,7 @@ pub fn run(session: &str, pane: PaneId, config: &Config, inline: bool) -> Result
         bail!("pane attach needs a terminal on stdin");
     }
     let Chord { code, mods } = config.prefix;
-    let prefix = encode_key(KeyEvent::new(code, mods), Keyboard::default())
+    let prefix = encode_key(KeyEvent::new(code, mods), None, Keyboard::default())
         .with_context(|| format!("the prefix {} has no key bytes", config.prefix.label()))?;
     let mut stream = match UnixStream::connect(socket_path(session)) {
         Ok(stream) => stream,
@@ -682,7 +682,12 @@ mod tests {
     fn the_configured_chord_gives_the_prefix_bytes() {
         let bytes = |spec| {
             let chord = Chord::parse(spec).unwrap();
-            encode_key(KeyEvent::new(chord.code, chord.mods), Keyboard::default()).unwrap()
+            encode_key(
+                KeyEvent::new(chord.code, chord.mods),
+                None,
+                Keyboard::default(),
+            )
+            .unwrap()
         };
         assert_eq!(bytes("C-b"), vec![0x02]);
         assert_eq!(bytes("C-a"), vec![0x01]);

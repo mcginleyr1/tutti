@@ -103,7 +103,11 @@ cargo fmt --check
     query without asking the terminal. A resize or a resume once made it
     time out after 2 s and end the TUI.
   - **Key events:** keys come out as the same `KeyEvent`s crossterm made, so
-    a new decoding must keep every binding's chord as it was.
+    a new decoding must keep every binding's chord as it was. What kitty's
+    `CSI … u` says beyond them (the unshifted code, alternates, raw modifier
+    bits, text) rides beside them in a `reader::Report`, for the panes only.
+  - **Releases and lone modifiers are never tutti's keys** (`App::on_typed`):
+    a release goes only to the pane its press went to (`App::pressed`).
 - **Shutdown order** (`serve`, server.rs): abort *and await* the layout saver,
   write the final save, then `kill_all`. A save after `kill_all` — or a saver
   tick racing the final write — records a layout with every pane gone. An empty

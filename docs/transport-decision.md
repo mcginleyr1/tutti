@@ -477,6 +477,15 @@ every key after a 997 report; crossterm now only draws.
   that takes over from one still out also waits for its fence.
 - **On a switch report:** the `terminal` theme's chrome recolours at once, and the TUI
   asks the colours again. It hands them to the daemon with the light/dark the report said.
+- **Kitty's flags:** pushed once the terminal answers `CSI ? u` — disambiguate and
+  alternates (1|4), the focused pane's event types (2), and all keys as escape codes with
+  their text (8|16) when the pane asked for 8 — then set on that same entry (`CSI = n ; 1
+  u`) as the focus or the pane's flags change, and popped on detach, suspend and panic.
+- **What a key keeps:** a key in its `CSI … u` form carries a `Report` beside its
+  `KeyEvent` — the code, unshifted, the shifted and base-layout keys, the modifier bits as
+  sent and the text — which the encoder passes on as far as the pane's program asked. A
+  release goes to the pane its press went to, and nowhere when the press was tutti's; a
+  lone modifier never acts as a key of tutti's.
 
 The ESC wait:
 - **Lone ESC:** an `ESC` at the end of a read waits the escape time (`escape_time_ms`,

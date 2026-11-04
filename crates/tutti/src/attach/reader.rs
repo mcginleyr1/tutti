@@ -29,7 +29,9 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 /// One thing the terminal said.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
-    Key(KeyEvent),
+    /// A key, with all kitty's protocol said of it when the terminal sent it
+    /// as `CSI … u`.
+    Key(KeyEvent, Option<Report>),
     Mouse(MouseEvent),
     /// What the terminal pasted, between its bracketed-paste marks.
     Paste(Vec<u8>),
@@ -48,6 +50,21 @@ pub enum Input {
     Version(String),
     /// DECRPM: a DEC private mode and its state (0 unknown, 1 set, 2 reset).
     Mode(u16, u8),
+}
+
+/// A key as kitty's protocol reported it (`CSI code:shifted:base ; mods ;
+/// text u`), for a pane that asked for the same reports: what crossterm's
+/// `KeyEvent` keeps no room for — the key's own code, unshifted (49 for
+/// `!`, 57441 for Left Shift), its shifted and base-layout keys (0 when not
+/// said), the modifier bits as sent, Shift and the locks included, and the
+/// text it typed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Report {
+    pub code: u32,
+    pub shifted: u32,
+    pub base: u32,
+    pub mods: u32,
+    pub text: String,
 }
 
 /// What the bytes at the front of the held input come to.
@@ -105,8 +122,8 @@ impl Decoder {
                     Some((&b, rest)) => {
                         if b == ESC {
                             out.push(key(KeyCode::Esc, KeyModifiers::ALT));
-                        } else if let Step::Input(Input::Key(k), _) = parse(&[b]) {
-                            out.push(Input::Key(alt(k)));
+                        } else if let Step::Input(Input::Key(k, _), _) = parse(&[b]) {
+                            out.push(alt(k));
                         }
                         self.held = rest.to_vec();
                         self.decode(&mut out);
@@ -167,12 +184,14 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 fn key(code: KeyCode, modifiers: KeyModifiers) -> Input {
-    Input::Key(KeyEvent::new(code, modifiers))
+    Input::Key(KeyEvent::new(code, modifiers), None)
 }
 
-fn alt(mut key: KeyEvent) -> KeyEvent {
+/// `key` with Alt, as an `ESC` before it says: what kitty's protocol said
+/// of the key without Alt goes.
+fn alt(mut key: KeyEvent) -> Input {
     key.modifiers |= KeyModifiers::ALT;
-    key
+    Input::Key(key, None)
 }
 
 fn parse(b: &[u8]) -> Step {
@@ -229,7 +248,7 @@ fn escape(b: &[u8]) -> Step {
         // Alt and whatever follows, a sequence included: `ESC ESC [ A` is
         // Alt+Up.
         _ => match parse(&b[1..]) {
-            Step::Input(Input::Key(k), len) => Step::Input(Input::Key(alt(k)), len + 1),
+            Step::Input(Input::Key(k, _), len) => Step::Input(alt(k), len + 1),
             Step::More => Step::More,
             _ => Step::Skip(1),
         },
@@ -240,7 +259,7 @@ fn escape(b: &[u8]) -> Step {
 /// Alt+O sends, when no sequence follows.
 fn alt_key(b: &[u8]) -> Step {
     match parse(&b[1..2]) {
-        Step::Input(Input::Key(k), _) => Step::Input(Input::Key(alt(k)), 2),
+        Step::Input(Input::Key(k, _), _) => Step::Input(alt(k), 2),
         _ => Step::Skip(2),
     }
 }
@@ -448,9 +467,10 @@ fn csi(b: &[u8]) -> Step {
         (None, b"", c) => match legacy_key(c) {
             Some(code) => {
                 let (modifiers, kind, state) = modifiers(n(1, 0), n(1, 1));
-                Input::Key(KeyEvent::new_with_kind_and_state(
-                    code, modifiers, kind, state,
-                ))
+                Input::Key(
+                    KeyEvent::new_with_kind_and_state(code, modifiers, kind, state),
+                    None,
+                )
             }
             None => return Step::Skip(len),
         },
@@ -518,12 +538,7 @@ fn tilde(groups: &[Vec<u32>]) -> Option<Input> {
     let n = |group: usize, index: usize| groups.get(group).and_then(|g| g.get(index)).copied();
     let (modifiers, kind, state) = modifiers(n(1, 0), n(1, 1));
     let code = match n(0, 0)? {
-        27 => {
-            let code = char_key(n(2, 0)?, modifiers)?;
-            return Some(Input::Key(KeyEvent::new_with_kind_and_state(
-                code, modifiers, kind, state,
-            )));
-        }
+        27 => char_key(n(2, 0)?, modifiers)?,
         1 | 7 => KeyCode::Home,
         2 => KeyCode::Insert,
         3 => KeyCode::Delete,
@@ -537,9 +552,10 @@ fn tilde(groups: &[Vec<u32>]) -> Option<Input> {
         v @ 31..=34 => KeyCode::F((v - 17) as u8),
         _ => return None,
     };
-    Some(Input::Key(KeyEvent::new_with_kind_and_state(
-        code, modifiers, kind, state,
-    )))
+    Some(Input::Key(
+        KeyEvent::new_with_kind_and_state(code, modifiers, kind, state),
+        None,
+    ))
 }
 
 /// A key by its Unicode code: the controls that are keys of their own, else
@@ -557,10 +573,17 @@ fn char_key(code: u32, modifiers: KeyModifiers) -> Option<KeyCode> {
 
 /// `ESC [ code[:shifted[:base]] ; mods[:kind] [; text] u`: kitty's keyboard
 /// protocol. A shifted key's alternate stands for the key, Shift then
-/// spent, as crossterm read it.
+/// spent, as crossterm read it; text with no key (code 0) is its first
+/// character. The `Report` keeps all the terminal said.
 fn csi_u(groups: &[Vec<u32>]) -> Option<Input> {
     let n = |group: usize, index: usize| groups.get(group).and_then(|g| g.get(index)).copied();
     let codepoint = n(0, 0)?;
+    let text: String = groups
+        .get(2)
+        .into_iter()
+        .flatten()
+        .filter_map(|&c| char::from_u32(c))
+        .collect();
     let (mut modifiers, kind, mut state) = modifiers(n(1, 0), n(1, 1));
     let mut code = match functional(codepoint) {
         Some((code, keypad)) => {
@@ -569,6 +592,7 @@ fn csi_u(groups: &[Vec<u32>]) -> Option<Input> {
             }
             code
         }
+        None if codepoint == 0 => KeyCode::Char(text.chars().next()?),
         None => char_key(codepoint, modifiers)?,
     };
     if let KeyCode::Modifier(held) = code {
@@ -588,9 +612,17 @@ fn csi_u(groups: &[Vec<u32>]) -> Option<Input> {
         code = KeyCode::Char(shifted);
         modifiers.remove(KeyModifiers::SHIFT);
     }
-    Some(Input::Key(KeyEvent::new_with_kind_and_state(
-        code, modifiers, kind, state,
-    )))
+    let report = Report {
+        code: codepoint,
+        shifted: n(0, 1).unwrap_or(0),
+        base: n(0, 2).unwrap_or(0),
+        mods: n(1, 0).unwrap_or(1).saturating_sub(1),
+        text,
+    };
+    Some(Input::Key(
+        KeyEvent::new_with_kind_and_state(code, modifiers, kind, state),
+        Some(report),
+    ))
 }
 
 /// Kitty's codes for the keys that have no character, from its private-use
@@ -886,12 +918,42 @@ mod tests {
             ),
             (
                 b"\x1b[57414u",
-                vec![Input::Key(KeyEvent::new_with_kind_and_state(
-                    KeyCode::Enter,
-                    NONE,
-                    KeyEventKind::Press,
-                    KeyEventState::KEYPAD,
-                ))],
+                vec![Input::Key(
+                    KeyEvent::new_with_kind_and_state(
+                        KeyCode::Enter,
+                        NONE,
+                        KeyEventKind::Press,
+                        KeyEventState::KEYPAD,
+                    ),
+                    None,
+                )],
+            ),
+            // Event types, all keys as escape codes, and text: a release, a
+            // repeat, Left Shift itself, text with no key.
+            (
+                b"\x1b[97;1:3u\x1b[1;5:2A\x1b[57441;2u\x1b[0;;229u",
+                vec![
+                    Input::Key(
+                        KeyEvent::new_with_kind_and_state(
+                            KeyCode::Char('a'),
+                            NONE,
+                            KeyEventKind::Release,
+                            KeyEventState::NONE,
+                        ),
+                        None,
+                    ),
+                    Input::Key(
+                        KeyEvent::new_with_kind_and_state(
+                            KeyCode::Up,
+                            CTRL,
+                            KeyEventKind::Repeat,
+                            KeyEventState::NONE,
+                        ),
+                        None,
+                    ),
+                    k(KeyCode::Modifier(ModifierKeyCode::LeftShift), SHIFT),
+                    c('å', NONE),
+                ],
             ),
             // xterm's modifyOtherKeys.
             (b"\x1b[27;5;105~", vec![c('i', CTRL)]),
@@ -942,11 +1004,59 @@ mod tests {
         ]
     }
 
+    /// The inputs `reads` decode to, but for kitty's reports
+    /// (`kitty_reports_keep_what_a_key_event_has_no_room_for`).
     fn decode(reads: &[&[u8]]) -> Vec<Input> {
         let mut decoder = Decoder::default();
         let mut out: Vec<Input> = reads.iter().flat_map(|read| decoder.feed(read)).collect();
         out.extend(decoder.flush());
-        out
+        out.into_iter()
+            .map(|input| match input {
+                Input::Key(key, _) => Input::Key(key, None),
+                input => input,
+            })
+            .collect()
+    }
+
+    /// A key in kitty's `CSI … u` form keeps all the terminal said of it:
+    /// its own code, unshifted, its alternates, the modifier bits as sent,
+    /// and its text.
+    #[test]
+    fn kitty_reports_keep_what_a_key_event_has_no_room_for() {
+        let report = |bytes: &[u8]| match Decoder::default().feed(bytes).as_slice() {
+            [Input::Key(_, Some(report))] => report.clone(),
+            inputs => panic!("{bytes:?}: {inputs:?}"),
+        };
+        assert_eq!(
+            report(b"\x1b[49:33;2;33u"),
+            Report {
+                code: 49,
+                shifted: 33,
+                mods: 1,
+                text: "!".into(),
+                ..Report::default()
+            }
+        );
+        assert_eq!(
+            report(b"\x1b[1089::99;69:3u"),
+            Report {
+                code: 1089,
+                base: 99,
+                mods: 68,
+                ..Report::default()
+            }
+        );
+        assert_eq!(
+            report(b"\x1b[0;;101:769u"),
+            Report {
+                text: "e\u{301}".into(),
+                ..Report::default()
+            }
+        );
+        assert_eq!(
+            Decoder::default().feed(b"\x1b[A"),
+            vec![k(KeyCode::Up, NONE)]
+        );
     }
 
     #[test]
@@ -1044,10 +1154,10 @@ mod tests {
         ];
         let cases = plain.into_iter().map(|key| (key, Keyboard::default()));
         for (key, keyboard) in cases.chain(disambiguated.into_iter().map(|key| (key, kitty))) {
-            let bytes = encode_key(key, keyboard).unwrap();
+            let bytes = encode_key(key, None, keyboard).unwrap();
             assert_eq!(
                 decode(&[&bytes]),
-                vec![Input::Key(key)],
+                vec![Input::Key(key, None)],
                 "{key:?} as {bytes:?}"
             );
         }
