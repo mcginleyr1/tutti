@@ -479,8 +479,9 @@ every key after a 997 report; crossterm now only draws.
   asks the colours again. It hands them to the daemon with the light/dark the report said.
 
 The ESC wait:
-- **Lone ESC:** an `ESC` at the end of a read waits 15 ms for the rest of a sequence
-  before it counts as the key.
+- **Lone ESC:** an `ESC` at the end of a read waits the escape time (`escape_time_ms`,
+  15 ms by default) for the rest of a sequence, or a typed key, before it counts as
+  Esc. A key in time goes with it as that key with Alt.
 - **Replies it doesn't expect:** `ESC ]` and `ESC P` count as string replies only in the
   forms the TUI asks for. Otherwise they are Alt+] and Alt+P.
 

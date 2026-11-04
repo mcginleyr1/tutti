@@ -706,6 +706,8 @@ notifications = true    # re-emit pane bells/notifications to your real terminal
 approvals = "watch"     # Claude/opencode permission requests: "watch" (default: block the
                         # pane, the agent shows its dialog) or "hold" (answer from tutti)
 approval_timeout_secs = 120  # a held request falls through to the agent's dialog after this (1–599)
+escape_time_ms = 15     # how long a lone Esc waits for the key after it, which then goes
+                        # with it as that key with Alt — tmux's escape-time (0–1000)
 
 [keys]                  # direct bindings; every entry optional; "none" disables
 focus_left  = "C-h"
@@ -773,6 +775,16 @@ Chord syntax is `C-<char>` (Ctrl), `A-<char>` (Alt), or a bare printable
 character. The top-level keys and `[keys]` above are exactly the defaults, so a
 file that reproduces them changes nothing; `[[projects]]`, `[[sandboxes]]` and
 `[[issues]]` are examples.
+
+**The escape time.** A terminal sends Alt+x as `Esc` then `x`, so a lone `Esc`
+waits `escape_time_ms` for the key after it, in the TUI and in `tutti pane
+attach`. A key within it goes with the `Esc` as that key with Alt: an `A-…`
+binding, or Alt+key to the pane. Past it, the `Esc` is Esc. The default, 15
+ms, is far longer than the gap within one sequence a terminal writes, and too
+short to notice: Esc in Neovim feels instant. Raise it (to 100–300 ms) to type
+Alt as `Esc` then a key, on a terminal whose Option or Alt key sends no Meta.
+A terminal that speaks kitty's keyboard protocol sends Esc unambiguously, so
+the TUI never waits on it there.
 
 **Presets.** `preset` selects the *prefix* keymap table. The which-key popup and
 help overlay always render whichever preset is active, so they stay accurate.

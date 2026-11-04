@@ -110,6 +110,7 @@ pub fn run(
         modes,
         reads,
         decoder: Decoder::default(),
+        escape: config.escape_time,
         held: None,
         asked,
         stop,
@@ -150,8 +151,10 @@ struct Tty {
     /// The reader thread's reads (`reader::spawn`).
     reads: Receiver<Vec<u8>>,
     decoder: Decoder,
-    /// Since when the decoder has held the start of a sequence, which is
-    /// what a person typed once `reader::ESC_WAIT` goes by with no more.
+    /// The escape time (`Config::escape_time`), and since when the decoder
+    /// has held the start of a sequence, which is what a person typed once
+    /// the escape time goes by with no more.
+    escape: Duration,
     held: Option<Instant>,
     asked: Option<Asked>,
     stop: Arc<AtomicBool>,
@@ -335,11 +338,11 @@ fn event_loop(
         }
 
         // Wait on the terminal: its next read, or the tick — or, while the
-        // start of a sequence is held, what is left of `ESC_WAIT`, after
-        // which a person typed it.
+        // start of a sequence is held, what is left of the escape time,
+        // after which a person typed it.
         let wait = tty
             .held
-            .map_or(POLL, |at| reader::ESC_WAIT.saturating_sub(at.elapsed()));
+            .map_or(POLL, |at| tty.escape.saturating_sub(at.elapsed()));
         let mut inputs = Vec::new();
         match tty.reads.recv_timeout(wait) {
             Ok(read) => {
@@ -350,7 +353,7 @@ fn event_loop(
                 tty.held = tty.decoder.waiting().then(Instant::now);
             }
             Err(RecvTimeoutError::Timeout) => {
-                if tty.held.is_some_and(|at| at.elapsed() >= reader::ESC_WAIT) {
+                if tty.held.is_some_and(|at| at.elapsed() >= tty.escape) {
                     inputs.extend(tty.decoder.flush());
                     tty.held = None;
                 }

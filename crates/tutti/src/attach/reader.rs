@@ -19,11 +19,6 @@ use ratatui::crossterm::event::{
 };
 use tutti_core::{HostColors, Rgb};
 
-/// How long the start of a sequence — a lone `ESC`, `ESC [` — waits for the
-/// rest before it is what a person typed: a terminal writes a sequence whole,
-/// and nobody types the key after Esc within this.
-pub const ESC_WAIT: Duration = Duration::from_millis(15);
-
 /// How long the TUI waits on the DA1 that fences its queries before it goes
 /// on with what it heard.
 const ASK_WAIT: Duration = Duration::from_secs(1);
@@ -86,17 +81,20 @@ impl Decoder {
         out
     }
 
-    /// Whether the decoder holds the start of a sequence, which `flush`
-    /// takes as typed if nothing follows within `ESC_WAIT`. A paste is never
+    /// Whether the decoder holds the start of a sequence — a lone `ESC`,
+    /// `ESC [` — which `flush` takes as typed if nothing follows within the
+    /// escape time (`Config::escape_time`): a terminal writes a sequence
+    /// whole, so what does follow in time is its rest, or the key a person
+    /// typed after Esc, which with it is that key with Alt. A paste is never
     /// cut short: it waits for its end mark.
     pub fn waiting(&self) -> bool {
         !self.held.is_empty() && self.paste.is_none()
     }
 
-    /// Nothing followed what is held within `ESC_WAIT`, so a person typed
-    /// it: an `ESC` alone is Esc, and with the byte after it that key with
-    /// Alt (`ESC [` is Alt+[). What comes after is read afresh; a character
-    /// cut short goes.
+    /// Nothing followed what is held within the escape time, so a person
+    /// typed it: an `ESC` alone is Esc, and with the byte after it that key
+    /// with Alt (`ESC [` is Alt+[). What comes after is read afresh; a
+    /// character cut short goes.
     pub fn flush(&mut self) -> Vec<Input> {
         let mut out = Vec::new();
         while self.waiting() {
