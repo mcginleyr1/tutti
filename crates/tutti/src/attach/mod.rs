@@ -344,11 +344,11 @@ fn event_loop(
         }
 
         // Wait on the terminal: its next read, or the tick — or, while the
-        // start of a sequence is held, what is left of the escape time,
-        // after which a person typed it.
+        // start of a sequence is held, what is left of the escape time, after
+        // which a person typed it, if that comes sooner.
         let wait = tty
             .held
-            .map_or(POLL, |at| tty.escape.saturating_sub(at.elapsed()));
+            .map_or(POLL, |at| tty.escape.saturating_sub(at.elapsed()).min(POLL));
         let mut inputs = Vec::new();
         match tty.reads.recv_timeout(wait) {
             Ok(read) => {
