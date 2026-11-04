@@ -313,13 +313,13 @@ pub enum Request {
         #[serde(default)]
         conversation: Option<String>,
     },
-    /// Hold a Claude permission request on `pane` for an answer from tutti —
-    /// what `tutti agent-event` sends under `approvals = "hold"` in place of
-    /// the request's `AgentEvent`, so the pane blocks just the same. `tool`
-    /// is what would run, `summary` its input on one line. Answered with
-    /// `Response::Approval` once an `ApprovalAnswer` names it, or at once with
-    /// `Pass` — Claude's own dialog — when no client is attached to answer or
-    /// the pane is unknown. A pane holds every request its agent raises (its
+    /// Hold an agent's permission request (Claude's, opencode's) on `pane`
+    /// for an answer from tutti — what `tutti agent-event` sends under
+    /// `approvals = "hold"` in place of the request's `AgentEvent`, so the
+    /// pane blocks just the same. `tool` is what would run, `summary` its
+    /// input on one line. Answered with `Response::Approval` once an
+    /// `ApprovalAnswer` names it, or at once with `Pass` — the agent's own
+    /// dialog — when no client is attached to answer or the pane is unknown. A pane holds every request its agent raises (its
     /// subagents ask in parallel), queued behind the ones before. The
     /// approval lives as long as this connection: hanging up drops it.
     ApprovalHold {

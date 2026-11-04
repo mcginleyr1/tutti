@@ -112,11 +112,11 @@ pub enum Theme {
     Light,
 }
 
-/// What a Claude permission request does to tutti. `Watch` (the default)
-/// only learns of it: the pane blocks with the tool named and Claude shows
-/// its own dialog. `Hold` keeps that dialog back until the request is
-/// answered from tutti's queue or `pane approve`, handing it on to Claude's
-/// own after `approval_timeout`.
+/// What a Claude or opencode permission request does to tutti. `Watch` (the
+/// default) only learns of it: the pane blocks with the tool named and the
+/// agent shows its own dialog. `Hold` waits for an answer from tutti's queue
+/// or `pane approve` — keeping Claude's dialog back; opencode's shows beside
+/// it — handing it on to the agent's own after `approval_timeout`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Approvals {
     Watch,
@@ -475,10 +475,11 @@ pub struct Config {
     /// Whether pane notifications re-emit to the real terminal and flash the
     /// status bar. The sidebar bell mark is unaffected — always on.
     pub notifications: bool,
-    /// What a Claude permission request does to tutti. Default `Watch`.
+    /// What a Claude or opencode permission request does to tutti. Default
+    /// `Watch`.
     pub approvals: Approvals,
     /// How long a held permission request waits for an answer before it
-    /// passes on to Claude's own dialog: `approval_timeout_secs`, default
+    /// passes on to the agent's own dialog: `approval_timeout_secs`, default
     /// 120, under Claude's 600 s hook timeout.
     pub approval_timeout: Duration,
     /// Startup projects: workspace dirs to mount (idempotently) on attach, each

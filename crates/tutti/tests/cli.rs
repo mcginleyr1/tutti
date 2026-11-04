@@ -282,6 +282,60 @@ fn agent_event_claude_holds_a_permission_request_for_its_answer() {
     assert!(held("holdpass", ApprovalDecision::Pass).is_empty());
 }
 
+/// Under `approvals = "hold"` an opencode `permission.asked` holds on the
+/// daemon too, naming its permission and patterns, and the answer prints as
+/// the reply body tutti's plugin posts to opencode; a pass prints nothing,
+/// leaving it to opencode's own dialog.
+#[test]
+fn agent_event_opencode_holds_a_permission_request_for_its_answer() {
+    let asked = r#"{"type":"permission.asked","properties":{"id":"per_1","sessionID":"ses_1",
+        "permission":"bash","patterns":["rm -rf build"],"metadata":{},"always":[]}}"#;
+    let held = |label: &str, decision: ApprovalDecision| {
+        let dir = config_dir(label, "approvals = \"hold\"\n");
+        let xdg = dir.to_str().unwrap().to_string();
+        let output = run_scenario_with(
+            label,
+            &["agent-event", "opencode"],
+            &[
+                ("TUTTI_PANE", "7"),
+                ("TUTTI_SESSION", "tutti"),
+                ("XDG_CONFIG_HOME", &xdg),
+            ],
+            asked,
+            |req| {
+                assert_eq!(
+                    *req,
+                    Request::ApprovalHold {
+                        pane: PaneId(7),
+                        conversation: None,
+                        tool: "bash".into(),
+                        summary: "rm -rf build".into(),
+                    }
+                );
+            },
+            Response::Approval { decision },
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(output.status.success(), "{label}");
+        output.stdout
+    };
+    let reply = |stdout: Vec<u8>| -> serde_json::Value { serde_json::from_slice(&stdout).unwrap() };
+    assert_eq!(
+        reply(held("ocallow", ApprovalDecision::Allow)),
+        serde_json::json!({ "reply": "once" })
+    );
+    assert_eq!(
+        reply(held(
+            "ocdeny",
+            ApprovalDecision::Deny {
+                message: Some("not on main".into())
+            }
+        )),
+        serde_json::json!({ "reply": "reject", "message": "not on main" })
+    );
+    assert!(held("ocpass", ApprovalDecision::Pass).is_empty());
+}
+
 /// A hold nobody answers gives up after `approval_timeout_secs`: the hook
 /// prints nothing and exits 0, and Claude's own dialog appears.
 #[test]

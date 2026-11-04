@@ -102,8 +102,8 @@ const SETUP_PREVIEW_ROWS: usize = 10;
 const SETUP_PATH_W: usize = 60;
 
 /// The approval overlay's hint row, two-tone: the three answers. `esc`
-/// answers too — it hands the request on to Claude's own dialog.
-const APPROVAL_HINT: &[(&str, &str)] = &[("y", "allow"), ("n", "deny"), ("esc", "pass to claude")];
+/// answers too — it hands the request on to the agent's own dialog.
+const APPROVAL_HINT: &[(&str, &str)] = &[("y", "allow"), ("n", "deny"), ("esc", "pass to agent")];
 
 /// The go-to overlay's key hint, two-tone at its input row's right edge —
 /// typing filters, so the movement keys are the ones worth saying.
@@ -4168,7 +4168,7 @@ mod tests {
         assert!(row(1).contains(" Bash "), "the tool: {:?}", row(1));
         assert!(row(2).contains(" rm -rf build "), "its input: {:?}", row(2));
         assert!(
-            row(3).contains("y allow  n deny  esc pass to claude"),
+            row(3).contains("y allow  n deny  esc pass to agent"),
             "the answers: {:?}",
             row(3)
         );

@@ -683,9 +683,9 @@ icons = "unicode"       # sidebar glyph set: "unicode" (default) or "nerdfont"
 theme = "terminal"      # "terminal" (default: your terminal's colours, live light/dark),
                         # "dark", or "light" (shaded truecolor chrome)
 notifications = true    # re-emit pane bells/notifications to your real terminal
-approvals = "watch"     # Claude permission requests: "watch" (default: block the pane,
-                        # Claude shows its dialog) or "hold" (answer from tutti)
-approval_timeout_secs = 120  # a held request falls through to Claude's dialog after this (1–599)
+approvals = "watch"     # Claude/opencode permission requests: "watch" (default: block the
+                        # pane, the agent shows its dialog) or "hold" (answer from tutti)
+approval_timeout_secs = 120  # a held request falls through to the agent's dialog after this (1–599)
 
 [keys]                  # direct bindings; every entry optional; "none" disables
 focus_left  = "C-h"
@@ -1004,6 +1004,15 @@ back to **working** once its screen shows Claude busy again — its spinner's
 having seen the dialog on the pane's screen, reads the screen until it goes. A
 request you deny there stays blocked — Claude asks what to do instead — until
 your next prompt.
+
+**opencode** holds its permission requests the same way through
+[its plugin](#opencode-integration): with `approvals = "hold"`, a
+`permission.asked` waits on tutti — `bash · rm -rf build` on its waiting row —
+and an allow or a deny from the overlay or `pane approve` becomes opencode's
+reply (a deny's reason reaches the agent). opencode gives a plugin no way to
+keep its dialog back, so its own dialog shows meanwhile: answered there first,
+the plugin drops tutti's hold; `esc`, a timeout or no attached TUI leave it to
+that dialog.
 
 ### Changed files panel
 
@@ -1565,7 +1574,9 @@ agent-event opencode` (outside one it does nothing):
   (and `session.idle`, `session.error`) marks it **done**;
 - `permission.asked` and `question.asked` mark it **blocked**; the matching
   `permission.replied` / `question.replied` / `question.rejected` puts it back
-  to **working**;
+  to **working**. With `approvals = "hold"` a permission request also waits on
+  tutti for an answer, which the plugin posts as opencode's reply (see
+  [Held approvals](#held-approvals));
 - a subagent's child session never moves the pane on its own busy/idle (its
   permission prompts still block it);
 - the root session's id (from its `session.*` events — never a subagent's) is
@@ -1574,7 +1585,8 @@ agent-event opencode` (outside one it does nothing):
 
 `agent-event opencode` is fail-safe in the same way as for Claude: it exits 0
 outside a tutti pane, on an irrelevant event, and when the daemon is
-unreachable or has not answered within 2 s. Remove `tutti.js` from the plugins
+unreachable or has not answered within 2 s (a held request waits out its own
+`approval_timeout_secs`). Its stdout carries only a held request's reply. Remove `tutti.js` from the plugins
 directory if you uninstall tutti.
 
 ## Kubernetes sandboxes
@@ -1883,7 +1895,8 @@ tutti is alpha; PLAN.md tracks what is open.
   their hooks, and agents that speak herdr's protocol (Crush) report on their
   own; Codex, Gemini and the rest of the catalog are read from the screen,
   tuned live only for some.
-- **Approvals are Claude Code's only.**
+- **Held approvals are Claude Code's and opencode's only**, and opencode
+  shows its own dialog beside a held request (whichever answers first wins).
 - **Write-back stops at the deploy.** A source can have a deploy comment on,
   assign, label or move its issue, but tutti never closes it, and a command
   source (any other tracker) is read-only.

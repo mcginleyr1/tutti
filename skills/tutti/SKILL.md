@@ -168,8 +168,8 @@ and nothing is typed. Taking the fingerprint before reading keeps that safe.
 `ctrl-c`. A permission prompt is your user's to grant: answer only what you are
 sure they would approve, and ask them about the rest.
 
-When your user runs tutti with `approvals = "hold"`, a Claude permission
-request waits in tutti, and `tutti pane list --json` lists the
+When your user runs tutti with `approvals = "hold"`, a Claude or opencode
+permission request waits in tutti, and `tutti pane list --json` lists the
 pane's held requests, oldest first, as `approvals` (id, tool and summary) —
 several when its subagents ask at once. Answer each on its own:
 

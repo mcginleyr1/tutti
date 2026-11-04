@@ -4,7 +4,8 @@
 //! `AgentHookEvent` and the agent's own conversation id; print the hooks
 //! snippets that wire each tool's events to `tutti agent-event <agent>` (or,
 //! for Claude in a sandbox image, straight to the terminal as OSC 7501), and
-//! the opencode plugin that pipes to `tutti agent-event opencode`.
+//! the opencode plugin that pipes to `tutti agent-event opencode`; and spell a
+//! held permission request's answer the way each agent takes it.
 //!
 //! The mappings read only the fields tutti reacts to and ignore everything else,
 //! so they tolerate each tool's evolving schema. They never fail: an
@@ -252,9 +253,7 @@ const SUMMARY_FIELDS: &[&str] = &[
 
 /// A tool call's input on one line, for a held approval: the first of
 /// `SUMMARY_FIELDS` present — a path relative to the session's `cwd` when
-/// beneath it — else its first string field; line breaks shown as `⏎`,
-/// control characters blanked so nothing reaches the terminal raw, and cut
-/// with `…` past 500 characters, so nothing is hidden without a mark.
+/// beneath it — else its first string field, through `one_line`.
 fn input_summary(v: &Value) -> String {
     let input = v.get("tool_input");
     let (field, text) = SUMMARY_FIELDS
@@ -266,9 +265,17 @@ fn input_summary(v: &Value) -> String {
         .get("cwd")
         .and_then(Value::as_str)
         .filter(|_| field.ends_with("path"));
-    let text: String = cwd
-        .and_then(|cwd| text.strip_prefix(cwd)?.strip_prefix('/'))
-        .unwrap_or(text)
+    one_line(
+        cwd.and_then(|cwd| text.strip_prefix(cwd)?.strip_prefix('/'))
+            .unwrap_or(text),
+    )
+}
+
+/// `text` on one line, for a held approval: line breaks shown as `⏎`,
+/// control characters blanked so nothing reaches the terminal raw, and cut
+/// with `…` past 500 characters, so nothing is hidden without a mark.
+fn one_line(text: &str) -> String {
+    let text: String = text
         .chars()
         .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
         .collect();
@@ -286,6 +293,9 @@ fn input_summary(v: &Value) -> String {
     summary
 }
 
+/// What an agent is told of a denial that gave no reason.
+const DENIED: &str = "the user denied this in tutti";
+
 /// The `PermissionRequest` hook output carrying `decision` to Claude, or
 /// `None` for a pass: the hook prints nothing and Claude shows its own
 /// dialog. A denial gives Claude its reason, else says tutti's user denied it.
@@ -294,13 +304,47 @@ pub fn permission_decision(decision: &ApprovalDecision) -> Option<Value> {
         ApprovalDecision::Allow => json!({ "behavior": "allow" }),
         ApprovalDecision::Deny { message } => json!({
             "behavior": "deny",
-            "message": message.as_deref().unwrap_or("the user denied this in tutti"),
+            "message": message.as_deref().unwrap_or(DENIED),
         }),
         ApprovalDecision::Pass => return None,
     };
     Some(json!({
         "hookSpecificOutput": { "hookEventName": "PermissionRequest", "decision": decision }
     }))
+}
+
+/// What an opencode `permission.asked` asks to run: the permission (`bash`,
+/// `edit`, …) and its patterns — the command, the paths — on one line
+/// (`one_line`). `None` for any other event.
+pub fn opencode_permission(v: &Value) -> Option<(String, String)> {
+    (v.get("type")?.as_str()? == "permission.asked").then(|| {
+        let tool = v.pointer("/properties/permission").and_then(Value::as_str);
+        let patterns = v.pointer("/properties/patterns").and_then(Value::as_array);
+        let patterns: Vec<&str> = patterns
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        (
+            tool.unwrap_or("tool").to_string(),
+            one_line(&patterns.join(" ")),
+        )
+    })
+}
+
+/// The reply tutti's opencode plugin posts for `decision` — the body of
+/// opencode's `POST /permission/{requestID}/reply` — or `None` for a pass:
+/// opencode's own dialog, showing all along, takes it. A denial gives the
+/// agent its reason, else says tutti's user denied it.
+pub fn opencode_reply(decision: &ApprovalDecision) -> Option<Value> {
+    match decision {
+        ApprovalDecision::Allow => Some(json!({ "reply": "once" })),
+        ApprovalDecision::Deny { message } => Some(json!({
+            "reply": "reject",
+            "message": message.as_deref().unwrap_or(DENIED),
+        })),
+        ApprovalDecision::Pass => None,
+    }
 }
 
 /// The settings.json `hooks` snippet wiring every relevant event to
@@ -1105,6 +1149,51 @@ mod tests {
         }
     }
 
+    /// A `permission.asked` as opencode 1.18.5 sent it live holds as its
+    /// permission over its patterns; the answer goes back as the body of
+    /// opencode's permission reply — a pass is opencode's own dialog's.
+    #[test]
+    fn an_opencode_permission_holds_and_its_answer_is_opencodes_reply() {
+        let asked = json!({
+            "type": "permission.asked",
+            "properties": {
+                "id": "per_1", "sessionID": "ses_1", "permission": "bash",
+                "patterns": ["touch oc.txt"], "metadata": { "command": "touch oc.txt" },
+                "always": ["touch *"], "tool": { "messageID": "msg_1", "callID": "call_1" },
+            },
+        });
+        assert_eq!(
+            opencode_permission(&asked),
+            Some(("bash".into(), "touch oc.txt".into()))
+        );
+        let edit = json!({ "type": "permission.asked",
+            "properties": { "permission": "edit", "patterns": ["a.rs", "b\nrs"] } });
+        assert_eq!(
+            opencode_permission(&edit),
+            Some(("edit".into(), "a.rs b ⏎ rs".into())),
+            "every pattern, on one line"
+        );
+        assert_eq!(
+            opencode_permission(&json!({ "type": "permission.replied", "properties": {} })),
+            None
+        );
+        assert_eq!(
+            opencode_reply(&ApprovalDecision::Allow),
+            Some(json!({ "reply": "once" }))
+        );
+        assert_eq!(
+            opencode_reply(&ApprovalDecision::Deny {
+                message: Some("not on main".into())
+            }),
+            Some(json!({ "reply": "reject", "message": "not on main" }))
+        );
+        assert_eq!(
+            opencode_reply(&ApprovalDecision::Deny { message: None }),
+            Some(json!({ "reply": "reject", "message": "the user denied this in tutti" }))
+        );
+        assert_eq!(opencode_reply(&ApprovalDecision::Pass), None);
+    }
+
     #[test]
     fn opencode_irrelevant_or_malformed_events_map_to_nothing() {
         assert_eq!(
@@ -1139,6 +1228,10 @@ mod tests {
             let payload = format!(r#"{{"type":"{event}","properties":{sample}}}"#);
             assert!(oc(&payload).is_some(), "the mapper handles {event}");
         }
+        assert!(
+            OPENCODE_PLUGIN.contains(r#"url: "/permission/{requestID}/reply""#),
+            "the plugin posts a held request's answer as opencode's reply"
+        );
     }
 
     /// A Codex hook payload as codex-cli 0.166.0 sends it (observed live; ids

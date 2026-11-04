@@ -1399,8 +1399,10 @@ fn edit_target(target: &str) -> (&str, Option<u32>, Option<u32>) {
 /// connect/send failure, or a daemon that has not answered within
 /// `AGENT_EVENT_DEADLINE`, is a stderr note, never a failure exit. This is the
 /// one deliberately never-fail path in the CLI. It writes stdout only to answer
-/// a held permission request (`approvals = "hold"`): on `UserPromptSubmit` and
-/// `SessionStart` Claude Code hands a hook's stdout to the model as context.
+/// a held permission request (`approvals = "hold"`) — Claude's decision
+/// object, or the reply tutti's opencode plugin posts: on `UserPromptSubmit`
+/// and `SessionStart` Claude Code hands a hook's stdout to the model as
+/// context.
 fn run_agent_event(session: &str, agent: HookAgent) -> Result<i32> {
     let Some(pane) = std::env::var("TUTTI_PANE")
         .ok()
@@ -1439,11 +1441,23 @@ fn run_agent_event(session: &str, agent: HookAgent) -> Result<i32> {
     let Some((event, conversation)) = mapped else {
         return Ok(0);
     };
-    if let Some((tool, summary)) = hooks::permission_request(&value)
+    let request = match agent {
+        HookAgent::Claude | HookAgent::Codex | HookAgent::Gemini => {
+            hooks::permission_request(&value)
+        }
+        HookAgent::Opencode => hooks::opencode_permission(&value),
+    };
+    if let Some((tool, summary)) = request
         && let Some(timeout) = approval_hold_timeout()
     {
         let held = hold_approval(&session, PaneId(pane), conversation, tool, summary, timeout);
-        match held.map(|decision| hooks::permission_decision(&decision)) {
+        let answer = held.map(|decision| match agent {
+            HookAgent::Claude | HookAgent::Codex | HookAgent::Gemini => {
+                hooks::permission_decision(&decision)
+            }
+            HookAgent::Opencode => hooks::opencode_reply(&decision),
+        });
+        match answer {
             Ok(Some(output)) => println!("{output}"),
             Ok(None) => {}
             Err(err) => eprintln!("tutti agent-event: {err:#}"),
