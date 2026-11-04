@@ -402,9 +402,13 @@ pub async fn serve(
         Ok(listener) => {
             hub.session().set_herdr_socket(herdr_path.clone());
             let herdr_hub = Arc::clone(&hub);
-            Some(tokio::spawn(herdr::serve(listener, move |request| {
-                guarded("herdr request", || herdr_request(&herdr_hub, request)).unwrap_or(false)
-            })))
+            Some(tokio::spawn(herdr::serve(
+                listener,
+                move |request, peer| {
+                    guarded("herdr request", || herdr_request(&herdr_hub, request, peer))
+                        .unwrap_or(false)
+                },
+            )))
         }
         Err(err) => {
             eprintln!("tutti: no herdr socket at {}: {err}", herdr_path.display());
@@ -1513,9 +1517,10 @@ fn program_status(hub: &Arc<Hub>, pane: PaneId, report: StatusReport) {
 
 /// Apply one herdr request (see `herdr`): a lifecycle report folds onto the
 /// pane's state much as a program's own report does and is published the
-/// same way; a notification is raised on its pane. `false` for an unknown
-/// pane.
-fn herdr_request(hub: &Arc<Hub>, request: herdr::Request) -> bool {
+/// same way; a notification is raised on its pane — for one naming none, the
+/// pane whose process sent it (`peer`, its pid). `false` for an unknown pane,
+/// or a notification no pane's process sent.
+fn herdr_request(hub: &Arc<Hub>, request: herdr::Request, peer: Option<u32>) -> bool {
     match request {
         herdr::Request::Report(pane, report) => {
             let outcome = hub.session().apply_herdr(pane, report, Instant::now());
@@ -1526,13 +1531,32 @@ fn herdr_request(hub: &Arc<Hub>, request: herdr::Request) -> bool {
             true
         }
         herdr::Request::Notify { pane, title, body } => {
-            let known = hub.session().pane_state(pane).is_some();
-            if known {
+            let pane = pane.or_else(|| {
+                let panes = hub.session().detectable_panes();
+                let roots = panes
+                    .iter()
+                    .filter_map(|(pane, pty)| Some((pty.child_pid()?, *pane)));
+                pane_of_process(&roots.collect(), peer?)
+            });
+            let known = pane.filter(|&pane| hub.session().pane_state(pane).is_some());
+            if let Some(pane) = known {
                 pane_notification(hub, pane, Some(title), body);
             }
-            known
+            known.is_some()
         }
     }
+}
+
+/// The pane that `pid` is the process of, or descends from: walking up its
+/// parents, the first that is one of `roots`, each pane's own process.
+fn pane_of_process(roots: &HashMap<u32, PaneId>, pid: u32) -> Option<PaneId> {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+    let mut sys = System::new();
+    std::iter::successors(Some(Pid::from_u32(pid)), |&pid| {
+        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), false);
+        sys.process(pid)?.parent()
+    })
+    .find_map(|pid| roots.get(&pid.as_u32()).copied())
 }
 
 /// Broadcast what a status report moved: the view first when the pane's
@@ -3440,6 +3464,26 @@ mod tests {
         let kept = hub.waits().len();
         assert!(kept <= 1, "{kept} queues kept for one live wait at most");
         hub.session().kill_all();
+    }
+
+    /// A process is a pane's when it is that pane's own process or descends
+    /// from it; the pane's parent — this test — is nobody's.
+    #[test]
+    fn a_process_belongs_to_the_pane_it_descends_from() {
+        let mut shell = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 2 & echo $!; wait"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        let mut out = std::io::BufReader::new(shell.stdout.take().unwrap());
+        std::io::BufRead::read_line(&mut out, &mut line).unwrap();
+        let sleeper: u32 = line.trim().parse().unwrap();
+        let roots = HashMap::from([(shell.id(), PaneId(7))]);
+        assert_eq!(pane_of_process(&roots, sleeper), Some(PaneId(7)));
+        assert_eq!(pane_of_process(&roots, shell.id()), Some(PaneId(7)));
+        assert_eq!(pane_of_process(&roots, std::process::id()), None);
+        shell.wait().unwrap();
     }
 
     /// A background pass that panics is caught, and its loop runs the next.

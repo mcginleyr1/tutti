@@ -1316,8 +1316,11 @@ install step; Crush does this out of the box.
 
 tutti speaks herdr's v0.9.3 reporting protocol: `pane.report_agent`,
 `pane.report_agent_session`, `pane.release_agent`, `pane.clear_agent_authority`,
-`notification.show` (on the pane its `pane_id` names), `pane.report_metadata`
-(acknowledged, not shown) and `ping`. `HERDR_*` variables inherited from
+`notification.show`, `pane.report_metadata` (acknowledged, not shown) and
+`ping`. A notification lands on the pane its `pane_id` names; one naming none
+lands on the pane whose process sent it — the socket's peer, or the pane it
+descends from — and one sent from outside every pane is refused (`pane_id is
+required`). `HERDR_*` variables inherited from
 outside are dropped, so a tutti pane never reports to a herdr that tutti itself
 runs inside.
 

@@ -3392,6 +3392,59 @@ async fn a_herdr_notification_lands_in_the_history() {
     server.stop().await;
 }
 
+/// A `notification.show` naming no pane lands on the pane whose process sent
+/// it — here a zsh under the pane's shell, found through the socket's peer
+/// pid — and one from outside every pane is refused as it always was. Skips
+/// cleanly without `/bin/zsh`, whose `zsocket` speaks to the socket.
+#[tokio::test]
+async fn a_herdr_notification_naming_no_pane_lands_on_its_senders() {
+    if !Path::new("/bin/zsh").exists() {
+        eprintln!("skipping: no /bin/zsh");
+        return;
+    }
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let show = r#"{\"id\":\"n1\",\"method\":\"notification.show\",\"params\":{\"title\":\"crush\",\"body\":\"ready\"}}"#;
+    let pane = run_marker(
+        &mut conn,
+        &format!(
+            "/bin/zsh -f -c 'zmodload zsh/net/socket && zsocket \"$HERDR_SOCKET_PATH\" \
+             && print -r -- \"{show}\" >&$REPLY && read -r reply <&$REPLY \
+             && print -r -- \"REPLY $reply\"'; sleep 30"
+        ),
+    )
+    .await;
+    assert!(
+        read_until(
+            &mut conn,
+            pane,
+            r#"REPLY {"id":"n1","result":{"type":"ok"}}"#
+        )
+        .await,
+        "the sender's pane took the notification"
+    );
+    let notes = list_notes(&mut conn, false).await;
+    let landed: Vec<_> = notes
+        .iter()
+        .map(|n| (n.pane, n.kind, n.title.as_deref(), n.body.as_deref()))
+        .collect();
+    assert_eq!(
+        landed,
+        [(pane, NoteKind::Notify, Some("crush"), Some("ready"))]
+    );
+
+    let socket = server.path.with_extension("herdr.sock");
+    let stray = serde_json::json!({"method": "notification.show", "params": {"title": "t"}});
+    assert_eq!(
+        herdr(&socket, stray).await["error"]["code"],
+        "invalid_request",
+        "this test's own process is in no pane"
+    );
+    assert_eq!(list_notes(&mut conn, false).await.len(), 1);
+
+    server.stop().await;
+}
+
 /// Once a pane reports a hook event it is hook-driven: the screen classifier
 /// stops touching it, so a working-pattern that would otherwise move a detected
 /// agent to `Working` leaves the hook-set `Blocked` state untouched.

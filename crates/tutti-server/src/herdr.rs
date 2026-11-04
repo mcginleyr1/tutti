@@ -29,9 +29,10 @@ const TEXT_MAX: usize = 2048;
 /// What a request asks of the server.
 #[derive(Debug, PartialEq)]
 pub enum Request {
-    /// `notification.show`, raised on the pane it names.
+    /// `notification.show`, raised on the pane it names — or, naming none, on
+    /// the pane whose process sent it.
     Notify {
-        pane: PaneId,
+        pane: Option<PaneId>,
         title: String,
         body: Option<String>,
     },
@@ -121,10 +122,11 @@ pub fn env(
 
 /// Answer requests on `listener` until the task is aborted, each connection
 /// on its own task so a slow peer stalls only itself. `handle` applies a
-/// request and says whether its pane exists.
+/// request, told the pid of the process that sent it when the socket says,
+/// and says whether its pane exists.
 pub async fn serve(
     listener: UnixListener,
-    handle: impl Fn(Request) -> bool + Send + Sync + 'static,
+    handle: impl Fn(Request, Option<u32>) -> bool + Send + Sync + 'static,
 ) {
     let handle = Arc::new(handle);
     loop {
@@ -144,7 +146,9 @@ pub async fn serve(
 
 /// Read one request line, answer it, close. A peer that sends no line within
 /// `READ_TIMEOUT` is dropped unanswered.
-async fn answer(stream: UnixStream, handle: &impl Fn(Request) -> bool) {
+async fn answer(stream: UnixStream, handle: &impl Fn(Request, Option<u32>) -> bool) {
+    let peer = stream.peer_cred().ok().and_then(|cred| cred.pid());
+    let peer = peer.and_then(|pid| u32::try_from(pid).ok());
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read.take(LINE_MAX));
     let mut line = Vec::new();
@@ -164,13 +168,11 @@ async fn answer(stream: UnixStream, handle: &impl Fn(Request) -> bool) {
             "type": "pong", "version": "0.9.3+tutti", "protocol": 22, "server": "tutti",
         })),
         Ask::Metadata => Ok(json!({"type": "ok"})),
-        Ask::Pane(pane, request) => {
-            if handle(request) {
-                Ok(json!({"type": "ok"}))
-            } else {
-                Err(not_found(&pane))
-            }
-        }
+        Ask::Pane(pane, request) => match (handle(request, peer), pane) {
+            (true, _) => Ok(json!({"type": "ok"})),
+            (false, Some(pane)) => Err(not_found(&pane)),
+            (false, None) => Err(Error::invalid("pane_id is required")),
+        },
     });
     let line = match reply {
         Ok(result) => json!({"id": id, "result": result}),
@@ -210,8 +212,9 @@ enum Ask {
     Ping,
     /// `pane.report_metadata`: display-only, so acknowledged and dropped.
     Metadata,
-    /// A request about the pane named by its `pane_id`, kept as sent.
-    Pane(String, Request),
+    /// A request about the pane named by its `pane_id`, kept as sent — `None`
+    /// for a notification naming none.
+    Pane(Option<String>, Request),
 }
 
 /// A request's `params`, every method's fields in one. herdr reads an empty
@@ -273,18 +276,15 @@ fn ask(value: Value) -> Result<Ask, Error> {
     let Envelope { method, params } =
         Envelope::deserialize(value).map_err(|err| Error::invalid(err.to_string()))?;
     let p = params.unwrap_or_default();
-    let pane = match p.pane_id {
-        None => Err(Error::invalid("pane_id is required")),
-        Some(id) => match pane_of(&id) {
-            Some(pane) => Ok((id, pane)),
-            None => Err(not_found(&id)),
-        },
-    };
+    let named = p.pane_id.map(|id| match pane_of(&id) {
+        Some(pane) => Ok((id, pane)),
+        None => Err(not_found(&id)),
+    });
     let act = match method.as_str() {
         "ping" => return Ok(Ask::Ping),
         "pane.report_metadata" => return Ok(Ask::Metadata),
         "notification.show" => {
-            let (id, pane) = pane?;
+            let (id, pane) = named.transpose()?.unzip();
             let title = p.title.ok_or_else(|| Error::invalid("title is required"))?;
             let body = p.body;
             return Ok(Ask::Pane(id, Request::Notify { pane, title, body }));
@@ -304,7 +304,7 @@ fn ask(value: Value) -> Result<Ask, Error> {
         "pane.clear_agent_authority" => Act::Clear,
         other => return Err(Error::invalid(format!("unknown method {other:?}"))),
     };
-    let (id, pane) = pane?;
+    let (id, pane) = named.unwrap_or_else(|| Err(Error::invalid("pane_id is required")))?;
     if act != Act::Clear {
         if p.source.is_none() {
             return Err(Error::invalid("source is required"));
@@ -323,7 +323,7 @@ fn ask(value: Value) -> Result<Ask, Error> {
         session: p.agent_session_id,
         act,
     };
-    Ok(Ask::Pane(id, Request::Report(pane, report)))
+    Ok(Ask::Pane(Some(id), Request::Report(pane, report)))
 }
 
 /// The tutti pane a `w<N>:p<M>` id (`env`'s) names.
@@ -395,7 +395,7 @@ mod tests {
                 act,
             };
             Ok(Ask::Pane(
-                "w1:p1".into(),
+                Some("w1:p1".into()),
                 Request::Report(PaneId(1), report),
             ))
         };
@@ -456,13 +456,26 @@ mod tests {
                 &[("title", json!("Done")), ("body", json!(""))]
             )),
             Ok(Ask::Pane(
-                "w2:p5".into(),
+                Some("w2:p5".into()),
                 Request::Notify {
-                    pane: PaneId(5),
+                    pane: Some(PaneId(5)),
                     title: "Done".into(),
                     body: None,
                 }
             ))
+        );
+        let unnamed = json!({"method": "notification.show", "params": {"title": "Done"}});
+        assert_eq!(
+            asked(unnamed),
+            Ok(Ask::Pane(
+                None,
+                Request::Notify {
+                    pane: None,
+                    title: "Done".into(),
+                    body: None,
+                }
+            )),
+            "a notification may name no pane: its sender's is found instead"
         );
         assert_eq!(asked(json!({"method": "ping"})), Ok(Ask::Ping));
         let go_nil = json!({"method": "ping", "params": null});
@@ -497,6 +510,10 @@ mod tests {
             (report(&[("seq", json!(-1))]), "invalid_request"),
             (report(&[("seq", json!("7"))]), "invalid_request"),
             (request("notification.show", &[]), "invalid_request"),
+            (
+                request("notification.show", &[("pane_id", json!("p5"))]),
+                "pane_not_found",
+            ),
             (request("pane.dance", &[]), "invalid_request"),
         ] {
             assert_eq!(asked(request.clone()).err(), Some(code), "{request}");
@@ -560,9 +577,12 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         let (seen, mut handled) = tokio::sync::mpsc::unbounded_channel();
-        let server = tokio::spawn(serve(listener, move |request| {
-            let found = !matches!(request, Request::Report(PaneId(99), _));
-            seen.send(request).unwrap();
+        let server = tokio::spawn(serve(listener, move |request, peer| {
+            let found = !matches!(
+                request,
+                Request::Report(PaneId(99), _) | Request::Notify { pane: None, .. }
+            );
+            seen.send((request, peer)).unwrap();
             found
         }));
         let exchange = async |line: &str, close: bool| {
@@ -585,20 +605,32 @@ mod tests {
             exchange(&format!("{release}\n"), false).await,
             json!({"id": "r1", "result": {"type": "ok"}})
         );
+        let (released, peer) = handled.recv().await.unwrap();
         assert!(matches!(
-            handled.recv().await,
-            Some(Request::Report(
+            released,
+            Request::Report(
                 PaneId(5),
                 Report {
                     act: Act::Release,
                     ..
                 }
-            ))
+            )
         ));
+        assert_eq!(
+            peer,
+            Some(std::process::id()),
+            "the sender's pid rides along"
+        );
         let gone = request("pane.release_agent", &[("pane_id", json!("w1:p99"))]);
         assert_eq!(
             exchange(&format!("{gone}\n"), false).await["error"]["code"],
             "pane_not_found"
+        );
+        let unnamed = json!({"id": "n1", "method": "notification.show", "params": {"title": "t"}});
+        assert_eq!(
+            exchange(&format!("{unnamed}\n"), false).await["error"],
+            json!({"code": "invalid_request", "message": "pane_id is required"}),
+            "a notification no pane claims is refused as one naming none always was"
         );
         assert_eq!(
             exchange(&format!("{release}"), true).await["error"]["code"],
