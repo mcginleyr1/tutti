@@ -7,8 +7,8 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use tutti_agents::Registry;
 use tutti_core::{
-    AgentHookEvent, ApprovalDecision, Direction, Event, PaneId, Request, Response, TabId, Toward,
-    WaitFor, WorkspaceId, WorkspaceInfo,
+    AgentHookEvent, AgentState, ApprovalDecision, Direction, Event, PaneId, Request, Response,
+    TabId, Toward, WaitFor, WorkspaceId, WorkspaceInfo,
 };
 
 use tutti::client::{self, Client, StopOutcome};
@@ -84,6 +84,19 @@ enum Command {
         title: Option<String>,
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
+    },
+    /// Say something to the agent in a pane and print its answer: type the
+    /// message, press enter, wait for the turn it starts to end, then print
+    /// the agent's final message (`pane read --last-reply`). One call for one
+    /// agent to talk to another. Exits 3 when the agent blocks instead (answer
+    /// it, then `pane wait --next` and `pane read --last-reply`), 124 on
+    /// `--timeout`.
+    Ask {
+        pane: u64,
+        message: String,
+        /// Give up after this many seconds.
+        #[arg(long)]
+        timeout: Option<f64>,
     },
     /// Open a file in your workspace's editor pane — a Neovim or Emacs whose
     /// tutti plugin set the `TUTTI_EDITOR` user var — and focus that pane.
@@ -630,6 +643,11 @@ fn run(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Some(Command::AgentEvent { agent }) => run_agent_event(&cli.session, agent),
+        Some(Command::Ask {
+            pane,
+            message,
+            timeout,
+        }) => run_ask(&cli.session, cli.json, PaneId(pane), message, timeout),
         Some(Command::Pane {
             action:
                 PaneAction::Wait {
@@ -1148,6 +1166,7 @@ fn to_request(command: Command) -> Result<Request> {
         | Command::Issue { .. }
         | Command::Edit { .. }
         | Command::Watch
+        | Command::Ask { .. }
         | Command::AgentEvent { .. }
         | Command::Hooks { .. }
         | Command::Skill { .. }
@@ -1191,6 +1210,126 @@ fn run_wait(
         }
     }
     Ok(0)
+}
+
+/// `ask`'s exit code when the agent blocked instead of answering.
+const BLOCKED: i32 = 3;
+
+/// How long `ask` waits between typing its message and pressing enter. An
+/// agent may read text and an enter that land together as a paste and keep
+/// the enter as a newline, as Codex does; codex-cli 0.166.0 took the enter as
+/// a submit from 30 ms apart.
+const ENTER_AFTER: Duration = Duration::from_millis(150);
+
+/// `ask`: refuse a pane that is gone, working or blocked — keys typed there
+/// would join a running turn or answer a dialog — then, on one connection —
+/// whose frames the daemon takes in order, so the wait is in place before the
+/// keys land — wait for the pane's next done or blocked, type the message,
+/// press enter `ENTER_AFTER` later, and print the reply the turn left. A
+/// refused send ends it there, and its wait with the connection.
+fn run_ask(
+    session: &str,
+    json: bool,
+    pane: PaneId,
+    message: String,
+    timeout: Option<f64>,
+) -> Result<i32> {
+    if caller_pane(session) == Some(pane) {
+        bail!("pane {pane} is the pane this runs in");
+    }
+    let timeout_ms = timeout
+        .map(Duration::try_from_secs_f64)
+        .transpose()
+        .context("invalid --timeout")?
+        .map(|t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX));
+    let panes = match Client::connect_or_start(session)?.request(&Request::PaneList)? {
+        Response::Panes { panes } => panes,
+        other => bail!("unexpected reply to pane list: {other:?}"),
+    };
+    let info = panes
+        .iter()
+        .find(|p| p.id == pane)
+        .with_context(|| format!("no pane {pane}"))?;
+    if let Some(code) = info.exited {
+        bail!("pane {pane} has exited (code {code})");
+    }
+    match info.state {
+        AgentState::Working => bail!(
+            "pane {pane} is working: wait for it first (tutti pane wait {pane} --until done,blocked)"
+        ),
+        AgentState::Blocked => bail!("pane {pane} is blocked: answer its prompt first"),
+        _ => {}
+    }
+    let mut client = Client::connect_or_start(session)?;
+    let until = vec![WaitFor::Done, WaitFor::Blocked];
+    client.send(
+        1,
+        &Request::PaneWait {
+            pane,
+            until,
+            next: true,
+            timeout_ms,
+        },
+    )?;
+    let typed = Request::PaneSend {
+        pane,
+        text: Some(message),
+        keys: None,
+        expect: None,
+    };
+    client.send(2, &typed)?;
+    std::thread::sleep(ENTER_AFTER);
+    let enter = Request::PaneSend {
+        pane,
+        text: None,
+        keys: Some("enter".into()),
+        expect: None,
+    };
+    client.send(3, &enter)?;
+    let waited = loop {
+        match client.answer()? {
+            (Some(1), waited) => break waited,
+            (_, Response::Ok) => {}
+            (_, refused) => return Ok(emit(refused, json)),
+        }
+    };
+    match waited {
+        Response::Waited {
+            pane: info,
+            timed_out: false,
+        } if info.state == AgentState::Blocked => {
+            let asks = info
+                .approval
+                .as_ref()
+                .map_or_else(String::new, |a| format!(" ({} · {})", a.tool, a.summary));
+            eprintln!(
+                "pane {pane} is blocked, waiting on an answer{asks}: answer it, then `tutti pane \
+                 wait {pane} --next --until done,blocked` and `tutti pane read {pane} --last-reply`"
+            );
+            if json {
+                let waited = Response::Waited {
+                    pane: info,
+                    timed_out: false,
+                };
+                emit(waited, true);
+            }
+            Ok(BLOCKED)
+        }
+        Response::Waited {
+            timed_out: false, ..
+        } => {
+            let read = Request::PaneRead {
+                pane,
+                lines: None,
+                unwrapped: false,
+                since: None,
+                last_output: false,
+                last_reply: true,
+            };
+            Ok(emit(client.request(&read)?, json))
+        }
+        timed_out_or_error => Ok(emit(timed_out_or_error, json)),
+    }
 }
 
 /// `issue list` and `issue deploy`. A listing talks to the trackers alone,
@@ -2643,6 +2782,19 @@ mod tests {
                 "{other:?}"
             );
         }
+    }
+
+    #[test]
+    fn ask_parses_a_pane_a_message_and_a_timeout() {
+        let cli = Cli::try_parse_from(["tutti", "ask", "7", "reply with pong", "--timeout", "90"]);
+        assert!(matches!(
+            cli.unwrap().command,
+            Some(Command::Ask { pane: 7, message, timeout: Some(90.0) }) if message == "reply with pong"
+        ));
+        assert!(
+            Cli::try_parse_from(["tutti", "ask", "7"]).is_err(),
+            "a message is required"
+        );
     }
 
     /// The last reply is the agent's text, not the screen's: no other read
