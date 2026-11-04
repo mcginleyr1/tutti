@@ -1944,11 +1944,12 @@ tutti is alpha; PLAN.md tracks what is open.
 - **From a checkout only.** Install is `cargo install --path` from this
   repository, on macOS or Linux; there is no crates.io release, Homebrew tap,
   or installer.
-- **Exact state needs an integration.** Claude Code and opencode report through
-  their hooks, and agents that speak herdr's protocol (Crush) report on their
-  own; Codex, Gemini and the rest of the catalog are read from the screen,
-  tuned live only for some.
-- **Held approvals are Claude Code's and opencode's only**, and opencode
+- **Exact state needs an integration.** Claude Code, Codex, Gemini CLI and
+  opencode report through their hooks, and agents that speak herdr's protocol
+  (Crush) report on their own; the rest of the catalog is read from the
+  screen, tuned live only for some.
+- **Held approvals are Claude Code's, Codex's and opencode's only.** Codex's
+  PermissionRequest hold is wired but not yet exercised live, and opencode
   shows its own dialog beside a held request (whichever answers first wins).
 - **Write-back stops at the deploy.** A source can have a deploy comment on,
   assign, label or move its issue, but tutti never closes it, and a command
