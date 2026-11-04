@@ -211,6 +211,27 @@ struct VcsMark {
     in_flight: usize,
 }
 
+/// One probe of a workspace counted in flight (`VcsMark::in_flight`) for as
+/// long as this lives. Dropped — at the probe's end, or as its task unwinds
+/// from a panic — it counts down, so a panic never leaves the watch standing
+/// off that workspace until the daemon restarts.
+struct InFlight(Arc<Hub>, WorkspaceId);
+
+impl InFlight {
+    fn new(hub: &Arc<Hub>, workspace: WorkspaceId) -> InFlight {
+        hub.vcs().entry(workspace).or_default().in_flight += 1;
+        InFlight(Arc::clone(hub), workspace)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        let mut vcs = self.0.vcs();
+        let entry = vcs.entry(self.1).or_default();
+        entry.in_flight = entry.in_flight.saturating_sub(1);
+    }
+}
+
 impl Hub {
     /// A hub for session `name`. The notification history the offer in
     /// `state` holds comes back at once, and new panes take ids past every
@@ -2538,20 +2559,17 @@ fn pane_restore(
         }
         Ok((workspace, dir, c.commit))
     });
-    if let Ok((workspace, ..)) = &target {
-        hub.vcs().entry(*workspace).or_default().in_flight += 1;
-    }
+    let in_flight = target
+        .as_ref()
+        .ok()
+        .map(|(workspace, ..)| InFlight::new(hub, *workspace));
     let hub = Arc::clone(hub);
     reply.spawn(|reply| async move {
         let response = match target {
             Ok((workspace, dir, commit)) => {
                 let response = restore_to(&hub, &dir, pane, n, &commit).await;
                 refresh_changes(&hub, workspace);
-                {
-                    let mut vcs = hub.vcs();
-                    let entry = vcs.entry(workspace).or_default();
-                    entry.in_flight = entry.in_flight.saturating_sub(1);
-                }
+                drop(in_flight);
                 response
             }
             Err(message) => Response::Error { message },
@@ -2648,7 +2666,7 @@ fn refresh_changes(hub: &Arc<Hub>, workspace: WorkspaceId) {
         };
         (dir, session.take_turns(workspace))
     };
-    hub.vcs().entry(workspace).or_default().in_flight += 1;
+    let in_flight = InFlight::new(hub, workspace);
     let hub = Arc::clone(hub);
     tokio::spawn(async move {
         let probe = jj::probe(&dir).await;
@@ -2671,9 +2689,9 @@ fn refresh_changes(hub: &Arc<Hub>, workspace: WorkspaceId) {
         {
             let mut vcs = hub.vcs();
             let entry = vcs.entry(workspace).or_default();
-            entry.in_flight = entry.in_flight.saturating_sub(1);
             entry.mark = entry.mark.max(probe.mark);
         }
+        drop(in_flight);
         if let Some(view) = view {
             broadcast_event(&hub, Event::LayoutChanged { workspaces: view });
         }
@@ -3480,6 +3498,22 @@ mod tests {
             panic!("expected an error, got {:?}", answer.body);
         };
         assert!(message.contains("panicked"), "{message}");
+    }
+
+    /// A probe's task that panics — a restore's, a refresh's — still counts
+    /// its probe down, so the VCS watch watches its workspace again.
+    #[tokio::test]
+    async fn a_probe_whose_task_panics_leaves_the_watch_watching() {
+        let hub = Arc::new(Hub::new(PaneSize::new(24, 80), "probe".into(), None));
+        let workspace = WorkspaceId(1);
+        let in_flight = InFlight::new(&hub, workspace);
+        assert_eq!(hub.vcs()[&workspace].in_flight, 1);
+        let task = tokio::spawn(async move {
+            let _in_flight = in_flight;
+            panic!("injected: a probe's task panics");
+        });
+        assert!(task.await.unwrap_err().is_panic());
+        assert_eq!(hub.vcs()[&workspace].in_flight, 0);
     }
 
     /// A `pane wait --next` whose pane moves on past its edge before the
