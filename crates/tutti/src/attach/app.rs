@@ -512,6 +512,8 @@ pub struct App {
     selection: Option<Selection>,
     /// Prefix chord, direct bindings, and the active prefix keymap.
     config: Config,
+    /// A `tutti attach --view`: it only watches, which its footer says.
+    pub view: bool,
 }
 
 impl Default for App {
@@ -615,6 +617,7 @@ impl App {
             mouse_capture: config.mouse,
             selection: None,
             config,
+            view: false,
         }
     }
 
@@ -1073,8 +1076,9 @@ impl App {
                         tutti_core::WIRE_REV
                     ));
                 }
-                // The offer comes first, over a first-run prompt too.
-                if let Some(offer) = restorable {
+                // The offer comes first, over a first-run prompt too — but
+                // not to a view, which could take it up in no way.
+                if let Some(offer) = restorable.filter(|_| !self.view) {
                     self.restore_offer = Some((offer, self.mode));
                     self.mode = Mode::RestoreOffer;
                 }
@@ -9668,6 +9672,16 @@ mod tests {
         assert_eq!(app.mode, Mode::RestoreOffer);
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(app.on_key(enter), restore(false));
+        assert_eq!(app.mode, Mode::Terminal);
+        assert_eq!(app.restore_offer(), None);
+    }
+
+    /// A view could neither restore nor discard: it is offered nothing.
+    #[test]
+    fn a_view_is_offered_no_layout() {
+        let mut app = App::new();
+        app.view = true;
+        attach_offering(&mut app, view_one_pane());
         assert_eq!(app.mode, Mode::Terminal);
         assert_eq!(app.restore_offer(), None);
     }

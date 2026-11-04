@@ -65,7 +65,13 @@ enum Command {
         action: PaneAction,
     },
     /// Attach the interactive TUI (alias for bare `tutti`).
-    Attach,
+    Attach {
+        /// Watch only, for a second screen or a pair: tutti's navigation and
+        /// detach work, but nothing reaches a pane — no keys, no size vote,
+        /// no change to the session. Never starts a daemon.
+        #[arg(long)]
+        view: bool,
+    },
     /// Run a command in a fresh tab and print the new pane's id — the one
     /// call an orchestrator makes: `p=$(tutti run -- claude "fix the tests")`.
     Run {
@@ -638,8 +644,12 @@ fn run(cli: Cli) -> Result<i32> {
     match cli.command {
         Some(Command::Server { action }) => run_server(action, &cli.session, cli.json),
         // Bare `tutti` and `tutti attach` both attach, mounting startup projects.
-        None | Some(Command::Attach) => {
-            attach_session(&cli.session)?;
+        None => {
+            attach_session(&cli.session, false)?;
+            Ok(0)
+        }
+        Some(Command::Attach { view }) => {
+            attach_session(&cli.session, view)?;
             Ok(0)
         }
         Some(Command::AgentEvent { agent }) => run_agent_event(&cli.session, agent),
@@ -787,11 +797,15 @@ fn session_from(pane_session: Option<String>) -> String {
 /// the first-run prompt (prefilled with the cwd) rather than assuming it —
 /// `first_run` carries that prefill. A project that fails to start yields a
 /// `notice` surfaced after attach; the rest still mount. Inside one of the
-/// session's own panes it refuses before loading or starting anything.
-fn attach_session(session: &str) -> Result<()> {
+/// session's own panes it refuses before loading or starting anything. A
+/// `view` changes nothing, and so mounts nothing and starts no daemon.
+fn attach_session(session: &str, view: bool) -> Result<()> {
     let pane_session = std::env::var_os("TUTTI_PANE").and(std::env::var("TUTTI_SESSION").ok());
     refuse_nested_attach(session, pane_session.as_deref())?;
     let config = Config::load()?;
+    if view {
+        return tutti::attach::run(session, config, None, None, true);
+    }
     // Absolutize project dirs client-side so the daemon (which has its own cwd)
     // records the real directory and its git-branch probe hits.
     let projects: Vec<PathBuf> = config.projects.iter().map(|d| absolutize(d)).collect();
@@ -814,8 +828,7 @@ fn attach_session(session: &str) -> Result<()> {
         .context("resolve current directory")?;
     let notice = (!notices.is_empty()).then(|| notices.join("; "));
 
-    tutti::attach::run(session, config, first_run, notice)?;
-    Ok(())
+    tutti::attach::run(session, config, first_run, notice, false)
 }
 
 /// Refuse to attach `session` from inside one of its own panes —
@@ -1160,7 +1173,7 @@ fn to_request(command: Command) -> Result<Request> {
             name,
         }),
         Command::Server { .. }
-        | Command::Attach
+        | Command::Attach { .. }
         | Command::Sandbox {
             action: SandboxAction::Run { .. },
         }
@@ -3184,7 +3197,13 @@ mod tests {
         ));
         assert!(matches!(
             Cli::try_parse_from(["tutti", "attach"]).unwrap().command,
-            Some(Command::Attach)
+            Some(Command::Attach { view: false })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["tutti", "attach", "--view"])
+                .unwrap()
+                .command,
+            Some(Command::Attach { view: true })
         ));
         let cli = Cli::try_parse_from(["tutti", "watch", "-s", "work"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Watch)));

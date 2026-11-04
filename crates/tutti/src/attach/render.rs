@@ -1318,9 +1318,12 @@ pub fn map_color(color: VtColor) -> Color {
 /// the standing help/detach hint pinned to the right. Draws over the terminal's
 /// own background so it tracks the terminal's light/dark scheme. The tab list and
 /// per-pane state chips are gone: the app bar and sidebar own those, and
-/// transients fire the notification band above.
+/// transients fire the notification band above. A view leads with `view`.
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans: Vec<Span> = Vec::new();
+    if app.view {
+        spans.push(Span::styled(" view ", dim().add_modifier(Modifier::BOLD)));
+    }
     if let Some(label) = mode_label(app.mode) {
         spans.push(Span::styled(
             format!(" {label} "),
@@ -3807,6 +3810,25 @@ mod tests {
                 .any(|c| c.bg == accent()),
             "the mode chip should be an accent block"
         );
+    }
+
+    /// A view's footer says so, whatever the mode — before the mode chip.
+    #[test]
+    fn a_views_footer_says_view() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = app_two_workspaces();
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert!(!row_text(terminal.backend().buffer(), 15).contains(" view "));
+        app.view = true;
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert!(row_text(terminal.backend().buffer(), 15).starts_with(" view "));
+        app.sync_sizes(Rect::new(0, 0, 100, 16));
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let footer = row_text(terminal.backend().buffer(), 15);
+        assert!(footer.starts_with(" view  SIDEBAR "), "{footer:?}");
     }
 
     #[test]

@@ -50,14 +50,19 @@ const POLL: Duration = Duration::from_millis(16);
 /// server goes away. `config` supplies the prefix chord, direct bindings, and
 /// the master mouse switch. `first_run` (a prefill dir) arms the first-run
 /// new-project prompt on an empty session; `notice` posts a one-shot status
-/// line (e.g. a startup-project error) once attached.
+/// line (e.g. a startup-project error) once attached. A `view` only watches:
+/// it sends the daemon nothing but navigation (`Connection::send`), so no
+/// key, size vote or colour of its terminal reaches a pane — the panes keep
+/// the sizes the other clients vote, or, with none, the size they have —
+/// and opens no file in a pane's editor.
 pub fn run(
     session: &str,
     config: Config,
     first_run: Option<String>,
     notice: Option<String>,
+    view: bool,
 ) -> Result<()> {
-    let mut conn = Connection::open(session)?;
+    let mut conn = Connection::open(session, view)?;
     // macOS names the GUI app a process was launched under; watchers raise it.
     // In rtty, a move past tutti's edge goes on to rtty's panes — the daemon
     // hands this client a program's moves at every edge for that. Tagged, so
@@ -243,6 +248,7 @@ fn event_loop(
     let mut captured = config.mouse;
     let mut app = App::with_config(config);
     app.in_rtty(rtty);
+    app.view = conn.view;
     if let Some(prefill) = first_run {
         app.start_first_run_prompt(prefill);
     }
@@ -437,8 +443,9 @@ fn event_loop(
                 });
             }
         }
-        // So does the editor's own CLI, which `e` in the changes panel runs.
-        if let Some(job) = app.take_editor_job() {
+        // So does the editor's own CLI, which `e` in the changes panel runs —
+        // but for a view, as it would open the file in a pane's editor.
+        if let Some(job) = app.take_editor_job().filter(|_| !app.view) {
             let tx = editor_tx.clone();
             std::thread::spawn(move || {
                 let opened = job.open();

@@ -196,6 +196,19 @@ tmux, and grows back when the smaller client detaches or switches away; a pane
 nobody shows keeps its size. A client whose window is bigger than a pane draws
 the pane from its top-left. `tutti watch` watchers never count.
 
+`tutti attach --view` attaches a TUI that only watches, for a second screen or
+someone pairing with you; its footer leads with `view`. It moves around as any
+client does — focus, tabs, the sidebar and the other panels, scrollback — and
+detaches, but nothing it does reaches a pane: keys, pastes and mouse reports
+go nowhere, it casts no size vote, its terminal's colours are not told to the
+panes, and no request that changes the session (a split, a kill, a launch, an
+approval, a merge) leaves it. Its focus is the session's, as any client's is:
+focusing a done agent marks it seen. The panes keep the sizes the other
+clients vote. With no other client they keep the size they have, drawn from
+the top-left and cut where the view is smaller: a resize would reach the
+pane's program, so a view never makes one. It never starts a daemon, and is
+offered no restore.
+
 ### What the TUI shows of a pane
 
 The TUI runs each pane on the daemon's own terminal engine, so it draws what
@@ -1987,6 +2000,7 @@ tutti edit <path>[:<line>[:<col>]] [--workspace <id>]  # open in the workspace's
 tutti shell-init zsh|bash|fish       # print the shell integration (OSC 7 cwd + OSC 133 marks) for your rc file
 tutti watch                          # JSON-line snapshots of every pane's state, one per change (read-only; never starts a daemon)
 tutti [attach]                       # bare `tutti` attaches; a fresh session asks where to start
+tutti attach --view                  # watch only: navigation and detach work, nothing reaches a pane, no size vote (never starts a daemon)
 ```
 
 A verb gives up on a daemon that has not answered within 10 s (exit 1, `did
