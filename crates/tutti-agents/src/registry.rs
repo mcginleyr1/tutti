@@ -35,13 +35,52 @@ impl ProcessTree {
 /// a node program, which runs as `node [flags] <script>` — its script's,
 /// from `args` (the argv after the executable). Gemini CLI runs so, then
 /// relaunches itself as `node --max-old-space-size=… <script>`: its
-/// executable is only ever `node`.
+/// executable is only ever `node`. A flag's value given as the argument
+/// after it (`node --require x <script>`) is never taken for the script.
 pub fn program_name<'a>(name: &'a str, mut args: impl Iterator<Item = &'a str>) -> &'a str {
     if name != "node" {
         return name;
     }
-    args.find(|arg| !arg.starts_with('-')).unwrap_or(name)
+    while let Some(arg) = args.next() {
+        if NODE_VALUE_FLAGS.contains(&arg) {
+            args.next();
+        } else if !arg.starts_with('-') {
+            return arg;
+        }
+    }
+    name
 }
+
+/// Node's options that take a value, which may come as the next argument:
+/// those `node --help` lists as `--flag=...`, but for the profiler, report,
+/// test-runner, snapshot and TLS ones no agent's launcher passes.
+const NODE_VALUE_FLAGS: &[&str] = &[
+    "-r",
+    "--require",
+    "--import",
+    "--loader",
+    "--experimental-loader",
+    "-C",
+    "--conditions",
+    "-e",
+    "--eval",
+    "--env-file",
+    "--env-file-if-exists",
+    "--experimental-config-file",
+    "--disable-warning",
+    "--input-type",
+    "--title",
+    "--inspect-port",
+    "--debug-port",
+    "--watch-path",
+    "--redirect-warnings",
+    "--unhandled-rejections",
+    "--dns-result-order",
+    "--max-http-header-size",
+    "--icu-data-dir",
+    "--openssl-config",
+    "--localstorage-file",
+];
 
 /// One agent's identity plus the screen-text patterns that classify its state.
 /// Patterns are plain case-sensitive substrings, so the whole registry stays a
@@ -611,7 +650,15 @@ mod tests {
         let relaunch = "--max-old-space-size=24576 /usr/local/lib/node_modules/.bin/gemini";
         assert_eq!(program_name("node", args(script)), script);
         assert_eq!(program_name("node", args(relaunch)), script);
+        let preloaded = "-r ./trace.js --import tsx --env-file .env --no-warnings \
+                         /usr/local/lib/node_modules/.bin/gemini";
+        assert_eq!(
+            program_name("node", args(preloaded)),
+            script,
+            "values skipped"
+        );
         assert_eq!(program_name("node", std::iter::empty()), "node", "a REPL");
+        assert_eq!(program_name("node", args("--require x")), "node", "a REPL");
         assert_eq!(program_name("claude", args("--resume s1")), "claude");
 
         let mut tree = ProcessTree::default();
