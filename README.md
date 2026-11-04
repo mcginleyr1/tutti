@@ -268,7 +268,10 @@ keeps its native scrollback:
   program's own alternate screen is your terminal's: its switches pass
   straight through.
 - **On a resize,** the pane's screen is drawn again as the daemon reflowed it;
-  what your terminal's own reflow moved into its scrollback stays there.
+  what your terminal's own reflow moved into its scrollback stays there. The
+  screen is erased for it with `ED 0`, never `ED 2`, which terminals that
+  scroll a cleared screen into their scrollback (kitty, alacritty, tmux's
+  scroll-on-clear) would keep a copy of each time.
 - **A reset** (`ESC c`) is drawn from the copy rather than passed through: it
   would turn off the light/dark reports, and some terminals clear their
   scrollback on it.

@@ -21,8 +21,8 @@
 //! lines on screen go up into the scrollback before the pane is drawn, and on
 //! leaving, the cursor goes under the pane's last line. A snapshot — the
 //! first, and each resize's — draws both of the pane's screens from the
-//! mirror (`Terminal::snapshot`), and so does a reset, which never reaches
-//! the terminal: it would turn off the light/dark reports, and some terminals
+//! mirror (`primary`), and so does a reset, which never reaches the
+//! terminal: it would turn off the light/dark reports, and some terminals
 //! clear their scrollback on it. Only the first brings history.
 //!
 //! This terminal's keys stay plain: the daemon keeps the pane's keyboard
@@ -200,7 +200,7 @@ fn show(
     let inline = INLINE.load(Ordering::SeqCst);
     let view = |mirror: &Terminal| {
         if inline {
-            strip(mirror.snapshot())
+            primary(mirror)
         } else {
             redraw(mirror)
         }
@@ -269,6 +269,17 @@ fn redraw(mirror: &Terminal) -> Vec<u8> {
         &strip(mirror.redraw(&rows)),
     ]
     .concat()
+}
+
+/// The mirror drawn whole, both screens, on an inline view's primary one —
+/// cleared with ED 0 from the top, not the snapshot's ED 2, which many
+/// terminals (kitty, alacritty, tmux's scroll-on-clear) push into their
+/// scrollback: a copy of the pane's screen there on every resize.
+fn primary(mirror: &Terminal) -> Vec<u8> {
+    let drawing = String::from_utf8(strip(mirror.snapshot())).expect("rtty-vt writes UTF-8");
+    drawing
+        .replacen("\x1b[H\x1b[2J", "\x1b[H\x1b[J", 1)
+        .into_bytes()
 }
 
 /// A mirror's drawing, but for what is this terminal's own: its keyboard
@@ -795,7 +806,9 @@ mod tests {
     /// terminal's scrollback before the pane is drawn, and so do the pane's
     /// own as it scrolls; the program's alternate screen is the terminal's,
     /// passed through; a reset is drawn from the mirror, and keeps the
-    /// light/dark reports on; leaving puts the cursor under the pane's text.
+    /// light/dark reports on; no drawing leaves a copy of the screen in a
+    /// scrollback that ED 2 pushes into (this one's); leaving puts the
+    /// cursor under the pane's text.
     #[test]
     fn inline_keeps_the_scrollback_and_passes_screen_switches_through() {
         let history = |term: &Terminal| -> Vec<String> {
@@ -809,9 +822,11 @@ mod tests {
         mirror.advance(b"$ ls\r\nfile\r\n$ ");
         // What `run` lifts: the cursor stood at the start of row 2.
         terminal.advance(b"\x1b[4;1H\n\n");
-        terminal.advance(&strip(mirror.snapshot()));
+        terminal.advance(&primary(&mirror));
         assert_eq!(history(&terminal), ["$ old", "$ tutti pane attach"]);
         assert_eq!(screen(&terminal), screen(&mirror));
+        terminal.advance(&primary(&mirror));
+        assert_eq!(history(&terminal), ["$ old", "$ tutti pane attach"]);
 
         let mut last = 0;
         for read in [
@@ -826,7 +841,7 @@ mod tests {
             let redrawn = feed(&mut mirror, &mut last, read, true);
             assert_eq!(redrawn, read == b"\x1bc", "{read:?}");
             terminal.advance(&if redrawn {
-                strip(mirror.snapshot())
+                primary(&mirror)
             } else {
                 read.to_vec()
             });
@@ -834,9 +849,9 @@ mod tests {
             assert_eq!(terminal.modes().alt_screen, mirror.modes().alt_screen);
         }
         assert_eq!(
-            history(&terminal)[..5],
+            history(&terminal),
             ["$ old", "$ tutti pane attach", "$ ls", "file", "$ vim"],
-            "the pane's lines scrolled into the terminal's own scrollback"
+            "the pane's lines scrolled into the terminal's own scrollback, once"
         );
         assert!(terminal.modes().color_scheme_reports, "the reset kept 2031");
 
