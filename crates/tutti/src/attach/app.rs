@@ -410,6 +410,8 @@ pub struct App {
     /// The file the changes panel's `e` asks the event loop to hand to an
     /// editor pane.
     editor_job: Option<EditorJob>,
+    /// What landed deploys ask the event loop to write back to trackers.
+    write_backs: Vec<WriteBack>,
     /// The project the panel lists for and deploys into, and whether it is
     /// a jj repo — so a deploy can give the issue its own workspace — probed
     /// once as the panel opens.
@@ -562,6 +564,7 @@ impl App {
             issues_generation: 0,
             issues_fetch: None,
             editor_job: None,
+            write_backs: Vec::new(),
             issues_project: None,
             issues_jj: false,
             issues_query: String::new(),
@@ -1076,8 +1079,13 @@ impl App {
                     self.mode = Mode::ConfirmCleanup(id);
                 }
             }
-            // A deploy's run landed: follow it to the agent's pane.
-            Response::Ran { tab, pane, .. } => {
+            // A deploy's run landed: follow it to the agent's pane, and write
+            // back to the tracker as its source asks.
+            Response::Ran {
+                workspace,
+                tab,
+                pane,
+            } => {
                 let deploys = |f: &FollowUp| *f == FollowUp::Deployed;
                 if self.take_follow_up(req, deploys) == Some(FollowUp::Deployed) {
                     let frames = self.jump_to(tab, Some(pane));
@@ -1092,6 +1100,7 @@ impl App {
                     if let Some(deployed) = deployed {
                         self.set_status(deployed);
                     }
+                    self.write_backs.extend(self.write_back(workspace, pane));
                     return frames;
                 }
             }
@@ -2460,6 +2469,59 @@ impl App {
     /// open off its thread; the outcome comes back through `editor_opened`.
     pub fn take_editor_job(&mut self) -> Option<EditorJob> {
         self.editor_job.take()
+    }
+
+    /// The write-backs landed deploys ask for, for the event loop to run off
+    /// its thread; each outcome comes back through `written_back`.
+    pub fn take_write_backs(&mut self) -> Vec<WriteBack> {
+        std::mem::take(&mut self.write_backs)
+    }
+
+    /// Land a write-back's outcome for issue `id`: said either way, a refusal
+    /// in the error accent.
+    pub fn written_back(&mut self, id: &str, written: Result<(), String>) {
+        self.set_status(match written {
+            Ok(()) => format!("wrote back to {}", issues::label(id)),
+            Err(err) => format!("error: writing back to {}: {err}", issues::label(id)),
+        });
+    }
+
+    /// What the agent deployed into `pane` of `workspace` writes back, if its
+    /// source asks: the comment names the workspace made for the issue in its
+    /// project — or the project, deployed there — the pane, this session, and
+    /// in a sandbox the branch it pushes to. The tracker is asked from the
+    /// project's directory.
+    fn write_back(&self, workspace: WorkspaceId, pane: PaneId) -> Option<WriteBack> {
+        let info = &self.panes.get(&pane)?.info;
+        let issue = info.issue.as_deref()?;
+        let source = self
+            .config
+            .issues
+            .iter()
+            .find(|s| s.name == issue.source && s.writes_back())?;
+        let find = |id| self.workspaces.iter().find(|w| w.id == id);
+        let ran = find(workspace)?;
+        let (project, made) = match ran.parent.and_then(find) {
+            Some(project) => (
+                project,
+                Some(issues::workspace_name(&issue.source, &issue.id)),
+            ),
+            None => (ran, None),
+        };
+        let branch = info.sandbox_name.as_deref().map(tutti_core::sandbox_branch);
+        Some(WriteBack {
+            source: source.clone(),
+            id: issue.id.clone(),
+            comment: issues::deployed_comment(
+                &info.title,
+                &project.name,
+                made.as_deref(),
+                pane,
+                &self.session,
+                branch.as_deref(),
+            ),
+            dir: project.dir.clone(),
+        })
     }
 
     /// Land an editor pane's answer for `file`: once it has the file, jump to
@@ -4897,6 +4959,25 @@ impl EditorJob {
             .find(|d| d.join(".jj").exists())
             .unwrap_or(&self.dir);
         editor::open(&self.editor, &root.join(&self.file), None, None).map_err(|e| format!("{e:#}"))
+    }
+}
+
+/// What a deploy writes back to its tracker (`App::take_write_backs`): the
+/// issue's source and id, the comment naming where its agent runs, and the
+/// project directory the tracker is asked from, as a fetch is.
+#[derive(Debug, PartialEq)]
+pub struct WriteBack {
+    source: issues::Source,
+    pub id: String,
+    comment: String,
+    dir: PathBuf,
+}
+
+impl WriteBack {
+    /// Write it back — blocking, so the event loop runs it on a thread.
+    pub fn run(&self) -> Result<(), String> {
+        issues::write_back(&self.source, &self.id, &self.comment, &self.dir)
+            .map_err(|e| format!("{e:#}"))
     }
 }
 
@@ -11572,6 +11653,81 @@ mod tests {
         assert!(app.handle_response(Some(1), refused).is_empty());
         let late = Response::WorkspaceCreated { id: WorkspaceId(3) };
         assert!(app.handle_response(Some(1), late).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Once a deploy's agent runs, a source that asks for write-back has the
+    /// event loop write it: the comment names the workspace made for the
+    /// issue and its project, the pane, the session and the sandbox's branch,
+    /// asked from the project's directory. Its outcome is said either way. A
+    /// source asking for nothing gets nothing.
+    #[test]
+    fn a_landed_deploy_writes_back_as_its_source_asks() {
+        let dir = jj_project("writeback");
+        for (config, asks) in [
+            (ISSUES_CONFIG.to_string(), false),
+            (
+                ISSUES_CONFIG.replace("kind = \"github\"\n", "kind = \"github\"\ncomment = true\n"),
+                true,
+            ),
+        ] {
+            let mut app = App::with_config(Config::parse(&config).unwrap());
+            attach_with(&mut app, project_at(&dir));
+            app.on_key(ctrl('b'));
+            app.on_key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::SHIFT));
+            let (generation, _, _) = app.take_issue_fetch().unwrap();
+            let fixed = gh_issue("123", "Fix the login redirect");
+            app.issues_loaded(generation, 0, Ok(vec![fixed.clone()]));
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            app.handle_response(Some(1), Response::WorkspaceCreated { id: WorkspaceId(2) });
+
+            let mut view = project_at(&dir);
+            let mut deployed = agent(9, "claude", AgentState::Working);
+            deployed.title = "claude".into();
+            deployed.issue = Some(Box::new(fixed.link()));
+            deployed.sandbox_name = Some("claude-9-x".into());
+            let mut made = workspace(
+                2,
+                "api-gh-123",
+                None,
+                vec![tab(5, "5", false, leaf(9), vec![deployed])],
+            );
+            made.parent = Some(WorkspaceId(1));
+            view.push(made);
+            app.handle_event(Event::LayoutChanged { workspaces: view });
+            let ran = Response::Ran {
+                workspace: WorkspaceId(2),
+                tab: TabId(5),
+                pane: PaneId(9),
+            };
+            app.handle_response(Some(2), ran);
+            let jobs = app.take_write_backs();
+            if !asks {
+                assert!(jobs.is_empty(), "a source asking nothing gets nothing");
+                continue;
+            }
+            assert_eq!(
+                jobs,
+                [WriteBack {
+                    source: app.config.issues[0].clone(),
+                    id: "123".into(),
+                    comment: "tutti deployed claude on this issue: workspace `gh-123` of project \
+                              `api`, pane 9 of session `t`, pushing to branch `tutti/claude-9-x`."
+                        .into(),
+                    dir: dir.clone(),
+                }]
+            );
+            assert!(app.take_write_backs().is_empty(), "taken once");
+            app.written_back("123", Err("gh: HTTP 403".into()));
+            assert_eq!(
+                app.transient(),
+                Some("error: writing back to #123: gh: HTTP 403")
+            );
+            app.written_back("123", Ok(()));
+            assert_eq!(app.transient(), Some("wrote back to #123"));
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -1240,10 +1240,12 @@ fetch used:
 - On Linear, `state` moves the issue to the workflow state of that name in its
   team; a name the team lacks fails, listing the ones it has.
 
-A refused write-back leaves the agent running: `tutti issue deploy` names the
-failure on stderr after the pane id and exits 1. tutti never closes an issue:
-GitHub closes one itself when a commit saying `Fixes #123` reaches the default
-branch, which a source's `prompt` can ask the agent to write.
+The panel's deploy writes back in the background and flashes `wrote back to
+#123`, or the tracker's refusal. A refused write-back leaves the agent running:
+`tutti issue deploy` names the failure on stderr after the pane id and exits 1.
+tutti never closes an issue: GitHub closes one itself when a commit saying
+`Fixes #123` reaches the default branch, which a source's `prompt` can ask the
+agent to write.
 
 Scripts get the same. `tutti issue list [--source <name>]` fetches in the
 current directory and prints a table of `SOURCE ID TITLE LABELS URL` (`--json`

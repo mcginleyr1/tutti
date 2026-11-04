@@ -254,8 +254,10 @@ fn event_loop(
     // the editors the changes panel hands files to.
     let (issues_tx, issues_rx) = std::sync::mpsc::channel();
     let (editor_tx, editor_rx) = std::sync::mpsc::channel::<(PaneId, String, Result<(), String>)>();
-    // So does `rtty cli`, a move handed on past tutti's edge.
+    // So does `rtty cli`, a move handed on past tutti's edge, and a deploy's
+    // write-back to its tracker.
     let (rtty_tx, rtty_rx) = std::sync::mpsc::channel();
+    let (written_tx, written_rx) = std::sync::mpsc::channel::<(String, Result<(), String>)>();
 
     loop {
         if tty.stop.swap(false, Ordering::SeqCst) {
@@ -298,6 +300,10 @@ fn event_loop(
             for frame in app.rtty_done(job, moved) {
                 let _ = conn.send(&frame);
             }
+            dirty = true;
+        }
+        while let Ok((id, written)) = written_rx.try_recv() {
+            app.written_back(&id, written);
             dirty = true;
         }
 
@@ -430,6 +436,14 @@ fn event_loop(
             std::thread::spawn(move || {
                 let moved = rtty::hand_off("rtty", &pane, job.handoff);
                 let _ = tx.send((job, moved));
+            });
+        }
+        // And a deploy's `gh` or `curl` back to its tracker.
+        for job in app.take_write_backs() {
+            let tx = written_tx.clone();
+            std::thread::spawn(move || {
+                let written = job.run();
+                let _ = tx.send((job.id, written));
             });
         }
 
