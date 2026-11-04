@@ -24,8 +24,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 
 use tutti_agents::{ProcessTree, Registry};
 use tutti_core::{
@@ -54,9 +53,6 @@ const CLASSIFY_INTERVAL: Duration = Duration::from_millis(300);
 /// frames (a lost delta corrupts its grid forever, a lost event is gone), we
 /// disconnect it — it can simply reattach.
 const CLIENT_QUEUE_CAP: usize = 256;
-/// Depth of the pane-signal broadcast `pane wait` subscribes to. A waiter that
-/// falls this far behind re-checks its pane's current state instead.
-const SIGNAL_CAP: usize = 256;
 /// Cadence of the layout save. A daemon that dies without a graceful shutdown
 /// loses at most this much of its layout's history.
 const SAVE_INTERVAL: Duration = Duration::from_secs(2);
@@ -69,19 +65,15 @@ const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 /// does. A grandchild holding the pty open never lets it.
 const EXIT_GRACE: Duration = Duration::from_millis(250);
 
-/// One pane's news, broadcast to every `pane wait`.
+/// One pane's news, sent to every `pane wait` on it (`tell_waits`).
 #[derive(Debug, Clone, Copy)]
 enum PaneSignal {
     /// Its state moved — sent by `publish_transition`, the one funnel.
-    Moved {
-        pane: PaneId,
-        from: AgentState,
-        to: AgentState,
-    },
+    Moved { from: AgentState, to: AgentState },
     /// Its child exited, whether or not that moved its state.
-    Exited(PaneId),
+    Exited,
     /// It left the session: killed, its workspace killed, or ephemeral and done.
-    Gone(PaneId),
+    Gone,
 }
 
 struct Client {
@@ -173,9 +165,10 @@ pub struct Hub {
     registry: Registry,
     /// The VCS watch's book, one entry per workspace it has seen.
     vcs: Mutex<HashMap<WorkspaceId, VcsMark>>,
-    /// Every pane's transitions, exits and removals, for `pane wait` to
-    /// subscribe to. With nobody waiting a send fails, harmlessly.
-    signals: broadcast::Sender<PaneSignal>,
+    /// Each live `pane wait`'s queue, by the pane it waits on. A queue is
+    /// unbounded so a wait never falls behind and loses an edge; it holds
+    /// only its own pane's moves, which its task drains as they come.
+    waits: Mutex<Vec<(PaneId, mpsc::UnboundedSender<PaneSignal>)>>,
     /// Where the layout is saved and the previous daemon's is offered back
     /// (`persist`); `None` with persistence off.
     state: Option<PathBuf>,
@@ -217,6 +210,25 @@ struct VcsMark {
 }
 
 impl Hub {
+    fn new(size: PaneSize, name: String, state: Option<PathBuf>) -> Hub {
+        Hub {
+            session: Mutex::new(Session::new(size, name.clone())),
+            clients: Mutex::new(HashMap::new()),
+            watchers: Mutex::new(HashMap::new()),
+            taps: Mutex::new(HashMap::new()),
+            last: Mutex::new(HashMap::new()),
+            next_client: AtomicU64::new(0),
+            stopping: AtomicBool::new(false),
+            name,
+            registry: Registry::default(),
+            vcs: Mutex::new(HashMap::new()),
+            waits: Mutex::new(Vec::new()),
+            state,
+            notes: Mutex::new(Notes::default()),
+            approvals: Mutex::new(HashMap::new()),
+        }
+    }
+
     fn session(&self) -> MutexGuard<'_, Session> {
         lock(&self.session)
     }
@@ -243,6 +255,10 @@ impl Hub {
 
     fn approvals(&self) -> MutexGuard<'_, HashMap<u64, oneshot::Sender<ApprovalDecision>>> {
         lock(&self.approvals)
+    }
+
+    fn waits(&self) -> MutexGuard<'_, Vec<(PaneId, mpsc::UnboundedSender<PaneSignal>)>> {
+        lock(&self.waits)
     }
 
     fn notes(&self) -> MutexGuard<'_, Notes> {
@@ -298,22 +314,7 @@ pub async fn serve(
     // Before the first request is read: a `server restore` that auto-started
     // this daemon finds the offer already in place.
     let state = state.filter(|dir| persist::offer_previous(dir, &name));
-    let hub = Arc::new(Hub {
-        session: Mutex::new(Session::new(size, name.clone())),
-        clients: Mutex::new(HashMap::new()),
-        watchers: Mutex::new(HashMap::new()),
-        taps: Mutex::new(HashMap::new()),
-        last: Mutex::new(HashMap::new()),
-        next_client: AtomicU64::new(0),
-        stopping: AtomicBool::new(false),
-        name,
-        registry: Registry::default(),
-        vcs: Mutex::new(HashMap::new()),
-        signals: broadcast::channel(SIGNAL_CAP).0,
-        state,
-        notes: Mutex::new(Notes::default()),
-        approvals: Mutex::new(HashMap::new()),
-    });
+    let hub = Arc::new(Hub::new(size, name, state));
 
     let tick_hub = Arc::clone(&hub);
     let ticker = tokio::spawn(async move {
@@ -989,7 +990,7 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
                     let view = session.view();
                     drop(session);
                     hub.last().remove(&pane);
-                    let _ = hub.signals.send(PaneSignal::Gone(pane));
+                    tell_waits(hub, pane, PaneSignal::Gone);
                     broadcast_event(hub, Event::LayoutChanged { workspaces: view });
                     Response::Ok
                 }
@@ -1369,13 +1370,20 @@ fn publish_transition(hub: &Hub, pane: PaneId, from: AgentState, to: AgentState)
     }
     hub.session().note_transition(pane, from, to);
     broadcast_event(hub, Event::StateChanged { pane, from, to });
-    let _ = hub.signals.send(PaneSignal::Moved { pane, from, to });
+    tell_waits(hub, pane, PaneSignal::Moved { from, to });
     let kind = match (from, to) {
         (_, AgentState::Blocked) => NoteKind::Blocked,
         (AgentState::Working, AgentState::Done) => NoteKind::Done,
         _ => return,
     };
     add_note(hub, pane, kind, None, None);
+}
+
+/// Send `news` of `pane` to every `pane wait` on it, in order, dropping the
+/// waits that have ended.
+fn tell_waits(hub: &Hub, pane: PaneId, news: PaneSignal) {
+    hub.waits()
+        .retain(|(on, tx)| !tx.is_closed() && (*on != pane || tx.send(news).is_ok()));
 }
 
 /// Note a pane's bell or desktop notification in the history, then broadcast
@@ -1835,16 +1843,15 @@ fn workspace_diff(hub: &Arc<Hub>, reply: &Reply, id: WorkspaceId, stat: bool) ->
 }
 
 /// Serve a `pane wait` on a spawned task, replying on the requester's own
-/// channel like `workspace_diff`. No polling: it subscribes to the pane
-/// signals *before* reading the pane, so a transition landing between the two
-/// is queued rather than lost, then answers on the first move into an `until`
-/// state — or at once, when the pane already holds one and `next` is off.
-/// Under `next` a move counts only when it enters a state from outside it, so
-/// a human focusing a Done pane (Done → Idle) is never a fresh finish. The
-/// child exiting ends the wait (`wait_verdict`); so does the pane leaving. A
-/// lagging subscription re-checks the pane as it is now, level-triggered —
-/// best effort: an edge it skipped is lost. The task gives up silently once
-/// its client hangs up.
+/// channel like `workspace_diff`. No polling: it queues the pane's signals
+/// (`tell_waits`) *before* reading the pane, so a transition landing between
+/// the two is queued rather than lost, then answers on the first move into an
+/// `until` state — or at once, when the pane already holds one and `next` is
+/// off. Under `next` a move counts only when it enters a state from outside
+/// it, so a human focusing a Done pane (Done → Idle) is never a fresh finish.
+/// The child exiting ends the wait (`wait_verdict`); so does the pane leaving.
+/// Its queue holds every move however far behind it falls, so it loses no
+/// edge. The task gives up silently once its client hangs up.
 fn pane_wait(
     hub: &Arc<Hub>,
     reply: &Reply,
@@ -1853,7 +1860,8 @@ fn pane_wait(
     next: bool,
     timeout_ms: Option<u64>,
 ) -> ControlFlow<()> {
-    let mut signals = hub.signals.subscribe();
+    let (queue, mut signals) = mpsc::unbounded_channel();
+    hub.waits().push((pane, queue));
     let start = hub.session().pane(pane);
     let hub = Arc::clone(hub);
     reply.spawn(|reply| async move {
@@ -1876,8 +1884,8 @@ fn pane_wait(
             }
             loop {
                 let signal = signals.recv().await;
-                let recheck = match signal {
-                    Ok(PaneSignal::Moved { pane: p, from, to }) if p == pane => {
+                let recheck = match signal.expect("the hub keeps a live wait's queue") {
+                    PaneSignal::Moved { from, to } => {
                         if until
                             .iter()
                             .any(|w| w.matches(to) && !(next && w.matches(from)))
@@ -1893,11 +1901,8 @@ fn pane_wait(
                         }
                         false
                     }
-                    Ok(PaneSignal::Exited(p)) => p == pane,
-                    Ok(PaneSignal::Gone(p)) if p == pane => return gone(),
-                    Ok(PaneSignal::Moved { .. } | PaneSignal::Gone(_)) => false,
-                    Err(RecvError::Lagged(_)) => true,
-                    Err(RecvError::Closed) => unreachable!("the hub owns the sender"),
+                    PaneSignal::Exited => true,
+                    PaneSignal::Gone => return gone(),
                 };
                 if !recheck {
                     continue;
@@ -1992,9 +1997,9 @@ fn workspace_kill(
             let view = session.view();
             drop(session);
             let mut last = hub.last();
-            for pane in &panes {
-                last.remove(pane);
-                let _ = hub.signals.send(PaneSignal::Gone(*pane));
+            for &pane in &panes {
+                last.remove(&pane);
+                tell_waits(hub, pane, PaneSignal::Gone);
             }
             drop(last);
             broadcast_event(hub, Event::LayoutChanged { workspaces: view });
@@ -2433,7 +2438,7 @@ fn spawn_reaper(hub: &Arc<Hub>, pane: PaneId, pty: Arc<PtyPane>) {
             let view = session.view();
             drop(session);
             hub.last().remove(&pane);
-            let _ = hub.signals.send(PaneSignal::Gone(pane));
+            tell_waits(&hub, pane, PaneSignal::Gone);
             broadcast_event(&hub, Event::LayoutChanged { workspaces: view });
             if let Some(workspace) = workspace {
                 refresh_changes(&hub, workspace);
@@ -2446,7 +2451,7 @@ fn spawn_reaper(hub: &Arc<Hub>, pane: PaneId, pty: Arc<PtyPane>) {
             broadcast_event(&hub, Event::PaneExited { pane, code });
             // Even when the state did not move (a Done pane exiting): a
             // waiter must learn the pane can move no more.
-            let _ = hub.signals.send(PaneSignal::Exited(pane));
+            tell_waits(&hub, pane, PaneSignal::Exited);
             // A finished agent likely touched files; refresh its workspace stat.
             refresh_pane_workspace(&hub, pane);
         }
@@ -3298,6 +3303,48 @@ mod tests {
             panic!("expected an error, got {:?}", answer.body);
         };
         assert!(message.contains("panicked"), "{message}");
+    }
+
+    /// A `pane wait --next` whose pane moves on past its edge before the
+    /// waiter's task runs still answers on that edge, never on the state the
+    /// pane is in by then: at 255 moves behind, at 256 (where the 256-signal
+    /// broadcast this replaced dropped the edge and re-checked the pane), and
+    /// far past it.
+    #[tokio::test]
+    async fn a_next_wait_far_behind_its_pane_still_answers_on_the_edge() {
+        let hub = Arc::new(Hub::new(PaneSize::new(24, 80), "behind".into(), None));
+        let pane = {
+            let mut session = hub.session();
+            session.workspace_new(std::env::temp_dir());
+            session.pane_run(None, vec!["/bin/cat".into()], false, None)
+        }
+        .unwrap();
+        for behind in [255, 256, 4096] {
+            let (tx, mut rx) = mpsc::channel(1);
+            let until = vec![WaitFor::Done];
+            let reply = Reply { tx, req: None };
+            assert!(pane_wait(&hub, &reply, pane, until, true, None).is_continue());
+            // One thread: the waiter's task runs only once this test awaits.
+            publish_transition(&hub, pane, AgentState::Working, AgentState::Done);
+            for i in 0..behind {
+                let (from, to) = (AgentState::Working, AgentState::Blocked);
+                let (from, to) = if i % 2 == 0 { (from, to) } else { (to, from) };
+                publish_transition(&hub, pane, from, to);
+            }
+            let bytes = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("{behind} behind: the wait never answered"))
+                .unwrap();
+            let Some((Frame::Control(json), _)) = Frame::decode(&bytes).unwrap() else {
+                panic!("expected a control frame");
+            };
+            let answer: Response = serde_json::from_slice(&json).unwrap();
+            let Response::Waited { pane: info, .. } = answer else {
+                panic!("{behind} behind: expected a wait's answer, got {answer:?}");
+            };
+            assert_eq!(info.state, AgentState::Done, "{behind} behind");
+        }
+        hub.session().kill_all();
     }
 
     /// A background pass that panics is caught, and its loop runs the next.

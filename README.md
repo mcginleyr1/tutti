@@ -1515,13 +1515,14 @@ and `pane rename`. A spawn that fails leaves no empty tab behind.
 `tutti pane wait <pane>...` blocks until each pane is `done` (finished, seen or
 not), or reaches whichever `--until working|blocked|done|idle` states you name,
 and prints each pane's state. The daemon answers from a subscription to state
-transitions; nothing polls. A pane already in the state answers at once;
-`--next` waits for a fresh transition instead, and a human looking at a
-finished pane never counts as one. A pane whose process exits ends its wait: a
-matching final state succeeds, and anything else fails (exit 1) naming the exit
-code, as a pane killed mid-wait does. `--timeout <secs>` bounds the whole wait
-across all panes and exits 124, as coreutils `timeout` does. Include
-`blocked`: an agent stuck on a permission prompt never becomes done.
+transitions that misses none, however busy the session; nothing polls. A pane
+already in the state answers at once; `--next` waits for a fresh transition
+instead, and a human looking at a finished pane never counts as one. A pane
+whose process exits ends its wait: a matching final state succeeds, and
+anything else fails (exit 1) naming the exit code, as a pane killed mid-wait
+does. `--timeout <secs>` bounds the whole wait across all panes and exits 124,
+as coreutils `timeout` does. Include `blocked`: an agent stuck on a permission
+prompt never becomes done.
 
 ```sh
 for dir in ../api ../web ../docs; do
