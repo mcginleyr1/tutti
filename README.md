@@ -181,7 +181,8 @@ restore [--discard]`.
 - Exited, ephemeral and sandbox panes are not saved.
 - The notification history comes back at once, before any restore, read
   marks and all; a restore then points each note at the pane it came back
-  as. A note whose pane did not come back stays listed, dim.
+  as, whose sidebar 🔔 is back at once when it has unread ones. A note whose
+  pane did not come back stays listed, dim.
 - A project whose directory is gone is skipped and named; one already mounted
   (a configured project) takes the restored tabs beside its own.
 - A save that cannot be read is set aside as `<session>.restore.json.bad` and

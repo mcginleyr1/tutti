@@ -950,10 +950,15 @@ impl App {
                 }
             }
             // A pane whose notifications have all been read, by anyone,
-            // loses its bell mark.
+            // loses its bell mark; one the history names for the first time
+            // with an unread one — a restored pane its notes now point at —
+            // gains it, as it would at an attach.
             Event::NotesChanged { notes } => {
                 let pending = notified_panes(&notes);
+                let named: HashSet<PaneId> = self.notes.iter().map(|n| n.pane).collect();
                 self.notified.retain(|pane| pending.contains(pane));
+                self.notified
+                    .extend(pending.into_iter().filter(|pane| !named.contains(pane)));
                 self.notes = notes;
             }
             // A script focused `pane` (a notch app's click): show it as an
@@ -11092,6 +11097,41 @@ mod tests {
         assert!(
             app.is_notified(PaneId(5)),
             "a done carrying its report's msg is that notification"
+        );
+    }
+
+    /// A restore points the history's notes at the panes that came back, and
+    /// their unread notes mark them at once, as the next attach would; a
+    /// pane the history already named keeps the mark it had.
+    #[test]
+    fn a_restore_marks_the_panes_its_notes_came_back_as() {
+        let mut app = App::new();
+        let blocked = Note {
+            body: Some("allow edit?".into()),
+            ..note(2, 3, NoteKind::Blocked)
+        };
+        attach_noting(&mut app, vec![note(1, 2, NoteKind::Bell), blocked]);
+        app.notified.remove(&PaneId(3));
+        assert!(app.is_notified(PaneId(2)));
+
+        let restored = vec![
+            note(1, 12, NoteKind::Bell),
+            Note {
+                body: Some("allow edit?".into()),
+                ..note(2, 3, NoteKind::Blocked)
+            },
+            Note {
+                read: true,
+                ..note(3, 13, NoteKind::Bell)
+            },
+        ];
+        event(&mut app, Event::NotesChanged { notes: restored });
+        assert!(app.is_notified(PaneId(12)), "its unread bell came back");
+        assert!(!app.is_notified(PaneId(13)), "a read note marks nothing");
+        assert!(!app.is_notified(PaneId(2)), "the pane it was is gone");
+        assert!(
+            !app.is_notified(PaneId(3)),
+            "a pane the history named already gains no mark"
         );
     }
 
