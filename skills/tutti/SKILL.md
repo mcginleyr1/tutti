@@ -151,8 +151,17 @@ turn: the pane is working or blocked (nothing was typed: wait for it, or
 answer it, first; an agent you just started can read as working for a
 moment), the agent exited, the pane is gone, or its turn ended without a
 reply (interrupted, or failed). `ask` and `--last-reply` work for Claude Code,
-Codex, Gemini CLI and opencode panes whose tutti hooks are installed; for any
-other agent, read its screen.
+Codex, Gemini CLI and opencode panes whose tutti hooks are installed; `ask`
+refuses any other pane, and a Codex or opencode until its first turn, so
+start those with their first message and wait for it before you ask:
+
+```sh
+tutti run -- codex --no-daemon "read crates/api and wait for my questions"
+tutti pane wait 9 --until done,blocked --timeout 600
+tutti ask 9 "which module handles auth?" --timeout 600
+```
+
+For any other agent, read its screen.
 
 `--last-reply` alone reads what an agent said at the end of its last finished
 turn, without sending anything: after `tutti run` and a wait, it is the

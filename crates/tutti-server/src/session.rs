@@ -118,6 +118,10 @@ struct PaneSlot {
     /// passed, its hook gone, or never held — with no sign since that the
     /// agent moved on: tutti's answer to another then leaves the pane blocked.
     passed: bool,
+    /// Whether a hook event — a session start included — has reached the
+    /// pane since its agent started; an agent leaving clears it. An ask needs
+    /// it: only a hook reports the turn end its wait is for.
+    hooked: bool,
     /// How many turn ends the pane's hooks have reported, those that carried
     /// no reply included: what an ask waits to see pass (`reply_after`).
     replies: u64,
@@ -858,6 +862,7 @@ impl Session {
         conversation: Option<String>,
     ) -> Option<AgentEventOutcome> {
         let slot = self.panes.get_mut(&pane)?;
+        slot.hooked = true;
         if event != AgentHookEvent::SessionStarted {
             slot.meta.source = Some(StateSource::Hook);
             slot.herdr = None;
@@ -958,7 +963,9 @@ impl Session {
 
     /// Refuse an ask's send unless `pane`'s agent is between turns — not
     /// working, blocked or exited — so its message never joins a running turn
-    /// or answers a dialog. The caller writes under the same session guard.
+    /// or answers a dialog, and unless its hooks have reported, as only a hook
+    /// reports the turn end the ask waits for. The caller writes under the
+    /// same session guard.
     pub fn between_turns(&self, pane: PaneId) -> Result<()> {
         let slot = self
             .panes
@@ -966,6 +973,14 @@ impl Session {
             .with_context(|| format!("no pane {pane}"))?;
         if let Some(code) = slot.meta.exited {
             bail!("pane {pane} has exited (code {code})");
+        }
+        if !slot.hooked {
+            bail!(
+                "pane {pane}'s agent has not reported through tutti's hooks, so no turn end of \
+                 its would ever reach an ask: install them (tutti hooks <agent> --install) and \
+                 restart the agent. Codex and opencode first report on their first turn: start \
+                 one with a first message and wait for it"
+            );
         }
         match slot.meta.state {
             AgentState::Working => bail!(
@@ -1016,7 +1031,8 @@ impl Session {
     /// they spoke for whatever ran there before; a hook claim stays (sticky),
     /// and so does a herdr claim when the agent detected is the one that
     /// reported it (detection catching up). An agent leaving takes its
-    /// conversation and its turn's prompt along; one appearing keeps what its
+    /// conversation, its turn's prompt and its having reported through hooks
+    /// (`hooked`) along; one appearing keeps what its
     /// hooks reported before detection caught up with it. An agent appearing
     /// notes its start as a checkpoint for the caller's next change probe —
     /// detection lands well before the agent's first edit.
@@ -1029,6 +1045,7 @@ impl Session {
                 if slot.meta.agent.is_some() {
                     slot.meta.conversation = None;
                     slot.turns.forget();
+                    slot.hooked = false;
                 }
                 let kept = slot.herdr.as_ref().is_none_or(|(_, reporter)| {
                     agent.as_ref().is_some_and(|kind| kind.0 == *reporter)
@@ -1687,6 +1704,7 @@ impl Session {
                 herdr_seqs: HashMap::new(),
                 dialog: false,
                 passed: false,
+                hooked: false,
                 replies: 0,
                 reply: (String::new(), false),
             },
@@ -2184,6 +2202,34 @@ mod tests {
         assert_eq!(text, format!("x{}", "é".repeat(REPLY_CAP / 2 - 1)));
         hook(&mut s, pane, done(&"x".repeat(REPLY_CAP)));
         assert!(!s.last_reply(pane).unwrap().1, "exactly the cap fits");
+    }
+
+    /// An ask needs a pane its hooks have reported through — a session start
+    /// is enough, detection catching up after keeps it — and the agent
+    /// leaving takes that along, as a turn under way or a block refuses it.
+    #[test]
+    fn an_ask_needs_a_pane_its_hooks_reported_through_and_between_turns() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let refused = |s: &Session| s.between_turns(pane).unwrap_err().to_string();
+        assert!(refused(&s).contains("has not reported through tutti's hooks"));
+
+        hook(&mut s, pane, AgentHookEvent::SessionStarted);
+        assert!(s.between_turns(pane).is_ok(), "a fresh Claude passes");
+        s.set_agent(pane, Some("claude".into()));
+        assert!(
+            s.between_turns(pane).is_ok(),
+            "detection catching up keeps it"
+        );
+        hook(&mut s, pane, AgentHookEvent::Activity { detail: None });
+        assert!(refused(&s).contains("is working"));
+        hook(&mut s, pane, AgentHookEvent::Blocked { message: None });
+        assert!(refused(&s).contains("is blocked"));
+        hook(&mut s, pane, AgentHookEvent::Done { reply: None });
+        assert!(s.between_turns(pane).is_ok());
+
+        s.set_agent(pane, None);
+        assert!(refused(&s).contains("has not reported through tutti's hooks"));
+        assert!(s.between_turns(PaneId(99)).is_err());
     }
 
     #[test]

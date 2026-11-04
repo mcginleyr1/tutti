@@ -1808,6 +1808,12 @@ The daemon types the message only while the agent is between turns — not
 working, blocked or exited — checked in the same step as the write, so it
 never joins a running turn or answers a dialog (one just started can read as
 working for a moment while it draws; a refused ask types nothing and exits 1).
+It also refuses a pane whose agent has not reported through tutti's hooks —
+a plain shell, or an agent without `tutti hooks <agent> --install` — since no
+turn end of its would ever reach the wait. Claude Code and Gemini CLI report
+as they start (SessionStart); Codex and opencode only from their first turn,
+so start one with a first message (`tutti run -- codex --no-daemon "…"`) and
+wait for it before you ask.
 `ask` then presses enter (150 ms later: an agent can take text and an enter
 that land together as a paste) and waits for the next turn end the agent's
 hooks report, or a block. It counts turn ends from its own send, so a turn
@@ -2018,7 +2024,8 @@ tutti is alpha; PLAN.md tracks what is open.
   screen, tuned live only for some.
 - **Replies come from the same four hooks.** `pane read --last-reply`, `tutti
   ask` and the sidebar's reply panel have nothing to show for any other
-  agent. Gemini CLI's reply is wired from its docs and source and not yet run
+  agent, and `ask` refuses its pane; it refuses a fresh Codex or opencode
+  too, until its first turn (their hooks first fire then). Gemini CLI's reply is wired from its docs and source and not yet run
   live; it is the whole turn's text, not only the last message. A turn
   interrupted with Esc in Claude Code sends no Stop: it leaves the previous
   turn's reply in place, and an `ask` waiting on it runs to its `--timeout`.

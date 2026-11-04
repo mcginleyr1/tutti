@@ -497,8 +497,9 @@ async fn an_ask_waits_for_the_next_reported_turn_end() {
 
 /// An agent that exits mid-ask ends the ask's wait with an error naming the
 /// exit, though the exit moves the pane to Done and a reply from an earlier
-/// turn is there to read. A pane that is working, blocked or gone refuses
-/// the ask's send and types nothing.
+/// turn is there to read. A pane no hook has reported through — a plain
+/// shell — or one that is working, blocked or gone refuses the ask's send
+/// and types nothing.
 #[tokio::test]
 async fn an_ask_reports_an_exit_mid_turn_and_refuses_a_busy_pane() {
     let server = TestServer::start();
@@ -514,9 +515,20 @@ async fn an_ask_reports_an_exit_mid_turn_and_refuses_a_busy_pane() {
 
     let pane = run_marker(
         &mut control,
-        "read line; echo got-$line-; read code; exit 3",
+        "read a; echo A-$a-; read b; echo B-$b-; read code; exit 3",
     )
     .await;
+    let shell = error_message(control.request(ask_send(pane, "typed")).await);
+    assert!(
+        shell.contains("has not reported through tutti's hooks"),
+        "{shell}"
+    );
+    assert_eq!(control.request(enter(pane)).await, Response::Ok);
+    assert!(
+        read_until(&mut control, pane, "A--").await,
+        "nothing was typed into the shell"
+    );
+
     let earlier = AgentHookEvent::Done {
         reply: Some("earlier".into()),
     };
@@ -531,8 +543,8 @@ async fn an_ask_reports_an_exit_mid_turn_and_refuses_a_busy_pane() {
     assert!(busy.contains("is working: wait for it first"), "{busy}");
     assert_eq!(control.request(enter(pane)).await, Response::Ok);
     assert!(
-        read_until(&mut control, pane, "got--").await,
-        "nothing was typed"
+        read_until(&mut control, pane, "B--").await,
+        "nothing was typed into the running turn"
     );
     hook(
         &mut control,
