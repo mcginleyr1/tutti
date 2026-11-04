@@ -1953,7 +1953,7 @@ tutti pane focus --direction left|right|up|down [--from <pane>] [--wrap]  # focu
 tutti pane resize --direction left|right|up|down [--amount <f>] [--from <pane>]  # move its split's border that way, as Alt+h/j/k/l (default step 0.05 of the split)
 tutti pane attach <pane> [--inline]  # show one pane in this terminal, drawn by the terminal itself; prefix d detaches (never starts a daemon); --inline: on the primary screen, keeping its scrollback
 tutti pane rename <pane> <title>
-tutti pane send <pane> --text <s> | --keys <s> [--expect <fp>]   # --expect: answer a blocked agent, refused if its prompt moved on
+tutti pane send <pane> --text <s> | --keys <s> [--expect <fp>]   # --expect: answer a blocked agent, refused if its prompt moved on; refused too once 64 sends wait on a program that stopped reading its input
 tutti pane read <pane> [--lines N] [--unwrapped] [--since <cursor> | --last-output] | --fingerprint | --last-reply
                                      # --since: rows scrolled off since the cursor, then the screen; next cursor on stderr
                                      # --last-output: the last finished command's output; `exit: N` on stderr (needs shell-init)

@@ -146,11 +146,13 @@ cargo fmt --all --check
     - the reader `try_send`s each read's answers after releasing the parser
       lock;
     - `set_colors` queues its light/dark notice;
-    - `write_input` queues the input and waits for the write's result.
+    - `write_input` queues the input and returns; a full queue refuses it.
   - **Nothing writes the pty from the reader or under that lock.** A raw-mode
     program that stops reading its input blocks a pty write. A reader blocked
     there never drains the program's output, and the pane deadlocks on
     something as plain as `cat`ting a file of `ESC[6n`.
+  - **Nothing waits on a pane's write either.** `pane_input` once waited for
+    it under the session lock, so one such program stalled the whole daemon.
   - **A second writer would let a typed key overtake an answer queued before
     it.** That is the 2031 server test's old race: it failed in 3 of 5 runs.
 - **Taps are fed in the same parser-lock hold as `Term::process`, minus what

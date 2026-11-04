@@ -749,17 +749,24 @@ impl Session {
             .and_then(|layout| layout.neighbor(pane, toward, wrap)))
     }
 
-    /// Type `bytes` into `pane`. Input past a finished program's own report —
-    /// a Program or Progress claim holding Done or Idle — ends that claim, the
-    /// state staying until something moves it, so a reporter that never sent
-    /// its clear cannot shut out the next one. Returns whether that settled
-    /// the pane out of the agent surfaces (the caller rebroadcasts the view).
+    /// Type `bytes` into `pane`: queued, never waited on (`write_input`), so
+    /// the caller's session guard is never held across a pane's pty. Input
+    /// past a finished program's own report — a Program or Progress claim
+    /// holding Done or Idle — ends that claim, the state staying until
+    /// something moves it, so a reporter that never sent its clear cannot
+    /// shut out the next one. Returns whether that settled the pane out of
+    /// the agent surfaces (the caller rebroadcasts the view).
     pub fn pane_send(&mut self, pane: PaneId, bytes: &[u8]) -> Result<bool> {
         let slot = self
             .panes
             .get_mut(&pane)
             .with_context(|| format!("no pane {pane}"))?;
-        slot.pty.write_input(bytes)?;
+        if let Some(code) = slot.meta.exited {
+            bail!("pane {pane} has exited (code {code})");
+        }
+        slot.pty
+            .write_input(bytes)
+            .with_context(|| format!("pane {pane}"))?;
         let finished = matches!(
             slot.meta.source,
             Some(StateSource::Program | StateSource::Progress)
@@ -794,7 +801,9 @@ impl Session {
         if prompt_fingerprint(&grid.lines) != expect {
             bail!("the prompt changed since you looked: read pane {pane} again");
         }
-        slot.pty.write_input(bytes)?;
+        slot.pty
+            .write_input(bytes)
+            .with_context(|| format!("pane {pane}"))?;
         slot.answered = Some(grid.generation);
         Ok(())
     }

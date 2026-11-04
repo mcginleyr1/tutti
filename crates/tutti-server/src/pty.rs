@@ -8,12 +8,12 @@ use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, SyncSender};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtyPair, PtySize, native_pty_system};
@@ -23,14 +23,10 @@ use tutti_core::{AgentState, HostColors, Rgb, StateSource};
 
 const SCROLLBACK_LINES: usize = 10_000;
 /// Writes waiting for a pane's writer thread: a read's answers, a light/dark
-/// notice, input. A program that asks and never reads the answers stops
-/// getting them past this, rather than stalling its own output behind them.
+/// notice, input. A program that stops reading its input gets no more past
+/// this — answers and input alike — rather than stalling its own output, or
+/// whoever typed, behind them.
 const WRITE_QUEUE: usize = 64;
-
-/// One write to a pane's pty (`PtyPane::writes`): a read's answers or a
-/// light/dark notice, or input, whose sender waits on the second for how the
-/// write went.
-type PtyWrite = (Vec<u8>, Option<SyncSender<std::io::Result<()>>>);
 /// The longest sequence held from the terminal and the taps while it could
 /// still be one the daemon answers or owns; past it, it goes on to both.
 const HOLD_MAX: usize = 256;
@@ -761,7 +757,7 @@ pub struct PtyPane {
     /// daemon answers on the pane's terminal's behalf and the input typed
     /// into it reach the pty in the order they were queued, as a terminal's
     /// own reports and keys do.
-    writes: SyncSender<PtyWrite>,
+    writes: SyncSender<Vec<u8>>,
     term: Arc<Mutex<Term>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     /// The child's OS process id, the root of the process-tree walk that agent
@@ -836,17 +832,16 @@ impl PtyPane {
         // overtakes an answer queued before it — and off the parser lock: a
         // program that asks and never reads its answers fills its input and
         // blocks that thread, never the reader, which would leave its output
-        // undrained. The thread ends once the reader and the pane have both
-        // let go of its queue.
-        let (writes, queued) = mpsc::sync_channel::<PtyWrite>(WRITE_QUEUE);
+        // undrained, nor whoever typed (`write_input`). A write that fails —
+        // the program is gone — is let go: the pane's exit tells of that.
+        // The thread ends once the reader and the pane have both let go of
+        // its queue.
+        let (writes, queued) = mpsc::sync_channel::<Vec<u8>>(WRITE_QUEUE);
         std::thread::Builder::new()
             .name("tutti-pty-writer".into())
             .spawn(move || {
-                for (bytes, done) in queued {
-                    let wrote = writer.write_all(&bytes).and_then(|()| writer.flush());
-                    if let Some(done) = done {
-                        let _ = done.send(wrote);
-                    }
+                for bytes in queued {
+                    let _ = writer.write_all(&bytes).and_then(|()| writer.flush());
                 }
             })
             .context("failed to spawn pty writer thread")?;
@@ -928,22 +923,24 @@ impl PtyPane {
             out.answers
         });
         if !answers.is_empty() {
-            let _ = self.writes.try_send((answers, None));
+            let _ = self.writes.try_send(answers);
         }
     }
 
-    /// Forward raw keystrokes to the child, after whatever the daemon
-    /// answered on its terminal's behalf before them, and return once they
-    /// are written.
+    /// Queue raw keystrokes for the child, behind whatever the daemon
+    /// answered on its terminal's behalf before them. Never waits on the
+    /// program: one that stops reading its input fills the queue, and its
+    /// input is refused from then on, so nothing that types — nor a lock it
+    /// holds — waits on a pane.
     pub fn write_input(&self, bytes: &[u8]) -> Result<()> {
-        let (done, wrote) = mpsc::sync_channel(1);
         self.writes
-            .send((bytes.to_vec(), Some(done)))
-            .context("the pane's writer is gone")?;
-        wrote
-            .recv()
-            .context("the pane's writer is gone")?
-            .context("write to pty failed")
+            .try_send(bytes.to_vec())
+            .map_err(|err| match err {
+                TrySendError::Full(_) => {
+                    anyhow!("its program is not reading its input ({WRITE_QUEUE} writes wait)")
+                }
+                TrySendError::Disconnected(_) => anyhow!("the pane's writer is gone"),
+            })
     }
 
     /// Resize both the kernel pty and the terminal, which reflows its
@@ -1247,7 +1244,7 @@ fn read_loop(
     pid: Option<u32>,
     output_tx: watch::Sender<u64>,
     notifications: Arc<Mutex<Vec<Signal>>>,
-    answers: SyncSender<PtyWrite>,
+    answers: SyncSender<Vec<u8>>,
 ) {
     let mut buf = [0u8; 8192];
     loop {
@@ -1295,7 +1292,7 @@ fn read_loop(
                 output_tx.send_modify(|generation| *generation = generation.wrapping_add(1));
                 drop(term);
                 if !answer.is_empty() {
-                    let _ = answers.try_send((answer, None));
+                    let _ = answers.try_send(answer);
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,

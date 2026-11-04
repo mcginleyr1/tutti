@@ -2514,6 +2514,121 @@ async fn a_pane_stream_that_never_reads_is_dropped() {
     server.stop().await;
 }
 
+/// A pane whose program stops reading its input stalls nobody: each send to
+/// it answers at once — queued until the queue is full, refused after —
+/// and all the while the session lists, and another pane takes input and is
+/// read, promptly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pane_that_stops_reading_its_input_stalls_nobody() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    // Raw, as an agent's terminal is: a cooked line discipline drops what
+    // overflows its line, where a raw one blocks the write.
+    let deaf = run_marker(&mut control, "stty raw -echo; echo deaf; exec sleep 600").await;
+    assert!(read_until(&mut control, deaf, "deaf").await);
+    let beside = pane_id(
+        control
+            .request(Request::PaneRun {
+                tab: None,
+                cmd: vec!["/bin/cat".into()],
+                ephemeral: false,
+                sandbox: None,
+            })
+            .await,
+    );
+    let send = |pane, text: String| Request::PaneSend {
+        pane,
+        text: Some(text),
+        keys: None,
+        expect: None,
+        between_turns: false,
+    };
+    let prompt = Duration::from_secs(2);
+
+    // The first send overflows the pty's input buffer (1 KiB on macOS), so
+    // the writer blocks on it; the queue's 64 then fill behind it.
+    let mut queued = 0;
+    let refused = loop {
+        let text = if queued == 0 {
+            "x".repeat(64 * 1024)
+        } else {
+            "x".into()
+        };
+        let answer = timeout(prompt, control.request(send(deaf, text)))
+            .await
+            .expect("a send to a pane that stopped reading answers promptly");
+        match answer {
+            Response::Ok => queued += 1,
+            Response::Error { message } => break message,
+            other => panic!("expected Ok or Error, got {other:?}"),
+        }
+        assert!(queued <= 65, "65 sends queued and none refused");
+    };
+    assert!(queued >= 64, "refused after {queued} sends");
+    assert!(refused.contains("not reading its input"), "{refused}");
+
+    for _ in 0..3 {
+        let listed = timeout(prompt, control.request(Request::PaneList))
+            .await
+            .expect("pane list answers promptly");
+        assert!(matches!(listed, Response::Panes { .. }), "{listed:?}");
+    }
+    let typed = timeout(prompt, control.request(send(beside, "beside\r".into())))
+        .await
+        .expect("another pane's send answers promptly");
+    assert_eq!(typed, Response::Ok);
+    let read = Request::PaneRead {
+        pane: beside,
+        lines: None,
+        unwrapped: false,
+        since: None,
+        last_output: false,
+        last_reply: false,
+    };
+    let screen = timeout(prompt, control.request(read))
+        .await
+        .expect("another pane's read answers promptly");
+    assert!(matches!(screen, Response::Content { .. }), "{screen:?}");
+    assert!(read_until(&mut control, beside, "beside").await);
+
+    server.stop().await;
+}
+
+/// A send to a pane whose program has exited is refused, saying so.
+#[tokio::test]
+async fn a_send_to_an_exited_pane_is_refused() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let pane = run_marker(&mut control, "exit 3").await;
+    timeout(DEADLINE, async {
+        loop {
+            let Response::Panes { panes } = control.request(Request::PaneList).await else {
+                panic!("expected the pane list");
+            };
+            if panes.iter().any(|p| p.id == pane && p.exited.is_some()) {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the pane never exited");
+    let refused = error_message(
+        control
+            .request(Request::PaneSend {
+                pane,
+                text: Some("late\r".into()),
+                keys: None,
+                expect: None,
+                between_turns: false,
+            })
+            .await,
+    );
+    assert!(refused.contains("has exited (code 3)"), "{refused}");
+
+    server.stop().await;
+}
+
 /// A request may carry a `req`, and its answer carries it back: a sync answer,
 /// one sent later from a spawned task, even the refusal of a request that does
 /// not parse. An untagged request's answer carries none, nor does an event.
