@@ -1201,9 +1201,11 @@ A source still fetching shows `loading…`; one that fails shows why, dim red.
 `j`/`k` move, and `esc` closes. `enter` opens the run launcher armed for the
 issue — ` deploy #123 · Fix the login ` — offering only the agents that take a
 first message on their command line (Claude Code, Codex, Gemini CLI, OpenCode,
-Muse Code, Mistral Vibe, Ori; Crush's interactive mode takes none), `tab`
-cycling sandboxes as usual and `esc` backing out to the panel. Picking one
-creates a **workspace for the issue** under the project, named after it
+Pi, Muse Code, Mistral Vibe, Ori; and, from their docs alone, untried, Goose,
+Qwen Code, Cursor CLI, Copilot CLI, Factory Droid, Augment Code and Amazon Q —
+the interactive modes of Crush, Aider and Amp take none), `tab` cycling
+sandboxes as usual and `esc` backing out to the panel. Picking one creates a
+**workspace for the issue** under the project, named after it
 (`gh-123`, `eng-42`), starts the agent there with the issue as its first
 message, jumps to it, and flashes `deployed #123 to claude`. That message
 defaults to `Work on this issue and commit your changes when done.` followed

@@ -215,12 +215,14 @@ impl Default for Registry {
         let guess = |kind: &str, display: &str, url: &str, names: &[&str]| {
             AgentSpec::new(kind, display, url, names, GUESS_BLOCKED, GUESS_WORKING, &[])
         };
-        // Prompt flags come from each tool's own `--help` (claude, opencode,
-        // ori, vibe, muse), or its docs where it isn't installed here (codex:
-        // "Optional text instruction to start the session"; gemini's
-        // `--prompt-interactive`: "Execute prompt and continue in interactive
-        // mode"). crush's interactive mode takes no prompt — `crush run` is
-        // headless — and the rest are unverified, so they take none.
+        // How each agent's interactive mode takes a first message, as the
+        // note on its row says: from its own `--help` where it is installed
+        // here (checked 2026-11-04, versions named), else from its own docs,
+        // quoted. Only Ori (`--prompt-file`), Pi and Augment (`@file`) and
+        // Goose (`--instructions <file>`) take it from a file while staying
+        // interactive, and only Amp from stdin, so a message too long for an
+        // argument rides a file every agent is told to read instead (tutti's
+        // `issues::fit_arg`).
         Registry {
             specs: vec![
                 AgentSpec::new(
@@ -232,6 +234,8 @@ impl Default for Registry {
                     &["esc to interrupt", "Thinking", "Running"],
                     &["❯"],
                 )
+                // `--help` (2.1.318): `claude [prompt]` "starts an interactive
+                // session by default".
                 .prompted(&[]),
                 AgentSpec::new(
                     "codex",
@@ -242,6 +246,8 @@ impl Default for Registry {
                     &["esc to interrupt", "Working", "Thinking"],
                     &["»"],
                 )
+                // `--help` (0.166.0): `codex [PROMPT]`, "Optional user prompt
+                // to start the session".
                 .prompted(&[]),
                 // The catalog: name-detection plus guess patterns only. crush
                 // resumes via `crush --session <id>`, but its store is sqlite,
@@ -252,44 +258,77 @@ impl Default for Registry {
                     "https://github.com/google-gemini/gemini-cli",
                     &["gemini"],
                 )
+                // `--help` (0.66.0): "Execute the provided prompt and continue
+                // in interactive mode".
                 .prompted(&["--prompt-interactive"]),
-                // Its TUI submits `--prompt` once a model is ready.
+                // `--help` (1.18.5): `--prompt`, "prompt to use"; its TUI
+                // submits it once a model is ready.
                 guess("opencode", "OpenCode", "https://opencode.ai", &["opencode"])
                     .prompted(&["--prompt"]),
+                // `--help` (0.87.0): a bare `crush` takes no prompt; `crush
+                // run` is headless.
                 guess(
                     "crush",
                     "Crush",
                     "https://github.com/charmbracelet/crush",
                     &["crush"],
                 ),
+                // Docs (aider.chat/docs/config/options.html): `--message` and
+                // `--message-file` "process reply then exit (disables chat
+                // mode)"; nothing sends one and stays.
                 guess("aider", "Aider", "https://aider.chat", &["aider"]),
+                // Docs (the goose CLI commands guide): `goose run --text` is
+                // "Input text to provide to goose directly", and
+                // `--interactive` will "Continue in interactive mode after
+                // processing initial input". Not run here.
                 guess(
                     "goose",
                     "Goose",
                     "https://github.com/block/goose",
                     &["goose"],
-                ),
-                guess("pi", "Pi", "https://github.com/badlogic/pi-mono", &["pi"]),
+                )
+                .prompted(&["run", "--interactive", "--text"]),
+                // `--help` (0.83.0): `pi "List all .ts files in src/"` is
+                // "Interactive mode with initial prompt". (An argument leading
+                // with `@` is a file to include, not a message.)
+                guess("pi", "Pi", "https://github.com/badlogic/pi-mono", &["pi"]).prompted(&[]),
+                // Docs (Qwen Code's settings reference): `--prompt-interactive`
+                // "Starts an interactive session with the provided prompt as the
+                // initial input". Not run here.
                 guess(
                     "qwen",
                     "Qwen Code",
                     "https://github.com/QwenLM/qwen-code",
                     &["qwen"],
-                ),
+                )
+                .prompted(&["--prompt-interactive"]),
+                // Docs (cursor.com/docs/cli/reference/parameters): `prompt`,
+                // "Initial prompt for the agent", in the agent mode it starts
+                // interactively by default. Not run here.
                 guess(
                     "cursor",
                     "Cursor CLI",
                     "https://cursor.com/cli",
                     &["cursor-agent"],
-                ),
+                )
+                .prompted(&[]),
+                // Docs (GitHub's Copilot CLI command reference): `-i PROMPT`,
+                // "Start an interactive session and automatically execute this
+                // prompt". Not run here.
                 guess(
                     "copilot",
                     "Copilot CLI",
                     "https://github.com/github/copilot-cli",
                     &["copilot"],
-                ),
+                )
+                .prompted(&["-i"]),
+                // Docs (ampcode.com/docs/cli): only piped stdin becomes "the
+                // first user message in interactive mode", and a pane's stdin
+                // is its terminal; `-x` is headless. So none.
                 guess("amp", "Amp", "https://ampcode.com", &["amp"]),
-                guess("droid", "Factory Droid", "https://factory.ai", &["droid"]),
+                // Docs (Factory's CLI reference): `droid "query"`, "Start REPL
+                // with initial prompt". Not run here.
+                guess("droid", "Factory Droid", "https://factory.ai", &["droid"]).prompted(&[]),
                 // Observed live (Muse Code 1.0.1 in a pty): the status line
                 // reads `Working (3s · esc to interrupt)` and `◇ Thinking`
                 // while a turn runs; the idle input box leads with `⟩`. Its
@@ -303,6 +342,7 @@ impl Default for Registry {
                     &["esc to interrupt", "Thinking", "Working"],
                     &["⟩"],
                 )
+                // `--help` (1.4.14): "pass a prompt to start a session".
                 .prompted(&[]),
                 // Mistral Vibe's strings, from its source (2.23.3): the loading
                 // line reads `Thinking (3s Esc to interrupt)` and the approval
@@ -317,22 +357,33 @@ impl Default for Registry {
                     &["to interrupt", "Thinking", "Retrying"],
                     &[],
                 )
+                // `--help` (3.0.3): `[INITIAL_PROMPT]`, "Initial prompt for the
+                // interactive session".
                 .prompted(&[]),
+                // Docs (docs.augmentcode.com/cli/reference): `auggie "Fix the
+                // typescript errors"`, "Provide an initial instruction in
+                // interactive mode". Not run here.
                 guess(
                     "auggie",
                     "Augment Code",
                     "https://www.augmentcode.com",
                     &["auggie"],
-                ),
+                )
+                .prompted(&[]),
                 // Amazon Q's binary is literally `q`, which can collide with
                 // other tools of that name (kdb+); the cost of a false match is
-                // only a mislabelled badge, so it stays in.
+                // only a mislabelled badge, so it stays in. Docs (the AWS
+                // command reference, read through a search excerpt — the page
+                // itself did not render here): `q chat [INPUT]`, "The first
+                // question to ask", interactive unless `--no-interactive`. Not
+                // run here.
                 guess(
                     "amazon-q",
                     "Amazon Q",
                     "https://github.com/aws/amazon-q-developer-cli",
                     &["q"],
-                ),
+                )
+                .prompted(&["chat"]),
                 // Ori's bare binary is a harness launcher (`ori claude`,
                 // `ori codex`, …) — the agent it wraps is detected as itself,
                 // deeper in the tree — so the launcher runs `ori code`, its
@@ -342,8 +393,9 @@ impl Default for Registry {
                 // the approval dialog is titled `Permission requested` with
                 // `Allow once` first. Its lowercase transcript echo,
                 // `⚠ permission requested: …`, outlives the dialog — never a
-                // Blocked marker. A bare `--prompt` runs one headless turn;
-                // `--interactive` opens the TUI with it as the first.
+                // Blocked marker. `code --help` (0.13.0): a bare `--prompt` runs
+                // one headless turn; `--interactive` will "Open the interactive
+                // TUI with --prompt/--prompt-file text as the first turn".
                 AgentSpec {
                     launch_args: owned(&["code"]),
                     ..AgentSpec::new(
@@ -621,10 +673,21 @@ mod tests {
             ),
             ("vibe", &["vibe", "fix it"]),
             ("muse", &["muse", "fix it"]),
+            ("pi", &["pi", "fix it"]),
+            (
+                "goose",
+                &["goose", "run", "--interactive", "--text", "fix it"],
+            ),
+            ("qwen", &["qwen", "--prompt-interactive", "fix it"]),
+            ("cursor", &["cursor-agent", "fix it"]),
+            ("copilot", &["copilot", "-i", "fix it"]),
+            ("droid", &["droid", "fix it"]),
+            ("auggie", &["auggie", "fix it"]),
+            ("amazon-q", &["q", "chat", "fix it"]),
         ] {
             assert_eq!(argv(kind).expect(kind), expected);
         }
-        for kind in ["crush", "aider", "goose", "amazon-q"] {
+        for kind in ["crush", "aider", "amp"] {
             assert_eq!(argv(kind), None, "{kind}");
         }
         assert_eq!(

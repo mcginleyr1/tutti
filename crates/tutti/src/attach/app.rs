@@ -11551,7 +11551,8 @@ mod tests {
         assert_eq!(
             names(&app),
             [
-                "claude", "codex", "gemini", "opencode", "muse", "vibe", "ori"
+                "claude", "codex", "gemini", "opencode", "goose", "pi", "qwen", "cursor",
+                "copilot", "droid", "muse", "vibe", "auggie", "amazon-q", "ori"
             ]
         );
         assert!(app.launcher_rows().iter().all(LauncherRow::selectable));
