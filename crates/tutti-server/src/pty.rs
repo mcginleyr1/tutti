@@ -533,10 +533,9 @@ impl Term {
         }
         let mut out = self.lines(start, end);
         // The cells before `D` on its own row are output too; what follows
-        // there — the next prompt, zsh's `%` — is not. A `D` on the last
-        // column takes its cell too: a wrap pending leaves the cursor there.
-        let cols = self.vt.size().1;
-        let end_col = if end_col + 1 >= cols { cols } else { end_col };
+        // there — the next prompt, zsh's `%` — is not. Output that filled
+        // its row leaves `D` past the last column (`Mark::col`), so the last
+        // cell is output too; a `D` on that column leaves it out.
         if end_col > 0 && start <= end {
             out.push((self.vt.text((end, 0), (end, end_col - 1)), false));
         }
@@ -2379,6 +2378,13 @@ mod tests {
         assert_eq!(
             last(&mut term, false),
             Some((vec!["0123456789ABCDEFGHIJ".to_string()], Some(0), false))
+        );
+        // One a column short leaves zsh's `%` on the last column, after `D`.
+        term.process(turn("printf", "0123456789ABCDEFGHI", 0).as_bytes());
+        term.process(b"%\r\n\x1b]133;A\x07$ ");
+        assert_eq!(
+            last(&mut term, false),
+            Some((vec!["0123456789ABCDEFGHI".to_string()], Some(0), false))
         );
     }
 
