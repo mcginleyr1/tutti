@@ -478,6 +478,11 @@ pub struct Config {
     /// What a Claude or opencode permission request does to tutti. Default
     /// `Watch`.
     pub approvals: Approvals,
+    /// How long a lone `ESC` waits for the key after it, which with it is that
+    /// key with Alt, before it is Esc: `escape_time_ms`, tmux's escape-time,
+    /// default 15 — under what a person notices, so Esc in Neovim feels
+    /// instant, and far over the gap within one sequence a terminal writes.
+    pub escape_time: Duration,
     /// How long a held permission request waits for an answer before it
     /// passes on to the agent's own dialog: `approval_timeout_secs`, default
     /// 120, under Claude's 600 s hook timeout.
@@ -587,6 +592,10 @@ impl Config {
                 "approval_timeout_secs: {other} is out of range (1 to 599 — Claude Code stops a hook at 600)"
             ),
         };
+        let escape_time = match raw.escape_time_ms.unwrap_or(15) {
+            ms @ 0..=1000 => Duration::from_millis(ms),
+            other => bail!("escape_time_ms: {other} is out of range (0 to 1000)"),
+        };
 
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let projects = raw
@@ -647,6 +656,7 @@ impl Config {
             theme,
             notifications,
             approvals,
+            escape_time,
             approval_timeout,
             projects,
             sandboxes,
@@ -731,6 +741,7 @@ struct RawConfig {
     notifications: Option<bool>,
     approvals: Option<String>,
     approval_timeout_secs: Option<u64>,
+    escape_time_ms: Option<u64>,
     #[serde(default)]
     keys: RawKeys,
     #[serde(default)]
@@ -1575,6 +1586,24 @@ command = ["~/bin/jira-issues", "--json"]
             let err = format!("{:#}", Config::parse(text).unwrap_err());
             assert!(err.contains(needle), "{text:?} → {err}");
         }
+    }
+
+    #[test]
+    fn the_escape_time_defaults_to_15_ms_and_names_a_value_out_of_range() {
+        assert_eq!(Config::default().escape_time, Duration::from_millis(15));
+        for ms in [0, 200, 1000] {
+            let config = Config::parse(&format!("escape_time_ms = {ms}\n")).unwrap();
+            assert_eq!(config.escape_time, Duration::from_millis(ms));
+        }
+        let err = format!(
+            "{:#}",
+            Config::parse("escape_time_ms = 1001\n").unwrap_err()
+        );
+        assert!(
+            err.contains("escape_time_ms: 1001 is out of range"),
+            "{err}"
+        );
+        assert!(Config::parse("escape_time_ms = -1\n").is_err());
     }
 
     #[test]

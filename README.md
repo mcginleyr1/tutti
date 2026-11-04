@@ -211,7 +211,10 @@ by that terminal itself rather than the TUI: a snapshot first, then the pane's
 output streamed raw, and your keys typed into the pane. It is the view for
 editor terminals — Ghostel in Emacs, Neovim's `:terminal` — and for a pane you
 want at full fidelity. The prefix then `d` detaches; the prefix twice sends one
-prefix through; the prefix then any other key sends both. The pane is drawn on
+prefix through; the prefix then any other key sends both. An `Esc` waits the
+escape time (`escape_time_ms`, see [Configuration](#configuration)) for the
+key after it: one that comes in time goes to the pane with it, in one write,
+as that key with Alt — and counts as an `A-…` prefix. The pane is drawn on
 the terminal's alternate screen, and your shell's screen comes back on exit,
 the terminal's modes restored. A program in the pane that uses an alternate
 screen of its own (vim, less) is redrawn from a local copy of the pane on each

@@ -16,6 +16,7 @@ rtty-vt.workspace = true
 terminal-colorsaurus.workspace = true
 signal-hook.workspace = true
 sysinfo.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tutti-core.workspace = true

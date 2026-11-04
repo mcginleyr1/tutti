@@ -643,7 +643,7 @@ fn run(cli: Cli) -> Result<i32> {
             if own {
                 bail!("pane {pane} is the pane this runs in");
             }
-            tutti::attach::raw::run(&cli.session, PaneId(pane), Config::load()?.prefix, inline)
+            tutti::attach::raw::run(&cli.session, PaneId(pane), &Config::load()?, inline)
         }
         Some(Command::Sandbox {
             action: SandboxAction::Run { profile, name, cmd },

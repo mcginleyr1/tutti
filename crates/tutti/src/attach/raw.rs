@@ -38,6 +38,7 @@ use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use ratatui::crossterm::event::KeyEvent;
@@ -50,7 +51,7 @@ use tutti_core::{Event, Frame, HostColors, PaneDims, PaneId, Request, Response, 
 use super::input::{Keyboard, encode_key};
 use super::theme::host_colors;
 use crate::client;
-use crate::config::{Chord, Theme};
+use crate::config::{Chord, Config, Theme};
 
 /// Push the window title and ask to hear of light/dark changes; but for
 /// `--inline`, take the alternate screen first.
@@ -74,16 +75,18 @@ static ALTERNATE: AtomicBool = AtomicBool::new(false);
 /// A mode-2031 terminal's light/dark reports, each with whether it says dark.
 const REPORTS: [(&[u8], bool); 2] = [(b"\x1b[?997;1n", true), (b"\x1b[?997;2n", false)];
 
-/// Show `pane` of `session` in this terminal until the prefix and `d` detach
-/// it, the pane exits (`[pane N exited: CODE]`), or the daemon goes away (an
-/// error) — on the alternate screen, or `inline` on the primary one. Never
-/// starts a daemon: with none running there is no pane to show.
-pub fn run(session: &str, pane: PaneId, prefix: Chord, inline: bool) -> Result<i32> {
+/// Show `pane` of `session` in this terminal until the config's prefix and
+/// `d` detach it, the pane exits (`[pane N exited: CODE]`), or the daemon
+/// goes away (an error) — on the alternate screen, or `inline` on the
+/// primary one. Never starts a daemon: with none running there is no pane to
+/// show.
+pub fn run(session: &str, pane: PaneId, config: &Config, inline: bool) -> Result<i32> {
     if !std::io::stdin().is_terminal() {
         bail!("pane attach needs a terminal on stdin");
     }
-    let prefix = encode_key(KeyEvent::new(prefix.code, prefix.mods), Keyboard::default())
-        .with_context(|| format!("the prefix {} has no key bytes", prefix.label()))?;
+    let Chord { code, mods } = config.prefix;
+    let prefix = encode_key(KeyEvent::new(code, mods), Keyboard::default())
+        .with_context(|| format!("the prefix {} has no key bytes", config.prefix.label()))?;
     let mut stream = match UnixStream::connect(socket_path(session)) {
         Ok(stream) => stream,
         Err(e) if client::not_running(&e) => {
@@ -137,7 +140,13 @@ pub fn run(session: &str, pane: PaneId, prefix: Chord, inline: bool) -> Result<i
     INLINE.store(inline, Ordering::SeqCst);
     install_panic_hook();
     let detached = Arc::new(AtomicBool::new(false));
-    spawn_keys(Keys::new(prefix), pane, &writer, &detached);
+    spawn_keys(
+        Keys::new(prefix),
+        config.escape_time,
+        pane,
+        &writer,
+        &detached,
+    );
     spawn_resizes(resizes, pane, &writer);
     let mut mirror = Terminal::new(24, 80, 0);
     let enter = [ENTER, if inline { b"" } else { ALTERNATE_SCREEN }].concat();
@@ -287,8 +296,11 @@ fn below(mirror: &mut Terminal) -> Vec<u8> {
 /// prefix then `d` detaches, the prefix twice sends one, and the prefix then
 /// anything else sends both — and for the terminal's light/dark reports
 /// (`REPORTS`), which are tutti's, never the pane's. Either still counts
-/// split across reads — a report once its `ESC [ ?` has come, which no key
-/// types: a lone `ESC` or `ESC [` ending a read is the key it looks like.
+/// split across reads: the start of one, a lone `ESC` included, is held
+/// (`waiting`) until the rest comes — or until the escape time goes by with
+/// nothing more (`flush`), when it is what a person typed. So an `ESC` and
+/// the key a person typed after it within the escape time reach the pane
+/// together, as that key with Alt.
 struct Keys {
     prefix: Vec<u8>,
     /// How many of the prefix's bytes the input has matched so far.
@@ -335,14 +347,30 @@ impl Keys {
                 }
             }
         }
-        if self.report.len() < 3 {
-            for k in std::mem::take(&mut self.report) {
-                if self.key(k, &mut out) {
-                    return (out, true, dark);
-                }
+        (out, false, dark)
+    }
+
+    /// Whether the start of a report or of the prefix is held.
+    fn waiting(&self) -> bool {
+        !self.report.is_empty() || self.held > 0
+    }
+
+    /// Nothing followed what is held within the escape time: it was typed.
+    /// The bytes to send, and whether they detached.
+    fn flush(&mut self) -> (Vec<u8>, bool) {
+        let mut out = Vec::new();
+        for k in std::mem::take(&mut self.report) {
+            if self.key(k, &mut out) {
+                return (out, true);
             }
         }
-        (out, false, dark)
+        if self.held > 0 {
+            if std::mem::take(&mut self.armed) {
+                out.extend_from_slice(&self.prefix);
+            }
+            out.extend_from_slice(&self.prefix[..std::mem::take(&mut self.held)]);
+        }
+        (out, false)
     }
 
     /// Step the prefix watch over one key's byte, adding to `out` what goes
@@ -374,26 +402,36 @@ impl Keys {
     }
 }
 
-/// Type stdin into the pane on a thread of its own. A detach marks
+/// Type stdin into the pane on a thread of its own, what `keys` holds going
+/// as typed once `escape` goes by with nothing more. A detach marks
 /// `detached` and shuts the socket, which ends `show`.
 fn spawn_keys(
     mut keys: Keys,
+    escape: Duration,
     pane: PaneId,
     writer: &Arc<Mutex<UnixStream>>,
     detached: &Arc<AtomicBool>,
 ) {
     let (writer, detached) = (Arc::clone(writer), Arc::clone(detached));
     std::thread::spawn(move || {
-        let mut input = [0u8; 4096];
+        // Larger than stdin's own buffer, so a read goes past it, and what
+        // `readable` sees waiting is all there is.
+        let mut input = [0u8; 16384];
         loop {
-            // Stdin is locked a read at a time: asking the colours locks it too.
-            let n = match std::io::stdin().read(&mut input) {
-                Ok(0) => return,
-                Ok(n) => n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => return,
+            let (bytes, detach, dark) = if keys.waiting() && !readable(escape) {
+                let (bytes, detach) = keys.flush();
+                (bytes, detach, None)
+            } else {
+                // Stdin is locked a read at a time: asking the colours locks
+                // it too.
+                let n = match std::io::stdin().read(&mut input) {
+                    Ok(0) => return,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return,
+                };
+                keys.feed(&input[..n])
             };
-            let (bytes, detach, dark) = keys.feed(&input[..n]);
             // A light/dark change: the colours are asked afresh, for the
             // daemon, from here — no other read of the terminal is under way,
             // and the query holds stdout, so no pane output lands amid it.
@@ -422,6 +460,24 @@ fn spawn_keys(
             }
         }
     });
+}
+
+/// Whether stdin has input within `wait`.
+fn readable(wait: Duration) -> bool {
+    let until = Instant::now() + wait;
+    loop {
+        let mut stdin = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let left = until.saturating_duration_since(Instant::now()).as_millis();
+        // SAFETY: one pollfd, which outlives the call.
+        match unsafe { libc::poll(&mut stdin, 1, i32::try_from(left).unwrap_or(i32::MAX)) } {
+            -1 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
+            n => return n > 0,
+        }
+    }
 }
 
 /// Send the terminal's size as the pane's view on every SIGWINCH.
@@ -508,9 +564,8 @@ mod tests {
     }
 
     /// The terminal's light/dark reports never reach the pane, wherever
-    /// reads cut them once their `ESC [ ?` has come; a near miss is keys, and
-    /// so is a lone `ESC` or `ESC [` ending a read — an arrow cut there
-    /// still arrives whole.
+    /// reads cut them, and a near miss is keys — an arrow cut after its
+    /// `ESC` still arrives whole.
     #[test]
     fn light_dark_reports_are_kept_from_the_pane() {
         let input = b"a\x1b[?997;2nb\x1b[?997;1n\x1b[?997;3n\x1b[Ac";
@@ -530,8 +585,7 @@ mod tests {
             (keys.clone(), vec![true]),
             "the read's last"
         );
-        // Cut after a report's `ESC` or `ESC [`, it reads as keys.
-        for cut in (0..=input.len()).filter(|cut| ![2, 3, 12, 13].contains(cut)) {
+        for cut in 0..=input.len() {
             let (sent, said) = feed(&[&input[..cut], &input[cut..]]);
             assert_eq!(sent, keys, "cut at {cut}");
             assert_eq!(said.last(), Some(&true), "cut at {cut}");
@@ -590,6 +644,37 @@ mod tests {
             let bytes: Vec<&[u8]> = input.chunks(1).collect();
             assert_eq!(typed(prefix, &bytes), want, "{input:?} a byte a read");
         }
+    }
+
+    /// What is held when the escape time runs out was typed: a lone `ESC`
+    /// is Esc, and the start of a report or of an Alt prefix goes on as
+    /// keys — but an `ESC` and the key after it within the escape time are
+    /// that key with Alt: an `A-b` prefix, or Alt+x for the pane, in one
+    /// write.
+    #[test]
+    fn what_is_held_when_the_escape_time_runs_out_was_typed() {
+        let mut keys = Keys::new(b"\x1bb".to_vec());
+        let flushed = |keys: &mut Keys| {
+            assert!(keys.waiting());
+            let flushed = keys.flush();
+            assert!(!keys.waiting());
+            flushed
+        };
+        assert_eq!(keys.feed(b"\x1b"), (vec![], false, None));
+        assert_eq!(flushed(&mut keys), (b"\x1b".to_vec(), false));
+        assert_eq!(keys.feed(b"b"), (b"b".to_vec(), false, None));
+        assert_eq!(keys.feed(b"\x1b[?99"), (vec![], false, None));
+        assert_eq!(flushed(&mut keys), (b"\x1b[?99".to_vec(), false));
+        assert_eq!(keys.feed(b"\x1b"), (vec![], false, None));
+        assert_eq!(keys.feed(b"x"), (b"\x1bx".to_vec(), false, None));
+        assert_eq!(keys.feed(b"\x1b"), (vec![], false, None));
+        assert_eq!(keys.feed(b"b"), (vec![], false, None));
+        assert_eq!(keys.feed(b"d"), (vec![], true, None), "Alt+b, then d");
+
+        // The prefix, then an `ESC` the time ran out on: both go.
+        let mut keys = Keys::new(b"\x1bb".to_vec());
+        assert_eq!(keys.feed(b"\x1bb\x1b"), (vec![], false, None));
+        assert_eq!(flushed(&mut keys), (b"\x1bb\x1b".to_vec(), false));
     }
 
     /// The default prefix is the byte `C-b` types.

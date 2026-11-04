@@ -461,8 +461,9 @@ set `CSI ? 2031 h`, as `CSI ? 997 ; 1 n` (dark) or `; 2 n` (light); a report tha
 it tells nothing. The daemon owns the mode for its panes, so it answers DECRQM for it (nvim
 0.12 probes it before setting it) and never passes it on. `tutti pane attach` sets 2031 on
 its own terminal, keeps the `CSI ? 997 ; 1|2 n` reports that terminal sends out of what it
-types into the pane (split across reads once their `ESC [ ?` has come — no key types
-that; a lone `ESC` or `ESC [` ending a read is the key it looks like), and turns each into
+types into the pane (split across reads too: the start of one is held until the rest
+comes, or until the escape time, `escape_time_ms`, goes by with nothing more — then it
+was typed, and a lone `ESC` is Esc), and turns each into
 a fresh report: the colours asked again from its keyboard thread, which is then the only
 reader of the terminal, with the light/dark the terminal said.
 
