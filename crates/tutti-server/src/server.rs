@@ -1597,10 +1597,11 @@ fn publish_report(hub: &Arc<Hub>, pane: PaneId, outcome: ReportOutcome) {
 /// or conversation change broadcasts the fresh view (`LayoutChanged`); a state
 /// move broadcasts `StateChanged` so a Blocked/Done still rings the client
 /// bell, and a blocked event's message rides on the move's note. Both can
-/// fire. A state move also refreshes the workspace's changes, which records
-/// the turn's checkpoint. An unknown pane is a silent `Ok` — the hook must
-/// never fail on tutti's side. The session guard is dropped before any
-/// broadcast (which re-locks `clients`).
+/// fire. A state move — or a prompt closing an interrupted turn — also
+/// refreshes the workspace's changes, which records the turn's checkpoint. An
+/// unknown pane is a silent `Ok` — the hook must never fail on tutti's side.
+/// The session guard is dropped before any broadcast (which re-locks
+/// `clients`).
 fn agent_event(
     hub: &Arc<Hub>,
     pane: PaneId,
@@ -1622,6 +1623,8 @@ fn agent_event(
     }
     if let Some((from, to)) = outcome.transition {
         publish_transition(hub, pane, from, to, said);
+    }
+    if outcome.transition.is_some() || outcome.noted {
         refresh_pane_workspace(hub, pane);
     }
     Response::Ok

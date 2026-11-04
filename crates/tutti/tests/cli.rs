@@ -140,8 +140,8 @@ fn agent_event_opencode_forwards_a_recorded_permission_prompt() {
 /// the model.
 #[test]
 fn agent_event_claude_forwards_a_prompt_with_its_conversation() {
-    let payload = r#"{"session_id":"abc123","transcript_path":"/tmp/t.jsonl","cwd":"/tmp",
-        "permission_mode":"default","hook_event_name":"UserPromptSubmit",
+    let payload = r#"{"session_id":"abc123","prompt_id":"p1","transcript_path":"/tmp/t.jsonl",
+        "cwd":"/tmp","permission_mode":"default","hook_event_name":"UserPromptSubmit",
         "prompt":"fix the failing test\nit is in tests/server.rs"}"#;
     let output = run_scenario_with(
         "ccprompt",
@@ -155,6 +155,7 @@ fn agent_event_claude_forwards_a_prompt_with_its_conversation() {
                     pane: PaneId(7),
                     event: AgentHookEvent::Prompt {
                         text: Some("fix the failing test".into()),
+                        id: Some("p1".into()),
                     },
                     conversation: Some("abc123".into()),
                 }

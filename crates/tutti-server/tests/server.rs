@@ -5997,7 +5997,7 @@ async fn a_turn_in_flight_at_a_restart_keeps_its_prompt() {
     );
     let pane = pane_id(conn.request(sleeper_in(None)).await);
     let text = Some("rename the module".to_string());
-    hook(&mut conn, pane, AgentHookEvent::Prompt { text }).await;
+    hook(&mut conn, pane, AgentHookEvent::Prompt { text, id: None }).await;
     wait_checkpoints(&mut conn, pane, 1).await;
     std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
     server.stop().await;
@@ -6056,7 +6056,7 @@ async fn a_turn_checkpoints_its_diff_and_restores_round_trip() {
 
     let prompt = Some("edit a and add b".to_string());
     let text = prompt.clone();
-    hook(&mut conn, pane, AgentHookEvent::Prompt { text }).await;
+    hook(&mut conn, pane, AgentHookEvent::Prompt { text, id: None }).await;
     let start = wait_checkpoints(&mut conn, pane, 1).await.remove(0);
     assert_eq!((start.n, start.label.as_str()), (1, "start"));
     assert_eq!(start.from, None, "nothing was recorded before the start");
@@ -6178,6 +6178,66 @@ async fn a_turn_checkpoints_its_diff_and_restores_round_trip() {
         "one\nTWO\nthree\n"
     );
     assert!(dir.join("b.txt").exists() && dir.join("c.txt").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+    server.stop().await;
+}
+
+/// A turn interrupted with Esc sends no Stop: the next prompt — a new
+/// `prompt_id` with none since — closes it as `interrupted` under its own
+/// prompt, its edits apart from the next turn's. More typed into a running
+/// turn (its own `prompt_id`) carries on in it. Skips cleanly without `jj`.
+#[tokio::test]
+async fn the_next_prompt_closes_an_interrupted_turn_under_its_own() {
+    if !jj_on_path() {
+        eprintln!("skipping: jj is not on PATH");
+        return;
+    }
+    let dir = jj_git_init("intr");
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    workspace_id(
+        conn.request(Request::WorkspaceNew { dir: dir.clone() })
+            .await,
+    );
+    let pane = pane_id(
+        conn.request(Request::PaneRun {
+            tab: None,
+            cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+            ephemeral: false,
+            sandbox: None,
+        })
+        .await,
+    );
+    let prompt = |text: &str, id: &str| AgentHookEvent::Prompt {
+        text: Some(text.into()),
+        id: Some(id.into()),
+    };
+
+    hook(&mut conn, pane, prompt("add a", "p1")).await;
+    wait_checkpoints(&mut conn, pane, 1).await;
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    hook(&mut conn, pane, prompt("and b too", "p1")).await;
+    std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+    // Esc: no Stop. The next prompt closes the turn.
+    hook(&mut conn, pane, prompt("now add c", "p2")).await;
+    let interrupted = wait_checkpoints(&mut conn, pane, 2).await.remove(1);
+    assert_eq!(interrupted.label, "interrupted");
+    assert_eq!(
+        interrupted.prompt.as_deref(),
+        Some("add a"),
+        "under the turn's first prompt, the one typed into it not a new turn"
+    );
+    assert_eq!(interrupted.files, 2);
+
+    std::fs::write(dir.join("c.txt"), "c\n").unwrap();
+    hook(&mut conn, pane, AgentHookEvent::Done).await;
+    let done = wait_checkpoints(&mut conn, pane, 3).await.remove(2);
+    assert_eq!(
+        (done.label.as_str(), done.prompt.as_deref(), done.files),
+        ("done", Some("now add c"), 1),
+        "the next turn holds its own edits only"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
     server.stop().await;

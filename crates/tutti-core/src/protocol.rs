@@ -479,10 +479,15 @@ pub enum AgentHookEvent {
     /// scheduled task, a background subagent reporting back) — so a turn
     /// begins (`Working`). `text` is its first line, trimmed and capped, which
     /// the checkpoint closing the turn lists as; `None` when that line is empty
-    /// or tool-injected content (a paste marker, a task notification).
+    /// or tool-injected content (a paste marker, a task notification). `id`
+    /// is the agent's own for the prompt (Claude's `prompt_id`): more typed
+    /// into a running turn carries that turn's. `None` from older clients
+    /// and agents that name none.
     Prompt {
         #[serde(default)]
         text: Option<String>,
+        #[serde(default)]
+        id: Option<String>,
     },
 }
 
@@ -1310,12 +1315,16 @@ mod tests {
             pane: PaneId(3),
             event: AgentHookEvent::Prompt {
                 text: Some("fix the failing test".into()),
+                id: Some("0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9".into()),
             },
             conversation: Some("ses_1".into()),
         });
         roundtrip(&Request::AgentEvent {
             pane: PaneId(3),
-            event: AgentHookEvent::Prompt { text: None },
+            event: AgentHookEvent::Prompt {
+                text: None,
+                id: None,
+            },
             conversation: None,
         });
         roundtrip(&Request::ApprovalHold {
@@ -1513,16 +1522,23 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&AgentHookEvent::Prompt {
-                text: Some("fix it".into())
+                text: Some("fix it".into()),
+                id: Some("p1".into()),
             })
             .unwrap(),
-            r#"{"kind":"prompt","text":"fix it"}"#
+            r#"{"kind":"prompt","text":"fix it","id":"p1"}"#
         );
         // A hook event serialized without the optional field still parses.
         let activity: AgentHookEvent = serde_json::from_str(r#"{"kind":"activity"}"#).unwrap();
         assert_eq!(activity, AgentHookEvent::Activity { detail: None });
         let prompt: AgentHookEvent = serde_json::from_str(r#"{"kind":"prompt"}"#).unwrap();
-        assert_eq!(prompt, AgentHookEvent::Prompt { text: None });
+        assert_eq!(
+            prompt,
+            AgentHookEvent::Prompt {
+                text: None,
+                id: None
+            }
+        );
     }
 
     /// A decision rides the wire tagged by `behavior`, as Claude's hook

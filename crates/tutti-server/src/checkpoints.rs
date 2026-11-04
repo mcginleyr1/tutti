@@ -17,8 +17,8 @@ pub type Noted = (String, Option<String>);
 
 /// One pane's checkpoints plus what the next change probe must record for it.
 /// Saved as its list, numbering and head, and the prompt of the turn in
-/// flight, which a restore closes (`note_restart`); the noted checkpoints are
-/// not saved.
+/// flight, which a restore closes (`note_restart`); the noted checkpoints and
+/// whether a turn is open are not saved.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Turns {
     entries: Vec<Checkpoint>,
@@ -34,6 +34,10 @@ pub struct Turns {
     /// Absent from saves made before it was kept.
     #[serde(default)]
     prompt: Option<String>,
+    /// The id of the prompt that opened the turn in flight (empty when the
+    /// agent named none), from that prompt until the agent's stop.
+    #[serde(skip)]
+    open: Option<String>,
 }
 
 impl Turns {
@@ -56,11 +60,35 @@ impl Turns {
         }
     }
 
-    /// Note the prompt that starts the next turn — replacing one whose turn
-    /// never closed (an interrupted agent sends no stop) — or, with `None`,
-    /// forget it.
-    pub fn set_prompt(&mut self, prompt: Option<String>) {
-        self.prompt = prompt;
+    /// Note a submitted prompt: `id` the agent's own for it, `text` its label.
+    /// One with the open turn's id is more typed into that turn, which goes
+    /// on under its first prompt. Any other starts a turn — closing first, as
+    /// `interrupted` and under its own prompt, a turn still open: no stop
+    /// came, as none does after an Esc. Returns whether it closed one, for the
+    /// caller's change probe to record.
+    pub fn prompted(&mut self, id: Option<String>, text: Option<String>) -> bool {
+        let id = id.unwrap_or_default();
+        if !id.is_empty() && self.open.as_ref() == Some(&id) {
+            return false;
+        }
+        let interrupted = self.open.replace(id).is_some();
+        if interrupted {
+            self.pending
+                .push(("interrupted".into(), self.prompt.take()));
+        }
+        self.prompt = text;
+        interrupted
+    }
+
+    /// The agent stopped: no turn is open.
+    pub fn stopped(&mut self) {
+        self.open = None;
+    }
+
+    /// Forget the turn in flight: its agent left the pane.
+    pub fn forget(&mut self) {
+        self.prompt = None;
+        self.open = None;
     }
 
     /// Note that an agent just started in the pane: where it began becomes a
@@ -197,7 +225,7 @@ mod tests {
     #[test]
     fn a_prompt_rides_each_end_of_its_turn_until_the_turn_finishes() {
         let mut turns = Turns::default();
-        turns.set_prompt(Some("fix the sidebar".into()));
+        turns.prompted(None, Some("fix the sidebar".into()));
         turns.note_transition(Idle, Working);
         assert_eq!(
             turns.take_pending(),
@@ -227,11 +255,52 @@ mod tests {
         );
     }
 
+    /// Esc sends no stop: the next prompt finds the turn still open and closes
+    /// it under its own prompt. More typed into a running turn (its prompt's
+    /// id) goes on in it; a stop between prompts leaves nothing to close.
+    #[test]
+    fn a_prompt_closes_the_turn_no_stop_ended() {
+        let mut turns = Turns::default();
+        turns.record(None, "c1", "start", None, 1, &[]).unwrap();
+        let p = |id: &str| Some(id.to_string());
+        let fix = || Some("fix the sidebar".to_string());
+
+        assert!(!turns.prompted(p("p1"), fix()), "nothing open yet");
+        assert!(
+            !turns.prompted(p("p1"), Some("also the footer".into())),
+            "more typed into the running turn"
+        );
+        assert!(
+            turns.prompted(p("p2"), Some("try again".into())),
+            "an interrupted turn closes"
+        );
+        assert_eq!(
+            turns.take_pending(),
+            vec![("interrupted".to_string(), fix())],
+            "under the prompt that started it"
+        );
+
+        turns.stopped();
+        turns.note_transition(Working, Done);
+        assert_eq!(
+            turns.take_pending(),
+            vec![("done".to_string(), Some("try again".into()))]
+        );
+        assert!(!turns.prompted(p("p3"), fix()), "a stop closed the last");
+        assert!(
+            turns.prompted(None, None),
+            "an agent naming no ids closes on any prompt"
+        );
+        assert!(turns.prompted(None, None));
+        turns.forget();
+        assert!(!turns.prompted(None, None), "its agent left: nothing open");
+    }
+
     #[test]
     fn a_turn_in_flight_keeps_its_prompt_through_a_save_and_a_restart_closes_it() {
         let mut turns = Turns::default();
         turns.record(None, "c1", "start", None, 1, &[]).unwrap();
-        turns.set_prompt(Some("fix the sidebar".into()));
+        turns.prompted(Some("p1".into()), Some("fix the sidebar".into()));
         turns.note_transition(Idle, Working);
         let mut restored: Turns =
             serde_json::from_slice(&serde_json::to_vec(&turns).unwrap()).unwrap();

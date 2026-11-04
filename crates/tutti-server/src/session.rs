@@ -823,11 +823,13 @@ impl Session {
     /// state and so leaves the screen classifier on until the agent's first
     /// turn. A `conversation` replaces the pane's (the agent switched to
     /// another); `None` keeps it. A prompt is noted for the checkpoint closing
-    /// the turn it starts. Returns what moved so the caller broadcasts the right
-    /// event(s): a state transition (via the shared `AgentState::apply`) drives
-    /// `StateChanged`; a subagent-list or conversation change drives
-    /// `LayoutChanged`. `None` for an unknown pane (a hook must never fail
-    /// because its pane has gone away).
+    /// the turn it starts, and closes a turn no stop ended (`Turns::prompted`)
+    /// — a sandbox pane's excepted, as `note_transition`'s are. Returns what
+    /// moved so the caller broadcasts the right event(s): a state transition
+    /// (via the shared `AgentState::apply`) drives `StateChanged`; a
+    /// subagent-list or conversation change drives `LayoutChanged`. `None` for
+    /// an unknown pane (a hook must never fail because its pane has gone
+    /// away).
     pub fn apply_agent_event(
         &mut self,
         pane: PaneId,
@@ -845,6 +847,7 @@ impl Session {
         }
         let subs = &mut slot.meta.subagents;
         let mut classified = None;
+        let mut noted = false;
         match event {
             AgentHookEvent::SubagentStarted { id, desc } => {
                 subs.push(SubagentInfo {
@@ -863,8 +866,8 @@ impl Session {
             AgentHookEvent::Activity { .. } => {
                 classified = Some(Observation::Working);
             }
-            AgentHookEvent::Prompt { text } => {
-                slot.turns.set_prompt(text);
+            AgentHookEvent::Prompt { text, id } => {
+                noted = slot.meta.sandbox.is_none() && slot.turns.prompted(id, text);
                 classified = Some(Observation::Working);
             }
             AgentHookEvent::Blocked { .. } => {
@@ -872,6 +875,7 @@ impl Session {
             }
             AgentHookEvent::Done => {
                 classified = Some(Observation::Done);
+                slot.turns.stopped();
                 // The turn ended: sweep the finished subagents that were kept
                 // around only to show their completion.
                 let before = subs.len();
@@ -889,6 +893,7 @@ impl Session {
         Some(AgentEventOutcome {
             transition,
             relisted,
+            noted,
         })
     }
 
@@ -933,7 +938,7 @@ impl Session {
                 }
                 if slot.meta.agent.is_some() {
                     slot.meta.conversation = None;
-                    slot.turns.set_prompt(None);
+                    slot.turns.forget();
                 }
                 let kept = slot.herdr.as_ref().is_none_or(|(_, reporter)| {
                     agent.as_ref().is_some_and(|kind| kind.0 == *reporter)
@@ -1588,6 +1593,9 @@ pub struct AgentEventOutcome {
     /// Whether the subagent list or the conversation changed (so a fresh view
     /// must be broadcast).
     pub relisted: bool,
+    /// Whether the event closed a turn with no state move — a prompt ending
+    /// an interrupted one — so its checkpoint waits for a change probe.
+    pub noted: bool,
 }
 
 /// What `apply_report` changed, so the server broadcasts the right events.
@@ -1984,6 +1992,13 @@ mod tests {
         }
     }
 
+    fn prompt(text: Option<String>, id: &str) -> AgentHookEvent {
+        AgentHookEvent::Prompt {
+            text,
+            id: Some(id.into()),
+        }
+    }
+
     #[test]
     fn hooks_name_the_conversation_and_a_later_one_replaces_it() {
         let (mut s, pane, _tmp) = session_with_pane();
@@ -2104,7 +2119,7 @@ mod tests {
         let (mut s, pane, _tmp) = session_with_pane();
         let workspace = s.workspace_of_pane(pane).unwrap();
         let fix = Some("fix the sidebar".to_string());
-        hook(&mut s, pane, AgentHookEvent::Prompt { text: fix.clone() });
+        hook(&mut s, pane, prompt(fix.clone(), "p1"));
         assert_eq!(state_of(&s, pane), (Working, Some(Hook)));
         hook(&mut s, pane, AgentHookEvent::Done);
         assert_eq!(
@@ -2123,7 +2138,7 @@ mod tests {
         let workspace = s.workspace_of_pane(pane).unwrap();
         s.set_agent(pane, Some("claude".into()));
         let fix = Some("fix the sidebar".to_string());
-        hook(&mut s, pane, AgentHookEvent::Prompt { text: fix });
+        hook(&mut s, pane, prompt(fix, "p1"));
         s.set_agent(pane, None);
         hook(&mut s, pane, AgentHookEvent::Done);
         let noted = s.take_turns(workspace).remove(0).1;
@@ -2131,6 +2146,25 @@ mod tests {
             noted.last(),
             Some(&("done".to_string(), None)),
             "whatever ended the turn later did not answer that prompt"
+        );
+    }
+
+    /// The next prompt closes a turn no Stop ended — Esc sends none — under
+    /// its own prompt, and says so, for the server's change probe.
+    #[test]
+    fn the_next_prompt_closes_an_interrupted_turn() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let workspace = s.workspace_of_pane(pane).unwrap();
+        let fix = Some("fix the sidebar".to_string());
+        hook(&mut s, pane, prompt(fix.clone(), "p1"));
+        s.take_turns(workspace);
+        let outcome = s
+            .apply_agent_event(pane, prompt(Some("try again".into()), "p2"), None)
+            .unwrap();
+        assert!(outcome.noted && outcome.transition.is_none());
+        assert_eq!(
+            s.take_turns(workspace),
+            vec![(pane, vec![("interrupted".to_string(), fix)])]
         );
     }
 
@@ -2623,7 +2657,7 @@ mod tests {
             .record(Some("k1".into()), "k2", "done", fix, 2, &edit)
             .unwrap();
         let busy = Some("add the tests".to_string());
-        s.apply_agent_event(agent, AgentHookEvent::Prompt { text: busy.clone() }, None);
+        s.apply_agent_event(agent, prompt(busy.clone(), "p1"), None);
         let logs = s.tab_new(Some(a)).unwrap();
         s.pane_run(Some(logs), sleep_cmd(), false, None).unwrap();
         s.tab_mut(logs).unwrap().name = "logs".into();

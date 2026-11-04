@@ -75,7 +75,9 @@ pub fn map_opencode_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)>
 /// input has `description`/`title`), `PermissionRequest` among them, fired
 /// the moment Claude would show a permission dialog; `Notification` carries
 /// `message` and `notification_type`; `UserPromptSubmit` carries the
-/// `prompt`; subagent events carry `agent_id`/`agent_type`.
+/// `prompt` and (Claude Code 2.1, verified live) the `prompt_id` every event
+/// of its turn shares — a message typed into a running turn keeps it; subagent
+/// events carry `agent_id`/`agent_type`.
 pub fn map_claude_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
     let event = match v.get("hook_event_name")?.as_str()? {
         // Blocked at once — the `permission_prompt` notification only comes
@@ -123,6 +125,10 @@ pub fn map_claude_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
                 .get("prompt")
                 .and_then(Value::as_str)
                 .and_then(tutti_agents::first_prompt_line),
+            id: v
+                .get("prompt_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         }),
         "SessionStart" => Some(AgentHookEvent::SessionStarted),
         _ => None,
@@ -167,6 +173,7 @@ pub fn map_gemini_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
         "SessionStart" => AgentHookEvent::SessionStarted,
         "BeforeAgent" => AgentHookEvent::Prompt {
             text: text(v, "prompt").and_then(|p| tutti_agents::first_prompt_line(&p)),
+            id: None,
         },
         "BeforeTool" | "AfterTool" => AgentHookEvent::Activity {
             detail: tool_name(v).map(str::to_string),
@@ -742,18 +749,14 @@ mod tests {
         let prompt = |text: &str| {
             ev(&json!({ "hook_event_name": "UserPromptSubmit", "prompt": text }).to_string())
         };
+        let labelled = |text: Option<String>| Some(AgentHookEvent::Prompt { text, id: None });
         assert_eq!(
             prompt("  fix the failing test  \nit is in tests/server.rs"),
-            Some(AgentHookEvent::Prompt {
-                text: Some("fix the failing test".into())
-            })
+            labelled(Some("fix the failing test".into()))
         );
-        let long = "x".repeat(200);
         assert_eq!(
-            prompt(&long),
-            Some(AgentHookEvent::Prompt {
-                text: Some("x".repeat(80))
-            }),
+            prompt(&"x".repeat(200)),
+            labelled(Some("x".repeat(80))),
             "a wall of text is capped to a label"
         );
         for injected in [
@@ -763,13 +766,34 @@ mod tests {
         ] {
             assert_eq!(
                 prompt(injected),
-                Some(AgentHookEvent::Prompt { text: None }),
+                labelled(None),
                 "still a turn, but nothing to label it by: {injected:?}"
             );
         }
         assert_eq!(
             ev(r#"{ "hook_event_name": "UserPromptSubmit" }"#),
-            Some(AgentHookEvent::Prompt { text: None })
+            labelled(None)
+        );
+    }
+
+    /// The payload shaped as Claude Code 2.1.318 sent it live: the prompt's
+    /// id rides along, so a turn can tell more typed into it from the next.
+    #[test]
+    fn a_submitted_prompt_names_its_prompt_id() {
+        assert_eq!(
+            ev(&json!({
+                "session_id": "abc123",
+                "prompt_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+                "cwd": "/srv/api",
+                "permission_mode": "default",
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "then also say hi",
+            })
+            .to_string()),
+            Some(AgentHookEvent::Prompt {
+                text: Some("then also say hi".into()),
+                id: Some("0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9".into()),
+            })
         );
     }
 
@@ -1150,7 +1174,8 @@ mod tests {
             ),
             Some((
                 AgentHookEvent::Prompt {
-                    text: Some("fix the build".into())
+                    text: Some("fix the build".into()),
+                    id: None,
                 },
                 id.clone()
             ))
@@ -1299,7 +1324,8 @@ mod tests {
             ),
             Some((
                 AgentHookEvent::Prompt {
-                    text: Some("fix the build".into())
+                    text: Some("fix the build".into()),
+                    id: None,
                 },
                 id.clone()
             ))

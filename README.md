@@ -1051,9 +1051,12 @@ too — when tutti first detects the agent, or when the pane first enters workin
 When the pane in view has checkpoints, the changes panel grows a `turns`
 section under the files: the newest five, `#N age <turn> +A −B` — the turn
 reads as the first line of the prompt that started it when Claude Code's hooks
-reported one, else as what closed it: `done`, `blocked`, `start`, `restart`,
-`before restore`. A turn that ends blocked keeps its prompt for the work after you
-answer. The cursor walks
+reported one, else as what closed it: `done`, `blocked`, `interrupted`,
+`start`, `restart`, `before restore`. A turn that ends blocked keeps its
+prompt for the work after you answer, and so does one you type more into while
+it runs. A turn you interrupt with `Esc` sends no stop, so tutti closes it — as
+`interrupted`, under its own prompt — when the next prompt arrives with none
+since. The cursor walks
 from the last file on into the turns; `Enter` on a turn pages **that turn's
 diff** (from the checkpoint before it) in an ephemeral pager pane, and `r` asks
 `restore the working copy to #N? y/N`. A restore rewrites the workspace's
@@ -1072,8 +1075,10 @@ turn still running when the daemon stopped is closed where the restore brings
 its pane back, as a `restart` checkpoint listed under the turn's prompt.
 Several agents in one workspace share a working copy, so a pane's turn diff
 includes anything else that changed in that window (another agent's edits, your
-own). A turn interrupted with Esc sends no stop, so its edits land in the next
-turn's checkpoint, under the next prompt. A restore rewrites the working copy
+own). An interrupted turn is checkpointed only once you send the next prompt
+(the agent says nothing until then), so anything changed in between — your
+own edits — joins it, and the pane reads **working** until that prompt. A
+restore rewrites the working copy
 only — work an agent committed stays in history, with `@` carrying the
 reverting change. Workspaces outside jj get no checkpoints.
 
@@ -1408,8 +1413,10 @@ stdin, maps it, and forwards it to the pane's daemon:
 
 - a tool use keeps the agent **working**; a submitted prompt
   (**UserPromptSubmit**) starts a turn, and its first line labels that turn's
-  checkpoint in the [turns](#turns-review-and-undo-one-agent-turn) list;
-  **Stop** marks it **done**;
+  checkpoint in the [turns](#turns-review-and-undo-one-agent-turn) list —
+  unless it carries the running turn's `prompt_id` (you typed more into that
+  turn), and a prompt arriving while a turn is still open closes that one as
+  `interrupted` (Esc sends no Stop); **Stop** marks it **done**;
 - a **PermissionRequest** marks it **blocked** the moment Claude is about to
   ask, naming the tool and its input (`Bash · rm -rf build`); with `approvals =
   "hold"` the request waits for an answer from tutti instead of Claude's dialog
