@@ -1492,8 +1492,8 @@ atomically. The printed snippet already includes the `"hooks"` key — merged by
 hand it goes at the settings.json **top level**. From the TUI, `Ctrl+B i`
 installs the same thing through the setup panel. Installed before prompt labels
 or approvals existed? Re-run `tutti hooks claude --install`: it adds just the
-missing `UserPromptSubmit`, `SessionStart` and `PermissionRequest` entries and
-leaves the rest alone.
+missing `UserPromptSubmit`, `SessionStart`, `PermissionRequest`, `StopFailure`
+and `PostToolUseFailure` entries and leaves the rest alone.
 
 Each wired event runs `tutti agent-event claude`, which reads the hook JSON on
 stdin, maps it, and forwards it to the pane's daemon:
@@ -1505,7 +1505,8 @@ stdin, maps it, and forwards it to the pane's daemon:
   turn), and a prompt arriving while a turn is still open closes that one as
   `interrupted` (Esc sends no Stop); **Stop** marks it **done**, handing tutti
   the turn's final message (`last_assistant_message`), which `tutti pane read
-  --last-reply` and `tutti ask` print;
+  --last-reply` and `tutti ask` print, and **StopFailure** — an API error
+  ended the turn — marks it done with no reply;
 - a **PermissionRequest** marks it **blocked** the moment Claude is about to
   ask, naming the tool and its input (`Bash · rm -rf build`); with `approvals =
   "hold"` the request waits for an answer from tutti instead of Claude's dialog

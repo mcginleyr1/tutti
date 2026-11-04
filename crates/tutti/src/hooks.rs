@@ -103,7 +103,7 @@ pub fn map_claude_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
                 desc,
             })
         }
-        "PreToolUse" | "PostToolUse" => Some(AgentHookEvent::Activity {
+        "PreToolUse" | "PostToolUse" | "PostToolUseFailure" => Some(AgentHookEvent::Activity {
             detail: tool_name(v).map(str::to_string),
         }),
         "SubagentStop" => Some(AgentHookEvent::SubagentStopped { id: subagent_id(v) }),
@@ -131,6 +131,8 @@ pub fn map_claude_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
         "Stop" => Some(AgentHookEvent::Done {
             reply: text(v, "last_assistant_message"),
         }),
+        // An API error ended the turn, with no Stop and no reply.
+        "StopFailure" => Some(AgentHookEvent::Done { reply: None }),
         "UserPromptSubmit" => Some(AgentHookEvent::Prompt {
             text: v
                 .get("prompt")
@@ -375,10 +377,12 @@ pub fn claude_hooks_json() -> Value {
         "hooks": {
             "PreToolUse": with_matcher,
             "PostToolUse": with_matcher,
+            "PostToolUseFailure": with_matcher,
             "PermissionRequest": with_matcher,
             "SubagentStop": with_matcher,
             "Notification": no_matcher,
             "Stop": no_matcher,
+            "StopFailure": no_matcher,
             "UserPromptSubmit": no_matcher,
             "SessionStart": no_matcher,
         }
@@ -442,8 +446,8 @@ const WAITING: &str =
 /// — one in a k8s sandbox. Each hook writes an OSC 7501 report straight to its
 /// terminal, which `kubectl exec -it` carries back to the pane like any other
 /// output, so the image needs only `printf`: a prompt or tool use reports
-/// `working`, a waiting Notification `blocked`, Stop `done`, and SessionEnd
-/// `clear`. Every command is silent and never fails, and writes nothing to
+/// `working`, a waiting Notification `blocked`, Stop (or StopFailure, an API
+/// error) `done`, and SessionEnd `clear`. Every command is silent and never fails, and writes nothing to
 /// stdout (Claude hands a UserPromptSubmit hook's stdout to the model).
 pub fn claude_tty_hooks_json() -> Value {
     let report = |state: &str, matcher: Option<&str>| {
@@ -461,8 +465,10 @@ pub fn claude_tty_hooks_json() -> Value {
             "UserPromptSubmit": report("working", None),
             "PreToolUse": report("working", Some("*")),
             "PostToolUse": report("working", Some("*")),
+            "PostToolUseFailure": report("working", Some("*")),
             "Notification": report("blocked", Some(WAITING)),
             "Stop": report("done", None),
+            "StopFailure": report("done", None),
             "SessionEnd": report("clear", None),
         }
     })
@@ -862,6 +868,23 @@ mod tests {
         }
     }
 
+    /// A turn an API error ends sends `StopFailure`, not `Stop`: it ends the
+    /// turn all the same, with no reply. A tool that fails sends
+    /// `PostToolUseFailure`, not `PostToolUse`: the agent works on.
+    #[test]
+    fn a_failed_turn_ends_and_a_failed_tool_works_on() {
+        assert_eq!(
+            ev(r#"{ "hook_event_name": "StopFailure" }"#),
+            Some(AgentHookEvent::Done { reply: None })
+        );
+        assert_eq!(
+            ev(r#"{ "hook_event_name": "PostToolUseFailure", "tool_name": "Bash" }"#),
+            Some(AgentHookEvent::Activity {
+                detail: Some("Bash".into())
+            })
+        );
+    }
+
     #[test]
     fn a_submitted_prompt_starts_a_turn_labelled_by_its_first_line() {
         let prompt = |text: &str| {
@@ -967,16 +990,18 @@ mod tests {
         for event in [
             "PreToolUse",
             "PostToolUse",
+            "PostToolUseFailure",
             "PermissionRequest",
             "SubagentStop",
             "Notification",
             "Stop",
+            "StopFailure",
             "UserPromptSubmit",
             "SessionStart",
         ] {
             assert!(hooks.get(event).is_some(), "missing {event}");
         }
-        assert_eq!(hooks.as_object().unwrap().len(), 8);
+        assert_eq!(hooks.as_object().unwrap().len(), 10);
         assert_eq!(
             hooks["PermissionRequest"][0]["matcher"], "*",
             "every tool's permission request"
@@ -994,8 +1019,10 @@ mod tests {
             ("UserPromptSubmit", None, "working"),
             ("PreToolUse", Some("*"), "working"),
             ("PostToolUse", Some("*"), "working"),
+            ("PostToolUseFailure", Some("*"), "working"),
             ("Notification", Some(WAITING), "blocked"),
             ("Stop", None, "done"),
+            ("StopFailure", None, "done"),
             ("SessionEnd", None, "clear"),
         ] {
             let group = &hooks[event][0];
@@ -1008,7 +1035,7 @@ mod tests {
                 "{event}"
             );
         }
-        assert_eq!(hooks.len(), 6);
+        assert_eq!(hooks.len(), 8);
         assert_eq!(
             WAITING.split('|').collect::<Vec<_>>(),
             [
@@ -1029,7 +1056,7 @@ mod tests {
     #[test]
     fn merge_installs_into_empty_settings() {
         let (merged, added) = merge_claude_hooks(&json!({})).unwrap().unwrap();
-        assert_eq!(added.len(), 8);
+        assert_eq!(added.len(), 10);
         assert!(merged["hooks"]["Stop"][0]["hooks"][0]["command"] == HOOK_COMMAND);
         assert!(
             merged["hooks"]["UserPromptSubmit"][0]
@@ -1059,7 +1086,13 @@ mod tests {
         added.sort();
         assert_eq!(
             added,
-            ["PermissionRequest", "SessionStart", "UserPromptSubmit"]
+            [
+                "PermissionRequest",
+                "PostToolUseFailure",
+                "SessionStart",
+                "StopFailure",
+                "UserPromptSubmit"
+            ]
         );
         for event in [
             "PreToolUse",
@@ -1493,7 +1526,7 @@ mod tests {
         );
         assert_eq!(
             merge_claude_hooks(&merged).unwrap().unwrap().1.len(),
-            8,
+            10,
             "Codex's hooks are not Claude's"
         );
     }
