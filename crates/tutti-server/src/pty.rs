@@ -2849,6 +2849,22 @@ mod tests {
         assert_eq!(answers, b"\x1b]10;rgb:6565/7b7b/8383\x07");
     }
 
+    /// A clipboard read (OSC 52 `?`) is never answered by the daemon, whose
+    /// client's clipboard it must not hand out (rtty-vt tells of the read as
+    /// `ClipboardRead`, which goes unheard here); it goes on to the taps, as
+    /// any query the daemon leaves, for a `pane attach` terminal's own policy.
+    #[test]
+    fn a_clipboard_read_gets_no_answer_from_the_daemon() {
+        let read: &[u8] = b"\x1b]52;c;?\x07";
+        let (raw, answers, _) = answered(Some(light()), &[read, b"\x1b[c"]);
+        assert_eq!(
+            (raw.as_slice(), answers.as_slice()),
+            (read, &b"\x1b[?62;22c"[..])
+        );
+        let mut term = Term::new(PaneSize::new(3, 20), Some(light()));
+        assert!(term.process(read).signals.is_empty());
+    }
+
     /// A cursor report reads the screen the query lands on: a wrap pending
     /// past the last column reports that column, and the alternate screen
     /// its own cursor.
