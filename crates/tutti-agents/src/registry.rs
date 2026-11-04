@@ -249,15 +249,22 @@ impl Default for Registry {
                 // `--help` (2.1.318): `claude [prompt]` "starts an interactive
                 // session by default".
                 .prompted(&[]),
-                AgentSpec::new(
-                    "codex",
-                    "Codex CLI",
-                    "https://github.com/openai/codex",
-                    &["codex"],
-                    &["Allow command", "approve", "y/n"],
-                    &["esc to interrupt", "Working", "Thinking"],
-                    &["»"],
-                )
+                // `--no-daemon`: Codex's shared app-server (its default since
+                // 0.16x) runs every session's hooks with the environment of
+                // whichever codex started it, so their `TUTTI_PANE` would be
+                // another pane's. Embedded, they are this pane's.
+                AgentSpec {
+                    launch_args: owned(&["--no-daemon"]),
+                    ..AgentSpec::new(
+                        "codex",
+                        "Codex CLI",
+                        "https://github.com/openai/codex",
+                        &["codex"],
+                        &["Allow command", "approve", "y/n"],
+                        &["esc to interrupt", "Working", "Thinking"],
+                        &["»"],
+                    )
+                }
                 // `--help` (0.166.0): `codex [PROMPT]`, "Optional user prompt
                 // to start the session".
                 .prompted(&[]),
@@ -712,7 +719,7 @@ mod tests {
         let argv = |kind: &str| reg.spec(&AgentKind::from(kind))?.prompted_argv("fix it");
         for (kind, expected) in [
             ("claude", &["claude", "fix it"][..]),
-            ("codex", &["codex", "fix it"]),
+            ("codex", &["codex", "--no-daemon", "fix it"]),
             ("gemini", &["gemini", "--prompt-interactive", "fix it"]),
             ("opencode", &["opencode", "--prompt", "fix it"]),
             (

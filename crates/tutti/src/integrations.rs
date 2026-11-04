@@ -1,5 +1,6 @@
-//! The integrations tutti installs: Claude Code's hooks, the opencode plugin,
-//! the tutti skill, and the shell integration's line in the user's rc file.
+//! The integrations tutti installs: Claude Code's and Codex's hooks, the
+//! opencode plugin, the tutti skill, and the shell integration's line in the
+//! user's rc file.
 //! `Integration::plan` inspects one's target file and works out what
 //! installing would change, with no side effects — cheap enough to run
 //! whenever a status is wanted — and `apply` carries a plan out. No stdin or
@@ -22,6 +23,8 @@ pub const SKILL: &str = include_str!("../../../skills/tutti/SKILL.md");
 pub enum Integration {
     /// Claude Code hooks in settings.json, running `tutti agent-event claude`.
     ClaudeHooks,
+    /// Codex hooks in hooks.json, running `tutti agent-event codex`.
+    CodexHooks,
     /// The opencode plugin, piping to `tutti agent-event opencode`.
     OpencodePlugin,
     /// The tutti skill, for Claude Code.
@@ -77,6 +80,8 @@ pub struct Dirs {
     pub home: Option<PathBuf>,
     /// `$XDG_CONFIG_HOME`, which opencode's user plugin dir honours.
     pub xdg_config_home: Option<PathBuf>,
+    /// `$CODEX_HOME`, Codex's user config dir (else `~/.codex`).
+    pub codex_home: Option<PathBuf>,
     /// Install into this project instead of the user's config. A relative
     /// path resolves against the cwd — an empty one is the cwd itself.
     pub project: Option<PathBuf>,
@@ -88,8 +93,8 @@ pub struct Dirs {
 
 impl Dirs {
     /// The user's directories from the environment — `$HOME`,
-    /// `$XDG_CONFIG_HOME`, `$SHELL` and `$ZDOTDIR`, each ignored when empty —
-    /// and no project.
+    /// `$XDG_CONFIG_HOME`, `$CODEX_HOME`, `$SHELL` and `$ZDOTDIR`, each
+    /// ignored when empty — and no project.
     pub fn from_env() -> Dirs {
         let var = |name| {
             std::env::var_os(name)
@@ -99,6 +104,7 @@ impl Dirs {
         Dirs {
             home: var("HOME"),
             xdg_config_home: var("XDG_CONFIG_HOME"),
+            codex_home: var("CODEX_HOME"),
             project: None,
             shell: var("SHELL"),
             zdotdir: var("ZDOTDIR"),
@@ -178,7 +184,21 @@ impl Integration {
             }
         };
         let status = match self {
-            Integration::ClaudeHooks => claude_hooks_status(&path, found.as_deref()),
+            Integration::ClaudeHooks => hooks_status(
+                &path,
+                found.as_deref(),
+                &hooks::claude_hooks_json(),
+                hooks::HOOK_COMMAND,
+                "",
+            ),
+            // Codex skips a new or changed hook until you trust it.
+            Integration::CodexHooks => hooks_status(
+                &path,
+                found.as_deref(),
+                &hooks::codex_hooks_json(),
+                hooks::CODEX_HOOK_COMMAND,
+                " (then trust them in Codex: /hooks)",
+            ),
             Integration::OpencodePlugin => whole_file_status(
                 found.as_deref(),
                 hooks::OPENCODE_PLUGIN,
@@ -203,6 +223,11 @@ impl Integration {
         Ok(match (self, &dirs.project) {
             (Integration::ClaudeHooks, Some(project)) => project.join(".claude/settings.json"),
             (Integration::ClaudeHooks, None) => home()?.join(".claude/settings.json"),
+            (Integration::CodexHooks, Some(project)) => project.join(".codex/hooks.json"),
+            (Integration::CodexHooks, None) => match &dirs.codex_home {
+                Some(codex) => codex.join("hooks.json"),
+                None => home()?.join(".codex/hooks.json"),
+            },
             (Integration::OpencodePlugin, Some(project)) => {
                 project.join(".opencode/plugins/tutti.js")
             }
@@ -269,15 +294,23 @@ pub fn apply(plan: &Plan) -> Result<Option<PathBuf>> {
     Ok(backup)
 }
 
-/// Claude Code's settings.json: the tutti hooks merged into whatever else it
-/// holds, foreign hooks included. With none of tutti's events wired yet it is
-/// `Missing`; with some, `Outdated` (an older install, or a hand-pruned one).
-fn claude_hooks_status(path: &Path, found: Option<&str>) -> Status {
+/// A hooks file nested as Claude Code's settings.json is — Codex's hooks.json
+/// too: tutti's hooks, `ours`, each running `command`, merged into whatever
+/// else it holds, foreign hooks included. With none of tutti's events wired
+/// yet it is `Missing`; with some, `Outdated` (an older install, or a
+/// hand-pruned one). `then` ends the summary: what the tool still asks.
+fn hooks_status(
+    path: &Path,
+    found: Option<&str>,
+    ours: &Value,
+    command: &str,
+    then: &str,
+) -> Status {
     let existing = match found.map(serde_json::from_str::<Value>).transpose() {
         Ok(existing) => existing.unwrap_or(Value::Null),
         Err(e) => return Status::Unreadable(format!("{} is not valid JSON: {e}", path.display())),
     };
-    let (merged, added) = match hooks::merge_claude_hooks(&existing) {
+    let (merged, added) = match hooks::merge_hooks(&existing, ours, command) {
         Ok(Some(merge)) => merge,
         Ok(None) => return Status::Installed,
         Err(e) => return Status::Unreadable(format!("{e:#}")),
@@ -288,15 +321,13 @@ fn claude_hooks_status(path: &Path, found: Option<&str>) -> Status {
         .map_or_else(|| "(no hooks yet)".into(), pretty);
     let change = Change {
         contents: pretty(&merged),
-        summary: format!("adding tutti hooks for {}", added.join(", ")),
+        summary: format!("adding tutti hooks for {}{then}", added.join(", ")),
         preview: format!(
             "--- hooks before ---\n{before}\n--- hooks after ---\n{}\n",
             pretty(&merged["hooks"])
         ),
     };
-    let events = hooks::claude_hooks_json()["hooks"]
-        .as_object()
-        .map_or(0, |hooks| hooks.len());
+    let events = ours["hooks"].as_object().map_or(0, |hooks| hooks.len());
     if added.len() == events {
         Status::Missing(change)
     } else {
@@ -457,6 +488,52 @@ mod tests {
         assert_eq!(
             now, full,
             "the model setting survives, the Stop hook is back"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn codex_hooks_go_in_codex_home_or_the_project_beside_foreign_ones() {
+        let home = temp_home();
+        let path = |dirs: &Dirs| Integration::CodexHooks.plan(dirs).unwrap().path;
+        assert_eq!(path(&user(&home)), home.join(".codex/hooks.json"));
+        let codex_home = Dirs {
+            codex_home: Some(home.join("codex")),
+            ..user(&home)
+        };
+        assert_eq!(path(&codex_home), home.join("codex/hooks.json"));
+
+        let project = Dirs {
+            project: Some(home.join("repo")),
+            ..Dirs::default()
+        };
+        let theirs = serde_json::json!({ "hooks": { "Stop": [
+            { "hooks": [{ "type": "command", "command": "notify-me" }] }
+        ] } });
+        write(&home.join("repo/.codex/hooks.json"), &theirs.to_string());
+        let plan = Integration::CodexHooks.plan(&project).unwrap();
+        assert_eq!(plan.path, home.join("repo/.codex/hooks.json"));
+        let Status::Missing(change) = &plan.status else {
+            panic!("expected missing, got {:?}", plan.status);
+        };
+        assert!(
+            change.summary.starts_with("adding tutti hooks for ")
+                && change
+                    .summary
+                    .ends_with(" (then trust them in Codex: /hooks)"),
+            "{}",
+            change.summary
+        );
+        assert!(apply(&plan).unwrap().is_some(), "theirs is backed up");
+        let now: Value = serde_json::from_str(&text(&plan.path)).unwrap();
+        assert_eq!(now["hooks"]["Stop"][0], theirs["hooks"]["Stop"][0]);
+        assert_eq!(
+            now["hooks"]["Stop"][1]["hooks"][0]["command"],
+            hooks::CODEX_HOOK_COMMAND
+        );
+        assert_eq!(
+            Integration::CodexHooks.plan(&project).unwrap().status,
+            Status::Installed
         );
         let _ = std::fs::remove_dir_all(&home);
     }

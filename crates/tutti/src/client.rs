@@ -181,6 +181,13 @@ pub enum StopOutcome {
     NotRunning,
 }
 
+/// The pid of `session`'s daemon, from the pid file it writes next to its
+/// socket; `None` when none is running.
+pub fn daemon_pid(session: &str) -> Option<u32> {
+    let pidfile = socket_dir().join(format!("{session}.pid"));
+    std::fs::read_to_string(pidfile).ok()?.trim().parse().ok()
+}
+
 /// Launch the daemon. The launched process only re-execs a detached copy of
 /// itself, whose stderr it sends to the session's log (`log_path`); its own
 /// stderr stays ours, so a launch that fails says why.

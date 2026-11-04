@@ -122,14 +122,15 @@ enum Command {
         action: Option<NotesAction>,
     },
     /// Forward an agent's hook event to tutti (reads its JSON on stdin): a
-    /// Claude Code hook payload, or an opencode event from tutti's plugin.
-    /// Wired up by `tutti hooks <agent>`; a silent no-op outside a tutti pane.
+    /// Claude Code or Codex hook payload, or an opencode event from tutti's
+    /// plugin. Wired up by `tutti hooks <agent>`; a silent no-op outside a
+    /// tutti pane.
     AgentEvent {
         #[arg(value_enum)]
         agent: HookAgent,
     },
     /// Print or install the hooks wiring an agent to tutti: Claude Code's
-    /// settings.json hooks, or opencode's plugin.
+    /// settings.json hooks, Codex's hooks.json, or opencode's plugin.
     Hooks {
         #[arg(value_enum)]
         agent: HookAgent,
@@ -145,7 +146,8 @@ enum Command {
         #[arg(long)]
         install: bool,
         /// Install into the project (./.claude/settings.json,
-        /// ./.opencode/plugins/) instead of the user config.
+        /// ./.codex/hooks.json, ./.opencode/plugins/) instead of the user
+        /// config.
         #[arg(long, requires = "install")]
         project: bool,
         /// Skip the confirmation prompt.
@@ -184,6 +186,7 @@ enum Command {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 enum HookAgent {
     Claude,
+    Codex,
     Opencode,
 }
 
@@ -657,17 +660,22 @@ fn run(cli: Cli) -> Result<i32> {
             project,
             yes,
         }) => match (agent, install) {
-            (HookAgent::Opencode, _) if tty => {
-                bail!("--tty is for claude: opencode reports through its plugin")
+            (HookAgent::Codex | HookAgent::Opencode, _) if tty => {
+                bail!("--tty is for claude: a sandbox image bakes in Claude Code's hooks")
             }
             (HookAgent::Claude, true) => {
                 install_integration(Integration::ClaudeHooks, project, yes)
             }
+            (HookAgent::Codex, true) => install_integration(Integration::CodexHooks, project, yes),
             (HookAgent::Opencode, true) => {
                 install_integration(Integration::OpencodePlugin, project, yes)
             }
             (HookAgent::Claude, false) => {
                 emit_hooks(raw, tty);
+                Ok(0)
+            }
+            (HookAgent::Codex, false) => {
+                emit_codex_hooks(raw);
                 Ok(0)
             }
             (HookAgent::Opencode, false) => {
@@ -1388,6 +1396,19 @@ fn run_agent_event(session: &str, agent: HookAgent) -> Result<i32> {
     };
     // The pane's own daemon owns the socket; the env var wins over the -s value.
     let session = std::env::var("TUTTI_SESSION").unwrap_or_else(|_| session.to_string());
+    // Codex's shared app-server runs hooks with the environment of whichever
+    // codex started it (observed live: another pane's events landed on the
+    // first), so its `TUTTI_PANE` may name a pane this hook is not from.
+    if agent == HookAgent::Codex
+        && let Some(daemon) = client::daemon_pid(&session)
+        && !beneath(daemon)
+    {
+        eprintln!(
+            "tutti agent-event: Codex ran this hook in its shared app-server, outside \
+             any tutti pane; run codex with --no-daemon inside tutti"
+        );
+        return Ok(0);
+    }
     let mut input = String::new();
     if std::io::stdin().read_to_string(&mut input).is_err() {
         return Ok(0);
@@ -1397,6 +1418,7 @@ fn run_agent_event(session: &str, agent: HookAgent) -> Result<i32> {
     };
     let mapped = match agent {
         HookAgent::Claude => hooks::map_claude_event(&value),
+        HookAgent::Codex => hooks::map_codex_event(&value),
         HookAgent::Opencode => hooks::map_opencode_event(&value),
     };
     let Some((event, conversation)) = mapped else {
@@ -1434,6 +1456,24 @@ fn run_agent_event(session: &str, agent: HookAgent) -> Result<i32> {
         ),
     }
     Ok(0)
+}
+
+/// Whether this process runs beneath `daemon` — in one of its panes, as an
+/// agent's hook does — walking up its ancestors.
+fn beneath(daemon: u32) -> bool {
+    use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut sys = System::new();
+    let mut pid = Pid::from_u32(std::process::id());
+    loop {
+        let only = [pid];
+        let nothing = ProcessRefreshKind::nothing();
+        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&only), false, nothing);
+        match sys.process(pid).and_then(Process::parent) {
+            Some(parent) if parent.as_u32() == daemon => return true,
+            Some(parent) if parent != pid => pid = parent,
+            _ => return false,
+        }
+    }
 }
 
 /// How long a permission request is held under `approvals = "hold"`, `None`
@@ -1553,6 +1593,19 @@ fn emit_hooks(raw: bool, tty: bool) {
     }
 }
 
+/// Print Codex's hooks.json: the JSON to stdout, plus — unless `--raw` —
+/// where it goes on stderr, so the JSON pipes cleanly on its own.
+fn emit_codex_hooks(raw: bool) {
+    let snippet = serde_json::to_string_pretty(&hooks::codex_hooks_json());
+    println!("{}", snippet.expect("hooks snippet serializes"));
+    if !raw {
+        eprintln!("# Merge the object above into ~/.codex/hooks.json ($CODEX_HOME honoured;");
+        eprintln!("# .codex/hooks.json in a project) — or let tutti do it: `tutti hooks");
+        eprintln!("# codex --install`. Codex skips a new hook until you trust it: open");
+        eprintln!("# /hooks in Codex once. Outside a tutti pane the hook does nothing.");
+    }
+}
+
 /// Print the opencode plugin: the JavaScript to stdout, plus — unless `--raw` —
 /// where it goes on stderr, so the plugin pipes cleanly on its own.
 fn emit_opencode_plugin(raw: bool) {
@@ -1588,9 +1641,9 @@ fn install_integration(integration: Integration, project: bool, yes: bool) -> Re
     };
     let plan = integration.plan(&dirs)?;
     let path = plan.path.display();
-    // Hooks merge into a file of Claude's; the plugin and skill are files of tutti's.
+    // Hooks merge into a file of the tool's; the plugin and skill are files of tutti's.
     let (noun, the, at) = match integration {
-        Integration::ClaudeHooks => ("hooks", "", "in"),
+        Integration::ClaudeHooks | Integration::CodexHooks => ("hooks", "", "in"),
         Integration::OpencodePlugin => ("plugin", "the ", "at"),
         Integration::Skill => ("skill", "the ", "at"),
         Integration::ShellInit => ("shell integration", "", "in"),
@@ -2962,8 +3015,36 @@ mod tests {
                 ..
             })
         ));
+        assert!(matches!(
+            Cli::try_parse_from(["tutti", "agent-event", "codex"])
+                .unwrap()
+                .command,
+            Some(Command::AgentEvent {
+                agent: HookAgent::Codex
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["tutti", "hooks", "codex", "--install", "--project"])
+                .unwrap()
+                .command,
+            Some(Command::Hooks {
+                agent: HookAgent::Codex,
+                install: true,
+                project: true,
+                ..
+            })
+        ));
         // An unknown agent is rejected at parse time.
-        assert!(Cli::try_parse_from(["tutti", "agent-event", "codex"]).is_err());
+        assert!(Cli::try_parse_from(["tutti", "agent-event", "aider"]).is_err());
+    }
+
+    /// What keeps a hook run by Codex's shared app-server off the pane its
+    /// environment names: only a process beneath the daemon is in a pane.
+    #[test]
+    fn a_process_is_beneath_its_ancestors_only() {
+        assert!(beneath(std::os::unix::process::parent_id()));
+        assert!(!beneath(std::process::id()), "not beneath itself");
+        assert!(!beneath(u32::MAX));
     }
 
     #[test]

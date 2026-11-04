@@ -65,8 +65,9 @@ Optional finishing touches:
 - `tutti hooks claude --install` upgrades Claude Code state detection from
   screen heuristics to exact hook signals — recommended; see
   [Claude Code integration](#claude-code-integration). It shows the merge and
-  asks before touching `~/.claude/settings.json`. `tutti hooks opencode
-  --install` does the same for opencode via a plugin — see
+  asks before touching `~/.claude/settings.json`. `tutti hooks codex
+  --install` does the same for Codex — see [Codex integration](#codex-integration)
+  — and `tutti hooks opencode --install` for opencode via a plugin — see
   [opencode integration](#opencode-integration).
 - `tutti skill --install` gives the Claude Code agents in your panes the tutti
   skill, so they can start and coordinate sub-agents of their own — see
@@ -1276,7 +1277,7 @@ name, or a node program's script — Gemini CLI runs as `node …/gemini`.
 A pane's state can come from five sources, ranked highest first:
 
 1. **hook** — the agent's own exact lifecycle signals: its hooks (`tutti hooks
-   claude`, `tutti hooks opencode`) or a
+   claude`, `tutti hooks codex`, `tutti hooks opencode`) or a
    [herdr report](#herdr-compatible-reporting).
 2. **program** — the pane's program reporting itself with OSC 7501.
 3. **progress** — an OSC 9;4 progress report (ConEmu / Windows Terminal /
@@ -1434,6 +1435,52 @@ Hooks are ground truth: once a pane reports one, its state is the hook's alone
 7501 reports are ignored (see [Agent state sources](#agent-state-sources)).
 Agent **detection** (which kind of agent runs there) is unaffected, so the badge
 still appears. Display only — tutti never manages a foreign agent's subagents.
+
+## Codex integration
+
+Codex's hooks speak Claude Code's schema, so Codex reports to tutti the same
+way. Install them (shows the before/after merge and asks first):
+
+```
+tutti hooks codex --install            # merge into ~/.codex/hooks.json ($CODEX_HOME honoured)
+tutti hooks codex --install --project  # …into ./.codex/hooks.json instead
+tutti hooks codex --install --yes      # skip the confirmation (scripts)
+tutti hooks codex                      # or just print the hooks.json…
+tutti hooks codex --raw                # …as bare JSON, for piping
+```
+
+`--install` keeps everything else in the file, is idempotent, backs the old
+file up to `hooks.json.bak`, and writes atomically; `Ctrl+B i` installs the
+same through the setup panel. **Then trust them in Codex**: it skips a new or
+changed hook until you do — open `/hooks` in Codex (it also offers a review
+when it starts) and trust tutti's `tutti agent-event codex` entries. A project
+install also needs the project trusted, which Codex asks the first time it
+opens there.
+
+Each wired event runs `tutti agent-event codex` (verified live against
+codex-cli 0.166.0):
+
+- a tool use keeps the agent **working**; a submitted prompt
+  (**UserPromptSubmit**) starts a turn and labels its checkpoint; **Stop** —
+  or **Interrupt**, as an interrupted turn sends no Stop — marks it **done**;
+- a **PermissionRequest** marks it **blocked**, naming the command (`Bash ·
+  touch hello.txt`); with `approvals = "hold"` it is held as Claude's is, the
+  answer going back as the decision object Codex's hooks reference documents
+  (see [Held approvals](#held-approvals));
+- **SessionStart** and every event's `session_id` record the conversation —
+  resumable with `codex resume --no-daemon <id>` and revived by a
+  [restore](#restoring-after-a-restart);
+- **SubagentStart**/**SubagentStop** add and complete a subagent sub-row.
+
+**Run codex with `--no-daemon` inside tutti** — the launcher, `issue deploy`
+and a restore do. By default Codex runs its sessions in a shared background
+app-server, which runs every session's hooks with the environment of
+whichever codex started it: their `TUTTI_PANE` names that first pane, and
+another pane's events would land on it. `agent-event codex` therefore drops an
+event unless the session's tutti-server is among its ancestors, with a note on
+stderr; such a pane falls back to screen detection. (Passing Codex a `-c`
+override also keeps it embedded.) Otherwise `agent-event codex` is fail-safe
+as Claude's is.
 
 ## opencode integration
 
@@ -1723,12 +1770,12 @@ tutti issue list [--source <name>]   # every configured tracker's open issues (-
 tutti issue deploy <source> <id> [--agent claude] [--project <id>] [--here] [--sandbox <profile>]  # an agent on the issue, in its own workspace; prints the pane id, then writes back as the source opts in
 tutti notes [--unread]               # the notification history, newest first
 tutti notes read [--up-to <id>] [--pane <id>] | clear  # mark notes read (all, or narrowed) / empty the history
-tutti hooks claude|opencode [--raw]  # print the Claude Code hooks snippet / the opencode plugin
-tutti hooks claude|opencode --install [--project] [--yes]  # install them (shows the change, asks first)
+tutti hooks claude|codex|opencode [--raw]  # print the Claude Code or Codex hooks / the opencode plugin
+tutti hooks claude|codex|opencode --install [--project] [--yes]  # install them (shows the change, asks first)
 tutti hooks claude --tty [--raw]     # print Claude hooks that report over OSC 7501 to /dev/tty — for sandbox images
 tutti skill [--raw]                  # print the tutti skill (a Claude Code SKILL.md)
 tutti skill --install [--project] [--yes]  # install it into ~/.claude/skills/tutti/ (or ./.claude/skills/tutti/)
-tutti agent-event claude|opencode    # forward an agent hook event (JSON on stdin) — used by the hooks/plugin
+tutti agent-event claude|codex|opencode  # forward an agent hook event (JSON on stdin) — used by the hooks/plugin
 tutti edit <path>[:<line>[:<col>]] [--workspace <id>]  # open in the workspace's editor pane (TUTTI_EDITOR) and focus it; returns at once
 tutti shell-init zsh|bash|fish       # print the shell integration (OSC 7 cwd + OSC 133 marks) for your rc file
 tutti watch                          # JSON-line snapshots of every pane's state, one per change (read-only; never starts a daemon)

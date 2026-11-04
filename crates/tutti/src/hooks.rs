@@ -1,10 +1,10 @@
-//! Agent hook integrations: map a Claude Code hook-event JSON object, or an
-//! opencode bus event forwarded by tutti's opencode plugin (each delivered on
-//! `tutti agent-event`'s stdin), to a tutti `AgentHookEvent` and the agent's
-//! own conversation id; print the settings.json snippet that wires Claude
-//! Code's events to `tutti agent-event claude` (or, for a sandbox image,
-//! straight to the terminal as OSC 7501), and the opencode plugin that pipes
-//! to `tutti agent-event opencode`.
+//! Agent hook integrations: map a Claude Code or Codex hook-event JSON
+//! object, or an opencode bus event forwarded by tutti's opencode plugin
+//! (each delivered on `tutti agent-event`'s stdin), to a tutti
+//! `AgentHookEvent` and the agent's own conversation id; print the hooks
+//! snippets that wire each tool's events to `tutti agent-event <agent>` (or,
+//! for Claude in a sandbox image, straight to the terminal as OSC 7501), and
+//! the opencode plugin that pipes to `tutti agent-event opencode`.
 //!
 //! The mappings read only the fields tutti reacts to and ignore everything else,
 //! so they tolerate each tool's evolving schema. They never fail: an
@@ -16,6 +16,8 @@ use tutti_core::{AgentHookEvent, ApprovalDecision};
 
 /// The command a hook runs; also the addressable verb this module documents.
 pub const HOOK_COMMAND: &str = "tutti agent-event claude";
+/// The command Codex's hooks run.
+pub const CODEX_HOOK_COMMAND: &str = "tutti agent-event codex";
 
 /// The opencode plugin `tutti hooks opencode` prints and installs.
 pub const OPENCODE_PLUGIN: &str = include_str!("opencode_plugin.js");
@@ -129,6 +131,34 @@ pub fn map_claude_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     Some((event, conversation))
+}
+
+/// Map one Codex hook event. Codex's hooks speak Claude Code's schema —
+/// observed live from codex-cli 0.166.0: the same `hook_event_name`,
+/// `session_id` (the UUID `codex resume` takes), `prompt`, and `tool_name`/
+/// `tool_input` (`Bash` with its `command`, a `PermissionRequest`'s
+/// `description` beside it) — so it maps as Claude's does, plus the two
+/// events Codex adds: `Interrupt` ends the turn, as no `Stop` follows an
+/// interrupted one, and `SubagentStart` opens a subagent row under its
+/// `agent_id`, which its `SubagentStop` names again.
+pub fn map_codex_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
+    let event = match v.get("hook_event_name")?.as_str()? {
+        "Interrupt" => AgentHookEvent::Done,
+        "SubagentStart" => AgentHookEvent::SubagentStarted {
+            id: subagent_id(v),
+            desc: text(v, "agent_type").unwrap_or_else(|| "subagent".into()),
+        },
+        _ => return map_claude_event(v),
+    };
+    Some((event, text(v, "session_id")))
+}
+
+/// A non-empty string field of an event.
+fn text(v: &Value, field: &str) -> Option<String> {
+    v.get(field)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 fn tool_name(v: &Value) -> Option<&str> {
@@ -265,6 +295,30 @@ pub fn claude_hooks_snippet() -> String {
     serde_json::to_string_pretty(&claude_hooks_json()).expect("hooks snippet serializes")
 }
 
+/// Codex's hooks.json wiring every relevant event to `tutti agent-event
+/// codex`. Tool and subagent events take the match-all matcher; the rest
+/// take none (Codex ignores one on prompts, stops and interrupts). An
+/// `Interrupt` hook gets 1s unless it asks for more (3s at most): the round
+/// trip to the daemon may take up to its 2s deadline.
+pub fn codex_hooks_json() -> Value {
+    let cmd = json!({ "type": "command", "command": CODEX_HOOK_COMMAND });
+    let every_tool = json!([{ "matcher": "*", "hooks": [cmd] }]);
+    let every = json!([{ "hooks": [cmd] }]);
+    json!({
+        "hooks": {
+            "SessionStart": every,
+            "UserPromptSubmit": every,
+            "PreToolUse": every_tool,
+            "PostToolUse": every_tool,
+            "PermissionRequest": every_tool,
+            "SubagentStart": every_tool,
+            "SubagentStop": every_tool,
+            "Stop": every,
+            "Interrupt": [{ "hooks": [{ "type": "command", "command": CODEX_HOOK_COMMAND, "timeout": 3 }] }],
+        }
+    })
+}
+
 /// The Notification types that wait on you, as the `--tty` hooks' matcher. A
 /// matcher can only name types, so an unknown one cannot read as blocked the
 /// way it does through `tutti agent-event`.
@@ -307,14 +361,25 @@ pub fn claude_tty_hooks_json() -> Value {
 /// settings keys and foreign hook entries are preserved untouched; a
 /// non-object `settings` or `hooks` value is a hard error rather than a guess.
 pub fn merge_claude_hooks(settings: &Value) -> anyhow::Result<Option<(Value, Vec<String>)>> {
+    merge_hooks(settings, &claude_hooks_json(), HOOK_COMMAND)
+}
+
+/// `merge_claude_hooks` for any tool whose hooks file nests as Claude's
+/// does — `{"hooks": {event: [{matcher?, hooks: [{command}]}]}}`, as Codex's
+/// hooks.json does: `ours` merged in, an event counting as wired once a
+/// group of it runs `command`.
+pub fn merge_hooks(
+    settings: &Value,
+    ours: &Value,
+    command: &str,
+) -> anyhow::Result<Option<(Value, Vec<String>)>> {
     use anyhow::bail;
 
     let mut merged = match settings {
         Value::Null => json!({}),
         Value::Object(_) => settings.clone(),
-        other => bail!("settings.json root is not an object: {other}"),
+        other => bail!("the file's root is not an object: {other}"),
     };
-    let ours = claude_hooks_json();
     let ours = ours["hooks"].as_object().expect("snippet has hooks");
 
     let hooks_slot = merged
@@ -332,7 +397,7 @@ pub fn merge_claude_hooks(settings: &Value) -> anyhow::Result<Option<(Value, Vec
         let Value::Array(existing) = slot else {
             bail!("existing hooks entry for {event} is not an array");
         };
-        if existing.iter().any(has_tutti_hook) {
+        if existing.iter().any(|group| has_tutti_hook(group, command)) {
             continue;
         }
         existing.extend(groups.as_array().expect("snippet groups").iter().cloned());
@@ -344,15 +409,15 @@ pub fn merge_claude_hooks(settings: &Value) -> anyhow::Result<Option<(Value, Vec
     Ok(Some((merged, added)))
 }
 
-/// Whether a hook group already runs the tutti command.
-fn has_tutti_hook(group: &Value) -> bool {
+/// Whether a hook group already runs the tutti `command`.
+fn has_tutti_hook(group: &Value, command: &str) -> bool {
     group
         .get("hooks")
         .and_then(Value::as_array)
         .is_some_and(|hooks| {
             hooks
                 .iter()
-                .any(|h| h.get("command").and_then(Value::as_str) == Some(HOOK_COMMAND))
+                .any(|h| h.get("command").and_then(Value::as_str) == Some(command))
         })
 }
 
@@ -1003,6 +1068,156 @@ mod tests {
             let payload = format!(r#"{{"type":"{event}","properties":{sample}}}"#);
             assert!(oc(&payload).is_some(), "the mapper handles {event}");
         }
+    }
+
+    /// A Codex hook payload as codex-cli 0.166.0 sends it (observed live; ids
+    /// and paths made up), with `fields` on top.
+    fn codex(event: &str, fields: Value) -> Option<(AgentHookEvent, Option<String>)> {
+        let mut payload = json!({
+            "session_id": "01a1a704-0000-7000-8000-000000000001",
+            "turn_id": "01a1a708-0000-7000-8000-000000000002",
+            "transcript_path": "/home/u/.codex/sessions/2026/11/04/rollout-1.jsonl",
+            "cwd": "/srv/api",
+            "hook_event_name": event,
+            "model": "a-model",
+            "permission_mode": "default",
+        });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        map_codex_event(&payload)
+    }
+
+    #[test]
+    fn codex_events_map_as_claudes_naming_the_session() {
+        let id = Some("01a1a704-0000-7000-8000-000000000001".to_string());
+        assert_eq!(
+            codex("SessionStart", json!({ "source": "startup" })),
+            Some((AgentHookEvent::SessionStarted, id.clone()))
+        );
+        assert_eq!(
+            codex(
+                "UserPromptSubmit",
+                json!({ "prompt": "fix the build\nit is red" })
+            ),
+            Some((
+                AgentHookEvent::Prompt {
+                    text: Some("fix the build".into())
+                },
+                id.clone()
+            ))
+        );
+        let bash = json!({ "tool_name": "Bash", "tool_input": { "command": "ls" }, "tool_use_id": "exec-1" });
+        let working = Some((
+            AgentHookEvent::Activity {
+                detail: Some("Bash".into()),
+            },
+            id.clone(),
+        ));
+        assert_eq!(codex("PreToolUse", bash.clone()), working);
+        let mut ran = bash.clone();
+        ran["tool_response"] = json!("notes.txt\n");
+        assert_eq!(codex("PostToolUse", ran), working);
+        assert_eq!(
+            codex(
+                "PermissionRequest",
+                json!({ "tool_name": "Bash", "tool_input": {
+                    "command": "touch hello.txt",
+                    "description": "Allow creating hello.txt in the workspace?"
+                } })
+            ),
+            Some((
+                AgentHookEvent::Blocked {
+                    message: Some("Bash · touch hello.txt".into())
+                },
+                id.clone()
+            ))
+        );
+        let stop = json!({ "stop_hook_active": false, "last_assistant_message": "ok" });
+        assert_eq!(
+            codex("Stop", stop),
+            Some((AgentHookEvent::Done, id.clone()))
+        );
+        assert_eq!(codex("SessionEnd", json!({ "reason": "other" })), None);
+    }
+
+    /// An interrupted turn sends `Interrupt` and never `Stop` (observed
+    /// live), so it ends the turn.
+    #[test]
+    fn a_codex_interrupt_ends_the_turn() {
+        assert_eq!(
+            codex("Interrupt", json!({})).map(|(event, _)| event),
+            Some(AgentHookEvent::Done)
+        );
+    }
+
+    #[test]
+    fn codex_subagents_open_and_close_a_row_under_their_agent_id() {
+        let started = codex(
+            "SubagentStart",
+            json!({ "agent_id": "agent-7", "agent_type": "explorer" }),
+        );
+        assert_eq!(
+            started.map(|(event, _)| event),
+            Some(AgentHookEvent::SubagentStarted {
+                id: "agent-7".into(),
+                desc: "explorer".into(),
+            })
+        );
+        let stopped = codex(
+            "SubagentStop",
+            json!({ "agent_id": "agent-7", "agent_type": "explorer", "last_assistant_message": "done" }),
+        );
+        assert_eq!(
+            stopped.map(|(event, _)| event),
+            Some(AgentHookEvent::SubagentStopped {
+                id: "agent-7".into()
+            })
+        );
+    }
+
+    #[test]
+    fn codex_hooks_wire_every_event_to_agent_event_codex() {
+        let value = codex_hooks_json();
+        let hooks = value["hooks"].as_object().unwrap();
+        for (event, matcher) in [
+            ("SessionStart", None),
+            ("UserPromptSubmit", None),
+            ("PreToolUse", Some("*")),
+            ("PostToolUse", Some("*")),
+            ("PermissionRequest", Some("*")),
+            ("SubagentStart", Some("*")),
+            ("SubagentStop", Some("*")),
+            ("Stop", None),
+            ("Interrupt", None),
+        ] {
+            let group = &hooks[event][0];
+            assert_eq!(group["matcher"].as_str(), matcher, "{event}");
+            assert_eq!(group["hooks"][0]["command"], CODEX_HOOK_COMMAND, "{event}");
+            let payload = json!({ "hook_event_name": event });
+            assert!(map_codex_event(&payload).is_some(), "{event} maps");
+        }
+        assert_eq!(hooks.len(), 9);
+        assert_eq!(
+            hooks["Interrupt"][0]["hooks"][0]["timeout"], 3,
+            "room for the daemon's round trip"
+        );
+
+        let (merged, added) = merge_hooks(&json!({}), &value, CODEX_HOOK_COMMAND)
+            .unwrap()
+            .unwrap();
+        assert_eq!(added.len(), 9);
+        assert!(
+            merge_hooks(&merged, &value, CODEX_HOOK_COMMAND)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            merge_claude_hooks(&merged).unwrap().unwrap().1.len(),
+            8,
+            "Codex's hooks are not Claude's"
+        );
     }
 
     #[test]

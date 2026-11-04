@@ -321,7 +321,7 @@ mod tests {
         );
         assert_eq!(pane(1, Some("claude"), None).revive(), None);
         assert_eq!(pane(1, None, Some("c1")).revive(), None);
-        assert_eq!(pane(1, Some("codex"), Some("c1")).revive(), None);
+        assert_eq!(pane(1, Some("aider"), Some("c1")).revive(), None);
     }
 
     #[test]

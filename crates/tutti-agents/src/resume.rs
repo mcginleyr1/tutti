@@ -63,16 +63,19 @@ impl Stores {
 /// The argv that resumes `agent`'s conversation `id` in a fresh pane — each
 /// tool's own recipe — or `None` for an agent without one tutti knows.
 /// opencode's is from its `--help` (1.18.5: `-s, --session  session id to
-/// continue`); it is not harvested, but its plugin reports the id.
+/// continue`), Codex's from its own (0.166.0: `codex resume [SESSION_ID]`,
+/// the UUID its hooks name, embedded as the registry launches it); neither
+/// is harvested, but their hooks report the id.
 pub fn resume_cmd(agent: &str, id: &str) -> Option<Vec<String>> {
-    let cmd = match agent {
-        "claude" => ["claude", "--resume", id],
-        "muse" => ["muse", "resume", id],
-        "vibe" => ["vibe", "--resume", id],
-        "opencode" => ["opencode", "--session", id],
+    let cmd: &[&str] = match agent {
+        "claude" => &["claude", "--resume", id],
+        "codex" => &["codex", "resume", "--no-daemon", id],
+        "muse" => &["muse", "resume", id],
+        "vibe" => &["vibe", "--resume", id],
+        "opencode" => &["opencode", "--session", id],
         _ => return None,
     };
-    Some(cmd.map(String::from).into())
+    Some(cmd.iter().map(|arg| arg.to_string()).collect())
 }
 
 /// The resumable conversations for the project at `dir` across every harvested
@@ -654,7 +657,8 @@ mod tests {
         assert_eq!(cmd("muse"), ["muse", "resume", "s1"]);
         assert_eq!(cmd("vibe"), ["vibe", "--resume", "s1"]);
         assert_eq!(cmd("opencode"), ["opencode", "--session", "s1"]);
-        assert_eq!(resume_cmd("codex", "s1"), None, "no recipe known");
+        assert_eq!(cmd("codex"), ["codex", "resume", "--no-daemon", "s1"]);
+        assert_eq!(resume_cmd("aider", "s1"), None, "no recipe known");
     }
 
     #[test]
