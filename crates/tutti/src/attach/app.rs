@@ -466,8 +466,10 @@ pub struct App {
     /// What the reply to each tagged request in flight completes, keyed by the
     /// `req` it rode out with: a guided create's jump and launcher, a merge's
     /// cleanup offer. Only that request's own reply — a refusal included —
-    /// completes or cancels one.
-    pending: HashMap<u64, FollowUp>,
+    /// completes or cancels one, unless its deadline passes first
+    /// (`expire_follow_ups`). Each goes with when it went out, and how long
+    /// the CLI would wait on its request (`client::deadline`).
+    pending: HashMap<u64, (FollowUp, Instant, Duration)>,
     /// The `req` of the last tagged request; the attach rides out as 0.
     last_req: u64,
     /// Whether the daemon predates request tags (wire rev 8): it answered the
@@ -1195,7 +1197,10 @@ impl App {
                 // refused answer leaves a merge's cleanup offer standing. An old
                 // daemon names no request, so its refusal cancels them all.
                 let mounted = match req {
-                    Some(req) => self.pending.remove(&req) == Some(FollowUp::Mount),
+                    Some(req) => self
+                        .pending
+                        .remove(&req)
+                        .is_some_and(|(follow_up, ..)| follow_up == FollowUp::Mount),
                     None if self.old_daemon => {
                         self.pending.clear();
                         true
@@ -1216,8 +1221,27 @@ impl App {
     /// that reply alone — a refusal included — completes or cancels it.
     fn follow(&mut self, request: &Request, follow_up: FollowUp) -> WireFrame {
         self.last_req += 1;
-        self.pending.insert(self.last_req, follow_up);
+        let deadline = crate::client::deadline(request).unwrap_or(Duration::MAX);
+        self.pending
+            .insert(self.last_req, (follow_up, Instant::now(), deadline));
         tagged(request, self.last_req)
+    }
+
+    /// Give up on each follow-up whose daemon has not answered by its
+    /// request's deadline, as on that request's refusal: its status says so,
+    /// and a reply coming later completes nothing. Whether any was given up.
+    pub fn expire_follow_ups(&mut self, now: Instant) -> bool {
+        let overdue: Vec<(u64, Duration)> = self
+            .pending
+            .iter()
+            .filter(|(_, (_, sent, deadline))| now.saturating_duration_since(*sent) >= *deadline)
+            .map(|(req, (_, _, deadline))| (*req, *deadline))
+            .collect();
+        for &(req, deadline) in &overdue {
+            let message = format!("tutti-server did not answer within {}s", deadline.as_secs());
+            self.handle_response(Some(req), Response::Error { message });
+        }
+        !overdue.is_empty()
     }
 
     /// The follow-up a reply completes: the one its `req` keys — or, from an
@@ -1232,12 +1256,12 @@ impl App {
             None if self.old_daemon => *self
                 .pending
                 .iter()
-                .filter(|(_, f)| fits(f))
+                .filter(|(_, (f, ..))| fits(f))
                 .map(|(req, _)| req)
                 .min()?,
             None => return None,
         };
-        self.pending.remove(&req)
+        self.pending.remove(&req).map(|(follow_up, ..)| follow_up)
     }
 
     /// Reconcile the pane/tab tree with a fresh view: update pane metadata, drop
@@ -9020,6 +9044,41 @@ mod tests {
         ));
         app.handle_frame(reply(2, merged()));
         assert_eq!(app.mode, Mode::Sidebar);
+    }
+
+    /// A follow-up its daemon leaves unanswered past its request's deadline
+    /// (the CLI's: three minutes for a merge) is given up on, saying so: a
+    /// `Merged` landing later offers no cleanup.
+    #[test]
+    fn a_follow_up_the_daemon_leaves_unanswered_times_out() {
+        let mut app = App::new();
+        let mut view = view_two_workspaces();
+        view[1].parent = Some(WorkspaceId(1));
+        attach_with(&mut app, view);
+        focus_sidebar(&mut app);
+        app.on_key(plain('j'));
+        app.on_key(plain('m'));
+        app.on_key(plain('y')); // the merge rides out as req 1
+
+        let sent = Instant::now();
+        assert!(!app.expire_follow_ups(sent + Duration::from_secs(179)));
+        assert!(app.expire_follow_ups(sent + Duration::from_secs(181)));
+        assert!(
+            app.transient()
+                .is_some_and(|t| t.contains("did not answer within 180s")),
+            "{:?}",
+            app.transient()
+        );
+        assert!(!app.expire_follow_ups(sent + Duration::from_secs(400)));
+
+        app.handle_frame(reply(
+            1,
+            Response::Merged {
+                pushed: false,
+                bookmark: "main".into(),
+            },
+        ));
+        assert_eq!(app.mode, Mode::Sidebar, "a late answer completes nothing");
     }
 
     /// Only add-project's own refusal disarms its jump to the new tab.

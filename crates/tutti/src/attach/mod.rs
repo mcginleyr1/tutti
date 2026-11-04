@@ -310,6 +310,12 @@ fn event_loop(
             dirty = true;
         }
 
+        // A follow-up the daemon leaves unanswered past its deadline is given
+        // up on, as the CLI gives up on its request.
+        if app.expire_follow_ups(Instant::now()) {
+            dirty = true;
+        }
+
         // The which-key popup appears purely on elapsed time; redraw when its
         // visibility flips even without any input event.
         if app.whichkey_visible() != whichkey {

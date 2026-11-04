@@ -109,8 +109,9 @@ impl Client {
 /// up on it: `None` for one that answers when something happens (a wait, an
 /// approval hold). The daemon answers anything else from memory at once, but
 /// what it runs jj for only within its jj runs' own caps (a merge's eight
-/// steps, 15 s apiece, the longest).
-fn deadline(request: &Request) -> Option<Duration> {
+/// steps, 15 s apiece, the longest). The TUI gives up on its follow-ups by
+/// the same deadlines (`App::expire_follow_ups`).
+pub fn deadline(request: &Request) -> Option<Duration> {
     match request {
         Request::PaneWait { .. } | Request::ApprovalHold { .. } => None,
         Request::WorkspaceFork { .. }

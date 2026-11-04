@@ -1987,6 +1987,9 @@ not answer within 10s`), or within 3 minutes for one the daemon runs jj for:
 `workspace add`, `merge`, `update`, `diff` and `kill --discard`, `sandbox
 pull`, `pane checkpoint-diff` and `restore`. `pane wait` and `ask` wait as
 long as their `--timeout`, and `watch` and attach as long as the daemon lives.
+The TUI gives up on what it waits to follow up — a project or workspace add,
+a merge, a deploy, a sandbox pull, a last reply — at the same deadlines, and
+says so on its status line.
 
 `--json` on any verb emits the raw protocol response for scripting. A
 project's id works anywhere a workspace id does (`run --workspace`, `tab new
