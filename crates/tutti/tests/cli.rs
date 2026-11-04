@@ -1097,6 +1097,7 @@ fn watch_prints_snapshot_lines_until_the_daemon_goes() {
             user_vars: Default::default(),
             cwd: None,
             approval: None,
+            issue: None,
         }],
     };
     let lines: Vec<String> = [AgentState::Working, AgentState::Blocked]

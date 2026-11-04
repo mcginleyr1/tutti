@@ -615,8 +615,8 @@ async fn run_reuses_an_open_dir_and_mounts_a_new_one() {
     server.stop().await;
 }
 
-/// A `run` deploying an issue links its pane to it — what `pane list` and
-/// every view carry — and a plain run links none.
+/// A `run` deploying an issue links its pane to it — what `pane list`, every
+/// view and a watcher's snapshot carry — and a plain run links none.
 #[tokio::test]
 async fn run_links_its_pane_to_the_issue_it_deploys() {
     let server = TestServer::start();
@@ -643,11 +643,17 @@ async fn run_links_its_pane_to_the_issue_it_deploys() {
     match conn.request(Request::PaneList).await {
         Response::Panes { panes } => {
             let linked = |pane| panes.iter().find(|p| p.id == pane).unwrap().issue.clone();
-            assert_eq!(linked(deployed), Some(Box::new(issue)));
+            assert_eq!(linked(deployed), Some(Box::new(issue.clone())));
             assert_eq!(linked(plain), None);
         }
         other => panic!("expected Panes, got {other:?}"),
     }
+    let mut watcher = server.connect().await;
+    watcher.send(&Request::Watch).await;
+    let (_, panes) = snapshot_until(&mut watcher, |_, panes| panes.len() == 2).await;
+    let linked = |pane| panes.iter().find(|p| p.id == pane).unwrap().issue.clone();
+    assert_eq!(linked(deployed), Some(Box::new(issue)));
+    assert_eq!(linked(plain), None);
 
     server.stop().await;
 }
@@ -4406,6 +4412,7 @@ async fn a_watcher_snapshots_the_session_beside_an_attached_client() {
             user_vars: Default::default(),
             cwd: None,
             approval: None,
+            issue: None,
         }]
     );
 

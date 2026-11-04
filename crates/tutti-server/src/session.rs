@@ -603,6 +603,7 @@ impl Session {
                         user_vars: slot.meta.user_vars.clone(),
                         cwd: slot.pty.cwd(),
                         approval: slot.meta.approval.clone(),
+                        issue: slot.meta.issue.clone(),
                     })
             })
             .collect()

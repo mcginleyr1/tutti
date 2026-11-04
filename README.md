@@ -1208,8 +1208,9 @@ project itself instead; a project that isn't a jj repo always does. The footer
 chip reads `ISSUES`.
 
 The agent's sidebar row and pane title carry the issue id (`claude #123`),
-`tutti --json pane list` carries its link (`issue: {source, id, title, url}`),
-and a [restore](#restoring-after-a-restart) that revives the agent keeps it.
+`tutti --json pane list` and [`tutti watch`](#watching-state-from-other-tools)
+carry its link (`issue: {source, id, title, url}`), and a
+[restore](#restoring-after-a-restart) that revives the agent keeps it.
 tutti only reads trackers: it never comments on, assigns, or moves an issue.
 
 Scripts get the same. `tutti issue list [--source <name>]` fetches in the
@@ -1597,7 +1598,7 @@ it against the CLI, so it cannot drift from the verbs it teaches.
 a menu-bar or notch app, a status line — as JSON lines on stdout, each flushed
 as it lands. Every line is a full snapshot of the session (replace, don't
 merge). The first comes at once, then one on each change to any pane's state,
-agent, title, exit, user vars, directory or held approval, to the
+agent, title, exit, user vars, directory, held approval or issue, to the
 workspace/tab/pane structure, or to the attached TUI's focus or terminal;
 bursts coalesce.
 
@@ -1606,7 +1607,9 @@ bursts coalesce.
  "panes":[{"id":3,"workspace":"smartnotch","dir":"/Users/me/develop/smartnotch","tab":"main",
            "title":"claude","agent":"claude","state":"blocked","source":"hook","exited":null,"focused":true,
            "user_vars":{},"cwd":"/Users/me/develop/smartnotch/src",
-           "approval":{"id":4,"tool":"Bash","summary":"rm -rf build"}}]}
+           "approval":{"id":4,"tool":"Bash","summary":"rm -rf build"},
+           "issue":{"source":"gh","id":"123","title":"Fix the login",
+                    "url":"https://github.com/acme/app/issues/123"}}]}
 ```
 
 - `id` is the pane id `tutti pane focus` takes; `workspace` and `dir` are its
@@ -1626,6 +1629,9 @@ bursts coalesce.
 - `approval` is the permission request the pane's agent holds for an answer
   (see [Held approvals](#held-approvals)) — its `id`, `tool` and one-line
   `summary` — `null` without one; answer it with `tutti pane approve <pane>`.
+- `issue` is the tracker issue the pane's agent was
+  [deployed on](#deploying-issues) — `{source, id, title, url}`, `url` `null`
+  when the tracker gave none — or `null` for every other pane.
 - `attached_terminal` is the terminal app the attached TUI runs in (macOS's
   `__CFBundleIdentifier`), `null` with nobody attached or off macOS;
   `wire_rev` is the daemon's protocol revision.

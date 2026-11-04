@@ -699,6 +699,10 @@ pub struct WatchPane {
     /// for an answer, `None` without one.
     #[serde(default)]
     pub approval: Option<PendingApproval>,
+    /// As `PaneInfo::issue`: the tracker issue the pane's agent was deployed
+    /// on. `None` for every other pane and from older servers.
+    #[serde(default)]
+    pub issue: Option<Box<IssueRef>>,
 }
 
 /// One subagent row under a hook-driven agent in the sidebar: a short
@@ -1876,6 +1880,12 @@ mod tests {
                     tool: "Bash".into(),
                     summary: "rm -rf build".into(),
                 }),
+                issue: Some(Box::new(IssueRef {
+                    source: "gh".into(),
+                    id: "123".into(),
+                    title: "Fix the login".into(),
+                    url: Some("https://github.com/acme/app/issues/123".into()),
+                })),
             }],
         }
     }
@@ -1891,7 +1901,9 @@ mod tests {
                 r#""panes":[{"id":3,"workspace":"smartnotch","dir":"/Users/me/develop/smartnotch","tab":"main","#,
                 r#""title":"claude","agent":"claude","state":"working","source":"hook","exited":null,"focused":true,"#,
                 r#""user_vars":{"TUTTI_KEYS":"pane"},"cwd":"/Users/me/develop/smartnotch/src","#,
-                r#""approval":{"id":4,"tool":"Bash","summary":"rm -rf build"}}]}"#
+                r#""approval":{"id":4,"tool":"Bash","summary":"rm -rf build"},"#,
+                r#""issue":{"source":"gh","id":"123","title":"Fix the login","#,
+                r#""url":"https://github.com/acme/app/issues/123"}}]}"#
             )
         );
     }
@@ -2058,8 +2070,8 @@ mod tests {
         assert_eq!(pane.cwd, None, "and before `cwd`, no report");
         assert_eq!(pane.approval, None, "and before `approval`, nothing held");
         assert_eq!(pane.workspace, None, "and before `workspace`, unnamed");
-        // A watcher's pane from before `user_vars`, `cwd` and `approval`
-        // existed has none of them.
+        // A watcher's pane from before `user_vars`, `cwd`, `approval` and
+        // `issue` existed has none of them.
         let watched: WatchPane = serde_json::from_str(concat!(
             r#"{"id":3,"workspace":"w","dir":"/w","tab":"t","title":"sh","agent":null,"#,
             r#""state":"idle","source":null,"exited":null,"focused":false}"#
@@ -2067,6 +2079,7 @@ mod tests {
         .unwrap();
         assert!(watched.user_vars.is_empty());
         assert_eq!((watched.cwd, watched.approval), (None, None));
+        assert_eq!(watched.issue, None);
         // A directional focus naming neither its source nor `wrap` starts at
         // the attached client's pane and stops at the edge.
         let focus: Request =
