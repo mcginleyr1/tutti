@@ -3607,6 +3607,55 @@ async fn hook_driven_pane_ignores_screen_classification() {
     server.stop().await;
 }
 
+/// Claude's dialog, answered in the pane, sends no hook: once the screen has
+/// shown the dialog the hook blocked for, the screen showing the tool running
+/// moves the pane to `Working`, still hook-driven.
+#[tokio::test]
+async fn a_dialog_answered_in_the_pane_ends_the_hooks_block() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let bin = copy_bin("claude", "/bin/cat");
+    new_workspace(&mut conn).await;
+    let pane = pane_id(
+        conn.request(Request::PaneRun {
+            tab: None,
+            cmd: vec![bin.display().to_string()],
+            ephemeral: false,
+            sandbox: None,
+        })
+        .await,
+    );
+    assert!(wait_agent(&mut conn, pane, "claude").await);
+    hook(&mut conn, pane, AgentHookEvent::Blocked { message: None }).await;
+    let send = |text: String| Request::PaneSend {
+        pane,
+        text: Some(text),
+        keys: None,
+        expect: None,
+    };
+    assert_eq!(
+        conn.request(send("Do you want to proceed?\n".into())).await,
+        Response::Ok
+    );
+    // A few classify passes (300ms each) see the dialog.
+    sleep(Duration::from_millis(900)).await;
+    assert!(wait_state(&mut conn, pane, AgentState::Blocked).await);
+    // The dialog scrolls out of the classifier's tail, the tool runs.
+    assert_eq!(
+        conn.request(send(format!("{}Running\n", "\n".repeat(20))))
+            .await,
+        Response::Ok
+    );
+    assert!(
+        wait_pane(&mut conn, pane, |p| p.state == AgentState::Working
+            && p.source == Some(StateSource::Hook))
+        .await,
+        "the approved tool runs: working, and still the hook's"
+    );
+
+    server.stop().await;
+}
+
 /// Poll `pane list` until `pane` satisfies `want` or the deadline elapses.
 async fn wait_pane(conn: &mut Conn, pane: PaneId, want: impl Fn(&PaneInfo) -> bool) -> bool {
     timeout(DEADLINE, async {

@@ -237,13 +237,18 @@ impl Default for Registry {
         // `issues::fit_arg`).
         Registry {
             specs: vec![
+                // Observed live at 80 columns, Claude Code 2.1.318 in both its
+                // renderers: no `esc to interrupt` any more; a running turn's
+                // spinner reads `✶ Dilly-dallying… (12s · ↓ 98 tokens)` or
+                // `(3s · ↓ 345 tokens · thinking)` once tokens flow, an ended
+                // one `✻ Brewed for 23s · done 9:43 AM`.
                 AgentSpec::new(
                     "claude",
                     "Claude Code",
                     "https://claude.com/claude-code",
                     &["claude"],
                     &["Do you want", "y/n", "Waiting for your input", "permission"],
-                    &["esc to interrupt", "Thinking", "Running"],
+                    &["esc to interrupt", "Thinking", "Running", "· ↓ "],
                     &["❯"],
                 )
                 // `--help` (2.1.318): `claude [prompt]` "starts an interactive
@@ -486,6 +491,24 @@ mod tests {
     fn working_beats_done() {
         let screen = "Thinking about it\nsome output\n❯";
         assert_eq!(claude().classify(screen), Some(Observation::Working));
+    }
+
+    /// Claude Code 2.1.318's screens as observed live: an approved tool
+    /// running under its spinner reads working in either renderer, the
+    /// dialog before it blocked, and the turn's end done.
+    #[test]
+    fn claudes_spinner_reads_working_and_its_end_done() {
+        let fullscreen = "❯ run it\n\n  Sleeping then creating a file · 15s\n  ⎿  $ sleep 15; touch b.txt (10s)\n     (ctrl+b to run in background)\n\n✶ Dilly-dallying… (12s · ↓ 98 tokens)\n\n────\n❯ \n────";
+        let thinking = "⏺ Write(f1.txt)\n  ⎿  Wrote 1 line to f1.txt\n\n✢ Simmering… (3s · ↓ 345 tokens · thinking)\n\n────\n❯ \n────";
+        let classic = "⏺ Bash(sleep 20; touch a.txt)\n  ⎿  (No output)\n\n✳ Ebbing… (1s · ↓ 96 tokens)\n\n────\n❯ \n────";
+        let dialog = "⏺ Bash(sleep 20; touch a.txt)\n  ⎿  Waiting…\n────\n Bash command\n sleep 20; touch a.txt\n Do you want to proceed?\n ❯ 1. Yes\n   4. No\n\n Esc to cancel · Tab to amend";
+        let ended =
+            "⏺ Ran sleep 20; touch a.txt.\n\n✻ Brewed for 23s · done 9:43 AM\n\n────\n❯ \n────";
+        assert_eq!(claude().classify(fullscreen), Some(Observation::Working));
+        assert_eq!(claude().classify(thinking), Some(Observation::Working));
+        assert_eq!(claude().classify(classic), Some(Observation::Working));
+        assert_eq!(claude().classify(dialog), Some(Observation::Blocked));
+        assert_eq!(claude().classify(ended), Some(Observation::Done));
     }
 
     #[test]

@@ -997,10 +997,13 @@ nothing and exiting 0 — when no TUI is attached to answer it, on `esc`, and
 when nobody answers within `approval_timeout_secs` (default 120, at most 599:
 Claude stops a hook at 600 s). The hook never fails a Claude session. An allow
 or a deny from tutti sets the pane **working** at once — the tool runs, or the
-agent hears the refusal. Answered in Claude's own dialog instead, the pane
-stays blocked until Claude's next tool event, since Claude has no "permission
-granted" hook: an approved long `cargo test` then reads as blocked for its
-whole run.
+agent hears the refusal. Answered in Claude's own dialog instead, the pane goes
+back to **working** once its screen shows Claude busy again — its spinner's
+`(12s · ↓ 98 tokens)`, or `Running…`: Claude has no "permission granted" hook
+(between your answer and the tool's end, `PostToolUse`, none fires), so tutti,
+having seen the dialog on the pane's screen, reads the screen until it goes. A
+request you deny there stays blocked — Claude asks what to do instead — until
+your next prompt.
 
 ### Changed files panel
 
@@ -1302,9 +1305,12 @@ A pane's state can come from five sources, ranked highest first:
 Hook, program and progress are *claims*: a claim holds the state until its own
 source ends it, and nothing ranked below may move it meanwhile — so a build that
 reports `done` stays done while it keeps printing, and a hook-driven agent's own
-progress bar never fights its hooks. The one exception: a screen **blocked**
+progress bar never fights its hooks. Two exceptions: a screen **blocked**
 match (a visible permission dialog) overrides a program/progress **working**
-claim, which is likelier stale than right. A hook claim holds until the pane's
+claim, which is likelier stale than right; and a hook's **blocked** gives way
+to a screen **working** match once the agent's own dialog it blocked for has
+shown on the screen — answered there, which no hook reports, while tutti
+holds none of the pane's requests. A hook claim holds until the pane's
 child exits; a herdr report's claim also ends when its agent releases or clears
 it, or when another agent is detected. A program/progress claim ends when that
 source clears it, when the pane's child exits, or when its detected agent
@@ -1447,8 +1453,9 @@ surface a non-blocking "command not found" warning on every tool call — remove
 the entries (restore `settings.json.bak` or delete them) when you go.
 
 Hooks are ground truth: once a pane reports one, its state is the hook's alone
-— tutti stops classifying that pane's screen, and the agent's own OSC 9;4 /
-7501 reports are ignored (see [Agent state sources](#agent-state-sources)).
+— tutti stops classifying that pane's screen (but for a dialog the hook
+blocked it for, answered in the pane), and the agent's own OSC 9;4 / 7501
+reports are ignored (see [Agent state sources](#agent-state-sources)).
 Agent **detection** (which kind of agent runs there) is unaffected, so the badge
 still appears. Display only — tutti never manages a foreign agent's subagents.
 

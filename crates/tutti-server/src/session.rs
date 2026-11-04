@@ -107,6 +107,10 @@ struct PaneSlot {
     herdr: Option<(String, String)>,
     /// The last `seq` accepted from each herdr source; it outlives claims.
     herdr_seqs: HashMap<String, u64>,
+    /// Whether the screen has shown the agent's own dialog since its last
+    /// hook event blocked the pane — what lets the screen end that block
+    /// (`observe`).
+    dialog: bool,
 }
 
 #[derive(Default)]
@@ -803,15 +807,18 @@ impl Session {
     /// detected agents (classified from their screen) plus any pane holding a
     /// program/progress claim (for the stall timer). A hook-driven pane is
     /// excluded: its state comes from exact hook signals, which the screen
-    /// heuristics would only fight, and hooks never stall. Agent detection is
-    /// unaffected (it walks `detectable_panes`), so a hook-driven pane keeps its
-    /// badge.
+    /// heuristics would only fight, and hooks never stall — except while a
+    /// hook holds it blocked and tutti holds none of its requests: the answer
+    /// to the agent's own dialog shows on the screen alone (`observe`). Agent
+    /// detection is unaffected (it walks `detectable_panes`), so a hook-driven
+    /// pane keeps its badge.
     pub fn agent_panes(&self) -> Vec<(PaneId, Option<AgentKind>, Arc<PtyPane>)> {
         self.panes
             .iter()
             .filter(|(_, s)| {
+                let dialog = s.meta.state == AgentState::Blocked && s.meta.approvals.is_empty();
                 s.meta.exited.is_none()
-                    && s.meta.source != Some(StateSource::Hook)
+                    && (s.meta.source != Some(StateSource::Hook) || dialog)
                     && (s.meta.agent.is_some() || s.meta.source.is_some_and(StateSource::claims))
             })
             .map(|(id, s)| (*id, s.meta.agent.clone(), Arc::clone(&s.pty)))
@@ -841,6 +848,7 @@ impl Session {
             slot.meta.source = Some(StateSource::Hook);
             slot.herdr = None;
         }
+        slot.dialog = false;
         let mut relisted = conversation.is_some() && slot.meta.conversation != conversation;
         if relisted {
             slot.meta.conversation = conversation;
@@ -1123,7 +1131,10 @@ impl Session {
     /// Fold one classify pass onto `pane`: PTY output since the last pass is an
     /// Activity, a screen match a Screen observation (applied second, so it
     /// wins), each landing only where the live claim lets it
-    /// (`StateSource::may_move`). Output or a `Working` match keeps the pane
+    /// (`StateSource::may_move`). A hook's `Blocked` gives way to a `Working`
+    /// match only once a `Blocked` one has shown the agent's own dialog: Claude
+    /// sends no hook when you answer it, and the screen working again is the
+    /// tool you approved running. Output or a `Working` match keeps the pane
     /// alive; a `Working` pane not held by a hook and silent for `STALL_AFTER`
     /// drops to `Unknown`, ending its claim. Returns the net transition.
     pub fn observe(
@@ -1151,6 +1162,13 @@ impl Session {
             if next != current && source.may_move(slot.meta.source, current, next) {
                 slot.meta.state = next;
                 slot.meta.source = Some(source);
+            }
+        }
+        if slot.meta.source == Some(StateSource::Hook) && slot.meta.state == AgentState::Blocked {
+            match classified {
+                Some(Observation::Blocked) => slot.dialog = true,
+                Some(Observation::Working) if slot.dialog => slot.meta.state = AgentState::Working,
+                _ => {}
             }
         }
         if slot.meta.state == AgentState::Working
@@ -1580,6 +1598,7 @@ impl Session {
                 notified: None,
                 herdr: None,
                 herdr_seqs: HashMap::new(),
+                dialog: false,
             },
         );
         Ok(id)
@@ -1907,9 +1926,50 @@ mod tests {
             (Blocked, Some(Hook)),
             "survives set_agent"
         );
+        let classified = |s: &Session| s.agent_panes().iter().any(|(p, _, _)| *p == pane);
         assert!(
-            s.agent_panes().iter().all(|(p, _, _)| *p != pane),
-            "a hook pane is never classified"
+            classified(&s),
+            "blocked, its dialog's answer is the screen's"
+        );
+        s.hold_approval(pane, "Bash".into(), "ls".into());
+        assert!(!classified(&s), "not while tutti holds a request");
+        s.take_approval(pane, None);
+        s.apply_agent_event(pane, AgentHookEvent::Activity { detail: None }, None);
+        assert!(!classified(&s), "a working hook pane never is");
+    }
+
+    /// Claude sends no hook when you answer its own dialog: once the screen
+    /// has shown that dialog, the screen working again — the approved tool
+    /// running — ends the hook's block. Never before the dialog showed (it
+    /// draws after the hook), and each hook event starts the watch afresh.
+    #[test]
+    fn a_hook_block_ends_when_the_screen_shows_its_dialog_then_work() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let t0 = Instant::now();
+        let blocked = AgentHookEvent::Blocked { message: None };
+        s.apply_agent_event(pane, blocked.clone(), None);
+        assert_eq!(
+            s.observe(pane, true, Some(Observation::Working), t0),
+            None,
+            "the dialog has not drawn yet"
+        );
+        assert_eq!(s.observe(pane, true, Some(Observation::Blocked), t0), None);
+        s.apply_agent_event(pane, blocked, None);
+        assert_eq!(
+            s.observe(pane, true, Some(Observation::Working), t0),
+            None,
+            "a fresh hook block waits for its own dialog"
+        );
+        assert_eq!(s.observe(pane, true, Some(Observation::Blocked), t0), None);
+        assert_eq!(s.observe(pane, true, Some(Observation::Done), t0), None);
+        assert_eq!(
+            s.observe(pane, true, Some(Observation::Working), t0),
+            Some((Blocked, Working))
+        );
+        assert_eq!(
+            state_of(&s, pane),
+            (Working, Some(Hook)),
+            "still the hook's"
         );
     }
 
