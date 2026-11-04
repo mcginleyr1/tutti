@@ -1727,7 +1727,17 @@ fn approval_hold(
         let view = hub.session().view();
         broadcast_event(hub, Event::LayoutChanged { workspaces: view });
     }
-    agent_event(hub, pane, AgentHookEvent::Blocked { message }, conversation);
+    let blocked = hub.session().pane_state(pane) == Some(AgentState::Blocked);
+    let blocks = AgentHookEvent::Blocked {
+        message: message.clone(),
+    };
+    agent_event(hub, pane, blocks, conversation);
+    // No move to note it on: a request beside another still lands in the
+    // history. Only a request's own hold notes it, never the agent's later
+    // `permission_prompt` for it, so each lands once.
+    if blocked {
+        add_note(hub, pane, NoteKind::Blocked, None, message);
+    }
     let Some(mut held) = held else {
         hub.session().passed_to_dialog(pane);
         let pass = Response::Approval {

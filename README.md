@@ -1186,7 +1186,9 @@ attention transition — an agent blocking, or finishing a turn (working →
 done). A transition's note carries what came with it — a hook's blocked
 message (`Bash · rm -rf build`), or an OSC 7501 or herdr report's `msg` under
 its app — so a report that finishes a pane with a message makes one note, not
-two. Each keeps the pane's title and workspace as they were, so it outlives
+two. A permission request tutti holds on a pane already blocked — parallel
+subagents ask at once — makes a note of its own. Each keeps the pane's title
+and workspace as they were, so it outlives
 the pane. `Ctrl+B N` opens the **notifications panel**, newest first: an
 unread dot, the age, the pane, a dim `workspace · kind`, and the text. `j`/`k`
 move, `enter` jumps to the note's pane and marks its notes read, `r` marks

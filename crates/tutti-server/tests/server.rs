@@ -3376,6 +3376,24 @@ async fn a_pane_holds_parallel_approvals_each_answered_on_its_own() {
         "in the order they came"
     );
     assert!(held.windows(2).all(|w| w[0].id < w[1].id));
+    let Response::Notes { notes } = control.request(Request::NotesList { unread: false }).await
+    else {
+        panic!("expected the notes");
+    };
+    let noted: Vec<_> = notes
+        .iter()
+        .filter(|n| n.kind == NoteKind::Blocked)
+        .map(|n| n.body.as_deref())
+        .collect();
+    assert_eq!(
+        noted,
+        [
+            Some("Bash · touch a.txt"),
+            Some("Bash · touch b.txt"),
+            Some("Bash · touch c.txt")
+        ],
+        "each request lands in the history, the blocked pane's later ones too"
+    );
 
     let answer = |id, decision| Request::ApprovalAnswer {
         pane,
