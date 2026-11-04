@@ -1693,10 +1693,10 @@ fn agent_event(
 /// as the request's own hook event would block it — so whoever that move
 /// wakes (a `pane wait`) finds an approval to answer. A spawned task then
 /// holds the reply until an answer comes down the approval's channel or the
-/// hook hangs up; either way the approval leaves the pane, and the pane's
-/// other approvals wait on, each until its own answer or hang-up. With no
-/// client attached nobody could answer: the reply is `Pass` at once, as it
-/// is for an unknown pane.
+/// hook hangs up; either way — or on a panic, here or in that task — the
+/// approval leaves the pane (`Held`), and the pane's other approvals wait
+/// on, each until its own answer or hang-up. With no client attached nobody
+/// could answer: the reply is `Pass` at once, as it is for an unknown pane.
 fn approval_hold(
     hub: &Arc<Hub>,
     cid: u64,
@@ -1714,42 +1714,67 @@ fn approval_hold(
         None
     };
     let (answer, answered) = oneshot::channel();
-    if let Some(id) = held {
+    let held = held.map(|id| {
         hub.approvals().insert(id, answer);
+        Held {
+            hub: Arc::clone(hub),
+            pane,
+            id,
+            answered: false,
+        }
+    });
+    if held.is_some() {
         let view = hub.session().view();
         broadcast_event(hub, Event::LayoutChanged { workspaces: view });
     }
     agent_event(hub, pane, AgentHookEvent::Blocked { message }, conversation);
-    let Some(id) = held else {
+    let Some(mut held) = held else {
         hub.session().passed_to_dialog(pane);
         let pass = Response::Approval {
             decision: ApprovalDecision::Pass,
         };
         return send_reply(hub, cid, &reply.tx, reply.encode(&pass));
     };
-    let hub = Arc::clone(hub);
     reply.spawn(|reply| async move {
         let decision = tokio::select! {
             () = reply.tx.closed() => None,
             decision = answered => decision.ok(),
         };
-        hub.approvals().remove(&id);
-        let view = {
-            let mut session = hub.session();
-            let taken = session.take_approval(pane, Some(id));
-            if taken.is_some() && decision.is_none() {
-                session.passed_to_dialog(pane);
-            }
-            taken.map(|_| session.view())
-        };
-        if let Some(view) = view {
-            broadcast_event(&hub, Event::LayoutChanged { workspaces: view });
-        }
+        held.answered = decision.is_some();
+        drop(held);
         if let Some(decision) = decision {
             reply.send(Response::Approval { decision }).await;
         }
     });
     ControlFlow::Continue(())
+}
+
+/// An approval held on a pane (`approval_hold`). Dropped — answered, its hook
+/// gone, or a panic unwinding past it — it leaves the hub and the pane, one
+/// not answered going on to the agent's own dialog, and the view without it
+/// goes out.
+struct Held {
+    hub: Arc<Hub>,
+    pane: PaneId,
+    id: u64,
+    answered: bool,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.hub.approvals().remove(&self.id);
+        let view = {
+            let mut session = self.hub.session();
+            let taken = session.take_approval(self.pane, Some(self.id));
+            if taken.is_some() && !self.answered {
+                session.passed_to_dialog(self.pane);
+            }
+            taken.map(|_| session.view())
+        };
+        if let Some(view) = view {
+            broadcast_event(&self.hub, Event::LayoutChanged { workspaces: view });
+        }
+    }
 }
 
 /// Answer one of `pane`'s held approvals — `id`'s, or its oldest when
@@ -3514,6 +3539,49 @@ mod tests {
         });
         assert!(task.await.unwrap_err().is_panic());
         assert_eq!(hub.vcs()[&workspace].in_flight, 0);
+    }
+
+    /// An approval hold whose task panics lets go of its approval: off the
+    /// hub and the pane, handed on to the agent's own dialog, so the pane
+    /// still reads as waiting on you without a stale approval to answer.
+    #[tokio::test]
+    async fn a_hold_whose_task_panics_lets_go_of_its_approval() {
+        let hub = Arc::new(Hub::new(PaneSize::new(24, 80), "hold".into(), None));
+        let pane = {
+            let mut session = hub.session();
+            session.workspace_new(std::env::temp_dir());
+            session.pane_run(None, vec!["/bin/cat".into()], false, None)
+        }
+        .unwrap();
+        let id = hub
+            .session()
+            .hold_approval(pane, "Bash".into(), "ls".into())
+            .unwrap();
+        let (answer, _answered) = oneshot::channel();
+        hub.approvals().insert(id, answer);
+        let held = Held {
+            hub: Arc::clone(&hub),
+            pane,
+            id,
+            answered: false,
+        };
+        let task = tokio::spawn(async move {
+            let _held = held;
+            panic!("injected: a hold's task panics");
+        });
+        assert!(task.await.unwrap_err().is_panic());
+        assert!(hub.approvals().is_empty());
+        assert_eq!(hub.session().pane(pane).unwrap().approval, None);
+        let next = hub
+            .session()
+            .hold_approval(pane, "Bash".into(), "pwd".into());
+        let taken = hub.session().take_approval(pane, None);
+        assert_eq!(
+            taken,
+            next.map(|next| (next, true)),
+            "the first went to the dialog"
+        );
+        hub.session().kill_all();
     }
 
     /// A `pane wait --next` whose pane moves on past its edge before the
