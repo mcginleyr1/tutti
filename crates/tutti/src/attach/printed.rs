@@ -6,10 +6,10 @@
 //!
 //! A terminal is its tty and the session that owns it (getsid): one closed,
 //! and another opened on the tty number it freed, is another session, and so
-//! a terminal that holds nothing.
+//! a terminal that holds nothing. Saves take a lock beside the file (`save`).
 
 use std::io::Write;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -51,8 +51,13 @@ pub fn load(file: &Path, terminal: &str, session: &str, pane: PaneId) -> Option<
 }
 
 /// Record in `file` that `terminal` holds `printed` of `pane` of `session`,
-/// in place of what it held of it before: a file of the process's own,
-/// written whole, then renamed over it.
+/// in place of what it held of it before. The whole update holds an
+/// exclusive lock on `<file>.lock`, so terminals leaving at once each keep
+/// their record: the file is read, written whole to `<file>.tmp` — a stale
+/// one, a writer's that died, replaced — and renamed over itself. A file
+/// that does not parse is set aside as `<file>.bad`, which stderr names, so
+/// no other terminal's records go unseen; one that cannot be read, or set
+/// aside, is left as it is and the save refused.
 pub fn save(
     file: &Path,
     terminal: &str,
@@ -60,7 +65,43 @@ pub fn save(
     pane: PaneId,
     printed: Printed,
 ) -> std::io::Result<()> {
-    let mut records = read(file);
+    if let Some(dir) = file.parent() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(file.with_extension("json.lock"))?;
+    // SAFETY: flock takes the descriptor `lock` holds open for the call; it
+    // is let go when `lock` closes, at the end of this function.
+    while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+    let mut records: Vec<Record> = match std::fs::read(file) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(err),
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(records) => records,
+            Err(err) => {
+                let bad = file.with_extension("json.bad");
+                std::fs::rename(file, &bad)?;
+                eprintln!(
+                    "tutti: set aside an unreadable {} as {}: {err}",
+                    file.display(),
+                    bad.display()
+                );
+                Vec::new()
+            }
+        },
+    };
     records.retain(|r| !(r.terminal == terminal && r.session == session && r.pane == pane));
     records.push(Record {
         terminal: terminal.into(),
@@ -69,13 +110,11 @@ pub fn save(
         printed,
     });
     records.drain(..records.len().saturating_sub(KEPT));
-    if let Some(dir) = file.parent() {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
+    let tmp = file.with_extension("json.tmp");
+    match std::fs::remove_file(&tmp) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err),
+        _ => {}
     }
-    let tmp = file.with_extension(format!("json.{}", std::process::id()));
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -107,14 +146,21 @@ mod tests {
         }
     }
 
+    /// A fresh scratch dir for `label`'s test, and the file in it.
+    fn scratch(label: &str) -> (PathBuf, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("tutti-printed-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("state").join("inline.json");
+        (dir, file)
+    }
+
     /// A record comes back for its terminal, session and pane only; a
     /// second for the same takes its place; the file is the owner's alone,
-    /// and keeps the newest `KEPT`; one unreadable holds none.
+    /// and keeps the newest `KEPT`.
     #[test]
     fn a_terminal_gets_back_what_it_last_printed_of_a_pane() {
-        let dir = std::env::temp_dir().join(format!("tutti-printed-{}", std::process::id()));
-        let file = dir.join("state").join("inline.json");
-        let _ = std::fs::remove_dir_all(&dir);
+        let (dir, file) = scratch("records");
         assert_eq!(load(&file, "tty 1 session 2", "s", PaneId(3)), None);
 
         save(&file, "tty 1 session 2", "s", PaneId(3), printed(40)).unwrap();
@@ -143,11 +189,58 @@ mod tests {
             None,
             "the oldest went"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
+    /// Terminals leaving at once each keep their record: the lock makes
+    /// every read-modify-rename whole.
+    #[test]
+    fn terminals_saving_at_once_each_keep_their_record() {
+        let (dir, file) = scratch("racing");
+        let savers: Vec<_> = (0..16u64)
+            .map(|pane| {
+                let file = file.clone();
+                std::thread::spawn(move || {
+                    let terminal = format!("tty {pane} session {pane}");
+                    save(&file, &terminal, "s", PaneId(pane), printed(pane)).unwrap();
+                })
+            })
+            .collect();
+        for saver in savers {
+            saver.join().unwrap();
+        }
+        for pane in 0..16u64 {
+            let terminal = format!("tty {pane} session {pane}");
+            assert_eq!(
+                load(&file, &terminal, "s", PaneId(pane)),
+                Some(printed(pane))
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file that does not parse is set aside whole, never written over
+    /// with the other terminals' records lost; a stale temp file a dead
+    /// writer left is replaced, and the file stays the owner's alone.
+    #[test]
+    fn an_unreadable_file_is_set_aside_and_a_stale_temp_replaced() {
+        let (dir, file) = scratch("bad");
+        save(&file, "tty 1 session 2", "s", PaneId(3), printed(40)).unwrap();
         std::fs::write(&file, b"not json").unwrap();
-        assert_eq!(load(&file, "tty 5 session 6", "s", PaneId(1)), None);
-        save(&file, "tty 1 session 2", "s", PaneId(3), printed(70)).unwrap();
+        assert_eq!(load(&file, "tty 1 session 2", "s", PaneId(3)), None);
+        save(&file, "tty 1 session 2", "s", PaneId(4), printed(50)).unwrap();
+        let bad = file.with_extension("json.bad");
+        assert_eq!(std::fs::read(&bad).unwrap(), b"not json");
         assert_eq!(read(&file).len(), 1);
+
+        let tmp = file.with_extension("json.tmp");
+        std::fs::write(&tmp, b"a dead writer's").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        save(&file, "tty 1 session 2", "s", PaneId(5), printed(60)).unwrap();
+        assert_eq!(read(&file).len(), 2);
+        assert!(!tmp.exists());
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
