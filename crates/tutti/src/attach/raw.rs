@@ -144,43 +144,17 @@ pub fn run(
         since,
     };
     stream.write_all(&control(&attach))?;
-    // A refusal — no such pane — lands before the terminal is touched; the
-    // colours' `Ok` is passed over, and the history, the raw frames before
-    // the first snapshot, gathered — after a line on what was skipped.
     let mut buf = Vec::new();
-    let mut past = Vec::new();
-    let mut numbering = None;
-    let first = loop {
-        let frame =
-            read_frame(&mut stream, &mut buf)?.context("tutti-server closed the connection")?;
-        let reply = match &frame {
-            Frame::Control(json) => serde_json::from_slice(json).ok(),
-            _ => None,
-        };
-        match (reply, frame) {
-            (Some(Response::Ok), _) => {}
-            (Some(Response::Error { message }), _) if message.starts_with("bad request") => {
-                bail!(
-                    "the daemon cannot stream a pane ({message}); restart it: `tutti server stop`"
-                )
-            }
-            (Some(Response::Error { message }), _) => bail!(message),
-            (_, Frame::PaneRaw { bytes, .. }) => past.extend(bytes),
-            (_, Frame::Control(json)) => {
-                if let Ok(Event::PaneRows {
-                    epoch,
-                    top,
-                    skipped,
-                    ..
-                }) = serde_json::from_slice(&json)
-                {
-                    past = skip_note(pane, skipped);
-                    numbering = Some(Numbering::new(epoch, top));
-                }
-            }
-            (_, frame) => break frame,
-        }
-    };
+    let (first, past, mut numbering) = opening(pane, &mut stream, &mut buf)?;
+    // Only a daemon from before inline views numbers no rows: it takes the
+    // stream for a plain one.
+    if inline && numbering.is_none() {
+        eprintln!(
+            "tutti: the daemon predates this inline view (wire rev 16): it prints the pane's \
+             history whole however much of it this terminal holds, and a resync drops the \
+             lines it skips — restart it: `tutti server stop`"
+        );
+    }
 
     // Inline, the lines on screen go up into the scrollback, up to the
     // cursor's, so the pane's screen is drawn on a blank one and they stay.
@@ -249,6 +223,50 @@ pub fn run(
         None => bail!("tutti-server closed the connection"),
     }
     Ok(0)
+}
+
+/// How `pane`'s stream opens, up to its first snapshot, which comes back
+/// first: a refusal — no such pane — is the error, before the terminal is
+/// touched; the colours' `Ok` is passed over; the history, the raw frames
+/// before the snapshot, is gathered after a line on what was skipped; and
+/// the snapshot's `PaneRows` numbers the rows, which a daemon from before
+/// inline views never sends.
+fn opening(
+    pane: PaneId,
+    stream: &mut UnixStream,
+    buf: &mut Vec<u8>,
+) -> Result<(Frame, Vec<u8>, Option<Numbering>)> {
+    let (mut past, mut numbering) = (Vec::new(), None);
+    loop {
+        let frame = read_frame(stream, buf)?.context("tutti-server closed the connection")?;
+        let reply = match &frame {
+            Frame::Control(json) => serde_json::from_slice(json).ok(),
+            _ => None,
+        };
+        match (reply, frame) {
+            (Some(Response::Ok), _) => {}
+            (Some(Response::Error { message }), _) if message.starts_with("bad request") => {
+                bail!(
+                    "the daemon cannot stream a pane ({message}); restart it: `tutti server stop`"
+                )
+            }
+            (Some(Response::Error { message }), _) => bail!(message),
+            (_, Frame::PaneRaw { bytes, .. }) => past.extend(bytes),
+            (_, Frame::Control(json)) => {
+                if let Ok(Event::PaneRows {
+                    epoch,
+                    top,
+                    skipped,
+                    ..
+                }) = serde_json::from_slice(&json)
+                {
+                    past = skip_note(pane, skipped);
+                    numbering = Some(Numbering::new(epoch, top));
+                }
+            }
+            (_, frame) => return Ok((frame, past, numbering)),
+        }
+    }
 }
 
 /// Where an inline view stands in the pane's numbered rows (`PaneRows`):
@@ -1049,6 +1067,67 @@ mod tests {
             .collect();
         assert_eq!(holds.held, screen);
         assert_eq!(holds.held.last(), Some(&row_hash("$ ls")));
+    }
+
+    /// What `opening` makes of `frames` from a daemon played over a socket
+    /// pair.
+    fn opened(frames: &[Frame]) -> Result<(Frame, Vec<u8>, Option<Numbering>)> {
+        let (mut ours, mut daemon) = UnixStream::pair().unwrap();
+        for frame in frames {
+            daemon.write_all(&frame.encode()).unwrap();
+        }
+        opening(PaneId(3), &mut ours, &mut Vec::new())
+    }
+
+    /// A stream opens on its history and the snapshot's numbering — a line
+    /// on the rows skipped first — past the colours' `Ok`; a daemon from
+    /// before inline views numbers nothing, which `run` warns of; a refusal
+    /// is the error.
+    #[test]
+    fn a_stream_opens_on_its_history_and_numbering() {
+        let json = |value: serde_json::Value| Frame::Control(value.to_string().into_bytes());
+        let ok = json(serde_json::to_value(Response::Ok).unwrap());
+        let rows = json(
+            serde_json::to_value(Event::PaneRows {
+                pane: PaneId(3),
+                epoch: 7,
+                top: 40,
+                skipped: 2,
+            })
+            .unwrap(),
+        );
+        let history = Frame::PaneRaw {
+            pane: PaneId(3),
+            bytes: b"one\r\n".to_vec(),
+        };
+        let snapshot = Frame::PaneSnapshot(tutti_core::PaneData {
+            pane: PaneId(3),
+            rows: 4,
+            cols: 20,
+            seq: 0,
+            bytes: b"screen".to_vec(),
+        });
+
+        let numbered = [ok.clone(), rows, history.clone(), snapshot.clone()];
+        let (first, past, numbering) = opened(&numbered).unwrap();
+        assert_eq!(first, snapshot);
+        assert_eq!(past, b"[pane 3: 2 lines not shown]\r\none\r\n");
+        let numbering = numbering.expect("numbered");
+        assert_eq!((numbering.epoch, numbering.top), (7, 40));
+
+        let old = [ok, history, snapshot.clone()];
+        let (first, past, numbering) = opened(&old).unwrap();
+        assert_eq!((first, past), (snapshot, b"one\r\n".to_vec()));
+        assert!(numbering.is_none(), "an old daemon numbers nothing");
+
+        let refusal = Response::Error {
+            message: "no pane 3".into(),
+        };
+        let refused = opened(&[json(serde_json::to_value(refusal).unwrap())]);
+        assert_eq!(
+            refused.err().map(|e| e.to_string()).as_deref(),
+            Some("no pane 3")
+        );
     }
 
     /// The rows `term` has scrolled into its scrollback, as text.

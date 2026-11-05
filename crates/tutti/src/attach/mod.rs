@@ -78,6 +78,9 @@ pub fn run(
     };
     conn.send(&tagged(&attach, 0))
         .context("send attach request")?;
+    if view {
+        conn.refuse_an_old_daemon()?;
+    }
 
     // A truecolor theme's panes are painted over its own ground, which their
     // colour queries are answered with; on `terminal` the terminal's own

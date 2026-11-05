@@ -6,18 +6,24 @@
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use tutti_core::{Frame, Request, Tagged, socket_path};
+use tutti_core::{Frame, Request, Response, Tagged, socket_path};
 
 use crate::client;
+
+/// The wire rev from which a daemon knows a view (`Attach.view`).
+const VIEW_REV: u32 = 16;
 
 pub struct Connection {
     stream: UnixStream,
     rx: Receiver<Frame>,
     reader: Option<JoinHandle<()>>,
+    /// Frames read off `rx` ahead of `drain`, which hands them on first.
+    early: Vec<Frame>,
     /// A `tutti attach --view`: `send` passes on only what navigates.
     pub view: bool,
 }
@@ -33,6 +39,11 @@ impl Connection {
         } else {
             client::open(session)?
         };
+        Self::new(stream, view)
+    }
+
+    /// The connection over `stream`, with its reader thread.
+    fn new(stream: UnixStream, view: bool) -> Result<Self> {
         let reader_stream = stream.try_clone().context("clone attach socket")?;
         let (tx, rx) = mpsc::channel();
         let reader = thread::Builder::new()
@@ -43,8 +54,57 @@ impl Connection {
             stream,
             rx,
             reader: Some(reader),
+            early: Vec::new(),
             view,
         })
+    }
+
+    /// A view's attach just sent, refused by the daemon's `Attached` reply
+    /// when that is from before `VIEW_REV`: such a daemon takes a view for a
+    /// client like any other, its focus marking agents seen and notes read
+    /// for everybody — refused before the view moves it once.
+    pub fn refuse_an_old_daemon(&mut self) -> Result<()> {
+        let rev = self.wire_rev(Duration::from_secs(5))?;
+        if rev < VIEW_REV {
+            bail!(
+                "the daemon predates `attach --view` (wire rev {rev}, a view needs {VIEW_REV}): \
+                 it would take this view's focus for yours — restart it: `tutti server stop`"
+            );
+        }
+        Ok(())
+    }
+
+    /// The daemon's wire rev, from its `Attached` reply to the attach just
+    /// sent, waited for up to `wait`. Every frame read on the way, the reply
+    /// included, stays for `drain`.
+    fn wire_rev(&mut self, wait: Duration) -> Result<u32> {
+        let until = Instant::now() + wait;
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            let frame = match self.rx.recv_timeout(left) {
+                Ok(frame) => frame,
+                Err(RecvTimeoutError::Timeout) => {
+                    bail!("tutti-server did not answer the attach within {wait:?}")
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    bail!("tutti-server closed the attach connection")
+                }
+            };
+            let rev = match &frame {
+                Frame::Control(json) => match serde_json::from_slice(json) {
+                    Ok(Tagged {
+                        body: Response::Attached { wire_rev, .. },
+                        ..
+                    }) => Some(wire_rev),
+                    _ => None,
+                },
+                _ => None,
+            };
+            self.early.push(frame);
+            if let Some(rev) = rev {
+                return Ok(rev);
+            }
+        }
     }
 
     /// Write `frame` to the daemon — from a view, only when it `navigates`:
@@ -61,8 +121,8 @@ impl Connection {
 
     /// Every frame the reader has decoded since the last call. `Err` means the
     /// server closed the connection and no frames remain.
-    pub fn drain(&self) -> Result<Vec<Frame>> {
-        let mut out = Vec::new();
+    pub fn drain(&mut self) -> Result<Vec<Frame>> {
+        let mut out = std::mem::take(&mut self.early);
         loop {
             match self.rx.try_recv() {
                 Ok(frame) => out.push(frame),
@@ -135,11 +195,55 @@ fn read_loop(mut stream: UnixStream, tx: &mpsc::Sender<Frame>) {
 #[cfg(test)]
 mod tests {
     use tutti_core::{
-        ApprovalDecision, Direction, HostColors, PaneDims, PaneId, Rgb, TabId, WorkspaceId,
+        ApprovalDecision, Direction, Event, HostColors, PaneDims, PaneId, Rgb, TabId, WorkspaceId,
     };
 
     use super::*;
     use crate::attach::{control, tagged};
+
+    /// A connection to a daemon played over a socket pair that answers an
+    /// attach as wire rev `rev`, after an event in the gap: what
+    /// `refuse_an_old_daemon` says, and what `drain` hands on after it.
+    fn attached_at(rev: u32) -> (Result<()>, Vec<Frame>) {
+        let (ours, mut daemon) = UnixStream::pair().unwrap();
+        let mut conn = Connection::new(ours, true).unwrap();
+        let json = |value: serde_json::Value| Frame::Control(value.to_string().into_bytes());
+        let event = json(serde_json::to_value(Event::PaneOutput { pane: PaneId(1) }).unwrap());
+        let attached = json(
+            serde_json::to_value(Tagged {
+                req: Some(0),
+                body: Response::Attached {
+                    session: "s".into(),
+                    workspaces: Vec::new(),
+                    wire_rev: rev,
+                    restorable: None,
+                    notes: Vec::new(),
+                },
+            })
+            .unwrap(),
+        );
+        for frame in [&event, &attached] {
+            daemon.write_all(&frame.encode()).unwrap();
+        }
+        let refused = conn.refuse_an_old_daemon();
+        (refused, conn.drain().unwrap())
+    }
+
+    /// A view on a daemon from before views is refused, naming the fix; on
+    /// one that knows views it goes on, and nothing read on the way to the
+    /// daemon's answer is lost to the TUI.
+    #[test]
+    fn a_view_refuses_a_daemon_from_before_views() {
+        let (refused, _) = attached_at(VIEW_REV - 1);
+        let message = refused.unwrap_err().to_string();
+        assert!(message.contains("tutti server stop"), "{message}");
+        let (refused, drained) = attached_at(VIEW_REV);
+        refused.unwrap();
+        assert_eq!(drained.len(), 2, "the event and the reply, in order");
+        assert!(
+            matches!(&drained[0], Frame::Control(json) if json.windows(11).any(|w| w == b"pane_output"))
+        );
+    }
 
     /// A view moves its own focus, tab and scrollback, reads, and detaches —
     /// tagged or not — but types nothing, votes no size, tells no colours
