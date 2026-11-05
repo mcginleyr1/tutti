@@ -696,8 +696,12 @@ In order; each lands its TUI path in the same wave as its verbs.
    screen markers were stale; and a hold answered in Claude's own dialog
    lingered on a finished pane. Review then tightened each fix (a fresh
    agent's grace, report rests, footer-anchored markers, scoped releases,
-   and an ask that takes no screen-read block), covered by tests; Codex's
-   hook items stay blocked on hook trust.
+   and an ask that takes no screen-read block), covered by tests. ✅ Round 4
+   ran Codex's hook items live once its hooks were trusted (by the lead, on
+   the user's word): held approvals answered from tutti, Subagent rows, `tutti
+   ask`, an Interrupt's reply. It found two more bugs, fixed: a pane went
+   working while a request it held still waited, and a start-up idle report
+   beat detection.
 2. ✅ **State follow-ups** (Phase 3 item 2) — typing ends a Done/Idle program
    claim; `OSC 9;N` subcommands never surface as notifications.
 3. ✅ **Debts against the ground rules** — a TUI path for installing the hooks,
@@ -1054,6 +1058,29 @@ list below:
   its approval dialog, done), so a hook-less Codex is a program claim; its
   screens were captured for the markers (Phase 4 item 6).
 
+✅ **Round 4 (w12, 2026-11-05)**, Codex 0.166.0 with tutti's per-invocation
+hooks trusted. First 7 were trusted (Stop and Interrupt not); from 13:38 all
+were. The checks:
+- A held Codex approval answered from tutti: `pane approve` allowed it,
+  `--deny --message` reached Codex ("Blocked by hook" with the message), and
+  two parallel calls were each held and answered by `--id`. Codex keeps its
+  own dialog back while the hook runs ("Running hook").
+- SubagentStart/Stop rows: a row running, then finished. Each is named by
+  its `agent_type`, `default`.
+- `tutti ask`: a reply (`pong`), and exit 3 on a held approval.
+- An Interrupt turn's `--last-reply`: "ended without a reply".
+- While Stop was untrusted, every turn left the pane hook-claimed working.
+  `ask` was then refused ("is working"), and `--last-reply` had no turn end.
+  Both trace to the untrusted hook, not to tutti.
+- Found and fixed:
+  - Allowed one of two held requests, Codex ran it, and its hooks moved the
+    pane to working while the other still waited. The pane now stays
+    blocked until the last request is answered. A held request's own tool
+    run (answered in the agent's dialog) lets it go, and so does a new
+    prompt. The fix was re-run live.
+  - Codex's start-up idle report beat detection, so the pane read idle
+    rather than unknown. That fix is tested, not re-run live.
+
 **Unverified live** — cover these in the next live run:
 - what the w12 review changed after its run: a fresh agent's 5 s grace
   then idle (a restored agent, one given no work); a detected agent's own
@@ -1074,16 +1101,15 @@ list below:
   write-back (the read documents validate against the live API, and every
   document against Linear's published schema; the replies are covered only
   by fixtures, the writes only by stubs);
-- Codex, blocked on hook trust: a held approval answered from tutti;
-  SubagentStart/Stop rows; `tutti ask` on Codex; the ancestry guard
-  dropping a shared-daemon hook (unit-tested only). They need tutti's hooks
-  trusted in Codex's `/hooks`, which writes the user's Codex state and is
-  the user's to do (w12 trusted nothing);
+- Codex: the ancestry guard dropping a shared-daemon hook (unit-tested
+  only);
+- a held Claude request answered in Claude's own dialog, let go by its
+  tool's run or a new prompt (tested only; round 4 ran Codex, which keeps
+  its dialog back);
 - Gemini CLI's tool and permission events, `--resume`, and its `AfterAgent`
   reply for `--last-reply`: they need the user's Gemini login (SessionStart
   and a prompt's BeforeAgent → AfterAgent ran live);
-- an opencode `session.error` or Codex `Interrupt` turn read with
-  `--last-reply`;
+- an opencode `session.error` turn read with `--last-reply`;
 - the first-message data for Goose, Qwen Code, Cursor, Copilot, Factory
   Droid, Augment and Amazon Q, from their docs only and unrun (Amazon Q's
   from a search excerpt of its reference page). The same goes for the file
