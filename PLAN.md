@@ -503,10 +503,14 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    `agent-event` and the `--tty` hooks (wave 11; re-run `hooks claude
    --install`). ✅ Both ran live (w12, Claude Code 2.1.318). Codex 0.166.0
    reports its own state over OSC 7501 (working, blocked, done), so a
-   hook-less Codex pane is a program claim. Its screen markers (the `›`
-   composer; the approval, folder-trust and hook-review dialogs) are now the
-   ones observed. The bare `approve` marker matched the transcript an
-   answered approval leaves, so it is gone (w12).
+   hook-less Codex pane is a program claim (seen live, w12). Its screen
+   markers are the screens captured live then: the `›` composer over its `?
+   for shortcuts` footer, and the approval, folder-trust and hook-review
+   dialogs, each an option over its footer on the screen's bottom line, so
+   a reply quoting one reads as a reply. The bare `approve` marker matched
+   the transcript an answered approval leaves, so it is gone, and so is the
+   unverified `Allow command`. The footer-anchored markers are checked
+   against those captures in tests, not yet re-run live.
 7. **Conversation resume**: ✅ wave 1 — the launcher harvests resumable
    conversations for its target workspace from the agent tools' own session
    stores (read-only; each candidate verified against the working directory
@@ -569,11 +573,18 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    (`approval_timeout_secs`, default 120) or on hook hang-up. An allow or a deny
    sets the pane Working at once (Claude sends no hook until the tool is done);
    an overlay that opened itself over the pane in view ignores keys for 800 ms,
-   so a `y`/`n` already on its way into the pane can't answer it. ✅ (w12)
-   Claude Code 2.1.318 shows its own dialog beside a hold; tutti's answer
-   closes it (`Allowed by PermissionRequest hook`). One answered in the dialog
-   left its hook holding past the turn, so a hook-reported turn end (Stop,
-   StopFailure, Codex's Interrupt) now passes whatever the pane still holds.
+   so a `y`/`n` already on its way into the pane can't answer it. ✅ (w12,
+   live) Claude Code 2.1.318 shows its own dialog beside a hold; tutti's
+   answer closes it (`Allowed by PermissionRequest hook`). One answered in
+   the dialog left its hook holding on a done pane until its timeout. ✅
+   (w12, tests) An agent's turn end now lets go of the requests that agent
+   raised, as a fall-through to its dialog: the main agent's Stop,
+   StopFailure or Interrupt its own, a SubagentStop that subagent's (a
+   request names its subagent by the hook's `agent_id`, `ApprovalHold.agent`,
+   wire rev 17), since Stop can come while a background subagent runs
+   (`background_tasks`, the hooks reference). An answer that comes after
+   the release is refused saying so. Live, only the main agent's case ran;
+   a background subagent's request surviving the main Stop is unverified.
    ✅ The sidebar and
    changes-panel keys are table-driven (`config::SIDEBAR_TABLE` /
    `CHANGES_TABLE`): dispatch, the help overlay and the footer hints all render
@@ -680,10 +691,13 @@ In order; each lands its TUI path in the same wave as its verbs.
 1. ✅ **Finish Phase 4** — `pane wait`, `pane read --since`, `tutti run`
    (`--workspace`/`--dir`, or beside its caller) and the agent skill landed.
    ✅ The acceptance ran for real against live Claude Code and Codex (w12,
-   below the Open list). It turned up three bugs, now fixed: a wait right
-   after `run` answered done on the agent's first frame; Codex 0.166's screen
-   markers were stale; and a hold answered in Claude's own dialog lingered
-   on a finished pane.
+   below the Open list). It turned up three bugs, fixed after it: a wait
+   right after `run` answered done on the agent's first frame; Codex 0.166's
+   screen markers were stale; and a hold answered in Claude's own dialog
+   lingered on a finished pane. Review then tightened each fix (a fresh
+   agent's grace, report rests, footer-anchored markers, scoped releases,
+   and an ask that takes no screen-read block), covered by tests; Codex's
+   hook items stay blocked on hook trust.
 2. ✅ **State follow-ups** (Phase 3 item 2) — typing ends a Done/Idle program
    claim; `OSC 9;N` subcommands never surface as notifications.
 3. ✅ **Debts against the ground rules** — a TUI path for installing the hooks,
@@ -969,9 +983,14 @@ In order; each lands its TUI path in the same wave as its verbs.
   pane can read as working while it draws (refused until it settles);
   replies are not kept across a daemon restart. ✅ (w12) Startup dialogs
   read blocked (Claude's folder trust, Codex's folder trust and hook
-  review), and a fresh agent's prompt stays `unknown` until it has worked,
-  so a `pane wait` right after `tutti run` no longer answers done before the
-  turn;
+  review; live with the first markers, the footer-anchored ones in tests),
+  and a fresh agent at rest before any work — its prompt on
+  screen, its own idle or done report — reads `unknown` for its first 5 s
+  (`FRESH_GRACE`), then `idle`, never done, so a `pane wait` right after
+  `tutti run` no longer answers before the turn (reproduced live, then the
+  `unknown` rule run live; the grace is tested, not run live). ✅ An ask's
+  wait takes a block only from a hook or the agent's own report, never one
+  read off the screen;
 - a view-only client (`attach --view`) counts as attached, so with only a
   view attached a held approval waits for `pane approve` or its timeout,
   though the view cannot answer it (seen live, w12);
@@ -1020,8 +1039,9 @@ list below:
 - a held Claude request passed with `esc` to Claude's dialog, timed out to
   it (5 s), allowed and denied (`--message` reached the model) with `pane
   approve`. Claude 2.1.318 shows its own dialog beside every hold; one
-  answered there left the hold on a done pane until its timeout, now
-  passed at the turn's end (Phase 4 item 9);
+  answered there left the hold on a done pane until its timeout. A turn's
+  end now lets it go (Phase 4 item 9); that, and its scoping to the agent
+  that asked, are covered by tests, not run live;
 - `tutti ask`: a reply, exit 3 on a held approval, exit 124 on a 2 s
   timeout;
 - `tutti attach --view` as a second client, under a pty: `view` in the
@@ -1032,10 +1052,15 @@ list below:
   command exiting 1 is a plain `PostToolUse`);
 - Codex 0.166.0 reports its own state over OSC 7501 (working, blocked on
   its approval dialog, done), so a hook-less Codex is a program claim; its
-  screen markers are now its own (`›` idle, the approval, trust and
-  hook-review dialogs blocked).
+  screens were captured for the markers (Phase 4 item 6).
 
 **Unverified live** — cover these in the next live run:
+- what the w12 review changed after its run: a fresh agent's 5 s grace
+  then idle (a restored agent, one given no work); a detected agent's own
+  idle or done report before any work; the footer-anchored dialog and idle
+  markers; a turn end releasing only its own agent's held requests (a
+  background subagent asking past the main Stop); an ask's wait refusing a
+  screen-read block. Each is covered by tests only;
 - a turn-end probe racing a restore;
 - opencode's question/error/retry events;
 - conversation ids from a real opencode, and prompt labels from a real
@@ -1049,10 +1074,11 @@ list below:
   write-back (the read documents validate against the live API, and every
   document against Linear's published schema; the replies are covered only
   by fixtures, the writes only by stubs);
-- Codex: a held approval answered from tutti; SubagentStart/Stop rows; the
-  ancestry guard dropping a shared-daemon hook (unit-tested only). They need
-  tutti's hooks trusted in Codex's `/hooks`, which writes the user's Codex
-  state (w12 did not);
+- Codex, blocked on hook trust: a held approval answered from tutti;
+  SubagentStart/Stop rows; `tutti ask` on Codex; the ancestry guard
+  dropping a shared-daemon hook (unit-tested only). They need tutti's hooks
+  trusted in Codex's `/hooks`, which writes the user's Codex state and is
+  the user's to do (w12 trusted nothing);
 - Gemini CLI's tool and permission events, `--resume`, and its `AfterAgent`
   reply for `--last-reply`: they need the user's Gemini login (SessionStart
   and a prompt's BeforeAgent → AfterAgent ran live);
