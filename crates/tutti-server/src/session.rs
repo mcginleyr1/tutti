@@ -161,9 +161,10 @@ struct PaneSlot {
     /// pane since its agent started; an agent leaving clears it. An ask needs
     /// it: only a hook reports the turn end its wait is for.
     hooked: bool,
-    /// The subagent that raised each held approval, by approval id; the main
-    /// agent's are absent. A turn's end lets go only of its own agent's.
-    asked_by: HashMap<u64, String>,
+    /// Who raised each held approval and for which call, by approval id: a
+    /// turn's end lets go only of its own agent's, a call's run only of that
+    /// call's.
+    asked: HashMap<u64, Asked>,
     /// The approvals turn ends let go of, newest last, so an answer that
     /// lost that race hears what became of its approval.
     let_go: Vec<u64>,
@@ -201,6 +202,14 @@ impl PaneSlot {
             AgentState::Idle
         }
     }
+}
+
+/// Who raised a held approval and for which tool call (`hold_approval`).
+struct Asked {
+    /// The subagent asking, `None` for the main agent.
+    agent: Option<String>,
+    /// The call it asks about, as its run's activity names it.
+    call: Option<String>,
 }
 
 /// Test builds only: a pause a pane's drop takes, then word that it ended
@@ -1030,23 +1039,26 @@ impl Session {
             }
             AgentHookEvent::SubagentStopped { id } => {
                 relisted |= stop_subagent(subs, &id);
-                stale = release_holds(&mut slot.meta.approvals, &mut slot.asked_by, Some(&id));
+                stale = release_holds(&mut slot.meta.approvals, &mut slot.asked, Some(&id));
                 fell_through = true;
             }
             AgentHookEvent::Activity { detail } => {
-                // A held request's own tool running was answered in the
-                // agent's dialog; any other tool's — a parallel call allowed
-                // — leaves the pane waiting on the requests still held.
+                // A held request's own call running was answered in the
+                // agent's dialog; any other named call — a parallel one
+                // allowed — leaves the pane waiting on the requests still
+                // held. An activity naming no call moves it as ever.
                 let held = &mut slot.meta.approvals;
-                let answered = held.iter().position(|a| {
-                    detail.as_deref() == Some(&format!("{} · {}", a.tool, a.summary))
+                let asked = &mut slot.asked;
+                let answered = detail.as_ref().and_then(|call| {
+                    held.iter()
+                        .position(|a| asked.get(&a.id).and_then(|a| a.call.as_ref()) == Some(call))
                 });
                 if let Some(at) = answered {
                     let id = held.remove(at).id;
-                    slot.asked_by.remove(&id);
+                    asked.remove(&id);
                     stale.push(id);
                 }
-                if held.is_empty() {
+                if held.is_empty() || detail.is_none() {
                     classified = Some(Observation::Working);
                 }
                 // Whatever went on to its dialog, the agent has moved on.
@@ -1056,7 +1068,7 @@ impl Session {
                 noted = slot.meta.sandbox.is_none() && slot.turns.prompted(id, text);
                 classified = Some(Observation::Working);
                 // A new prompt ends the turn the main agent asked in.
-                stale = release_holds(&mut slot.meta.approvals, &mut slot.asked_by, None);
+                stale = release_holds(&mut slot.meta.approvals, &mut slot.asked, None);
             }
             AgentHookEvent::Blocked { .. } => {
                 classified = Some(Observation::Blocked);
@@ -1075,7 +1087,7 @@ impl Session {
                 let before = subs.len();
                 subs.retain(|s| s.running);
                 relisted |= subs.len() != before;
-                stale = release_holds(&mut slot.meta.approvals, &mut slot.asked_by, None);
+                stale = release_holds(&mut slot.meta.approvals, &mut slot.asked, None);
                 fell_through = true;
             }
             AgentHookEvent::SessionStarted => {}
@@ -1176,7 +1188,8 @@ impl Session {
     /// pending approval its view carries, queued behind any it holds already
     /// (parallel subagents ask at once), under a fresh id an answer must
     /// name. `agent` is the subagent asking, `None` for the main agent: the
-    /// turn end that releases it (`release_holds`). `None` — the request goes
+    /// turn end that releases it (`release_holds`); `call` the tool call, whose
+    /// run releases it (`apply_agent_event`). `None` — the request goes
     /// straight on to Claude's own dialog — for an unknown pane.
     pub fn hold_approval(
         &mut self,
@@ -1184,15 +1197,14 @@ impl Session {
         tool: String,
         summary: String,
         agent: Option<String>,
+        call: Option<String>,
     ) -> Option<u64> {
         let slot = self.panes.get_mut(&pane)?;
         let id = self.ids.approval();
         slot.meta
             .approvals
             .push(PendingApproval { id, tool, summary });
-        if let Some(agent) = agent {
-            slot.asked_by.insert(id, agent);
-        }
+        slot.asked.insert(id, Asked { agent, call });
         Some(id)
     }
 
@@ -1205,7 +1217,7 @@ impl Session {
         let held = &mut slot.meta.approvals;
         let at = held.iter().position(|a| id.is_none_or(|id| id == a.id))?;
         let taken = held.remove(at).id;
-        slot.asked_by.remove(&taken);
+        slot.asked.remove(&taken);
         Some((taken, !held.is_empty() || slot.passed))
     }
 
@@ -1610,7 +1622,7 @@ impl Session {
                 slot.meta.source = None;
                 slot.herdr = None;
                 slot.meta.approvals.clear();
-                slot.asked_by.clear();
+                slot.asked.clear();
                 Some((from, to))
             }
             _ => None,
@@ -1949,7 +1961,7 @@ impl Session {
                 dialog: false,
                 passed: false,
                 hooked: false,
-                asked_by: HashMap::new(),
+                asked: HashMap::new(),
                 let_go: Vec::new(),
                 worked: false,
                 started: Instant::now(),
@@ -2060,14 +2072,14 @@ fn stop_subagent(subs: &mut [SubagentInfo], id: &str) -> bool {
 /// (Stop's `background_tasks`), so its requests wait for its own stop.
 fn release_holds(
     approvals: &mut Vec<PendingApproval>,
-    asked_by: &mut HashMap<u64, String>,
+    asked: &mut HashMap<u64, Asked>,
     agent: Option<&str>,
 ) -> Vec<u64> {
     let mut released = Vec::new();
     approvals.retain(|a| {
-        let stale = asked_by.get(&a.id).map(String::as_str) == agent;
+        let stale = asked.get(&a.id).and_then(|a| a.agent.as_deref()) == agent;
         if stale {
-            asked_by.remove(&a.id);
+            asked.remove(&a.id);
             released.push(a.id);
         }
         !stale
@@ -2361,7 +2373,7 @@ mod tests {
             classified(&s),
             "blocked, its dialog's answer is the screen's"
         );
-        s.hold_approval(pane, "Bash".into(), "ls".into(), None);
+        s.hold_approval(pane, "Bash".into(), "ls".into(), None, None);
         assert!(!classified(&s), "not while tutti holds a request");
         s.take_approval(pane, None);
         s.apply_agent_event(pane, AgentHookEvent::Activity { detail: None }, None);
@@ -2572,6 +2584,29 @@ mod tests {
         assert_eq!(s.observe(pane, false, None, detected), None);
         let after = detected + FRESH_GRACE;
         assert_eq!(s.observe(pane, false, None, after), Some((Unknown, Idle)));
+    }
+
+    /// A program reporting over OSC 7501 that detection never names rests
+    /// on its start-up idle all the same, and is never stuck unknown: its
+    /// report's claim keeps it in the classify pass, which reads it idle
+    /// once the grace from the pane's start is over.
+    #[test]
+    fn a_never_detected_reporters_start_up_idle_settles_after_the_grace() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let t0 = Instant::now();
+        let idle = s.apply_report(pane, report(Program, Some(Idle)), t0);
+        assert_eq!(idle.transition, None);
+        assert_eq!(state_of(&s, pane), (Unknown, Some(Program)));
+        assert!(
+            s.agent_panes()
+                .iter()
+                .any(|(p, kind, _)| *p == pane && kind.is_none()),
+            "classified though no agent is detected"
+        );
+        assert_eq!(s.observe(pane, false, None, t0), None);
+        let after = t0 + FRESH_GRACE;
+        assert_eq!(s.observe(pane, false, None, after), Some((Unknown, Idle)));
+        assert_eq!(state_of(&s, pane), (Idle, Some(Program)));
     }
 
     /// A restore revives an agent at its prompt, having done nothing since:
@@ -2792,10 +2827,10 @@ mod tests {
             summary: "src/main.rs".into(),
         };
         let first = s
-            .hold_approval(pane, "Bash".into(), "rm -rf build".into(), None)
+            .hold_approval(pane, "Bash".into(), "rm -rf build".into(), None, None)
             .unwrap();
         let second = s
-            .hold_approval(pane, "Edit".into(), "src/main.rs".into(), None)
+            .hold_approval(pane, "Edit".into(), "src/main.rs".into(), None, None)
             .unwrap();
         assert!(second > first, "ids count up");
         assert_eq!(
@@ -2816,10 +2851,10 @@ mod tests {
         assert_eq!(s.take_approval(pane, None), None, "nothing left to take");
 
         let third = s
-            .hold_approval(pane, "Edit".into(), "src/main.rs".into(), None)
+            .hold_approval(pane, "Edit".into(), "src/main.rs".into(), None, None)
             .unwrap();
         let fourth = s
-            .hold_approval(pane, "Bash".into(), "rm -rf build".into(), None)
+            .hold_approval(pane, "Bash".into(), "rm -rf build".into(), None, None)
             .unwrap();
         assert_eq!(
             s.take_approval(pane, None),
@@ -2828,14 +2863,14 @@ mod tests {
         );
         assert!(fourth > third, "an id is never reused");
         assert_eq!(
-            s.hold_approval(PaneId(99), "Bash".into(), "ls".into(), None),
+            s.hold_approval(PaneId(99), "Bash".into(), "ls".into(), None, None),
             None,
             "an unknown pane holds nothing"
         );
 
         s.passed_to_dialog(pane);
         let fifth = s
-            .hold_approval(pane, "Bash".into(), "ls".into(), None)
+            .hold_approval(pane, "Bash".into(), "ls".into(), None, None)
             .unwrap();
         assert_eq!(
             s.take_approval(pane, None),
@@ -2848,6 +2883,65 @@ mod tests {
             Some((fifth, false)),
             "until a hook shows the agent moved on"
         );
+    }
+
+    /// A run lets go of the held request naming its call — answered in the
+    /// agent's own dialog — and of no other: of two alike, the oldest goes
+    /// and the other still waits; opencode's reply naming its request lets
+    /// go of that one alone. A run naming no call moves the pane, its holds
+    /// kept, as ever. Each agent's turn end lets go of its own requests
+    /// only, the main agent's and a subagent's either way round.
+    #[test]
+    fn a_run_lets_go_of_the_held_request_naming_its_call() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let hold = |s: &mut Session, agent: Option<&str>, call: &str| {
+            let (agent, call) = (agent.map(str::to_string), Some(call.to_string()));
+            s.hold_approval(pane, "bash".into(), "ls".into(), agent, call)
+                .unwrap()
+        };
+        let held = |s: &Session| {
+            let info = s.pane(pane).unwrap();
+            info.approvals.iter().map(|a| a.id).collect::<Vec<_>>()
+        };
+        let ran = |s: &mut Session, detail: Option<&str>| {
+            let detail = detail.map(str::to_string);
+            s.apply_agent_event(pane, AgentHookEvent::Activity { detail }, None)
+                .unwrap()
+                .stale
+        };
+        let blocked = AgentHookEvent::Blocked {
+            message: None,
+            reminder: false,
+        };
+        hook(&mut s, pane, blocked.clone());
+        let first = hold(&mut s, None, "opencode:per_1");
+        let second = hold(&mut s, None, "k-ls");
+        let third = hold(&mut s, None, "k-ls");
+        assert_eq!(ran(&mut s, Some("k-ls")), [second]);
+        assert_eq!(held(&s), [first, third], "the other alike still waits");
+        assert_eq!(state_of(&s, pane), (Blocked, Some(Hook)));
+        assert!(ran(&mut s, Some("opencode:per_9")).is_empty());
+        assert_eq!(ran(&mut s, Some("opencode:per_1")), [first]);
+        assert_eq!(state_of(&s, pane), (Blocked, Some(Hook)));
+        assert!(ran(&mut s, None).is_empty());
+        assert_eq!(held(&s), [third]);
+        assert_eq!(state_of(&s, pane), (Working, Some(Hook)), "as ever");
+        assert_eq!(ran(&mut s, Some("k-ls")), [third]);
+
+        hook(&mut s, pane, blocked);
+        let main = hold(&mut s, None, "k-main");
+        let sub = hold(&mut s, Some("a1"), "k-sub");
+        let stopped = AgentHookEvent::SubagentStopped { id: "a1".into() };
+        let out = s.apply_agent_event(pane, stopped, None).unwrap();
+        assert_eq!(out.stale, [sub], "a subagent's stop lets go of its own");
+        let prompt = AgentHookEvent::Prompt {
+            text: None,
+            id: None,
+        };
+        let sub = hold(&mut s, Some("a1"), "k-sub");
+        let out = s.apply_agent_event(pane, prompt, None).unwrap();
+        assert_eq!(out.stale, [main], "the main agent's turn end, its own");
+        assert_eq!(held(&s), [sub]);
     }
 
     #[test]

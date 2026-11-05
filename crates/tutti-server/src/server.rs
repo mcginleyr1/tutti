@@ -860,7 +860,18 @@ fn handle_frame(
                 tool,
                 summary,
                 agent,
-            }) => approval_hold(hub, cid, &reply, pane, conversation, tool, summary, agent),
+                call,
+            }) => approval_hold(
+                hub,
+                cid,
+                &reply,
+                pane,
+                conversation,
+                tool,
+                summary,
+                agent,
+                call,
+            ),
             Ok(Request::PaneWait {
                 pane,
                 until,
@@ -2023,11 +2034,13 @@ fn approval_hold(
     tool: String,
     summary: String,
     agent: Option<String>,
+    call: Option<String>,
 ) -> ControlFlow<()> {
     let message = Some(format!("{tool} · {summary}"));
     let attached = hub.clients().values().any(|client| !client.watching);
     let held = if attached {
-        hub.session().hold_approval(pane, tool, summary, agent)
+        hub.session()
+            .hold_approval(pane, tool, summary, agent, call)
     } else {
         None
     };
@@ -3941,7 +3954,7 @@ mod tests {
         .unwrap();
         let id = hub
             .session()
-            .hold_approval(pane, "Bash".into(), "ls".into(), None)
+            .hold_approval(pane, "Bash".into(), "ls".into(), None, None)
             .unwrap();
         let (answer, _answered) = oneshot::channel();
         hub.approvals().insert(id, answer);
@@ -3960,7 +3973,7 @@ mod tests {
         assert_eq!(hub.session().pane(pane).unwrap().approval, None);
         let next = hub
             .session()
-            .hold_approval(pane, "Bash".into(), "pwd".into(), None);
+            .hold_approval(pane, "Bash".into(), "pwd".into(), None, None);
         let taken = hub.session().take_approval(pane, None);
         assert_eq!(
             taken,

@@ -1673,25 +1673,27 @@ fn run_agent_event(session: &str, agent: HookAgent) -> Result<i32> {
     let Some((event, conversation)) = mapped else {
         return Ok(0);
     };
-    let request = match agent {
+    let (request, call) = match agent {
         HookAgent::Claude | HookAgent::Codex | HookAgent::Gemini => {
-            hooks::permission_request(&value)
+            (hooks::permission_request(&value), hooks::call_key(&value))
         }
-        HookAgent::Opencode => hooks::opencode_permission(&value),
+        HookAgent::Opencode => (
+            hooks::opencode_permission(&value),
+            hooks::opencode_asked_call(&value),
+        ),
     };
     if let Some((tool, summary)) = request
         && let Some(timeout) = approval_hold_timeout()
     {
-        let asking = hooks::asking_subagent(&value);
-        let held = hold_approval(
-            &session,
-            PaneId(pane),
+        let hold = Request::ApprovalHold {
+            pane: PaneId(pane),
             conversation,
             tool,
             summary,
-            asking,
-            timeout,
-        );
+            agent: hooks::asking_subagent(&value),
+            call,
+        };
+        let held = hold_approval(&session, &hold, timeout);
         let answer = held.map(|decision| match agent {
             HookAgent::Claude | HookAgent::Codex | HookAgent::Gemini => {
                 hooks::permission_decision(&decision)
@@ -1762,27 +1764,11 @@ fn approval_hold_timeout() -> Option<Duration> {
 /// Hold a permission request on the session's daemon until it is answered —
 /// in place of its `AgentEvent`, which the hold blocks the pane for just the
 /// same. `timeout` running out is an error, as is any failure: Claude's own
-/// dialog then appears. `agent` is the subagent asking, `None` for the main
-/// agent. Never auto-starts a server.
-fn hold_approval(
-    session: &str,
-    pane: PaneId,
-    conversation: Option<String>,
-    tool: String,
-    summary: String,
-    agent: Option<String>,
-    timeout: Duration,
-) -> Result<ApprovalDecision> {
+/// dialog then appears. Never auto-starts a server.
+fn hold_approval(session: &str, hold: &Request, timeout: Duration) -> Result<ApprovalDecision> {
     let mut client = Client::connect(session).context("connecting to tutti-server")?;
     client.set_timeout(timeout)?;
-    let hold = Request::ApprovalHold {
-        pane,
-        conversation,
-        tool,
-        summary,
-        agent,
-    };
-    match client.request(&hold)? {
+    match client.request(hold)? {
         Response::Approval { decision } => Ok(decision),
         other => bail!("unexpected reply to an approval hold: {other:?}"),
     }

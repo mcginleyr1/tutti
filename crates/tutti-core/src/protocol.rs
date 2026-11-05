@@ -11,7 +11,7 @@ use crate::state::{AgentState, StateSource};
 /// Response / Event shapes (including additive fields): the daemon reports it
 /// on attach and mismatched clients tell the user to restart the daemon —
 /// binaries upgrade on install, running daemons do not.
-pub const WIRE_REV: u32 = 17;
+pub const WIRE_REV: u32 = 18;
 
 /// The most notes the daemon's notification history keeps, the oldest going
 /// first. A client caps its copy the same, so the two agree.
@@ -352,6 +352,9 @@ pub enum Request {
     /// `agent` is the subagent asking — the request's `agent_id` — `None`
     /// for the main agent and from older clients: the main agent's turn end
     /// lets go of its own requests, a subagent's stop of that subagent's.
+    /// `call` identifies the tool call asked about, as its run's
+    /// `AgentHookEvent::Activity::detail` does, so that run lets go of a
+    /// request answered in the agent's own dialog; `None` from older clients.
     ApprovalHold {
         pane: PaneId,
         #[serde(default)]
@@ -360,6 +363,8 @@ pub enum Request {
         summary: String,
         #[serde(default)]
         agent: Option<String>,
+        #[serde(default)]
+        call: Option<String>,
     },
     /// Answer one of `pane`'s held approvals: `id` names the one the sender
     /// looked at (`PaneInfo::approvals`), `None` the oldest. Error when the
@@ -541,11 +546,13 @@ pub enum AgentHookEvent {
     SubagentStarted { id: String, desc: String },
     /// A subagent finished: its sub-row flips to "just-finished".
     SubagentStopped { id: String },
-    /// Any tool use — a heartbeat that keeps the pane `Working`; `detail` names
-    /// the tool when known, with its input as a held approval names it (`Bash
-    /// · rm -rf build`) from Claude's and Codex's hooks: the run of a request
-    /// tutti holds, answered in the agent's own dialog. A pane holding any
-    /// other request stays `Blocked`.
+    /// Any tool use — a heartbeat that keeps the pane `Working`. `detail`
+    /// identifies the call when known, as a held request's
+    /// `Request::ApprovalHold::call` does: from Claude's and Codex's hooks the
+    /// asking agent, tool and input hashed, from opencode's `permission.replied`
+    /// the permission's id. The run of a request tutti holds — answered in the
+    /// agent's own dialog — lets that request go; a pane holding any other
+    /// stays `Blocked`. An activity naming no call moves the pane as ever.
     Activity {
         #[serde(default)]
         detail: Option<String>,
@@ -1515,6 +1522,7 @@ mod tests {
             tool: "Bash".into(),
             summary: "rm -rf build".into(),
             agent: Some("a1b2".into()),
+            call: Some("8c1f0e2a9b3d4c5e".into()),
         });
         roundtrip(&Request::ApprovalAnswer {
             pane: PaneId(3),
@@ -1787,8 +1795,9 @@ mod tests {
                 tool: "Edit".into(),
                 summary: "src/main.rs".into(),
                 agent: None,
+                call: None,
             },
-            "an older client's hold is the main agent's"
+            "an older client's hold is the main agent's, naming no call"
         );
         let answer: Request = serde_json::from_str(
             r#"{"type":"approval_answer","pane":3,"decision":{"behavior":"deny"}}"#,

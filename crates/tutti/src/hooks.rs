@@ -67,9 +67,12 @@ pub fn map_opencode_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)>
             message: text("/properties/questions/0/question"),
             reminder: false,
         }),
-        "permission.replied" | "question.replied" | "question.rejected" => {
-            Some(AgentHookEvent::Activity { detail: None })
-        }
+        // A reply in opencode's own dialog names the request it answered:
+        // the run of a request tutti still holds.
+        "permission.replied" => Some(AgentHookEvent::Activity {
+            detail: text("/properties/requestID").map(|id| opencode_call(&id)),
+        }),
+        "question.replied" | "question.rejected" => Some(AgentHookEvent::Activity { detail: None }),
         _ => None,
     }?;
     let root = matches!(kind, "session.status" | "session.idle" | "session.error");
@@ -107,7 +110,7 @@ pub fn map_claude_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
             })
         }
         "PreToolUse" | "PostToolUse" | "PostToolUseFailure" => Some(AgentHookEvent::Activity {
-            detail: tool_name(v).map(|tool| format!("{tool} · {}", input_summary(v))),
+            detail: call_key(v),
         }),
         "SubagentStop" => Some(AgentHookEvent::SubagentStopped { id: subagent_id(v) }),
         // Only a Notification that waits on you blocks (`WAITING`), and one
@@ -251,6 +254,48 @@ pub fn asking_subagent(v: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
         .map(str::to_string)
+}
+
+/// The identity of one tool call, the same from its `PermissionRequest` as
+/// from its `PreToolUse` and `PostToolUse`, so the run of a held request
+/// answered in the agent's own dialog lets that request go: the asking agent
+/// (`asking_subagent`), the tool and its whole input, as canonical JSON
+/// (`serde_json` sorts an object's keys: it is built without
+/// `preserve_order`), FNV-1a hashed. Captured live (Claude Code 2.1.318,
+/// Codex 0.166.0), a `PermissionRequest` carries no `tool_use_id`, and
+/// Codex's adds to the input a `description` (its reason) the call's other
+/// events lack — so the input counts without it. Calls alike in agent, tool
+/// and input share it: the oldest such request goes, passed, and the agent's
+/// own dialog still asks for the other.
+pub fn call_key(v: &Value) -> Option<String> {
+    let tool = tool_name(v)?;
+    let mut input = v.get("tool_input").cloned().unwrap_or(Value::Null);
+    if let Some(fields) = input.as_object_mut() {
+        fields.remove("description");
+    }
+    let agent = asking_subagent(v).unwrap_or_default();
+    let canonical = json!([agent, tool, input]).to_string();
+    let hash = canonical
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+    Some(format!("{hash:016x}"))
+}
+
+/// The identity of an opencode permission request — its `permission.asked`
+/// `id`, which its `permission.replied` names as `requestID` (opencode
+/// 1.18.5's own event schema: `{sessionID, requestID, reply}`, its TUI
+/// matching the two by id) — as `call_key` gives a Claude or Codex call's.
+fn opencode_call(id: &str) -> String {
+    format!("opencode:{id}")
+}
+
+/// The identity of the request a `permission.asked` holds (`opencode_call`).
+pub fn opencode_asked_call(v: &Value) -> Option<String> {
+    v.pointer("/properties/id")
+        .and_then(Value::as_str)
+        .map(opencode_call)
 }
 
 /// What a `PermissionRequest` asks to run: its tool, and the tool's input on
@@ -586,25 +631,25 @@ mod tests {
     #[test]
     fn pre_tool_use_agent_becomes_subagent_started() {
         let agent = |event: &str| {
-            ev(&json!({
+            json!({
                 "session_id": "abc123",
                 "hook_event_name": event,
                 "tool_name": "Agent",
                 "tool_input": { "description": "Touch a.txt", "prompt": "Run touch a.txt" },
             })
-            .to_string())
         };
         assert_eq!(
-            agent("PreToolUse"),
+            ev(&agent("PreToolUse").to_string()),
             Some(AgentHookEvent::SubagentStarted {
                 id: "Touch a.txt".into(),
                 desc: "Touch a.txt".into(),
             })
         );
+        let ran = agent("PostToolUse");
         assert_eq!(
-            agent("PostToolUse"),
+            ev(&ran.to_string()),
             Some(AgentHookEvent::Activity {
-                detail: Some("Agent · Touch a.txt".into())
+                detail: call_key(&ran)
             })
         );
     }
@@ -634,42 +679,139 @@ mod tests {
         );
     }
 
-    /// A tool use is activity naming the tool and its input as a held
-    /// approval names them, so the run of a held request — answered in the
+    /// A tool use is activity naming its call (`call_key`), as a held
+    /// approval names it, so the run of a held request — answered in the
     /// agent's own dialog — is known for it.
     #[test]
     fn other_tools_and_post_tool_use_become_activity() {
+        let activity = |v: &Value| {
+            let detail = call_key(v);
+            assert!(detail.is_some(), "{v}");
+            (
+                ev(&v.to_string()),
+                Some(AgentHookEvent::Activity { detail }),
+            )
+        };
+        let bash =
+            json!({ "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {} });
+        let (out, want) = activity(&bash);
+        assert_eq!(out, want);
+        let edit = json!({ "hook_event_name": "PostToolUse", "tool_name": "Edit" });
+        let (out, want) = activity(&edit);
+        assert_eq!(out, want);
+        let failed = json!({ "hook_event_name": "PostToolUseFailure", "tool_name": "Bash", "tool_input": {} });
+        let (out, want) = activity(&failed);
+        assert_eq!(out, want);
+        assert_ne!(call_key(&bash), call_key(&edit));
         assert_eq!(
-            ev(r#"{ "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {} }"#),
-            Some(AgentHookEvent::Activity {
-                detail: Some("Bash · ".into())
-            })
+            ev(r#"{ "hook_event_name": "PostToolUse" }"#),
+            Some(AgentHookEvent::Activity { detail: None }),
+            "a run naming no tool names no call"
         );
+    }
+
+    /// One call's events, shaped as Claude Code 2.1.318 and Codex 0.166.0
+    /// sent them live in a scratch repo (ids, paths and outputs made up):
+    /// its request and its run name one call, though only the run carries a
+    /// `tool_use_id` and Codex's request alone adds its reason to the input as
+    /// `description`; a field's place in the input changes nothing. The main
+    /// agent's call and a subagent's alike name two, either way round, and so
+    /// do two calls differing in input alone.
+    #[test]
+    fn a_held_requests_call_is_its_runs_as_captured_live() {
+        let claude = |event: &str, agent: Option<&str>| {
+            let mut v = json!({
+                "session_id": "s1", "transcript_path": "/t/s1.jsonl", "cwd": "/w",
+                "permission_mode": "default", "effort": { "level": "medium" },
+                "prompt_id": "p1", "scratchpad_dir": "/t/scratch",
+                "hook_event_name": event, "tool_name": "Bash",
+                "tool_input": { "command": "touch b.txt", "description": "Create empty file b.txt" },
+            });
+            match event {
+                "PermissionRequest" => {
+                    v["permission_suggestions"] = json!([{ "destination": "session", "mode": "acceptEdits", "type": "setMode" }]);
+                }
+                _ => v["tool_use_id"] = json!("toolu_01"),
+            }
+            if event == "PostToolUse" {
+                v["duration_ms"] = json!(395);
+                v["tool_response"] = json!({ "interrupted": false, "stdout": "", "stderr": "" });
+            }
+            if let Some(agent) = agent {
+                v["agent_id"] = json!(agent);
+                v["agent_type"] = json!("general-purpose");
+            }
+            v
+        };
+        let codex = |event: &str, agent: Option<&str>| {
+            let mut v = json!({
+                "session_id": "s2", "transcript_path": "/t/s2.jsonl", "cwd": "/w",
+                "permission_mode": "default", "model": "gpt", "turn_id": "t1",
+                "hook_event_name": event, "tool_name": "Bash",
+                "tool_input": { "command": "touch x.txt" },
+            });
+            match event {
+                "PermissionRequest" => {
+                    v["tool_input"]["description"] = json!(
+                        "May I run the requested touch command outside the read-only sandbox?"
+                    );
+                }
+                _ => v["tool_use_id"] = json!("exec-1"),
+            }
+            if event == "PostToolUse" {
+                v["tool_response"] = json!("");
+            }
+            if let Some(agent) = agent {
+                v["agent_id"] = json!(agent);
+                v["agent_type"] = json!("default");
+            }
+            v
+        };
+        let detail = |v: &Value| match map_codex_event(v) {
+            Some((AgentHookEvent::Activity { detail }, _)) => detail,
+            other => panic!("expected activity, got {other:?}"),
+        };
+        for (name, event) in [
+            ("claude", &claude as &dyn Fn(&str, Option<&str>) -> Value),
+            ("codex", &codex),
+        ] {
+            for agent in [None, Some("a1")] {
+                let asked = call_key(&event("PermissionRequest", agent));
+                assert!(asked.is_some(), "{name}");
+                for run in ["PreToolUse", "PostToolUse"] {
+                    assert_eq!(detail(&event(run, agent)), asked, "{name} {run} {agent:?}");
+                }
+            }
+            let (main, sub) = (
+                call_key(&event("PermissionRequest", None)),
+                call_key(&event("PermissionRequest", Some("a1"))),
+            );
+            assert_ne!(
+                detail(&event("PostToolUse", Some("a1"))),
+                main,
+                "{name}: a subagent's run is not the main agent's call"
+            );
+            assert_ne!(
+                detail(&event("PostToolUse", None)),
+                sub,
+                "{name}: the main agent's run is not a subagent's call"
+            );
+            let mut other = event("PostToolUse", None);
+            other["tool_input"]["command"] = json!("touch y.txt");
+            assert_ne!(
+                detail(&other),
+                main,
+                "{name}: another input is another call"
+            );
+        }
+        let reordered: Value = serde_json::from_str(
+            r#"{"hook_event_name":"PostToolUse","tool_input":{"description":"Create empty file b.txt","command":"touch b.txt"},"tool_name":"Bash","session_id":"s1"}"#,
+        )
+        .unwrap();
         assert_eq!(
-            ev(r#"{ "hook_event_name": "PostToolUse", "tool_name": "Edit" }"#),
-            Some(AgentHookEvent::Activity {
-                detail: Some("Edit · ".into())
-            })
-        );
-        let ran = json!({
-            "hook_event_name": "PostToolUse",
-            "cwd": "/w",
-            "tool_name": "Write",
-            "tool_input": { "file_path": "/w/bye.txt", "content": "bye" },
-        });
-        let asked = json!({
-            "hook_event_name": "PermissionRequest",
-            "cwd": "/w",
-            "tool_name": "Write",
-            "tool_input": { "file_path": "/w/bye.txt", "content": "bye" },
-        });
-        let (tool, summary) = permission_request(&asked).unwrap();
-        assert_eq!(
-            map_claude_event(&ran).map(|(event, _)| event),
-            Some(AgentHookEvent::Activity {
-                detail: Some(format!("{tool} · {summary}"))
-            }),
-            "the run names what its request named"
+            call_key(&reordered),
+            call_key(&claude("PermissionRequest", None)),
+            "key order is no part of a call"
         );
     }
 
@@ -938,12 +1080,10 @@ mod tests {
             ev(r#"{ "hook_event_name": "StopFailure" }"#),
             Some(AgentHookEvent::Done { reply: None })
         );
-        assert_eq!(
+        assert!(matches!(
             ev(r#"{ "hook_event_name": "PostToolUseFailure", "tool_name": "Bash" }"#),
-            Some(AgentHookEvent::Activity {
-                detail: Some("Bash · ".into())
-            })
-        );
+            Some(AgentHookEvent::Activity { detail: Some(_) })
+        ));
     }
 
     #[test]
@@ -1337,7 +1477,6 @@ mod tests {
             })
         );
         for answered in [
-            r#"{"type":"permission.replied","properties":{"sessionID":"ses_1","requestID":"per_1","reply":"once"}}"#,
             r#"{"type":"question.replied","properties":{"sessionID":"ses_1","requestID":"que_1","answers":[]}}"#,
             r#"{"type":"question.rejected","properties":{"sessionID":"ses_1","requestID":"que_1"}}"#,
         ] {
@@ -1347,6 +1486,34 @@ mod tests {
                 "{answered}"
             );
         }
+    }
+
+    /// opencode 1.18.5's `permission.replied` (`{sessionID, requestID,
+    /// reply}`) names the `permission.asked` it answered by that one's `id`:
+    /// its call is the held request's, so its own dialog's answer lets go of
+    /// that request exactly. A reply naming none moves the pane as ever.
+    #[test]
+    fn an_opencode_reply_names_the_request_it_answered() {
+        let asked = json!({ "type": "permission.asked",
+            "properties": { "id": "per_1", "sessionID": "ses_1", "permission": "bash" } });
+        let call = opencode_asked_call(&asked);
+        assert_eq!(call.as_deref(), Some("opencode:per_1"));
+        assert_eq!(
+            oc(
+                r#"{"type":"permission.replied","properties":{"sessionID":"ses_1","requestID":"per_1","reply":"once"}}"#
+            ),
+            Some(AgentHookEvent::Activity { detail: call })
+        );
+        assert_eq!(
+            oc(
+                r#"{"type":"permission.replied","properties":{"sessionID":"ses_1","reply":"reject"}}"#
+            ),
+            Some(AgentHookEvent::Activity { detail: None })
+        );
+        assert_eq!(
+            opencode_asked_call(&json!({ "type": "permission.asked", "properties": {} })),
+            None
+        );
     }
 
     /// A `permission.asked` as opencode 1.18.5 sent it live holds as its
@@ -1481,7 +1648,7 @@ mod tests {
         let bash = json!({ "tool_name": "Bash", "tool_input": { "command": "ls" }, "tool_use_id": "exec-1" });
         let working = Some((
             AgentHookEvent::Activity {
-                detail: Some("Bash · ls".into()),
+                detail: call_key(&bash),
             },
             id.clone(),
         ));

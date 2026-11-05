@@ -582,11 +582,14 @@ fn agent_event_claude_watches_a_permission_request_by_default() {
 /// the hook exits 0.
 #[test]
 fn agent_event_claude_holds_a_permission_request_for_its_answer() {
+    let call = tutti::hooks::call_key(&serde_json::from_str(PERMISSION_REQUEST).unwrap());
+    assert!(call.is_some(), "a request naming its tool names its call");
     let held = |label: &str, decision: ApprovalDecision| {
+        let call = call.clone();
         let output = permission_request(
             label,
             "approvals = \"hold\"\n",
-            |req| {
+            move |req| {
                 assert_eq!(
                     *req,
                     Request::ApprovalHold {
@@ -595,6 +598,7 @@ fn agent_event_claude_holds_a_permission_request_for_its_answer() {
                         tool: "Bash".into(),
                         summary: "rm -rf build".into(),
                         agent: None,
+                        call,
                     }
                 );
             },
@@ -655,6 +659,7 @@ fn agent_event_opencode_holds_a_permission_request_for_its_answer() {
                         tool: "bash".into(),
                         summary: "rm -rf build".into(),
                         agent: None,
+                        call: Some("opencode:per_1".into()),
                     }
                 );
             },

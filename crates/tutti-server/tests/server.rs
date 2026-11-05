@@ -3749,6 +3749,7 @@ fn hold(pane: PaneId) -> Request {
         tool: "Bash".into(),
         summary: "rm -rf build".into(),
         agent: None,
+        call: Some("rm-build".into()),
     }
 }
 
@@ -3909,12 +3910,13 @@ async fn a_hook_hanging_up_drops_its_approval() {
 }
 
 /// Claude (2.1.318) shows its own dialog beside a held request. Answered
-/// there, the tool runs and the turn ends while the hook still holds. An
-/// agent's turn end passes the requests that agent raised — the main agent's
-/// at Stop, a subagent's at its SubagentStop — and no other: a background
-/// subagent can still run, and ask, past the main agent's Stop. Each passed
-/// request counts as gone to the agent's dialog, as a timed-out one does, and
-/// an answer that lost the race to the turn end is told so.
+/// there, the tool runs — under a call naming no held request, or none — and
+/// the turn ends while the hook still holds. An agent's turn end passes the
+/// requests that agent raised — the main agent's at Stop, a subagent's at its
+/// SubagentStop — and no other: a background subagent can still run, and
+/// ask, past the main agent's Stop. Each passed request counts as gone to the
+/// agent's dialog, as a timed-out one does, and an answer that lost the race
+/// to the turn end is told so.
 #[tokio::test]
 async fn a_turns_end_passes_the_requests_its_own_agent_raised() {
     let server = TestServer::start();
@@ -3933,12 +3935,22 @@ async fn a_turns_end_passes_the_requests_its_own_agent_raised() {
             tool: "Bash".into(),
             summary: "touch b.txt".into(),
             agent: Some("sub1".into()),
+            call: Some("sub1-touch-b".into()),
         })
         .await;
     assert!(wait_pane(&mut control, pane, |p| p.approvals.len() == 2).await);
     let held = held_approvals(&mut control, pane).await;
     let ran = AgentHookEvent::Activity { detail: None };
     hook(&mut control, pane, ran).await;
+    let other = AgentHookEvent::Activity {
+        detail: Some("main-touch-b".into()),
+    };
+    hook(&mut control, pane, other).await;
+    assert_eq!(
+        held_approvals(&mut control, pane).await,
+        held,
+        "a run of another call, or of none named, lets go of nothing"
+    );
 
     let done = AgentHookEvent::Done {
         reply: Some("done".into()),
@@ -3995,10 +4007,10 @@ async fn a_turns_end_passes_the_requests_its_own_agent_raised() {
 /// allowed one of two held requests, it runs that tool and its hooks report
 /// the work, while the other still waits on you — so the pane stays blocked
 /// until that one is answered. A tool run is also how a request answered in
-/// the agent's own dialog shows itself: work on a held request's own tool
-/// and input lets that request go, passed to its hook, and the agent works
-/// on. A new prompt lets go of what the main agent still held: the turn it
-/// asked in is over.
+/// the agent's own dialog shows itself: a run naming a held request's own
+/// call lets that request go, passed to its hook, and the agent works on. A
+/// new prompt lets go of what the main agent still held: the turn it asked
+/// in is over.
 #[tokio::test]
 async fn a_pane_stays_blocked_while_a_request_it_holds_waits() {
     let server = TestServer::start();
@@ -4011,9 +4023,10 @@ async fn a_pane_stays_blocked_while_a_request_it_holds_waits() {
         tool: "Bash".into(),
         summary: summary.into(),
         agent: None,
+        call: Some(format!("call {summary}")),
     };
     let ran = |summary: &str| AgentHookEvent::Activity {
-        detail: Some(format!("Bash · {summary}")),
+        detail: Some(format!("call {summary}")),
     };
     let state = async |control: &mut Conn| {
         let Response::Panes { panes } = control.request(Request::PaneList).await else {
@@ -4125,6 +4138,7 @@ async fn a_pane_holds_parallel_approvals_each_answered_on_its_own() {
             tool: "Bash".into(),
             summary: summary.into(),
             agent: None,
+            call: Some(summary.into()),
         })
         .await;
         hooks.push(hook);
