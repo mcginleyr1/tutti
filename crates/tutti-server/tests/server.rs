@@ -2956,6 +2956,32 @@ async fn an_accept_error_is_logged_and_retried() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// A daemon that died without stopping leaves its prompt files behind; the
+/// next one for the session clears them before it binds its socket — before
+/// any client can write a new one there. (`TestServer` skips `run`.)
+#[tokio::test]
+async fn a_starting_daemon_clears_the_prompt_files_a_dead_one_left() {
+    let base = runtime_dir("prompts");
+    let prompts = base.join("tutti").join("left.prompts");
+    std::fs::create_dir_all(&prompts).unwrap();
+    std::fs::write(prompts.join("prompt-1-2.md"), "fix it").unwrap();
+    let mut daemon = std::process::Command::new(env!("CARGO_BIN_EXE_tutti-server"))
+        .args(["--session", "left", "--foreground"])
+        .env("XDG_RUNTIME_DIR", &base)
+        .env("XDG_STATE_HOME", base.join("state"))
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let path = base.join("tutti").join("left.sock");
+    let stop = StopOnDrop(path.clone());
+    assert!(answers(&path).await, "the daemon came up");
+    assert!(!prompts.exists(), "the leftovers went before it bound");
+
+    drop(stop);
+    let _ = daemon.wait();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// Started detached, the daemon appends its stderr to `<session>.log` beside
 /// its socket, so crash notes outlive it — trimming a log grown past 4 MiB to
 /// its newest MiB, from a line start, as it starts and again while it runs,
