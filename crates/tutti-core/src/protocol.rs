@@ -542,7 +542,10 @@ pub enum AgentHookEvent {
     /// A subagent finished: its sub-row flips to "just-finished".
     SubagentStopped { id: String },
     /// Any tool use — a heartbeat that keeps the pane `Working`; `detail` names
-    /// the tool when known.
+    /// the tool when known, with its input as a held approval names it (`Bash
+    /// · rm -rf build`) from Claude's and Codex's hooks: the run of a request
+    /// tutti holds, answered in the agent's own dialog. A pane holding any
+    /// other request stays `Blocked`.
     Activity {
         #[serde(default)]
         detail: Option<String>,

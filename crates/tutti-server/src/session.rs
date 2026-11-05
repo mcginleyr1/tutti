@@ -1015,6 +1015,7 @@ impl Session {
         let mut noted = false;
         let mut replied = false;
         let mut stale = Vec::new();
+        let mut fell_through = false;
         match event {
             AgentHookEvent::SubagentStarted { id, desc } => {
                 subs.push(SubagentInfo {
@@ -1030,13 +1031,32 @@ impl Session {
             AgentHookEvent::SubagentStopped { id } => {
                 relisted |= stop_subagent(subs, &id);
                 stale = release_holds(&mut slot.meta.approvals, &mut slot.asked_by, Some(&id));
+                fell_through = true;
             }
-            AgentHookEvent::Activity { .. } => {
-                classified = Some(Observation::Working);
+            AgentHookEvent::Activity { detail } => {
+                // A held request's own tool running was answered in the
+                // agent's dialog; any other tool's — a parallel call allowed
+                // — leaves the pane waiting on the requests still held.
+                let held = &mut slot.meta.approvals;
+                let answered = held.iter().position(|a| {
+                    detail.as_deref() == Some(&format!("{} · {}", a.tool, a.summary))
+                });
+                if let Some(at) = answered {
+                    let id = held.remove(at).id;
+                    slot.asked_by.remove(&id);
+                    stale.push(id);
+                }
+                if held.is_empty() {
+                    classified = Some(Observation::Working);
+                }
+                // Whatever went on to its dialog, the agent has moved on.
+                slot.passed = false;
             }
             AgentHookEvent::Prompt { text, id } => {
                 noted = slot.meta.sandbox.is_none() && slot.turns.prompted(id, text);
                 classified = Some(Observation::Working);
+                // A new prompt ends the turn the main agent asked in.
+                stale = release_holds(&mut slot.meta.approvals, &mut slot.asked_by, None);
             }
             AgentHookEvent::Blocked { .. } => {
                 classified = Some(Observation::Blocked);
@@ -1056,6 +1076,7 @@ impl Session {
                 subs.retain(|s| s.running);
                 relisted |= subs.len() != before;
                 stale = release_holds(&mut slot.meta.approvals, &mut slot.asked_by, None);
+                fell_through = true;
             }
             AgentHookEvent::SessionStarted => {}
         }
@@ -1063,9 +1084,10 @@ impl Session {
             slot.passed = false;
         }
         if !stale.is_empty() {
-            // Each goes on to the agent's dialog, as a timed-out or passed
-            // request does, should it still show there.
-            slot.passed = true;
+            // One a turn's end lets go of goes on to the agent's dialog, as a
+            // timed-out or passed request does, should it still show there;
+            // one its tool's run or a new prompt settled is behind it.
+            slot.passed |= fell_through;
             slot.let_go.extend(&stale);
             let excess = slot.let_go.len().saturating_sub(LET_GO_KEPT);
             slot.let_go.drain(..excess);

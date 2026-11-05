@@ -107,7 +107,7 @@ pub fn map_claude_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
             })
         }
         "PreToolUse" | "PostToolUse" | "PostToolUseFailure" => Some(AgentHookEvent::Activity {
-            detail: tool_name(v).map(str::to_string),
+            detail: tool_name(v).map(|tool| format!("{tool} · {}", input_summary(v))),
         }),
         "SubagentStop" => Some(AgentHookEvent::SubagentStopped { id: subagent_id(v) }),
         // Only a Notification that waits on you blocks (`WAITING`), and one
@@ -604,7 +604,7 @@ mod tests {
         assert_eq!(
             agent("PostToolUse"),
             Some(AgentHookEvent::Activity {
-                detail: Some("Agent".into())
+                detail: Some("Agent · Touch a.txt".into())
             })
         );
     }
@@ -634,19 +634,42 @@ mod tests {
         );
     }
 
+    /// A tool use is activity naming the tool and its input as a held
+    /// approval names them, so the run of a held request — answered in the
+    /// agent's own dialog — is known for it.
     #[test]
     fn other_tools_and_post_tool_use_become_activity() {
         assert_eq!(
             ev(r#"{ "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {} }"#),
             Some(AgentHookEvent::Activity {
-                detail: Some("Bash".into())
+                detail: Some("Bash · ".into())
             })
         );
         assert_eq!(
             ev(r#"{ "hook_event_name": "PostToolUse", "tool_name": "Edit" }"#),
             Some(AgentHookEvent::Activity {
-                detail: Some("Edit".into())
+                detail: Some("Edit · ".into())
             })
+        );
+        let ran = json!({
+            "hook_event_name": "PostToolUse",
+            "cwd": "/w",
+            "tool_name": "Write",
+            "tool_input": { "file_path": "/w/bye.txt", "content": "bye" },
+        });
+        let asked = json!({
+            "hook_event_name": "PermissionRequest",
+            "cwd": "/w",
+            "tool_name": "Write",
+            "tool_input": { "file_path": "/w/bye.txt", "content": "bye" },
+        });
+        let (tool, summary) = permission_request(&asked).unwrap();
+        assert_eq!(
+            map_claude_event(&ran).map(|(event, _)| event),
+            Some(AgentHookEvent::Activity {
+                detail: Some(format!("{tool} · {summary}"))
+            }),
+            "the run names what its request named"
         );
     }
 
@@ -918,7 +941,7 @@ mod tests {
         assert_eq!(
             ev(r#"{ "hook_event_name": "PostToolUseFailure", "tool_name": "Bash" }"#),
             Some(AgentHookEvent::Activity {
-                detail: Some("Bash".into())
+                detail: Some("Bash · ".into())
             })
         );
     }
@@ -1458,7 +1481,7 @@ mod tests {
         let bash = json!({ "tool_name": "Bash", "tool_input": { "command": "ls" }, "tool_use_id": "exec-1" });
         let working = Some((
             AgentHookEvent::Activity {
-                detail: Some("Bash".into()),
+                detail: Some("Bash · ls".into()),
             },
             id.clone(),
         ));

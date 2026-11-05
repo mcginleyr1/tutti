@@ -1089,17 +1089,20 @@ request blocks its pane the moment Claude is about to ask, naming the tool and
 its input. By default (`approvals = "watch"`) that is all: Claude shows its own
 dialog, which you answer in the pane or through a peek. Set `approvals =
 "hold"` and the hook also holds the request for an answer from tutti.
-Claude Code 2.1.318 shows its own dialog beside the hold. An answer from
-tutti closes that dialog (`Allowed by PermissionRequest hook`). A request
-answered in the dialog instead leaves its hook waiting, and tutti lets go of
-it when the turn of the agent that asked ends:
+Claude Code 2.1.318 shows its own dialog beside the hold (Codex 0.166.0
+keeps its back while the hook runs). An answer from tutti closes that dialog
+(`Allowed by PermissionRequest hook`). A request answered in the dialog
+instead leaves its hook waiting: tutti lets go of it when that tool's run
+reports (its `PreToolUse`/`PostToolUse` naming the same tool and input), a
+new prompt comes, or the turn of the agent that asked ends:
 
 - The agent's waiting row reads `Bash · rm -rf build`, and a held approval
   leads the queue whatever the pane's state. A pane holds every request its
   agent raises — parallel subagents ask at once — each on a waiting row of
   its own, in the order they came, answered on its own and waiting out its
   own `approval_timeout_secs`. The pane stays blocked until the last is
-  answered.
+  answered, though the agent works meanwhile on what you allowed (Codex
+  runs parallel tool calls, each asking on its own).
 - `p` on that row (its tree row too), or a right-click, opens an **approval**
   overlay framed and placed like the peek: the tool over its input, line
   breaks shown as `⏎`, long input cut with `…` past 500 characters. `y` allows

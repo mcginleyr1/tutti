@@ -3991,6 +3991,76 @@ async fn a_turns_end_passes_the_requests_its_own_agent_raised() {
     server.stop().await;
 }
 
+/// Codex 0.166 runs parallel tool calls, each asking on its own (seen live):
+/// allowed one of two held requests, it runs that tool and its hooks report
+/// the work, while the other still waits on you — so the pane stays blocked
+/// until that one is answered. A tool run is also how a request answered in
+/// the agent's own dialog shows itself: work on a held request's own tool
+/// and input lets that request go, passed to its hook, and the agent works
+/// on. A new prompt lets go of what the main agent still held: the turn it
+/// asked in is over.
+#[tokio::test]
+async fn a_pane_stays_blocked_while_a_request_it_holds_waits() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let pane = run_sleeper(&mut control).await;
+    let _viewer = attached_viewer(&server).await;
+    let asks = |summary: &str| Request::ApprovalHold {
+        pane,
+        conversation: None,
+        tool: "Bash".into(),
+        summary: summary.into(),
+        agent: None,
+    };
+    let ran = |summary: &str| AgentHookEvent::Activity {
+        detail: Some(format!("Bash · {summary}")),
+    };
+    let state = async |control: &mut Conn| {
+        let Response::Panes { panes } = control.request(Request::PaneList).await else {
+            panic!("expected the panes");
+        };
+        let info = panes.into_iter().find(|p| p.id == pane).unwrap();
+        (info.state, info.approvals.len())
+    };
+
+    let (mut c, mut d) = (server.connect().await, server.connect().await);
+    c.send(&asks("touch c.txt")).await;
+    assert!(wait_pane(&mut control, pane, |p| p.approvals.len() == 1).await);
+    d.send(&asks("touch d.txt")).await;
+    assert!(wait_pane(&mut control, pane, |p| p.approvals.len() == 2).await);
+    let held = held_approvals(&mut control, pane).await;
+    let allow = Request::ApprovalAnswer {
+        pane,
+        id: Some(held[0].id),
+        decision: ApprovalDecision::Allow,
+    };
+    assert_eq!(control.request(allow).await, Response::Ok);
+    assert_eq!(approval(c.response().await), ApprovalDecision::Allow);
+    hook(&mut control, pane, ran("touch c.txt")).await;
+    assert_eq!(
+        state(&mut control).await,
+        (AgentState::Blocked, 1),
+        "the other request still waits on you"
+    );
+
+    hook(&mut control, pane, ran("touch d.txt")).await;
+    assert_eq!(approval(d.response().await), ApprovalDecision::Pass);
+    assert_eq!(state(&mut control).await, (AgentState::Working, 0));
+
+    let mut e = server.connect().await;
+    e.send(&asks("touch e.txt")).await;
+    assert!(wait_pane(&mut control, pane, |p| p.approvals.len() == 1).await);
+    let next = AgentHookEvent::Prompt {
+        text: Some("try something else".into()),
+        id: Some("p2".into()),
+    };
+    hook(&mut control, pane, next).await;
+    assert_eq!(approval(e.response().await), ApprovalDecision::Pass);
+    assert_eq!(state(&mut control).await, (AgentState::Working, 0));
+
+    server.stop().await;
+}
+
 /// An answer lands only on the approval it names: a stale id is refused, as
 /// is any answer once nothing is held, while `None` answers the oldest.
 #[tokio::test]
