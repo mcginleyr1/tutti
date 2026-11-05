@@ -311,7 +311,12 @@ active one, no `Focused` event moves a `Done` pane to `Idle`, no note is marked
 read, and a note about the pane it looks at lands unread (a bell there too).
 "The" attached client — whose focus a `pane_focus_toward` without `from`
 starts from, and a watcher's snapshot names — is the newest that is no view,
-else the newest view. A missing `view` reads as `false`.
+else the newest view. `notes_read` and `notes_clear` from a view are refused
+(`a view marks no note read`), and an `approval_hold` waits only while a
+client that is no view is attached — with views alone it passes at once. A
+missing `view` reads as `false`; a daemon from before it drops the flag
+unseen, so `attach --view` waits for the `attached` reply and refuses a
+`wire_rev` below 16 before it sends anything else.
 
 ## Raw pane streams for real terminals (wire rev 10)
 
@@ -351,8 +356,10 @@ moves its size vote with `ViewSizes` naming the pane, and detaches by closing th
 for it — has what is queued dropped and a fresh `PaneSnapshot` sent in its place, taken
 in the hold that parsed the read it fell behind on, and streams on after it: a slow
 terminal skips ahead to the pane's screen. A tap takes a read whole or not at all, and
-the outbox records the pane's screen top as of what its writer last took, so the rows a
-skip passes over are exactly known: with `"inline":true` (wire rev 16), every snapshot
+the outbox records the pane's screen top as of what its writer last took — a drop puts
+it back there, so a take of the emptied outbox before the resync's snapshot moves
+nothing — so the rows a skip passes over are exactly known: with `"inline":true` (wire
+rev 16), every snapshot
 follows an `Event::PaneRows { pane, epoch, top, skipped }` — `top` the absolute row its
 screen starts at, `epoch` the daemon run the rows are numbered in — and a resync's
 snapshot comes after the rows from there up to `top` (at most 10 000, a pane's whole
@@ -361,7 +368,12 @@ rows left out before them. `"since":{"epoch":E,"row":R,"held":[hashes]}` (wire r
 starts the history past what the client's terminal already holds — every row before
 `R`, then the rows from `R` whose text still hashes (FNV-1a, trailing blanks trimmed) to
 `held` — within `"history"`, a record from another epoch or past the screen counting
-for nothing. The stream ends with `Event::PaneExited` once
+for nothing. A daemon from before rev 16 ignores `inline` and `since` and sends no
+`PaneRows`: a first snapshot that comes unnumbered tells `pane attach --inline` so, and
+it warns that the history prints whole and a resync drops what it skips (no `attached`
+reply, and so no `wire_rev`, comes on a stream). A resize's snapshot hands on no rows:
+whether the terminal's own reflow kept the ones the daemon's pushed off its screen is
+not the daemon's to know. The stream ends with `Event::PaneExited` once
 the child's last output is queued (up to 250 ms is spent letting the reader drain the pty
 first), and the daemon then closes the connection.
 A daemon that stops just closes it: its own shutdown killed the pane, which did not exit.
@@ -438,7 +450,10 @@ so no CPR can be asked) — before the snapshot is drawn. On exit the CLI keeps 
 terminal holds of the pane (its `PaneRows` numbering, the mirror's screen top, and the
 hashes of the screen rows down to the last drawn) in `$XDG_STATE_HOME/tutti/inline.json`,
 0600, keyed by the terminal's tty and the session owning it, for the next attach's
-`since`.
+`since`. The file is read, rewritten to `inline.json.tmp` and renamed over itself under
+an flock on `inline.json.lock`; one that does not parse is set aside as
+`inline.json.bad`. It records what the terminal was handed, not what it still holds: a
+scrollback the terminal trimmed or the user cleared is still taken to hold its rows.
 
 ## Terminal queries: the daemon answers what it can
 

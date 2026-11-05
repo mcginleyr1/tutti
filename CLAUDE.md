@@ -181,7 +181,9 @@ cargo fmt --all --check
   outbox whole, so `Queue::taken` is exactly the row a stream's terminal has
   reached, and an inline resync hands on exactly the rows it skipped: hand a
   tap a read in pieces again, or take part of the outbox, and it loses or
-  repeats rows.
+  repeats rows. A tap dropping what is queued puts `Queue::top` back at
+  `taken` (`StreamTap::feed`): the writer may take the emptied outbox before
+  the resync's snapshot is queued.
 - **A command's end (OSC 133;D) turns off the modes the command left on**
   (rtty-vt's `set_command_end_reset`, on in `Term::new`; the taps hear of it
   through `LEFT_ON_TAPS`, `Term::drain`, pty.rs):

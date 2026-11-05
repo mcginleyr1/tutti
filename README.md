@@ -206,8 +206,12 @@ approval, a merge) leaves it. Its focus is its own: the daemon knows where it
 looks (a move past that pane's edge comes to it), but focusing a done agent
 marks it nobody's seen, a note about the pane it looks at stays unread — a
 bell there lands — and it moves no pane of the session's; a script or a
-watcher takes another attached client's focus over a view's. The panes keep
-the sizes the other clients vote. With no other client they keep the size they have, drawn from
+watcher takes another attached client's focus over a view's. It marks no
+note read and clears none (the notes panel's `r` and a jump to a note mark
+nothing; the daemon refuses them from a view), and a held approval does not
+wait on a view, which cannot answer it. A daemon from before views (wire rev
+16) would take one for a client like any other, so the view refuses it:
+restart the daemon. The panes keep the sizes the other clients vote. With no other client they keep the size they have, drawn from
 the top-left and cut where the view is smaller: a resize would reach the
 pane's program, so a view never makes one. It never starts a daemon, and is
 offered no restore.
@@ -269,27 +273,37 @@ keeps its native scrollback:
   lacks. On detach, `pane attach` keeps what your terminal now holds of the
   pane — its rows up to the screen, and the screen's down to the last drawn —
   in `$XDG_STATE_HOME/tutti/inline.json` (yours alone, 0600; the newest 64
-  terminal-and-pane records), keyed by the terminal: its tty, and the session
-  that owns it, so a terminal opened later on the same tty is another one.
-  The next attach there starts the history at the first of those screen rows
-  the pane has changed since (the prompt you typed on), or past them; the
-  screen it draws is the pane's as it is now, under the copy your terminal
-  kept. `--history` still caps it, and a line `[pane N: M lines not shown]`
-  stands where the cap, or a scrollback the pane cleared, left rows out. A
-  daemon restarted since numbers its rows afresh, and the record counts for
-  nothing.
+  terminal-and-pane records; updated under a lock on `inline.json.lock`, so
+  terminals leaving at once each keep theirs, and one that fails to parse is
+  set aside as `inline.json.bad`, which the detach names), keyed by the
+  terminal: its tty, and the session that owns it, so a terminal opened later
+  on the same tty is another one. The next attach there starts the history
+  at the first of those screen rows the pane has changed since (the prompt
+  you typed on), or past them; the screen it draws is the pane's as it is
+  now, under the copy your terminal kept. `--history` still caps it, and a
+  line `[pane N: M lines not shown]` stands where the cap, or a scrollback the
+  pane itself cleared, left rows out. A daemon restarted since numbers its
+  rows afresh, and the record counts for nothing; one from before inline
+  views (wire rev 16) prints the history whole, which the attach warns of.
+  The record is what your terminal was handed, not what it still has: rows
+  its own scrollback trimmed to its limit, or a clear of it (Cmd+K) dropped,
+  are not printed again, and no line says so.
 - **While attached,** what the pane scrolls off goes into your terminal's
   scrollback, and a program's own alternate screen is your terminal's: its
   switches pass straight through. A terminal that cannot keep up skips ahead
   as above, and is first handed the lines that scrolled off meanwhile, which
   go into its scrollback over the stale screen: it misses none the pane still
-  holds — the newest 10 000, its whole scrollback. Past that, a line
-  `[pane N: M lines not shown]` stands where they were.
+  holds — the newest 10 000, its whole scrollback. Past those, a line
+  `[pane N: M lines not shown]` stands where the rows the pane no longer held
+  were.
 - **On a resize,** the pane's screen is drawn again as the daemon reflowed it;
-  what your terminal's own reflow moved into its scrollback stays there. The
-  screen is erased for it with `ED 0`, never `ED 2`, which terminals that
-  scroll a cleared screen into their scrollback (kitty, alacritty, tmux's
-  scroll-on-clear) would keep a copy of each time.
+  what your terminal's own reflow moved into its scrollback stays there. Rows
+  the daemon's reflow pushed off the pane's screen are not handed on: when
+  your terminal shrank too, its own reflow kept its copy of them, but a pane
+  made smaller by another client's vote loses them from your scrollback, and
+  no line says so. The screen is erased for it with `ED 0`, never `ED 2`,
+  which terminals that scroll a cleared screen into their scrollback (kitty,
+  alacritty, tmux's scroll-on-clear) would keep a copy of each time.
 - **A reset** (`ESC c`) is drawn from the copy rather than passed through: it
   would turn off the light/dark reports, and some terminals clear their
   scrollback on it.
@@ -2083,7 +2097,7 @@ tutti edit <path>[:<line>[:<col>]] [--workspace <id>]  # open in the workspace's
 tutti shell-init zsh|bash|fish       # print the shell integration (OSC 7 cwd + OSC 133 marks) for your rc file
 tutti watch                          # JSON-line snapshots of every pane's state, one per change (read-only; never starts a daemon)
 tutti [attach]                       # bare `tutti` attaches; a fresh session asks where to start
-tutti attach --view                  # watch only: navigation and detach work, nothing reaches a pane, no size vote, its focus marks nothing seen (never starts a daemon)
+tutti attach --view                  # watch only: navigation and detach work, nothing reaches a pane, no size vote, marks nothing seen or read (never starts a daemon; refuses a daemon from before views)
 ```
 
 A verb gives up on a daemon that has not answered within 10 s (exit 1, `did

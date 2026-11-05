@@ -929,10 +929,19 @@ In order; each lands its TUI path in the same wave as its verbs.
   releases, repeats or text gets presses only (its text derived from the
   key);
 - ✅ (wave 12) inline, a resync hands the host's scrollback the lines it
-  skipped (up to the pane's 10 000; past them a line says how many are not
-  shown), and a second attach in the same terminal prints only the history
-  that terminal lacks; ✅ a view's focus is its own, so a view focusing a
-  done agent marks nothing seen;
+  skipped (up to the pane's 10 000; past them a line says how many the pane
+  no longer held), and a second attach in the same terminal prints only the
+  history that terminal lacks; ✅ a view's focus is its own, so a view
+  focusing a done agent marks nothing seen, and a view marks no note read.
+  Open: a terminal's record says what it was handed, not what it still has
+  — rows its own scrollback trimmed, or a clear of it (Cmd+K) dropped, are
+  not printed again and no line says so; and rows a resize pushes off the
+  pane's screen are not handed on: a terminal that shrank too keeps them by
+  its own reflow, but a pane shrunk by another client's vote loses them
+  from an inline terminal's scrollback unnoted. Handing them on is not
+  sound: the daemon cannot tell the two cases apart — in the first they
+  would come twice — nor, once its reflow renumbered the rows it kept,
+  which of them the terminal holds;
 - `tutti ask` needs a pane its agent's hooks have reported through. ✅ A
   fresh Codex or opencode (Codex sends SessionStart only with its first
   prompt, opencode's plugin nothing before a turn) is taken when `ask` finds
@@ -956,7 +965,10 @@ is refused. A launcher row shows a number only where a digit launches it
 stream outbox knows the row its terminal reached, so an inline resync hands
 on exactly the rows it skipped (`PaneRows`); `pane attach --inline` keeps
 what each terminal holds of each pane (`PaneAttach.since`) and prints only
-the history past it; `attach --view`'s focus marks nothing seen. Live, with
+the history past it (`inline.json`, updated under a lock, an unreadable one
+set aside); `attach --view`'s focus marks nothing seen, it marks no note
+read, a held approval waits on no view, and a view refuses a daemon from
+before views (an inline attach warns of one). Live, with
 tutti panes as the hosts (a scratch session): 21/21 — two inline attaches
 print 1..150 once each, a client stopped through a 2.7 MB flood resyncs and
 its terminal holds all 3000 lines once, a view leaves a done pane done and
