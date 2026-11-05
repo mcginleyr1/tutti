@@ -1724,20 +1724,22 @@ fn publish_report(hub: &Arc<Hub>, pane: PaneId, outcome: ReportOutcome) {
 /// or conversation change broadcasts the fresh view (`LayoutChanged`); a state
 /// move broadcasts `StateChanged` so a Blocked/Done still rings the client
 /// bell, and a blocked event's message rides on the move's note. Both can
-/// fire. A state move — or a prompt closing an interrupted turn — also
-/// refreshes the workspace's changes, which records the turn's checkpoint. An
-/// unknown pane is a silent `Ok` — the hook must never fail on tutti's side.
-/// The session guard is dropped before any broadcast (which re-locks
-/// `clients`).
+/// fire. A blocked event on a pane already blocked — another request, a
+/// question — makes a note of its own, but for a `reminder` of a dialog
+/// whose request was noted already. A state move — or a prompt closing an
+/// interrupted turn — also refreshes the workspace's changes, which records
+/// the turn's checkpoint. An unknown pane is a silent `Ok` — the hook must
+/// never fail on tutti's side. The session guard is dropped before any
+/// broadcast (which re-locks `clients`).
 fn agent_event(
     hub: &Arc<Hub>,
     pane: PaneId,
     event: AgentHookEvent,
     conversation: Option<String>,
 ) -> Response {
-    let said = match &event {
-        AgentHookEvent::Blocked { message } => message.clone().map(|m| (None, m)),
-        _ => None,
+    let (said, news) = match &event {
+        AgentHookEvent::Blocked { message, reminder } => (message.clone(), !reminder),
+        _ => (None, false),
     };
     let mut session = hub.session();
     let Some(outcome) = session.apply_agent_event(pane, event, conversation) else {
@@ -1751,8 +1753,12 @@ fn agent_event(
     if outcome.replied {
         tell_waits(hub, pane, PaneSignal::Replied);
     }
-    if let Some((from, to)) = outcome.transition {
-        publish_transition(hub, pane, from, to, said);
+    match outcome.transition {
+        Some((from, to)) => {
+            publish_transition(hub, pane, from, to, said.map(|m| (None, m)));
+        }
+        None if news => add_note(hub, pane, NoteKind::Blocked, None, said),
+        None => {}
     }
     if outcome.transition.is_some() || outcome.noted {
         refresh_pane_workspace(hub, pane);
@@ -1799,17 +1805,11 @@ fn approval_hold(
         let view = hub.session().view();
         broadcast_event(hub, Event::LayoutChanged { workspaces: view });
     }
-    let blocked = hub.session().pane_state(pane) == Some(AgentState::Blocked);
     let blocks = AgentHookEvent::Blocked {
-        message: message.clone(),
+        message,
+        reminder: false,
     };
     agent_event(hub, pane, blocks, conversation);
-    // No move to note it on: a request beside another still lands in the
-    // history. Only a request's own hold notes it, never the agent's later
-    // `permission_prompt` for it, so each lands once.
-    if blocked {
-        add_note(hub, pane, NoteKind::Blocked, None, message);
-    }
     let Some(mut held) = held else {
         hub.session().passed_to_dialog(pane);
         let pass = Response::Approval {

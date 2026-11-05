@@ -61,9 +61,11 @@ pub fn map_opencode_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)>
         "session.error" => Some(AgentHookEvent::Done { reply: None }),
         "permission.asked" => Some(AgentHookEvent::Blocked {
             message: text("/properties/permission"),
+            reminder: false,
         }),
         "question.asked" => Some(AgentHookEvent::Blocked {
             message: text("/properties/questions/0/question"),
+            reminder: false,
         }),
         "permission.replied" | "question.replied" | "question.rejected" => {
             Some(AgentHookEvent::Activity { detail: None })
@@ -94,6 +96,7 @@ pub fn map_claude_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
         "PermissionRequest" => {
             permission_request(v).map(|(tool, summary)| AgentHookEvent::Blocked {
                 message: Some(format!("{tool} · {summary}")),
+                reminder: false,
             })
         }
         "PreToolUse" if matches!(tool_name(v), Some("Agent" | "Task")) => {
@@ -123,9 +126,11 @@ pub fn map_claude_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
             // Claude waits on you — a permission or MCP dialog, a question, an
             // Enter after a usage limit (`quota_auto_resume_stale`). An older
             // Claude names no type, and a type tutti does not know yet keeps
-            // the safe reading: blocked.
-            _ => Some(AgentHookEvent::Blocked {
+            // the safe reading: blocked. A permission dialog's notice comes
+            // six seconds into a dialog its PermissionRequest reported.
+            kind => Some(AgentHookEvent::Blocked {
                 message: v.get("message").and_then(Value::as_str).map(str::to_string),
+                reminder: kind == Some("permission_prompt"),
             }),
         },
         "Stop" => Some(AgentHookEvent::Done {
@@ -197,6 +202,7 @@ pub fn map_gemini_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
         "Notification" if text(v, "notification_type").as_deref() == Some("ToolPermission") => {
             AgentHookEvent::Blocked {
                 message: text(v, "message"),
+                reminder: false,
             }
         }
         "AfterAgent" => AgentHookEvent::Done {
@@ -658,7 +664,8 @@ mod tests {
         assert_eq!(
             ev(r#"{ "hook_event_name": "Notification", "message": "allow edit?" }"#),
             Some(AgentHookEvent::Blocked {
-                message: Some("allow edit?".into())
+                message: Some("allow edit?".into()),
+                reminder: false,
             })
         );
     }
@@ -669,20 +676,23 @@ mod tests {
         ))
     }
 
+    /// Each blocks; only a permission dialog's notice is a reminder, its
+    /// request reported by the PermissionRequest before it.
     #[test]
     fn notifications_that_wait_on_you_block() {
-        for kind in [
-            "permission_prompt",
-            "elicitation_dialog",
-            "elicitation_url_dialog",
-            "agent_needs_input",
-            "quota_auto_resume_stale",
-            "some_future_type",
+        for (kind, reminder) in [
+            ("permission_prompt", true),
+            ("elicitation_dialog", false),
+            ("elicitation_url_dialog", false),
+            ("agent_needs_input", false),
+            ("quota_auto_resume_stale", false),
+            ("some_future_type", false),
         ] {
             assert_eq!(
                 notification(kind),
                 Some(AgentHookEvent::Blocked {
-                    message: Some("m".into())
+                    message: Some("m".into()),
+                    reminder,
                 }),
                 "{kind}"
             );
@@ -723,6 +733,7 @@ mod tests {
         let message = |text: &str| {
             Some(AgentHookEvent::Blocked {
                 message: Some(text.into()),
+                reminder: false,
             })
         };
         assert_eq!(
@@ -783,6 +794,7 @@ mod tests {
         );
         let Some(AgentHookEvent::Blocked {
             message: Some(long),
+            ..
         }) = blocked("Bash", json!({ "command": "x".repeat(600) }))
         else {
             panic!("expected a blocked event");
@@ -1260,7 +1272,8 @@ mod tests {
                 "permission":"bash","patterns":["rm -rf build"],"metadata":{},"always":[]}}"#
             ),
             Some(AgentHookEvent::Blocked {
-                message: Some("bash".into())
+                message: Some("bash".into()),
+                reminder: false,
             })
         );
         assert_eq!(
@@ -1269,7 +1282,8 @@ mod tests {
                 "questions":[{"header":"Scope","question":"Which crate?","options":[]}]}}"#
             ),
             Some(AgentHookEvent::Blocked {
-                message: Some("Which crate?".into())
+                message: Some("Which crate?".into()),
+                reminder: false,
             })
         );
         for answered in [
@@ -1435,7 +1449,8 @@ mod tests {
             ),
             Some((
                 AgentHookEvent::Blocked {
-                    message: Some("Bash · touch hello.txt".into())
+                    message: Some("Bash · touch hello.txt".into()),
+                    reminder: false,
                 },
                 id.clone()
             ))
@@ -1591,7 +1606,8 @@ mod tests {
             ),
             Some((
                 AgentHookEvent::Blocked {
-                    message: Some("Allow run_shell_command: rm -rf build?".into())
+                    message: Some("Allow run_shell_command: rm -rf build?".into()),
+                    reminder: false,
                 },
                 id.clone()
             ))

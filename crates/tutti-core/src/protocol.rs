@@ -11,7 +11,7 @@ use crate::state::{AgentState, StateSource};
 /// Response / Event shapes (including additive fields): the daemon reports it
 /// on attach and mismatched clients tell the user to restart the daemon —
 /// binaries upgrade on install, running daemons do not.
-pub const WIRE_REV: u32 = 14;
+pub const WIRE_REV: u32 = 15;
 
 /// The most notes the daemon's notification history keeps, the oldest going
 /// first. A client caps its copy the same, so the two agree.
@@ -493,10 +493,16 @@ pub enum AgentHookEvent {
         detail: Option<String>,
     },
     /// The agent is waiting on the user (a permission or idle prompt), carrying
-    /// the notification text when the hook provided one.
+    /// the notification text when the hook provided one. A `reminder` says a
+    /// dialog is still up, not that the agent asks anything new: Claude's
+    /// `permission_prompt` Notification, about six seconds into a dialog
+    /// whose request its `PermissionRequest` hook reported already. On a pane
+    /// already blocked it makes no note; any other blocked event does.
     Blocked {
         #[serde(default)]
         message: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        reminder: bool,
     },
     /// The agent finished responding. `reply` is its final message as its
     /// turn-end hook names it (Claude's and Codex's `last_assistant_message`,
@@ -1373,6 +1379,15 @@ mod tests {
             pane: PaneId(3),
             event: AgentHookEvent::Blocked {
                 message: Some("allow edit?".into()),
+                reminder: false,
+            },
+            conversation: None,
+        });
+        roundtrip(&Request::AgentEvent {
+            pane: PaneId(3),
+            event: AgentHookEvent::Blocked {
+                message: Some("Claude needs your permission to use Bash".into()),
+                reminder: true,
             },
             conversation: None,
         });
@@ -2184,6 +2199,18 @@ mod tests {
                 history: 0,
             }
         );
+        // A blocked event from before reminders is no reminder, and one that
+        // is none says nothing of them, so an older daemon reads it as before.
+        let blocked = r#"{"kind":"blocked","message":"allow edit?"}"#;
+        let event = AgentHookEvent::Blocked {
+            message: Some("allow edit?".into()),
+            reminder: false,
+        };
+        assert_eq!(
+            serde_json::from_str::<AgentHookEvent>(blocked).unwrap(),
+            event
+        );
+        assert_eq!(serde_json::to_string(&event).unwrap(), blocked);
         // `workspace_diff` without `stat` defaults to the full diff.
         let diff: Request = serde_json::from_str(r#"{"type":"workspace_diff","id":7}"#).unwrap();
         assert_eq!(

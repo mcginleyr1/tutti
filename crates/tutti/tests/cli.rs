@@ -122,6 +122,7 @@ fn agent_event_opencode_forwards_a_recorded_permission_prompt() {
                     pane: PaneId(7),
                     event: AgentHookEvent::Blocked {
                         message: Some("bash".into()),
+                        reminder: false,
                     },
                     // A prompt may be a subagent's: it names no conversation.
                     conversation: None,
@@ -442,6 +443,7 @@ fn agent_event_claude_watches_a_permission_request_by_default() {
                     pane: PaneId(7),
                     event: AgentHookEvent::Blocked {
                         message: Some("Bash · rm -rf build".into()),
+                        reminder: false,
                     },
                     conversation: Some("abc123".into()),
                 }

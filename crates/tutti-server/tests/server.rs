@@ -320,7 +320,10 @@ async fn pane_wait_answers_on_a_later_transition() {
     hook(
         &mut control,
         pane,
-        AgentHookEvent::Blocked { message: None },
+        AgentHookEvent::Blocked {
+            message: None,
+            reminder: false,
+        },
     )
     .await;
     assert_eq!(
@@ -484,7 +487,10 @@ async fn an_ask_waits_for_the_next_reported_turn_end() {
     hook(
         &mut control,
         pane,
-        AgentHookEvent::Blocked { message: None },
+        AgentHookEvent::Blocked {
+            message: None,
+            reminder: false,
+        },
     )
     .await;
     assert_eq!(
@@ -549,7 +555,10 @@ async fn an_ask_reports_an_exit_mid_turn_and_refuses_a_busy_pane() {
     hook(
         &mut control,
         pane,
-        AgentHookEvent::Blocked { message: None },
+        AgentHookEvent::Blocked {
+            message: None,
+            reminder: false,
+        },
     )
     .await;
     let blocked = error_message(control.request(ask_send(pane, "y")).await);
@@ -3298,6 +3307,7 @@ async fn agent_event_blocks_and_broadcasts() {
                 pane,
                 event: AgentHookEvent::Blocked {
                     message: Some("allow edit?".into()),
+                    reminder: false,
                 },
                 conversation: None,
             })
@@ -3867,6 +3877,7 @@ async fn notifications_and_attention_transitions_land_in_the_history() {
         AgentHookEvent::Activity { detail: None },
         AgentHookEvent::Blocked {
             message: Some("Bash · rm -rf build".into()),
+            reminder: false,
         },
         AgentHookEvent::Activity { detail: None },
         AgentHookEvent::Done { reply: None },
@@ -3907,6 +3918,51 @@ async fn notifications_and_attention_transitions_land_in_the_history() {
     .await
     .expect("no Attached reply");
     assert_eq!(caught_up, history, "an attach carries the whole history");
+
+    server.stop().await;
+}
+
+/// A pane already blocked notes each further thing its agent waits on — a
+/// second request, a question — but never Claude's `permission_prompt`
+/// reminder of a dialog whose request is noted. A reminder that is the first
+/// word of a block (no PermissionRequest hook wired) still notes the move.
+#[tokio::test]
+async fn a_second_blocked_event_notes_what_is_new_never_a_reminder() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let pane = run_shell(&mut control).await;
+    let blocked = |message: &str, reminder| AgentHookEvent::Blocked {
+        message: Some(message.into()),
+        reminder,
+    };
+    for event in [
+        blocked("Bash · rm -rf build", false),
+        blocked("Claude needs your permission to use Bash", true),
+        blocked("Edit · src/main.rs", false),
+        blocked("Claude needs your permission to use Edit", true),
+        blocked("Which crate?", false),
+        AgentHookEvent::Activity { detail: None },
+        blocked("Claude needs your permission to use Write", true),
+    ] {
+        hook(&mut control, pane, event).await;
+    }
+    let notes = list_notes(&mut control, false).await;
+    let noted: Vec<_> = notes
+        .iter()
+        .map(|n| (n.kind, n.body.as_deref().unwrap_or_default()))
+        .collect();
+    assert_eq!(
+        noted,
+        [
+            (NoteKind::Blocked, "Bash · rm -rf build"),
+            (NoteKind::Blocked, "Edit · src/main.rs"),
+            (NoteKind::Blocked, "Which crate?"),
+            (
+                NoteKind::Blocked,
+                "Claude needs your permission to use Write"
+            ),
+        ]
+    );
 
     server.stop().await;
 }
@@ -4217,7 +4273,10 @@ async fn hook_driven_pane_ignores_screen_classification() {
     assert_eq!(
         conn.request(Request::AgentEvent {
             pane,
-            event: AgentHookEvent::Blocked { message: None },
+            event: AgentHookEvent::Blocked {
+                message: None,
+                reminder: false
+            },
             conversation: None,
         })
         .await,
@@ -4273,7 +4332,15 @@ async fn a_dialog_answered_in_the_pane_ends_the_hooks_block() {
         .await,
     );
     assert!(wait_agent(&mut conn, pane, "claude").await);
-    hook(&mut conn, pane, AgentHookEvent::Blocked { message: None }).await;
+    hook(
+        &mut conn,
+        pane,
+        AgentHookEvent::Blocked {
+            message: None,
+            reminder: false,
+        },
+    )
+    .await;
     let send = |text: String| Request::PaneSend {
         pane,
         text: Some(text),
@@ -4645,7 +4712,10 @@ async fn blocked_prompt(conn: &mut Conn) -> (PaneId, String) {
     assert_eq!(
         conn.request(Request::AgentEvent {
             pane,
-            event: AgentHookEvent::Blocked { message: None },
+            event: AgentHookEvent::Blocked {
+                message: None,
+                reminder: false
+            },
             conversation: None,
         })
         .await,

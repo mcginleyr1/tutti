@@ -2038,7 +2038,14 @@ mod tests {
     fn a_hook_claim_is_absolute_and_sticky() {
         let (mut s, pane, _tmp) = session_with_pane();
         let t0 = Instant::now();
-        s.apply_agent_event(pane, AgentHookEvent::Blocked { message: None }, None);
+        s.apply_agent_event(
+            pane,
+            AgentHookEvent::Blocked {
+                message: None,
+                reminder: false,
+            },
+            None,
+        );
         assert_eq!(state_of(&s, pane), (Blocked, Some(Hook)));
         s.apply_report(pane, report(Program, Some(Done)), t0);
         s.apply_report(pane, report(Progress, Some(Working)), t0);
@@ -2070,7 +2077,10 @@ mod tests {
     fn a_hook_block_ends_when_the_screen_shows_its_dialog_then_work() {
         let (mut s, pane, _tmp) = session_with_pane();
         let t0 = Instant::now();
-        let blocked = AgentHookEvent::Blocked { message: None };
+        let blocked = AgentHookEvent::Blocked {
+            message: None,
+            reminder: false,
+        };
         s.apply_agent_event(pane, blocked.clone(), None);
         assert_eq!(
             s.observe(pane, true, Some(Observation::Working), t0),
@@ -2236,7 +2246,14 @@ mod tests {
         );
         hook(&mut s, pane, AgentHookEvent::Activity { detail: None });
         assert!(refused(&s).contains("is working"));
-        hook(&mut s, pane, AgentHookEvent::Blocked { message: None });
+        hook(
+            &mut s,
+            pane,
+            AgentHookEvent::Blocked {
+                message: None,
+                reminder: false,
+            },
+        );
         assert!(refused(&s).contains("is blocked"));
         hook(&mut s, pane, AgentHookEvent::Done { reply: None });
         assert!(s.between_turns(pane).is_ok());
