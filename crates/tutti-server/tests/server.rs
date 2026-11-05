@@ -503,6 +503,84 @@ async fn an_ask_waits_for_the_next_reported_turn_end() {
     server.stop().await;
 }
 
+/// An ask's wait takes a block only from the agent's own word — a hook, or
+/// a status report it claims the pane with — never from the screen, which
+/// can misread a reply quoting a dialog: neither a pane the screen reads
+/// blocked as the wait starts, nor a move into blocked the screen makes,
+/// ends it. A hook's block does, the one re-asserting a block the screen
+/// already read included.
+#[tokio::test]
+async fn an_asks_wait_takes_no_block_the_screen_read() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let mut waiter = server.connect().await;
+    let bin = copy_bin("claude", "/bin/cat");
+    new_workspace(&mut control).await;
+    let pane = pane_id(
+        control
+            .request(Request::PaneRun {
+                tab: None,
+                cmd: vec![bin.display().to_string()],
+                ephemeral: false,
+                sandbox: None,
+            })
+            .await,
+    );
+    assert!(wait_agent(&mut control, pane, "claude").await);
+    let show = |text: &str| Request::PaneSend {
+        pane,
+        text: Some(format!("{text}\n")),
+        keys: None,
+        expect: None,
+        between_turns: false,
+        hooks: None,
+    };
+    let screen =
+        |state| move |p: &PaneInfo| p.state == state && p.source == Some(StateSource::Screen);
+
+    assert_eq!(
+        control.request(show("Do you want to proceed?")).await,
+        Response::Ok
+    );
+    assert!(wait_pane(&mut control, pane, screen(AgentState::Blocked)).await);
+    let level = waiter.request(ask_wait(pane, 0, 800)).await;
+    assert_eq!(waited(level), (AgentState::Blocked, true), "the level");
+
+    for _ in 0..16 {
+        assert_eq!(control.request(show("…")).await, Response::Ok);
+    }
+    assert_eq!(
+        control.request(show("esc to interrupt")).await,
+        Response::Ok
+    );
+    assert!(wait_pane(&mut control, pane, screen(AgentState::Working)).await);
+    start_wait(&mut waiter, ask_wait(pane, 0, 1_500)).await;
+    assert_eq!(
+        control.request(show("Do you want to proceed?")).await,
+        Response::Ok
+    );
+    assert!(wait_pane(&mut control, pane, screen(AgentState::Blocked)).await);
+    assert_eq!(
+        waited(waiter.response().await),
+        (AgentState::Blocked, true),
+        "the edge"
+    );
+
+    start_wait(&mut waiter, ask_wait(pane, 0, 5_000)).await;
+    let blocked = AgentHookEvent::Blocked {
+        message: None,
+        reminder: false,
+    };
+    hook(&mut control, pane, blocked).await;
+    assert_eq!(
+        waited(waiter.response().await),
+        (AgentState::Blocked, false),
+        "the agent's own word"
+    );
+
+    server.stop().await;
+}
+
 /// An agent that exits mid-ask ends the ask's wait with an error naming the
 /// exit, though the exit moves the pane to Done and a reply from an earlier
 /// turn is there to read. A pane no hook has reported through — a plain

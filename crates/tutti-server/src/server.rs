@@ -30,7 +30,7 @@ use tutti_agents::{ProcessTree, Registry};
 use tutti_core::{
     AgentHookEvent, AgentKind, AgentState, ApprovalDecision, Checkpoint, Direction, Event, Frame,
     IssueRef, MAX_FRAME_LEN, NOTES_CAP, Note, NoteKind, Observation, PaneData, PaneDims, PaneId,
-    PaneInfo, Request, Response, StateEvent, Tagged, Toward, WaitFor, WorkspaceId,
+    PaneInfo, Request, Response, StateEvent, StateSource, Tagged, Toward, WaitFor, WorkspaceId,
     prompt_fingerprint,
 };
 
@@ -1939,6 +1939,7 @@ fn agent_event(
     event: AgentHookEvent,
     conversation: Option<String>,
 ) -> Response {
+    let blocks = matches!(event, AgentHookEvent::Blocked { .. });
     let (said, news) = match &event {
         AgentHookEvent::Blocked { message, reminder } => (message.clone(), !reminder),
         _ => (None, false),
@@ -1960,6 +1961,19 @@ fn agent_event(
     }
     if outcome.replied {
         tell_waits(hub, pane, PaneSignal::Replied);
+    }
+    if blocks && outcome.transition.is_none() {
+        // The agent's own word on a block the screen may have read first:
+        // an ask's wait takes it now (`pane_wait`), a `--next` one never.
+        let again = AgentState::Blocked;
+        tell_waits(
+            hub,
+            pane,
+            PaneSignal::Moved {
+                from: again,
+                to: again,
+            },
+        );
     }
     match outcome.transition {
         Some((from, to)) => {
@@ -2335,8 +2349,10 @@ fn workspace_diff(hub: &Arc<Hub>, reply: &Reply, id: WorkspaceId, stat: bool) ->
 /// Its queue holds every move however far behind it falls, so it loses no
 /// edge. With `reply_after` it also answers once the pane's hooks have
 /// reported more turn ends than that — at once, or on the `Replied` that
-/// passes it — and never on a state an exit or the screen reached. The task
-/// gives up silently once its client hangs up.
+/// passes it — and never on a state an exit or the screen reached: an
+/// `until` state counts only while a claim (a hook, the agent's own report)
+/// holds it, so a dialog misread off the screen ends no ask. The task gives
+/// up silently once its client hangs up.
 fn pane_wait(
     hub: &Arc<Hub>,
     reply: &Reply,
@@ -2365,6 +2381,8 @@ fn pane_wait(
         };
         let replied =
             |replies: Option<u64>| reply_after.zip(replies).is_some_and(|(after, n)| n > after);
+        let claimed =
+            |info: &PaneInfo| reply_after.is_none() || info.source.is_some_and(StateSource::claims);
         let wait = async {
             if until.is_empty() {
                 return Response::Error {
@@ -2382,7 +2400,8 @@ fn pane_wait(
                     timed_out: false,
                 };
             }
-            if let Some(answer) = wait_verdict(info, &until, !next) {
+            let level = !next && claimed(&info);
+            if let Some(answer) = wait_verdict(info, &until, level) {
                 return answer;
             }
             loop {
@@ -2394,13 +2413,16 @@ fn pane_wait(
                             .any(|w| w.matches(to) && !(next && w.matches(from)))
                         {
                             let info = hub.session().pane(pane);
-                            return match info {
-                                Some(info) => Response::Waited {
-                                    pane: Box::new(PaneInfo { state: to, ..info }),
-                                    timed_out: false,
-                                },
-                                None => gone(),
-                            };
+                            match info {
+                                Some(info) if claimed(&info) => {
+                                    return Response::Waited {
+                                        pane: Box::new(PaneInfo { state: to, ..info }),
+                                        timed_out: false,
+                                    };
+                                }
+                                Some(_) => {}
+                                None => return gone(),
+                            }
                         }
                         false
                     }
@@ -2427,7 +2449,8 @@ fn pane_wait(
                 let Some(info) = info else {
                     return gone();
                 };
-                if let Some(answer) = wait_verdict(info, &until, true) {
+                let level = claimed(&info);
+                if let Some(answer) = wait_verdict(info, &until, level) {
                     return answer;
                 }
             }

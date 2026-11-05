@@ -1960,7 +1960,8 @@ one: neither a state read off the screen nor a Done the agent's exit left.
 It prints the new reply as `--last-reply` would; a turn that ended without
 one (interrupted, failed) is that error. An agent that exits instead is an
 error naming the exit (exit 1), never an older reply. An agent that blocks
-instead exits 3, naming what it asks on stderr: answer it, then `tutti pane
+instead — by its own word, a hook or its own status report, never a dialog
+read off its screen — exits 3, naming what it asks on stderr: answer it, then `tutti pane
 wait <pane> --next --until done,blocked` and `pane read --last-reply`.
 `--timeout <secs>` bounds the wait and exits 124. A human talks to an agent
 by typing into its pane; the sidebar's `p` on a done agent shows its [last
