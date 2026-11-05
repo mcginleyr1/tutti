@@ -596,7 +596,10 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    its `agent_id`. So a main agent's run never lets go of a subagent's
    request, or the other way round. Calls alike in agent, tool and input
    stay ambiguous: the oldest such request goes, passed to the agent's own
-   dialog. opencode's `permission.replied` names its request
+   dialog, and one run's `PreToolUse` and `PostToolUse` can each let go of
+   one of two alike. A new prompt lets go of the main agent's requests, but
+   more typed into the open turn (Claude gives it that turn's `prompt_id`)
+   leaves them waiting. opencode's `permission.replied` names its request
    (`requestID`, the `permission.asked` `id`) and lets go of that hold
    alone; a reply or activity naming no call moves the pane as before.
    Live (Claude 2.1.318, a scratch session): a held Bash request answered

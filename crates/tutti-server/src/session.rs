@@ -1065,10 +1065,13 @@ impl Session {
                 slot.passed = false;
             }
             AgentHookEvent::Prompt { text, id } => {
+                // A new prompt ends the turn the main agent asked in; more
+                // typed into that turn leaves its requests waiting.
+                if !slot.turns.continues(id.as_deref()) {
+                    stale = release_holds(&mut slot.meta.approvals, &mut slot.asked, None);
+                }
                 noted = slot.meta.sandbox.is_none() && slot.turns.prompted(id, text);
                 classified = Some(Observation::Working);
-                // A new prompt ends the turn the main agent asked in.
-                stale = release_holds(&mut slot.meta.approvals, &mut slot.asked, None);
             }
             AgentHookEvent::Blocked { .. } => {
                 classified = Some(Observation::Blocked);
@@ -2942,6 +2945,20 @@ mod tests {
         let out = s.apply_agent_event(pane, prompt, None).unwrap();
         assert_eq!(out.stale, [main], "the main agent's turn end, its own");
         assert_eq!(held(&s), [sub]);
+
+        let typed = |id: &str| AgentHookEvent::Prompt {
+            text: None,
+            id: Some(id.into()),
+        };
+        s.apply_agent_event(pane, typed("p1"), None).unwrap();
+        let asked = hold(&mut s, None, "k-p1");
+        let out = s.apply_agent_event(pane, typed("p1"), None).unwrap();
+        assert!(
+            out.stale.is_empty(),
+            "more typed into the turn keeps its requests"
+        );
+        let out = s.apply_agent_event(pane, typed("p2"), None).unwrap();
+        assert_eq!(out.stale, [asked], "the next turn lets them go");
     }
 
     #[test]

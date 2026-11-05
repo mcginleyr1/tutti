@@ -67,17 +67,22 @@ impl Turns {
     /// came, as none does after an Esc. Returns whether it closed one, for the
     /// caller's change probe to record.
     pub fn prompted(&mut self, id: Option<String>, text: Option<String>) -> bool {
-        let id = id.unwrap_or_default();
-        if !id.is_empty() && self.open.as_ref() == Some(&id) {
+        if self.continues(id.as_deref()) {
             return false;
         }
-        let interrupted = self.open.replace(id).is_some();
+        let interrupted = self.open.replace(id.unwrap_or_default()).is_some();
         if interrupted {
             self.pending
                 .push(("interrupted".into(), self.prompt.take()));
         }
         self.prompt = text;
         interrupted
+    }
+
+    /// Whether a prompt with `id` is more typed into the open turn: Claude
+    /// gives it that turn's id.
+    pub fn continues(&self, id: Option<&str>) -> bool {
+        id.is_some_and(|id| !id.is_empty() && self.open.as_deref() == Some(id))
     }
 
     /// The agent stopped: no turn is open.
