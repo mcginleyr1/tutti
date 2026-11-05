@@ -364,6 +364,10 @@ pub struct App {
     /// The `PATH` the launcher finds installed agents on — the real one,
     /// emptied in tests so their rows never depend on this machine.
     pub(crate) launcher_path: Option<std::ffi::OsString>,
+    /// Where a deploy writes a first message too long to ride an argument
+    /// well (`issues::deploy_argv`): `None` for the session's own
+    /// (`tutti_core::prompts_dir`), a scratch directory in tests.
+    prompts_dir: Option<PathBuf>,
     /// Where the setup panel installs for the user — the real `$HOME` and
     /// `$XDG_CONFIG_HOME`, pointed at a fixture tree in tests.
     pub(crate) setup_dirs: Dirs,
@@ -568,6 +572,7 @@ impl App {
             launcher_issue: None,
             resume_home: std::env::var_os("HOME").map(PathBuf::from),
             launcher_path: std::env::var_os("PATH"),
+            prompts_dir: None,
             setup_dirs: Dirs::from_env(),
             setup_project: None,
             setup_plans: Vec::new(),
@@ -3298,7 +3303,7 @@ impl App {
             }
         };
         self.launcher = match &self.launcher_issue {
-            Some((_, prompt)) => launcher::armed_rows(rows, &registry, prompt),
+            Some(_) => launcher::armed_rows(rows, &registry),
             None => rows,
         };
         self.launcher_selected = launcher::first_selectable(&self.launcher);
@@ -3401,13 +3406,13 @@ impl App {
     /// or unavailable quick-select is ignored. An agent/shell spawns a pane and
     /// closes the launcher; `command…` opens the free-form input instead.
     fn launch_index(&mut self, idx: usize) -> Vec<WireFrame> {
-        let kind = match self.launcher.get(idx) {
-            Some(row) if row.selectable() => row.kind.clone(),
+        let (name, kind) = match self.launcher.get(idx) {
+            Some(row) if row.selectable() => (row.name.clone(), row.kind.clone()),
             _ => return Vec::new(),
         };
         match kind {
             LaunchKind::Agent(cmd) | LaunchKind::Resume(cmd) => match self.launcher_issue.take() {
-                Some((issue, prompt)) => self.deploy_frames(&issue, prompt, cmd),
+                Some((issue, prompt)) => self.deploy_frames(&issue, &name, &prompt, cmd),
                 None => self.launch_frames(cmd),
             },
             LaunchKind::Shell => self.launch_shell_and_close(),
@@ -3467,33 +3472,37 @@ impl App {
         vec![run_pane(cmd, sandbox)]
     }
 
-    /// Close the launcher and deploy `issue` on `cmd` — the picked agent
-    /// already on `prompt`, its last argument, which a file carries when it is
-    /// too long for one (`issues::fit_arg`): a `Run` in a fresh tab of the
-    /// panel's project when deploying here, else a workspace named for the
-    /// issue first, the `Run` following its `WorkspaceCreated`. The `Ran`
-    /// jumps to the agent.
+    /// Close the launcher and deploy `issue` with `agent`, its row's `argv`
+    /// handed `prompt` as its first message — through a file when it is long
+    /// (`issues::deploy_argv`): a `Run` in a fresh tab of the panel's project
+    /// when deploying here, else a workspace named for the issue first, the
+    /// `Run` following its `WorkspaceCreated`. The `Ran` jumps to the agent.
     fn deploy_frames(
         &mut self,
         issue: &Issue,
-        prompt: String,
-        mut cmd: Vec<String>,
+        agent: &str,
+        prompt: &str,
+        argv: Vec<String>,
     ) -> Vec<WireFrame> {
         let sandbox = self.launcher_profile().map(String::from);
         self.close_launcher();
-        let Some(project) = self.issues_project else {
+        let registry = Registry::default();
+        let (Some(project), Some(spec)) = (self.issues_project, registry.spec(&agent.into()))
+        else {
             return Vec::new();
         };
-        match issues::fit_arg(prompt, sandbox.is_some()) {
-            Ok(prompt) => {
-                cmd.pop();
-                cmd.push(prompt);
-            }
+        let files = sandbox.is_none().then(|| {
+            self.prompts_dir
+                .clone()
+                .unwrap_or_else(|| tutti_core::prompts_dir(&self.session))
+        });
+        let cmd = match issues::deploy_argv(spec, argv, prompt, files.as_deref()) {
+            Ok(cmd) => cmd,
             Err(e) => {
                 self.set_status(format!("{e:#}"));
                 return Vec::new();
             }
-        }
+        };
         let run = Request::Run {
             workspace: Some(project),
             dir: None,
@@ -12191,10 +12200,7 @@ mod tests {
             .iter()
             .find(|r| r.name == "claude")
             .unwrap();
-        assert_eq!(
-            claude.kind,
-            LaunchKind::Agent(vec!["claude".into(), prompt.into()])
-        );
+        assert_eq!(claude.kind, LaunchKind::Agent(vec!["claude".into()]));
 
         // In the sandbox every agent that takes a prompt is selectable — and
         // only those, no shell or command.
@@ -12387,12 +12393,15 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// An issue whose prompt is too long for one argument deploys through the
-    /// file `issues::fit_arg` writes — and never into a sandbox, whose agent
-    /// can't read it.
+    /// An issue whose prompt is too long for one argument deploys through a
+    /// file of the session's prompt directory (`issues::deploy_argv`) — the
+    /// agent's own file input where it has one, else a file its message
+    /// names — and never into a sandbox, whose agent can't read it.
     #[test]
     fn a_prompt_too_long_for_one_argument_deploys_through_a_file_never_a_sandbox() {
         let mut app = issues_panel(Path::new("/tmp/w"));
+        let files = std::env::temp_dir().join(format!("tutti-app-{}.prompts", std::process::id()));
+        app.prompts_dir = Some(files.clone());
         let mut long = gh_issue("7", "Long");
         long.body = "a".repeat(issues::MAX_ARG);
         app.issues_loaded(app.issues_generation, 0, Ok(vec![long]));
@@ -12410,25 +12419,32 @@ mod tests {
         app.mode = Mode::Issues;
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let (issue, prompt) = app.launcher_issue.take().unwrap();
-        let out = app.deploy_frames(
-            &issue,
-            prompt.clone(),
-            vec!["claude".into(), prompt.clone()],
-        );
-        let [WireFrame::Control(sent)] = &out[..] else {
-            panic!("expected one run, got {out:?}");
+        let mut run = |agent: &str, argv: &[&str]| {
+            let argv = argv.iter().map(|s| s.to_string()).collect();
+            let out = app.deploy_frames(&issue, agent, &prompt, argv);
+            let [WireFrame::Control(sent)] = &out[..] else {
+                panic!("expected one run, got {out:?}");
+            };
+            let sent: serde_json::Value = serde_json::from_slice(sent).unwrap();
+            assert_eq!(sent["type"], "run");
+            let cmd: Vec<String> = serde_json::from_value(sent["cmd"].clone()).unwrap();
+            cmd
         };
-        let sent: serde_json::Value = serde_json::from_slice(sent).unwrap();
-        assert_eq!(sent["type"], "run");
-        let message = sent["cmd"][1].as_str().unwrap();
-        assert!(message.len() < 1024, "{message}");
-        let path = message
+        let claude = run("claude", &["claude"]);
+        assert!(claude[1].len() < 1024, "{claude:?}");
+        let named = claude[1]
             .split("in the file ")
             .nth(1)
             .and_then(|rest| rest.split(". Read").next())
-            .unwrap();
-        assert_eq!(std::fs::read_to_string(path).unwrap(), prompt);
-        std::fs::remove_file(path).unwrap();
+            .unwrap()
+            .to_string();
+        let ori = run("ori", &["ori", "code"]);
+        assert_eq!(ori[..4], ["ori", "code", "--interactive", "--prompt-file"]);
+        for file in [named.as_str(), ori[4].as_str()] {
+            assert!(Path::new(file).starts_with(&files), "{file}");
+            assert_eq!(std::fs::read_to_string(file).unwrap(), prompt);
+        }
+        std::fs::remove_dir_all(&files).unwrap();
     }
 
     #[test]

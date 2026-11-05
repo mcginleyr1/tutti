@@ -12,6 +12,15 @@ pub fn log_path(session: &str) -> PathBuf {
     socket_dir().join(format!("{session}.log"))
 }
 
+/// Where a client writes a first message too long to ride an argument well,
+/// beside the socket: `<session>.prompts`, private to the user like the
+/// socket's own directory. The daemon removes a file once the program of the
+/// pane whose argv names it exits, and the whole directory as it starts and
+/// stops.
+pub fn prompts_dir(session: &str) -> PathBuf {
+    socket_path(session).with_extension("prompts")
+}
+
 pub fn socket_dir() -> PathBuf {
     match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("tutti"),

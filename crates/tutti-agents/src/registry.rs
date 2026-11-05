@@ -83,6 +83,21 @@ const NODE_VALUE_FLAGS: &[&str] = &[
     "--localstorage-file",
 ];
 
+/// How an agent's interactive mode takes its first message from a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptFile {
+    /// These args, then the file's path, in place of its prompt flags and
+    /// the message: the file's text is the message (Ori's `--prompt-file`,
+    /// Goose's `--instructions`).
+    Flags(Vec<String>),
+    /// `@<path>` after its prompt flags, then `ATTACHED_TASK`: the file rides
+    /// in the first message, which points at it (Pi's and Augment's `@file`).
+    Attached,
+}
+
+/// The first message beside an attached prompt file (`PromptFile::Attached`).
+pub const ATTACHED_TASK: &str = "Your task is in the attached file. Do what it says.";
+
 /// One agent's identity plus the screen-text patterns that classify its state.
 /// Patterns are plain case-sensitive substrings, so the whole registry stays a
 /// data table: tuning a heuristic or adding an agent is an edit here, not code.
@@ -110,6 +125,9 @@ pub struct AgentSpec {
     /// (`claude <prompt>`), `--prompt` for opencode. `None` when it takes
     /// none, so nothing can be deployed to it.
     pub prompt_flags: Option<Vec<String>>,
+    /// How its interactive mode takes a first message from a file, for one
+    /// too long to ride an argument well; `None` when it can't.
+    pub prompt_file: Option<PromptFile>,
     pub blocked_patterns: Vec<String>,
     pub working_patterns: Vec<String>,
     pub done_patterns: Vec<String>,
@@ -143,6 +161,7 @@ impl AgentSpec {
             binaries: owned(process_names),
             launch_args: Vec::new(),
             prompt_flags: None,
+            prompt_file: None,
             blocked_patterns: owned(blocked_patterns),
             working_patterns: owned(working_patterns),
             done_patterns: owned(done_patterns),
@@ -207,11 +226,35 @@ impl AgentSpec {
             .collect()
     }
 
+    /// This spec taking a first message from a file (see `prompt_file`).
+    fn filed(self, file: PromptFile) -> Self {
+        AgentSpec {
+            prompt_file: Some(file),
+            ..self
+        }
+    }
+
     /// The args after its argv handing the agent `prompt` as its first
     /// message, or `None` when it takes no prompt.
     pub fn prompt_args(&self, prompt: &str) -> Option<Vec<String>> {
         let flags = self.prompt_flags.as_ref()?;
         Some(flags.iter().cloned().chain([prompt.to_string()]).collect())
+    }
+
+    /// The args after its argv handing the agent the first message `file`
+    /// holds, through its own file input; `None` when it has none.
+    pub fn prompt_file_args(&self, file: &Path) -> Option<Vec<String>> {
+        let file = file.to_string_lossy();
+        match self.prompt_file.as_ref()? {
+            PromptFile::Flags(flags) => {
+                Some(flags.iter().cloned().chain([file.into_owned()]).collect())
+            }
+            PromptFile::Attached => {
+                let flags = self.prompt_flags.as_ref()?;
+                let attached = [format!("@{file}"), ATTACHED_TASK.to_string()];
+                Some(flags.iter().cloned().chain(attached).collect())
+            }
+        }
     }
 
     /// Blocked (needs input) outranks Working (active task) outranks Done, so the
@@ -305,9 +348,9 @@ impl Default for Registry {
         // here (checked 2026-11-04, versions named), else from its own docs,
         // quoted. Only Ori (`--prompt-file`), Pi and Augment (`@file`) and
         // Goose (`--instructions <file>`) take it from a file while staying
-        // interactive, and only Amp from stdin, so a message too long for an
-        // argument rides a file every agent is told to read instead (tutti's
-        // `issues::fit_arg`).
+        // interactive (`prompt_file`, which a long message rides), and only
+        // Amp from stdin; any other agent is told to read a message too long
+        // for an argument from a file (tutti's `issues::deploy_argv`).
         Registry {
             specs: vec![
                 // Observed live at 80 columns, Claude Code 2.1.318 in both its
@@ -377,18 +420,30 @@ impl Default for Registry {
                 // Docs (the goose CLI commands guide): `goose run --text` is
                 // "Input text to provide to goose directly", and
                 // `--interactive` will "Continue in interactive mode after
-                // processing initial input". Not run here.
+                // processing initial input". The `goose run` man page:
+                // `--instructions` is "Path to instruction file containing
+                // commands", and the running-tasks guide shows `goose run -i
+                // instructions.txt -s`. Not run here.
                 guess(
                     "goose",
                     "Goose",
                     "https://github.com/block/goose",
                     &["goose"],
                 )
-                .prompted(&["run", "--interactive", "--text"]),
+                .prompted(&["run", "--interactive", "--text"])
+                .filed(PromptFile::Flags(owned(&[
+                    "run",
+                    "--interactive",
+                    "--instructions",
+                ]))),
                 // `--help` (0.83.0): `pi "List all .ts files in src/"` is
-                // "Interactive mode with initial prompt". (An argument leading
-                // with `@` is a file to include, not a message.)
-                guess("pi", "Pi", "https://github.com/badlogic/pi-mono", &["pi"]).prompted(&[]),
+                // "Interactive mode with initial prompt". Docs (pi-mono's
+                // docs/cli.md): `pi [options] [--] [@files...] [messages...]`,
+                // `@path` to "Include a text file or image in the first
+                // prompt".
+                guess("pi", "Pi", "https://github.com/badlogic/pi-mono", &["pi"])
+                    .prompted(&[])
+                    .filed(PromptFile::Attached),
                 // Prime Agent began as a fork of Pi but runs as its own
                 // binary — its installer's `prime-agent` launcher execs
                 // `share/prime-agent/prime-agent` — so it never reads as Pi.
@@ -484,14 +539,17 @@ impl Default for Registry {
                 .prompted(&[]),
                 // Docs (docs.augmentcode.com/cli/reference): `auggie "Fix the
                 // typescript errors"`, "Provide an initial instruction in
-                // interactive mode". Not run here.
+                // interactive mode", and `auggie @prompt.md @screenshot.png
+                // "Explain this UI error"`, "Include files and images in the
+                // initial message". Not run here.
                 guess(
                     "auggie",
                     "Augment Code",
                     "https://www.augmentcode.com",
                     &["auggie"],
                 )
-                .prompted(&[]),
+                .prompted(&[])
+                .filed(PromptFile::Attached),
                 // Amazon Q's binary is literally `q`, which can collide with
                 // other tools of that name (kdb+); the cost of a false match is
                 // only a mislabelled badge, so it stays in. Docs (the AWS
@@ -517,7 +575,9 @@ impl Default for Registry {
                 // `⚠ permission requested: …`, outlives the dialog — never a
                 // Blocked marker. `code --help` (0.13.0): a bare `--prompt` runs
                 // one headless turn; `--interactive` will "Open the interactive
-                // TUI with --prompt/--prompt-file text as the first turn".
+                // TUI with --prompt/--prompt-file text as the first turn". Its
+                // changelog (0.2.4): "An initial prompt accepts `--prompt`,
+                // `-p`, or `--prompt-file`."
                 AgentSpec {
                     launch_args: owned(&["code"]),
                     ..AgentSpec::new(
@@ -530,7 +590,11 @@ impl Default for Registry {
                         &["Ask Ori anything"],
                     )
                 }
-                .prompted(&["--interactive", "--prompt"]),
+                .prompted(&["--interactive", "--prompt"])
+                .filed(PromptFile::Flags(owned(&[
+                    "--interactive",
+                    "--prompt-file",
+                ]))),
             ],
         }
     }
@@ -881,6 +945,52 @@ mod tests {
             ["ori", "code"],
             "a plain launch runs the binary and its launch args"
         );
+    }
+
+    /// The four agents whose interactive mode reads a first message from a
+    /// file take it their own documented way; every other agent has none.
+    #[test]
+    fn agents_with_a_file_input_take_a_first_message_from_a_file() {
+        let reg = Registry::default();
+        let file = Path::new("/run/tutti/t.prompts/prompt-1-2.md");
+        let argv = |kind: &str| {
+            let spec = reg.spec(&AgentKind::from(kind))?;
+            Some([spec.argv(None), spec.prompt_file_args(file)?].concat())
+        };
+        let at = "@/run/tutti/t.prompts/prompt-1-2.md";
+        for (kind, expected) in [
+            (
+                "ori",
+                &[
+                    "ori",
+                    "code",
+                    "--interactive",
+                    "--prompt-file",
+                    &*file.to_string_lossy(),
+                ][..],
+            ),
+            (
+                "goose",
+                &[
+                    "goose",
+                    "run",
+                    "--interactive",
+                    "--instructions",
+                    &*file.to_string_lossy(),
+                ],
+            ),
+            ("pi", &["pi", at, ATTACHED_TASK]),
+            ("auggie", &["auggie", at, ATTACHED_TASK]),
+        ] {
+            assert_eq!(argv(kind).expect(kind), expected);
+        }
+        let filed: Vec<&str> = reg
+            .specs()
+            .iter()
+            .filter(|s| s.prompt_file.is_some())
+            .map(|s| s.kind.0.as_str())
+            .collect();
+        assert_eq!(filed, ["goose", "pi", "auggie", "ori"]);
     }
 
     fn scratch(name: &str) -> PathBuf {

@@ -1136,8 +1136,11 @@ fn issue_deploy_writes_back_through_stub_gh_and_curl() {
 
 /// An issue whose prompt is past what Linux's exec takes in one argument
 /// deploys with every argument under it: the prompt goes to a file only the
-/// user can read, which a short message names. A sandbox deploy, whose agent
-/// can't read that file, is refused before anything runs.
+/// user can read, in the session's private prompt directory beside its
+/// socket — never the temp directory — which a short message names, or which
+/// an agent with a file input of its own reads through that. A sandbox
+/// deploy, whose agent can't read that file, is refused before anything
+/// runs.
 #[test]
 fn a_prompt_too_long_for_one_argument_deploys_through_a_file() {
     use std::os::unix::fs::PermissionsExt;
@@ -1145,6 +1148,7 @@ fn a_prompt_too_long_for_one_argument_deploys_through_a_file() {
     let base = unique_base("longprompt");
     let project = base.join("api");
     let tmp = base.join("tmp");
+    let files = base.join("tutti/tutti.prompts");
     for dir in [&project, &tmp, &base.join("tutti")] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -1182,29 +1186,54 @@ fn a_prompt_too_long_for_one_argument_deploys_through_a_file() {
         (output, server.join().unwrap())
     };
 
-    let (output, requests) = deploy(&[], 2);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let Request::Run { cmd, .. } = &requests[1] else {
-        panic!("expected a run, got {:?}", requests[1]);
+    let ran = |extra: &[&str]| {
+        let (output, requests) = deploy(extra, 2);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let Request::Run { cmd, .. } = &requests[1] else {
+            panic!("expected a run, got {:?}", requests[1]);
+        };
+        assert!(cmd.iter().all(|arg| arg.len() < 1024), "{cmd:?}");
+        let written: Vec<PathBuf> = std::fs::read_dir(&files)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|file| cmd.iter().any(|arg| arg.contains(&*file.to_string_lossy())))
+            .collect();
+        let [file] = &written[..] else {
+            panic!("expected one file named in {cmd:?}, got {written:?}");
+        };
+        let prompt = std::fs::read_to_string(file).unwrap();
+        assert!(prompt.len() > MAX_ARG && prompt.starts_with("Work on this issue"));
+        assert!(prompt.contains(&"a".repeat(200_000)));
+        let mode = std::fs::metadata(file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        (cmd.clone(), file.to_string_lossy().into_owned())
     };
-    assert_eq!(cmd[0], "claude");
-    assert!(cmd.iter().all(|arg| arg.len() < 1024), "{cmd:?}");
-    let file = std::fs::read_dir(&tmp)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    assert!(cmd[1].contains(&*file.to_string_lossy()), "{cmd:?}");
-    let prompt = std::fs::read_to_string(&file).unwrap();
-    assert!(prompt.len() > MAX_ARG && prompt.starts_with("Work on this issue"));
-    assert!(prompt.contains(&"a".repeat(200_000)));
-    let mode = std::fs::metadata(&file).unwrap().permissions().mode();
-    assert_eq!(mode & 0o777, 0o600);
+    let (claude, named) = ran(&[]);
+    assert_eq!(claude[0], "claude");
+    assert!(claude[1].contains(&named), "a message names it: {claude:?}");
+    let (ori, read) = ran(&["--agent", "ori"]);
+    assert_eq!(
+        ori,
+        [
+            "ori",
+            "code",
+            "--interactive",
+            "--prompt-file",
+            read.as_str()
+        ],
+        "Ori reads it through its own --prompt-file"
+    );
+    let mode = std::fs::metadata(&files).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o700, "the prompt directory is private");
+    assert_eq!(
+        std::fs::read_dir(&tmp).unwrap().count(),
+        0,
+        "nothing in TMPDIR"
+    );
 
     let (refused, requests) = deploy(&["--sandbox", "orb"], 1);
     assert_eq!(refused.status.code(), Some(1));

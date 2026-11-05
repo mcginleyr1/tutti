@@ -6,16 +6,17 @@
 //! directory with the user's environment: the daemon never talks to a
 //! tracker. A source that opts in hears back from a deploy (`write_back`).
 
-use std::fs::OpenOptions;
+use std::fs::{DirBuilder, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use tutti_agents::AgentSpec;
 use tutti_core::{IssueRef, PaneId};
 
 /// The prompt a deployed agent gets unless its source names another.
@@ -302,24 +303,61 @@ pub fn deployed_comment(
 /// 32 pages). A first message that long rides a file instead.
 pub const MAX_ARG: usize = 128 * 1024;
 
-/// `prompt` as it can ride an agent's command line: itself while it fits one
-/// argument (`MAX_ARG`). Past that it goes to a file only the user can read,
-/// and a message naming the file takes its place, for the agent to read as it
-/// reads any file — refused in a sandbox, whose agent can't see this machine.
-pub fn fit_arg(prompt: String, sandbox: bool) -> Result<String> {
-    if prompt.len() < MAX_ARG {
-        return Ok(prompt);
-    }
-    if sandbox {
-        bail!(
+/// From this long on, a first message goes through the agent's own file
+/// input where it has one (`AgentSpec::prompt_file`). An eighth of `MAX_ARG`,
+/// so an argument this size is far from both Linux's limit per argument and
+/// macOS's 1 MiB for the argv and environment together; but past it — some
+/// 300 lines — a message is a document, which an agent that reads one from a
+/// file gets as one, and which then stays out of `ps` and out of the layout
+/// the daemon saves with each pane's argv.
+pub const FILE_PROMPT: usize = 16 * 1024;
+
+/// `argv`, the agent's own (`AgentSpec::argv`), handed `prompt` as its first
+/// message. One of `FILE_PROMPT` or more goes through the agent's own file
+/// input where it has one; one too long for an argument (`MAX_ARG`) goes to a
+/// file a short message names, for the agent to read as it reads any file.
+/// Either file is written 0600 into `files`, the session's private prompt
+/// directory (`tutti_core::prompts_dir`), which the daemon clears of it once
+/// the agent exits. A sandbox (`files` `None`) can't read this machine's
+/// files: there a prompt rides as itself, and one too long for that is
+/// refused.
+pub fn deploy_argv(
+    spec: &AgentSpec,
+    argv: Vec<String>,
+    prompt: &str,
+    files: Option<&Path>,
+) -> Result<Vec<String>> {
+    let refuse = || format!("{} takes no first message on its command line", spec.kind);
+    let inline = spec.prompt_args(prompt).with_context(refuse)?;
+    let args = match files {
+        Some(dir) if prompt.len() >= FILE_PROMPT && spec.prompt_file.is_some() => {
+            spec.prompt_file_args(&write_prompt(dir, prompt)?)
+        }
+        Some(dir) if prompt.len() >= MAX_ARG => spec.prompt_args(&format!(
+            "Your task is too long for a command line, so it is in the file {}. Read that file and do what it says.",
+            write_prompt(dir, prompt)?.display()
+        )),
+        None if prompt.len() >= MAX_ARG => bail!(
             "the issue's prompt is {} bytes, too long for a command line ({MAX_ARG}), and a sandbox can't read it from a file here",
             prompt.len()
-        );
-    }
+        ),
+        _ => Some(inline),
+    };
+    Ok([argv, args.with_context(refuse)?].concat())
+}
+
+/// `prompt` in a fresh file of `dir`, which is made private to the user
+/// (0700) if it is new; the file only the user can read (0600).
+fn write_prompt(dir: &Path, prompt: &str) -> Result<PathBuf> {
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    let path = std::env::temp_dir().join(format!("tutti-prompt-{}-{nanos}.md", std::process::id()));
+    let path = dir.join(format!("prompt-{}-{nanos}.md", std::process::id()));
     OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -327,10 +365,7 @@ pub fn fit_arg(prompt: String, sandbox: bool) -> Result<String> {
         .open(&path)
         .and_then(|mut file| file.write_all(prompt.as_bytes()))
         .with_context(|| format!("writing the prompt to {}", path.display()))?;
-    Ok(format!(
-        "Your task is too long for a command line, so it is in the file {}. Read that file and do what it says.",
-        path.display()
-    ))
+    Ok(path)
 }
 
 /// `template` with `{id}`, `{title}`, `{body}` and `{url}` filled in from
@@ -781,30 +816,80 @@ mod tests {
         );
     }
 
-    /// A prompt one argument can carry rides as itself. One that long goes to
-    /// a file only the user can read, named by a message a fraction its size;
-    /// a sandbox, which can't read this machine's files, refuses it.
+    /// A first message rides as itself until it is long. Then an agent with
+    /// a file input of its own reads it through that; any other gets a file
+    /// named by a short message once it is too long for one argument. Each
+    /// file only the user can read, in the private prompt directory. A
+    /// sandbox, which can't read this machine's files, takes what fits and
+    /// refuses the rest.
     #[test]
-    fn a_prompt_too_long_for_one_argument_rides_a_file() {
+    fn a_long_first_message_rides_the_agents_own_file_input_or_a_named_file() {
         use std::os::unix::fs::PermissionsExt;
-        let fits = "x".repeat(MAX_ARG - 1);
-        assert_eq!(fit_arg(fits.clone(), true).unwrap(), fits);
+        use tutti_agents::{ATTACHED_TASK, Registry};
+        let registry = Registry::default();
+        let base = scratch("prompts");
+        let dir = base.join("t.prompts");
+        let deploy = |kind: &str, prompt: &str, files: Option<&Path>| {
+            let spec = registry.spec(&kind.into()).unwrap();
+            deploy_argv(spec, spec.argv(None), prompt, files)
+        };
+        let read = |file: &str| {
+            let file = Path::new(file.strip_prefix('@').unwrap_or(file));
+            assert_eq!(file.parent(), Some(&*dir), "{file:?}");
+            let mode = std::fs::metadata(file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+            std::fs::read_to_string(file).unwrap()
+        };
 
-        let long = "é".repeat(MAX_ARG / 2);
-        let message = fit_arg(long.clone(), false).unwrap();
-        assert!(message.len() < 1024, "{message}");
-        let path = message
+        let short = "x".repeat(FILE_PROMPT - 1);
+        for kind in ["claude", "ori", "pi"] {
+            let argv = deploy(kind, &short, Some(&dir)).unwrap();
+            assert_eq!(argv.last(), Some(&short), "{kind}");
+        }
+        assert!(!dir.exists(), "nothing written");
+
+        let long = "é".repeat(FILE_PROMPT / 2);
+        let ori = deploy("ori", &long, Some(&dir)).unwrap();
+        assert_eq!(ori[..4], ["ori", "code", "--interactive", "--prompt-file"]);
+        assert_eq!(read(&ori[4]), long);
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o777, 0o700);
+        let goose = deploy("goose", &long, Some(&dir)).unwrap();
+        assert_eq!(
+            goose[..4],
+            ["goose", "run", "--interactive", "--instructions"]
+        );
+        assert_eq!(read(&goose[4]), long);
+        for kind in ["pi", "auggie"] {
+            let argv = deploy(kind, &long, Some(&dir)).unwrap();
+            assert_eq!((argv.len(), argv[2].as_str()), (3, ATTACHED_TASK), "{kind}");
+            assert!(argv[1].starts_with('@'), "{argv:?}");
+            assert_eq!(read(&argv[1]), long);
+        }
+        let claude = deploy("claude", &long, Some(&dir)).unwrap();
+        assert_eq!(claude, ["claude", long.as_str()], "fits one argument");
+
+        let huge = "é".repeat(MAX_ARG / 2);
+        let claude = deploy("claude", &huge, Some(&dir)).unwrap();
+        assert!(claude[1].len() < 1024, "{claude:?}");
+        let named = claude[1]
             .split("in the file ")
             .nth(1)
             .and_then(|rest| rest.split(". Read").next())
             .unwrap();
-        assert_eq!(std::fs::read_to_string(path).unwrap(), long);
-        let mode = std::fs::metadata(path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
-        std::fs::remove_file(path).unwrap();
+        assert_eq!(read(named), huge);
 
-        let refused = fit_arg(long, true).unwrap_err().to_string();
+        let sandboxed = deploy("ori", &long, None).unwrap();
+        assert_eq!(sandboxed.last(), Some(&long), "a sandbox takes what fits");
+        let refused = deploy("ori", &huge, None).unwrap_err().to_string();
         assert!(refused.contains("too long for a command line"), "{refused}");
+        let crush = deploy("crush", &huge, Some(&base.join("none"))).unwrap_err();
+        assert!(
+            crush.to_string().contains("takes no first message"),
+            "{crush}"
+        );
+        assert!(!base.join("none").exists(), "refused before writing");
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

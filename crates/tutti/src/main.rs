@@ -1419,17 +1419,15 @@ fn run_issue(action: IssueAction, session: &str, json: bool) -> Result<i32> {
             let project = deploy_project(&mut client, project)?;
             let issue = issues::fetch(source, &id, &project.dir)?;
             let prompt = issues::prompt(&source.prompt, &issue);
-            // The binary installed here; a sandbox's image can't be looked in.
+            // The binary installed here and the session's prompt files; a
+            // sandbox's image can't be looked in, nor this machine from it.
             let path = sandbox
                 .is_none()
                 .then(|| std::env::var_os("PATH"))
                 .flatten();
-            let message = issues::fit_arg(prompt, sandbox.is_some())?;
-            let cmd = [
-                spec.argv(path.as_deref()),
-                spec.prompt_args(&message).unwrap_or_default(),
-            ]
-            .concat();
+            let files = sandbox.is_none().then(|| tutti_core::prompts_dir(session));
+            let argv = spec.argv(path.as_deref());
+            let cmd = issues::deploy_argv(spec, argv, &prompt, files.as_deref())?;
             let into = (!here && project.dir.ancestors().any(|d| d.join(".jj").exists()))
                 .then(|| issues::workspace_name(&issue.source, &issue.id));
             let workspace = match &into {

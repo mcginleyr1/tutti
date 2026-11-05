@@ -197,6 +197,9 @@ pub struct Hub {
     /// Where the layout is saved and the previous daemon's is offered back
     /// (`persist`); `None` with persistence off.
     state: Option<PathBuf>,
+    /// The session's prompt files (`tutti_core::prompts_dir`, beside the
+    /// socket): first messages clients wrote for panes' agents to read.
+    prompts: PathBuf,
     /// Each held approval's way back to the hook holding it, by approval id:
     /// an answer sends its decision down the channel.
     approvals: Mutex<HashMap<u64, oneshot::Sender<ApprovalDecision>>>,
@@ -259,7 +262,7 @@ impl Hub {
     /// A hub for session `name`. The notification history the offer in
     /// `state` holds comes back at once, and new panes take ids past every
     /// one it names.
-    fn new(size: PaneSize, name: String, state: Option<PathBuf>) -> Hub {
+    fn new(size: PaneSize, name: String, state: Option<PathBuf>, prompts: PathBuf) -> Hub {
         let mut session = Session::new(size, name.clone());
         let offered = state
             .as_deref()
@@ -284,6 +287,7 @@ impl Hub {
             vcs: Mutex::new(HashMap::new()),
             waits: Mutex::new(Vec::new()),
             state,
+            prompts,
             notes: Mutex::new(notes),
             approvals: Mutex::new(HashMap::new()),
         }
@@ -337,6 +341,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// fires, saving the layout under `state`. This is the binary's entry point.
 pub async fn run(socket_path: PathBuf, size: PaneSize, state: Option<PathBuf>) -> Result<()> {
     prepare_socket(&socket_path)?;
+    // A daemon that died without stopping left its prompt files; no client
+    // can write a new one before the socket is bound.
+    let _ = std::fs::remove_dir_all(socket_path.with_extension("prompts"));
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("bind {}", socket_path.display()))?;
     let shutdown = async {
@@ -375,7 +382,8 @@ pub async fn serve(
     // this daemon finds the offer already in place, and its notification
     // history is back (`Hub::new`).
     let state = state.filter(|dir| persist::offer_previous(dir, &name));
-    let hub = Arc::new(Hub::new(size, name, state));
+    let prompts = socket_path.with_extension("prompts");
+    let hub = Arc::new(Hub::new(size, name, state, prompts));
 
     let tick_hub = Arc::clone(&hub);
     let ticker = tokio::spawn(async move {
@@ -506,6 +514,9 @@ pub async fn serve(
     }
     hub.stopping.store(true, Ordering::SeqCst);
     hub.session().kill_all();
+    // No pane is left to read one: a restore revives each agent in its own
+    // conversation, never on its first message.
+    let _ = std::fs::remove_dir_all(&hub.prompts);
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(&pid_path);
     Ok(())
@@ -2706,9 +2717,11 @@ async fn restore_to(hub: &Hub, dir: &Path, pane: PaneId, n: u64, commit: &str) -
 }
 
 fn spawn_reaper(hub: &Arc<Hub>, pane: PaneId, pty: Arc<PtyPane>) {
+    let argv = hub.session().argv(pane).unwrap_or_default();
     let hub = Arc::clone(hub);
     tokio::spawn(async move {
         let exit = pty.wait().await;
+        forget_prompts(&hub.prompts, &argv);
         let code = exit.code as i32;
         // An ephemeral pane (e.g. the diff view) leaves no corpse: drop it from
         // the layout + pane map and rebroadcast the view. `pane_kill` also fixes
@@ -2740,6 +2753,22 @@ fn spawn_reaper(hub: &Arc<Hub>, pane: PaneId, pty: Arc<PtyPane>) {
             refresh_pane_workspace(&hub, pane);
         }
     });
+}
+
+/// Remove the files of `dir`, the session's prompt files, that a pane's
+/// `argv` names — as an argument, as `@<file>`, or inside a message
+/// (`issues::deploy_argv` in the client): its program, which read its first
+/// message from there, has exited.
+fn forget_prompts(dir: &Path, argv: &[String]) {
+    let Ok(files) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for file in files.flatten().map(|entry| entry.path()) {
+        let name = file.to_string_lossy();
+        if argv.iter().any(|arg| arg.contains(&*name)) {
+            let _ = std::fs::remove_file(&file);
+        }
+    }
 }
 
 /// Recompute a workspace's jj change stat *and* stale flag off the
@@ -3600,7 +3629,12 @@ mod tests {
     /// its probe down, so the VCS watch watches its workspace again.
     #[tokio::test]
     async fn a_probe_whose_task_panics_leaves_the_watch_watching() {
-        let hub = Arc::new(Hub::new(PaneSize::new(24, 80), "probe".into(), None));
+        let hub = Arc::new(Hub::new(
+            PaneSize::new(24, 80),
+            "probe".into(),
+            None,
+            PathBuf::new(),
+        ));
         let workspace = WorkspaceId(1);
         let in_flight = InFlight::new(&hub, workspace);
         assert_eq!(hub.vcs()[&workspace].in_flight, 1);
@@ -3617,7 +3651,12 @@ mod tests {
     /// still reads as waiting on you without a stale approval to answer.
     #[tokio::test]
     async fn a_hold_whose_task_panics_lets_go_of_its_approval() {
-        let hub = Arc::new(Hub::new(PaneSize::new(24, 80), "hold".into(), None));
+        let hub = Arc::new(Hub::new(
+            PaneSize::new(24, 80),
+            "hold".into(),
+            None,
+            PathBuf::new(),
+        ));
         let pane = {
             let mut session = hub.session();
             session.workspace_new(std::env::temp_dir());
@@ -3662,7 +3701,12 @@ mod tests {
     /// far past it.
     #[tokio::test]
     async fn a_next_wait_far_behind_its_pane_still_answers_on_the_edge() {
-        let hub = Arc::new(Hub::new(PaneSize::new(24, 80), "behind".into(), None));
+        let hub = Arc::new(Hub::new(
+            PaneSize::new(24, 80),
+            "behind".into(),
+            None,
+            PathBuf::new(),
+        ));
         let pane = {
             let mut session = hub.session();
             session.workspace_new(std::env::temp_dir());
@@ -3702,7 +3746,12 @@ mod tests {
     /// wait drops the ended ones as it registers.
     #[tokio::test]
     async fn ended_waits_in_a_quiet_session_leave_no_queue_behind() {
-        let hub = Arc::new(Hub::new(PaneSize::new(24, 80), "quiet".into(), None));
+        let hub = Arc::new(Hub::new(
+            PaneSize::new(24, 80),
+            "quiet".into(),
+            None,
+            PathBuf::new(),
+        ));
         let pane = {
             let mut session = hub.session();
             session.workspace_new(std::env::temp_dir());

@@ -123,23 +123,17 @@ pub fn sandbox_rows(registry: &Registry) -> Vec<LauncherRow> {
         .collect()
 }
 
-/// The rows of a launcher armed to deploy an issue on `prompt`: the rows of
-/// the agents that take a first message (a shell, command or resume row names
-/// no agent), each running its agent — the binary the row found — on the
-/// prompt, still dim when it is not installed.
-pub fn armed_rows(rows: Vec<LauncherRow>, registry: &Registry, prompt: &str) -> Vec<LauncherRow> {
+/// The rows of a launcher armed to deploy an issue: the rows of the agents
+/// that take a first message (a shell, command or resume row names no agent),
+/// still dim when not installed. The pick hands its agent the prompt
+/// (`issues::deploy_argv`).
+pub fn armed_rows(rows: Vec<LauncherRow>, registry: &Registry) -> Vec<LauncherRow> {
     rows.into_iter()
-        .filter_map(|row| {
-            let args = registry
-                .spec(&row.name.as_str().into())?
-                .prompt_args(prompt)?;
-            let LaunchKind::Agent(argv) = row.kind else {
-                return None;
-            };
-            Some(LauncherRow {
-                kind: LaunchKind::Agent([argv, args].concat()),
-                ..row
-            })
+        .filter(|row| {
+            matches!(row.kind, LaunchKind::Agent(_))
+                && registry
+                    .spec(&row.name.as_str().into())
+                    .is_some_and(|spec| spec.prompt_flags.is_some())
         })
         .collect()
 }
@@ -370,7 +364,7 @@ mod tests {
     }
 
     /// Armed to deploy, the picker keeps only the agents that take a first
-    /// message, each launching on the prompt, an uninstalled one still dim.
+    /// message, each with its own argv, an uninstalled one still dim.
     #[test]
     fn armed_rows_keep_the_agents_that_take_a_prompt() {
         let registry = Registry::default();
@@ -391,13 +385,10 @@ mod tests {
                 available: true,
             },
         ];
-        let armed = armed_rows(rows, &registry, "fix it");
+        let armed = armed_rows(rows, &registry);
         let names: Vec<&str> = armed.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["claude", "codex"], "crush takes no prompt");
-        assert_eq!(
-            armed[0].kind,
-            LaunchKind::Agent(vec!["claude".into(), "fix it".into()])
-        );
+        assert_eq!(armed[0].kind, LaunchKind::Agent(vec!["claude".into()]));
         assert!(armed[0].selectable());
         assert!(!armed[1].selectable(), "codex is not installed");
     }

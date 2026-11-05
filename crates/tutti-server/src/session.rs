@@ -631,6 +631,11 @@ impl Session {
             .collect()
     }
 
+    /// The argv a pane was spawned with.
+    pub fn argv(&self, pane: PaneId) -> Option<Vec<String>> {
+        self.panes.get(&pane).map(|slot| slot.argv.clone())
+    }
+
     pub fn pane_list(&self) -> Vec<PaneInfo> {
         let mut panes: Vec<&PaneSlot> = self.panes.values().collect();
         panes.sort_by_key(|s| s.meta.id.0);

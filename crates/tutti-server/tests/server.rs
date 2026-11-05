@@ -905,6 +905,72 @@ async fn run_links_its_pane_to_the_issue_it_deploys() {
     server.stop().await;
 }
 
+/// Whether `file` is gone within the deadline.
+async fn vanishes(file: &str) -> bool {
+    timeout(DEADLINE, async {
+        while Path::new(file).exists() {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// The session's prompt files a pane's argv names — as an argument, as
+/// `@<file>`, inside a message — go once its program exits, killed or not;
+/// another pane's stay while it runs, a file elsewhere is never touched, and
+/// the daemon's stop takes what is left.
+#[tokio::test]
+async fn a_panes_prompt_files_go_once_its_program_exits() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let workspace = new_workspace(&mut conn).await;
+    let prompts = server.path.with_extension("prompts");
+    std::fs::create_dir_all(&prompts).unwrap();
+    let write = |file: PathBuf| {
+        std::fs::write(&file, "fix it").unwrap();
+        file.to_string_lossy().into_owned()
+    };
+    let [bare, at, named, running, unclaimed] =
+        [1, 2, 3, 4, 5].map(|n| write(prompts.join(format!("prompt-{n}.md"))));
+    let elsewhere = write(server.path.with_extension("md"));
+    let run = |script: &str, args: Vec<String>| Request::Run {
+        workspace: Some(workspace),
+        dir: None,
+        cmd: [
+            vec!["/bin/sh".into(), "-c".into(), script.into(), "sh".into()],
+            args,
+        ]
+        .concat(),
+        sandbox: None,
+        title: None,
+        issue: None,
+        from: None,
+    };
+    let message = format!("Your task is in the file {named}. Read that file.");
+    let quick = vec![bare.clone(), format!("@{at}"), message, elsewhere.clone()];
+    ran(conn.request(run("exit 0", quick)).await);
+    let (_, _, slow) = ran(conn.request(run("sleep 30", vec![running.clone()])).await);
+
+    for file in [&bare, &at, &named] {
+        assert!(vanishes(file).await, "{file} outlived its pane");
+    }
+    for file in [&running, &unclaimed, &elsewhere] {
+        assert!(Path::new(file).exists(), "{file}");
+    }
+    assert_eq!(
+        conn.request(Request::PaneKill { pane: slow }).await,
+        Response::Ok
+    );
+    assert!(vanishes(&running).await, "a killed pane's file goes too");
+    assert!(Path::new(&unclaimed).exists());
+
+    server.stop().await;
+    assert!(!prompts.exists(), "the stop clears the rest");
+    assert!(Path::new(&elsewhere).exists(), "never a file of the user's");
+    let _ = std::fs::remove_file(&elsewhere);
+}
+
 /// `run` refuses a directory that is not on disk and a workspace named beside
 /// a directory, and a command that cannot spawn leaves no empty tab or
 /// workspace behind.

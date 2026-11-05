@@ -10,7 +10,7 @@ mod state;
 pub use domain::{AgentKind, Direction, Layout, Toward};
 pub use frame::{Frame, FrameError, MAX_FRAME_LEN, PaneData};
 pub use ids::{PaneId, TabId, WorkspaceId};
-pub use paths::{log_path, socket_dir, socket_path, state_dir};
+pub use paths::{log_path, prompts_dir, socket_dir, socket_path, state_dir};
 pub use prompt::{PROMPT_LINES, prompt_fingerprint, prompt_rows};
 pub use protocol::{
     AgentHookEvent, ApprovalDecision, Checkpoint, DIFF_RANGE, Event, FileStat, HostColors,
