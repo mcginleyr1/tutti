@@ -1251,10 +1251,12 @@ impl Session {
                     slot.turns.forget();
                     slot.hooked = false;
                     slot.worked = false;
+                    slot.rested = false;
                 }
+                // A rest the agent reported before detection caught up with it
+                // stays held, to be read idle once this grace is over.
                 if agent.is_some() {
                     slot.started = Instant::now();
-                    slot.rested = false;
                 }
                 let kept = slot.herdr.as_ref().is_none_or(|(_, reporter)| {
                     agent.as_ref().is_some_and(|kind| kind.0 == *reporter)
@@ -1333,11 +1335,17 @@ impl Session {
         };
         let (from, held) = (slot.meta.state, slot.meta.source);
         let to = match report.state {
-            Some(AgentState::Done | AgentState::Idle)
-                if slot.meta.agent.is_some() && !slot.worked =>
+            // An idle report before any work is a fresh start, detected yet or
+            // not (Codex's OSC 7501 can beat detection); a done one only a
+            // detected agent's. A herdr reporter names itself, and keeps its
+            // exact idle until detection names it too.
+            Some(AgentState::Idle)
+                if !slot.worked
+                    && (slot.meta.agent.is_some() || report.source != StateSource::Hook) =>
             {
                 slot.rest(now)
             }
+            Some(AgentState::Done) if slot.meta.agent.is_some() && !slot.worked => slot.rest(now),
             Some(state) => state,
             None if held == Some(report.source) => match from {
                 AgentState::Working | AgentState::Blocked => AgentState::Idle,
@@ -2545,6 +2553,25 @@ mod tests {
         let (mut s, shell, _tmp) = session_with_pane();
         let done = s.apply_report(shell, report(Program, Some(Done)), t0);
         assert_eq!(done.transition, Some((Unknown, Done)));
+    }
+
+    /// Codex 0.166.0's start-up idle report can land before detection names
+    /// the agent (seen live: idle, not unknown, the moment it was detected),
+    /// and a wait for done takes idle. An idle report before any work is a
+    /// fresh rest whether or not detection has caught up; held back, it
+    /// reads idle once the grace that detection starts is over.
+    #[test]
+    fn a_start_up_idle_report_before_detection_waits_out_the_grace() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let t0 = Instant::now();
+        let idle = s.apply_report(pane, report(Program, Some(Idle)), t0);
+        assert_eq!(idle.transition, None);
+        assert_eq!(state_of(&s, pane), (Unknown, Some(Program)));
+        s.set_agent(pane, Some("codex".into()));
+        let detected = Instant::now();
+        assert_eq!(s.observe(pane, false, None, detected), None);
+        let after = detected + FRESH_GRACE;
+        assert_eq!(s.observe(pane, false, None, after), Some((Unknown, Idle)));
     }
 
     /// A restore revives an agent at its prompt, having done nothing since:
