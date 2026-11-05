@@ -893,6 +893,14 @@ fn handle_frame(
             Ok(Request::PaneRestore { pane, n, force }) => {
                 pane_restore(hub, &reply, pane, n, force)
             }
+            // The history is the user's: a view, who may not be them, marks
+            // or clears none of it for everybody.
+            Ok(Request::NotesRead { .. } | Request::NotesClear) if watching(hub, cid) => {
+                let refusal = Response::Error {
+                    message: "a view marks no note read".into(),
+                };
+                send_reply(hub, cid, tx, reply.encode(&refusal))
+            }
             Ok(request) => {
                 let response = dispatch(hub, request);
                 send_reply(hub, cid, tx, reply.encode(&response))
@@ -1567,11 +1575,7 @@ fn split_ratio(hub: &Arc<Hub>, a: PaneId, b: PaneId, ratio: f32) -> Response {
 /// it shows: it moves no pane of the session's, and sees nothing for the
 /// user, who may not be watching it.
 fn focus_pane(hub: &Arc<Hub>, cid: u64, pane: PaneId) -> Response {
-    let watching = hub
-        .clients()
-        .get(&cid)
-        .is_some_and(|client| client.watching);
-    if watching {
+    if watching(hub, cid) {
         let known = hub.session().pane_state(pane).is_some();
         let mut clients = hub.clients();
         return match clients.get_mut(&cid) {
@@ -1687,6 +1691,13 @@ fn source_pane(hub: &Hub, from: Option<PaneId>) -> Result<PaneId> {
             .and_then(|(_, client)| client.focused)
     })
     .context("no pane to start from: name one, or focus one in an attached client")
+}
+
+/// Whether connection `cid` is an attached view.
+fn watching(hub: &Hub, cid: u64) -> bool {
+    hub.clients()
+        .get(&cid)
+        .is_some_and(|client| client.watching)
 }
 
 /// Which attached client is "the" one, the greatest by this key: the newest

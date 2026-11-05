@@ -151,7 +151,7 @@ impl Drop for Connection {
 /// What a view may send: attaching and detaching, moves of its focus, tab
 /// and scrollback, and reads. Never input, a size vote, its terminal's
 /// colours — the panes' programs would hear of them — or any change to the
-/// session.
+/// session, marking notes read included: the history is the user's.
 fn navigates(frame: &Frame) -> bool {
     let Frame::Control(json) = frame else {
         return false;
@@ -165,7 +165,6 @@ fn navigates(frame: &Frame) -> bool {
                 | Request::TabSelect { .. }
                 | Request::PaneScroll { .. }
                 | Request::PaneRead { .. }
-                | Request::NotesRead { .. }
         )
     })
 }
@@ -247,7 +246,7 @@ mod tests {
 
     /// A view moves its own focus, tab and scrollback, reads, and detaches —
     /// tagged or not — but types nothing, votes no size, tells no colours
-    /// and changes nothing in the session.
+    /// and changes nothing in the session, not even which notes are read.
     #[test]
     fn a_view_sends_only_what_navigates() {
         let pane = PaneId(1);
@@ -261,10 +260,6 @@ mod tests {
             Request::PaneFocus { pane },
             Request::TabSelect { id: TabId(2) },
             Request::PaneScroll { pane, offset: 3 },
-            Request::NotesRead {
-                up_to: None,
-                pane: None,
-            },
         ] {
             assert!(navigates(&control(&request)), "{request:?}");
             assert!(navigates(&tagged(&request, 7)), "tagged {request:?}");
@@ -303,6 +298,11 @@ mod tests {
                 id: WorkspaceId(1),
                 discard: false,
             },
+            Request::NotesRead {
+                up_to: None,
+                pane: None,
+            },
+            Request::NotesClear,
         ] {
             assert!(!navigates(&control(&request)), "{request:?}");
         }

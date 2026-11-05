@@ -5547,6 +5547,23 @@ async fn a_views_focus_marks_nothing_seen() {
         unread(list_notes(&mut control, true).await),
         [(shell, NoteKind::Notify), (shell, NoteKind::Bell)]
     );
+    // Nor may it mark them read, or clear them, for everybody.
+    for request in [
+        Request::NotesRead {
+            up_to: None,
+            pane: None,
+        },
+        Request::NotesClear,
+    ] {
+        viewer.send(&request).await;
+        let refused = read_until_control(&mut viewer, |r: &Response| {
+            matches!(r, Response::Error { .. })
+        })
+        .await;
+        let message = "a view marks no note read".to_string();
+        assert_eq!(refused, Response::Error { message }, "{request:?}");
+    }
+    assert_eq!(list_notes(&mut control, true).await.len(), 2);
     assert!(wait_state(&mut control, done, AgentState::Done).await);
     let toward = |from| Request::PaneFocusToward {
         from,
