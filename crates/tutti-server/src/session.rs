@@ -1351,6 +1351,9 @@ impl Session {
             transition: (from != to).then_some((from, to)),
             relisted,
             notify,
+            claimed_block: from == AgentState::Blocked
+                && to == AgentState::Blocked
+                && held != Some(report.source),
         }
     }
 
@@ -1972,6 +1975,9 @@ pub struct ReportOutcome {
     pub relisted: bool,
     /// A `(title, body)` notification from the report's `msg`.
     pub notify: Option<(Option<String>, String)>,
+    /// Whether the report claimed a block another source (the screen) had
+    /// already set: no move, but an ask's wait now takes it (`pane_wait`).
+    pub claimed_block: bool,
 }
 
 /// Where a `tutti run` lands (`Session::run_in_fresh_tab`): `workspace`, else

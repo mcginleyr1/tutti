@@ -514,29 +514,8 @@ async fn an_asks_wait_takes_no_block_the_screen_read() {
     let server = TestServer::start();
     let mut control = server.connect().await;
     let mut waiter = server.connect().await;
-    let bin = copy_bin("claude", "/bin/cat");
-    new_workspace(&mut control).await;
-    let pane = pane_id(
-        control
-            .request(Request::PaneRun {
-                tab: None,
-                cmd: vec![bin.display().to_string()],
-                ephemeral: false,
-                sandbox: None,
-            })
-            .await,
-    );
-    assert!(wait_agent(&mut control, pane, "claude").await);
-    let show = |text: &str| Request::PaneSend {
-        pane,
-        text: Some(format!("{text}\n")),
-        keys: None,
-        expect: None,
-        between_turns: false,
-        hooks: None,
-    };
-    let screen =
-        |state| move |p: &PaneInfo| p.state == state && p.source == Some(StateSource::Screen);
+    let pane = claude_cat(&mut control).await;
+    let show = |text: &str| shown(pane, text);
 
     assert_eq!(
         control.request(show("Do you want to proceed?")).await,
@@ -579,6 +558,73 @@ async fn an_asks_wait_takes_no_block_the_screen_read() {
     );
 
     server.stop().await;
+}
+
+/// Codex 0.166 reports its own blocked over OSC 7501. Such a report on a
+/// pane the screen already read blocked moves no state, yet it is the
+/// agent's own word: an ask's wait takes it, as it takes a hook's.
+#[tokio::test]
+async fn an_asks_wait_takes_a_report_claiming_a_block_the_screen_read() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let mut waiter = server.connect().await;
+    let pane = claude_cat(&mut control).await;
+    let shows = control
+        .request(shown(pane, "Do you want to proceed?"))
+        .await;
+    assert_eq!(shows, Response::Ok);
+    assert!(wait_pane(&mut control, pane, screen(AgentState::Blocked)).await);
+
+    start_wait(&mut waiter, ask_wait(pane, 0, 5_000)).await;
+    let report = shown(pane, "\u{1b}]7501;state=blocked\u{1b}\\");
+    assert_eq!(control.request(report).await, Response::Ok);
+    assert_eq!(
+        waited(waiter.response().await),
+        (AgentState::Blocked, false),
+        "the report's own word"
+    );
+    assert!(
+        wait_pane(&mut control, pane, |p| p.source
+            == Some(StateSource::Program))
+        .await
+    );
+
+    server.stop().await;
+}
+
+/// A `cat` renamed `claude`: detected as the agent, it draws on its screen
+/// whatever is sent to it (`shown`), for the classifier to read.
+async fn claude_cat(conn: &mut Conn) -> PaneId {
+    let bin = copy_bin("claude", "/bin/cat");
+    new_workspace(conn).await;
+    let pane = pane_id(
+        conn.request(Request::PaneRun {
+            tab: None,
+            cmd: vec![bin.display().to_string()],
+            ephemeral: false,
+            sandbox: None,
+        })
+        .await,
+    );
+    assert!(wait_agent(conn, pane, "claude").await);
+    pane
+}
+
+/// The line `text` sent to `pane`, for its program to echo.
+fn shown(pane: PaneId, text: &str) -> Request {
+    Request::PaneSend {
+        pane,
+        text: Some(format!("{text}\n")),
+        keys: None,
+        expect: None,
+        between_turns: false,
+        hooks: None,
+    }
+}
+
+/// Whether a pane is in `state` as its screen read it.
+fn screen(state: AgentState) -> impl Fn(&PaneInfo) -> bool {
+    move |p| p.state == state && p.source == Some(StateSource::Screen)
 }
 
 /// An agent that exits mid-ask ends the ask's wait with an error naming the

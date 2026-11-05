@@ -1896,7 +1896,9 @@ fn pane_of_process(roots: &HashMap<u32, PaneId>, pid: u32) -> Option<PaneId> {
 /// refreshes the workspace, as a hook's does: that probe records the turn's
 /// checkpoint, and entering `Working` must probe too, or a first turn's
 /// baseline would only be snapshotted at its end. Progress ticks within one
-/// state move nothing, so a progress bar never runs jj.
+/// state move nothing, so a progress bar never runs jj. A report claiming a
+/// block the screen read first moves nothing either, but the waits hear of
+/// it as a hook's is told (`claimed_block`).
 fn publish_report(hub: &Arc<Hub>, pane: PaneId, outcome: ReportOutcome) {
     let view = {
         let mut session = hub.session();
@@ -1904,6 +1906,19 @@ fn publish_report(hub: &Arc<Hub>, pane: PaneId, outcome: ReportOutcome) {
     };
     if let Some(view) = view {
         broadcast_event(hub, Event::LayoutChanged { workspaces: view });
+    }
+    if outcome.claimed_block {
+        // As for a hook's block (`agent_event`): an ask's wait takes it now,
+        // a `--next` one never.
+        let again = AgentState::Blocked;
+        tell_waits(
+            hub,
+            pane,
+            PaneSignal::Moved {
+                from: again,
+                to: again,
+            },
+        );
     }
     let noted = outcome
         .transition
