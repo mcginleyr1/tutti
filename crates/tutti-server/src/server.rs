@@ -1963,8 +1963,9 @@ fn agent_event(
 /// holds the reply until an answer comes down the approval's channel or the
 /// hook hangs up; either way — or on a panic, here or in that task — the
 /// approval leaves the pane (`Held`), and the pane's other approvals wait
-/// on, each until its own answer or hang-up. With no client attached nobody
-/// could answer: the reply is `Pass` at once, as it is for an unknown pane.
+/// on, each until its own answer or hang-up. With no client attached that
+/// could answer — a view cannot — the reply is `Pass` at once, as it is for
+/// an unknown pane.
 fn approval_hold(
     hub: &Arc<Hub>,
     cid: u64,
@@ -1975,7 +1976,7 @@ fn approval_hold(
     summary: String,
 ) -> ControlFlow<()> {
     let message = Some(format!("{tool} · {summary}"));
-    let attached = !hub.clients().is_empty();
+    let attached = hub.clients().values().any(|client| !client.watching);
     let held = if attached {
         hub.session().hold_approval(pane, tool, summary)
     } else {

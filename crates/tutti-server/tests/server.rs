@@ -3622,7 +3622,8 @@ async fn view_approval(viewer: &mut Conn, pane: PaneId, held: bool) -> Option<Pe
 
 /// With no client attached nobody could answer: the hold answers `Pass` at
 /// once — Claude's own dialog appears — yet the pane blocks as the request's
-/// hook event would have blocked it, and nothing stays held.
+/// hook event would have blocked it, and nothing stays held. A view, which
+/// answers nothing, is nobody to wait for either.
 #[tokio::test]
 async fn an_approval_hold_with_no_client_attached_passes_at_once() {
     let server = TestServer::start();
@@ -3640,6 +3641,25 @@ async fn an_approval_hold_with_no_client_attached_passes_at_once() {
             && p.conversation.as_deref() == Some("c1")
             && p.approval.is_none())
         .await
+    );
+
+    let mut viewer = server.connect().await;
+    viewer
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: false,
+            view: true,
+        })
+        .await;
+    read_until_control(&mut viewer, |r: &Response| {
+        matches!(r, Response::Attached { .. })
+    })
+    .await;
+    let mut hook = server.connect().await;
+    let answer = timeout(DEADLINE, hook.request(hold(pane))).await;
+    assert_eq!(
+        approval(answer.expect("a view held the request")),
+        ApprovalDecision::Pass
     );
 
     server.stop().await;
