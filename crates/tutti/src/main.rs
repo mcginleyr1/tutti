@@ -1360,7 +1360,9 @@ fn run_ask(
 /// installed for it, in the user's config or the pane's project. An ask's
 /// send names it, so the daemon takes the pane before the hooks have spoken.
 /// Installed is all tutti can see: Codex runs a hook only once it is trusted
-/// in its `/hooks`, so an untrusted one leaves the ask to its `--timeout`.
+/// in its `/hooks`, and a project's `.codex/hooks.json` only in a trusted
+/// project (its hooks docs), so an untrusted one leaves the ask to its
+/// `--timeout`.
 fn installed_hooks(client: &mut Client, pane: PaneId) -> Result<Option<AgentKind>> {
     let Response::Panes { panes } = client.request(&Request::PaneList)? else {
         return Ok(None);

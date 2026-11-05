@@ -1882,13 +1882,14 @@ It also refuses a pane whose agent has not reported through tutti's hooks —
 a plain shell, or an agent without `tutti hooks <agent> --install` — since no
 turn end of its would ever reach the wait. Claude Code and Gemini CLI report
 as they start (SessionStart); Codex and opencode only from their first turn,
-so for a fresh one `ask` checks tutti's integration itself — Codex's hooks in
-`$CODEX_HOME` (else `~/.codex`) or the pane's project, opencode's plugin in
-its user or project plugin dir — and, installed, the daemon takes the pane
-once detection names its agent (within a second of its start): the ask's
-message is its first turn. Codex runs a hook only once it is trusted in its
-`/hooks`, which tutti cannot see, so an untrusted one leaves the ask to its
-`--timeout`.
+so for a fresh one `ask` checks tutti's integration itself — Codex's
+`hooks.json` in `$CODEX_HOME` (else `~/.codex`) or in the pane's project's
+`.codex/`, opencode's plugin in its user or project plugin dir — and,
+installed, the daemon takes the pane once detection names its agent (within
+a second of its start): the ask's message is its first turn. Codex runs a
+hook only once you have trusted it in its `/hooks`, and a project's
+`.codex/` hooks only in a project you have trusted; tutti sees neither, so
+an untrusted one leaves the ask to its `--timeout`.
 `ask` then presses enter (150 ms later: an agent can take text and an enter
 that land together as a paste) and waits for the next turn end the agent's
 hooks report, or a block. It counts turn ends from its own send, so a turn
