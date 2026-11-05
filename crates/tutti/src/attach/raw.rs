@@ -23,7 +23,11 @@
 //! first, and each resize's — draws both of the pane's screens from the
 //! mirror (`primary`), and so does a reset, which never reaches the
 //! terminal: it would turn off the light/dark reports, and some terminals
-//! clear their scrollback on it. Only the first brings history.
+//! clear their scrollback on it. The first snapshot brings the history, and
+//! so does a resync's — a stream that fell behind skips ahead to the pane's
+//! screen — with the rows that scrolled off the screen meanwhile, which go
+//! into the scrollback over the stale screen (`scroll_off`): it misses no
+//! line the pane still holds, and a line tells of any it no longer did.
 //!
 //! This terminal's keys stay plain: the daemon keeps the pane's keyboard
 //! protocols (kitty's, modifyOtherKeys) out of the stream, and the mirror's
@@ -67,6 +71,13 @@ const MODES_OFF: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?100
 \x1b[?1004l\x1b[?2004l\x1b[?2031l\x1b[?1l\x1b>\x1b[0 q\x1b[?25h\x1b[m";
 const LEAVE_ALTERNATE: &[u8] = b"\x1b[?1049l";
 const POP_TITLE: &[u8] = b"\x1b[23;0t";
+/// Inline, the screen a resync's rows are printed on: the cursor hidden
+/// until the snapshot shows it, the pane's alternate screen left, the scroll
+/// region whole, origin mode and insert off, autowrap on, no rendition, link
+/// or other character set, and the primary cleared from the top with ED 0 —
+/// which, unlike ED 2, no terminal pushes into its scrollback.
+const PLAIN: &[u8] =
+    b"\x1b[?25l\x1b[?1049l\x1b[r\x1b[?6l\x1b[?7h\x1b[4l\x1b[0m\x1b]8;;\x1b\\\x1b(B\x0f\x1b[H\x1b[J";
 
 /// Whether the view is `--inline`, and whether the pane's program has this
 /// terminal's alternate screen up: what `restore`, a panic's included,
@@ -111,11 +122,12 @@ pub fn run(
         rows,
         cols,
         history,
+        inline,
     };
     stream.write_all(&control(&attach))?;
     // A refusal — no such pane — lands before the terminal is touched; the
     // colours' `Ok` is passed over, and the history, the raw frames before
-    // the first snapshot, gathered.
+    // the first snapshot, gathered — after a line on what was skipped.
     let mut buf = Vec::new();
     let mut past = Vec::new();
     let first = loop {
@@ -134,6 +146,11 @@ pub fn run(
             }
             (Some(Response::Error { message }), _) => bail!(message),
             (_, Frame::PaneRaw { bytes, .. }) => past.extend(bytes),
+            (_, Frame::Control(json)) => {
+                if let Ok(Event::PaneRows { skipped, .. }) = serde_json::from_slice(&json) {
+                    past = skip_note(pane, skipped);
+                }
+            }
             (_, frame) => break frame,
         }
     };
@@ -173,8 +190,10 @@ pub fn run(
     spawn_resizes(resizes, pane, &writer);
     let mut mirror = Terminal::new(24, 80, 0);
     let enter = [ENTER, if inline { b"" } else { ALTERNATE_SCREEN }].concat();
-    let shown = emit(&enter)
-        .and_then(|()| show(first, &mut stream, &mut buf, &mut mirror, lift.into_bytes()));
+    let shown = emit(&enter).and_then(|()| {
+        let lift = lift.into_bytes();
+        show(pane, first, &mut stream, &mut buf, &mut mirror, lift)
+    });
     if inline {
         let _ = emit(&below(&mut mirror));
     }
@@ -187,10 +206,14 @@ pub fn run(
     Ok(0)
 }
 
-/// Draw the stream, `first` frame on, until the pane exits (its code) or the
-/// connection closes (`None`), with `mirror` following it. `lift` goes out
-/// before the first snapshot. A refusal on the way is the error.
+/// Draw `pane`'s stream, `first` frame on, until the pane exits (its code)
+/// or the connection closes (`None`), with `mirror` following it. `lift`
+/// goes out before the first snapshot. Inline, the rows a resync hands on —
+/// the raw frames between its `PaneRows` and its snapshot — go into this
+/// terminal's scrollback first (`scroll_off`). A refusal on the way is the
+/// error.
 fn show(
+    pane: PaneId,
     first: Frame,
     stream: &mut UnixStream,
     buf: &mut Vec<u8>,
@@ -206,6 +229,7 @@ fn show(
         }
     };
     let mut last = 0;
+    let mut past: Option<Vec<u8>> = None;
     let mut frame = Some(first);
     loop {
         let next = match frame.take() {
@@ -220,7 +244,16 @@ fn show(
                 *mirror = Terminal::new(data.rows, data.cols, 0);
                 mirror.advance(&data.bytes);
                 mirror.take_events();
-                emit(&[std::mem::take(&mut lift), view(mirror)].concat())?;
+                let past = past.take().unwrap_or_default();
+                let scrolled = if past.is_empty() {
+                    Vec::new()
+                } else {
+                    scroll_off(&past, terminal::size().unwrap_or((80, 24)))
+                };
+                emit(&[std::mem::take(&mut lift), scrolled, view(mirror)].concat())?;
+            }
+            Frame::PaneRaw { bytes, .. } if past.is_some() => {
+                past.get_or_insert_default().extend(bytes);
             }
             Frame::PaneRaw { bytes, .. } if feed(mirror, &mut last, &bytes, inline) => {
                 emit(&view(mirror))?;
@@ -230,6 +263,9 @@ fn show(
                 if let Ok(Event::PaneExited { code, .. }) = serde_json::from_slice(&json) {
                     return Ok(Some(code));
                 }
+                if let Ok(Event::PaneRows { skipped, .. }) = serde_json::from_slice(&json) {
+                    past = Some(skip_note(pane, skipped));
+                }
                 if let Ok(Response::Error { message }) = serde_json::from_slice(&json) {
                     bail!(message);
                 }
@@ -238,6 +274,33 @@ fn show(
         }
         ALTERNATE.store(mirror.modes().alt_screen, Ordering::SeqCst);
     }
+}
+
+/// A line on the rows of `pane` left out before the history that follows,
+/// if any were.
+fn skip_note(pane: PaneId, skipped: u64) -> Vec<u8> {
+    if skipped == 0 {
+        return Vec::new();
+    }
+    format!("[pane {pane}: {skipped} lines not shown]\r\n").into_bytes()
+}
+
+/// What prints `past` — the rows a resync handed on — into the scrollback
+/// of this terminal, `(cols, rows)` big, over the stale screen: a plain
+/// primary screen cleared from the top (`PLAIN`), the rows, then as many
+/// lines fed at the bottom as they fill of the screen, so the snapshot is
+/// drawn on a blank one. A scratch terminal of this one's size counts them:
+/// no cursor report can be asked here, as the keys' thread reads the
+/// terminal.
+fn scroll_off(past: &[u8], (cols, rows): (u16, u16)) -> Vec<u8> {
+    let mut scratch = Terminal::new(rows, cols, 0);
+    scratch.advance(past);
+    let (row, col) = scratch.cursor_position();
+    let lift = format!(
+        "\x1b[{rows};1H{}",
+        "\n".repeat(usize::from(row + u16::from(col > 0)))
+    );
+    [PLAIN, past, lift.as_bytes()].concat()
 }
 
 /// Feed one read of the pane's output to the mirror: true when it reset the
@@ -811,11 +874,7 @@ mod tests {
     /// cursor under the pane's text.
     #[test]
     fn inline_keeps_the_scrollback_and_passes_screen_switches_through() {
-        let history = |term: &Terminal| -> Vec<String> {
-            term.rows(term.oldest_row(), term.screen_top())
-                .map(|(_, row)| row.text().trim_end().to_string())
-                .collect()
-        };
+        let history = scrollback;
         let mut terminal = Terminal::new(4, 20, 100);
         terminal.advance(b"\x1b[?2031h$ old\r\n$ tutti pane attach\r\n");
         let mut mirror = Terminal::new(4, 20, 0);
@@ -861,6 +920,59 @@ mod tests {
         terminal.advance(&below(&mut mirror));
         assert!(!terminal.modes().alt_screen && !ALTERNATE.load(Ordering::SeqCst));
         assert_eq!(terminal.cursor_position(), (1, 0), "under `after`");
+    }
+
+    /// The rows `term` has scrolled into its scrollback, as text.
+    fn scrollback(term: &Terminal) -> Vec<String> {
+        term.rows(term.oldest_row(), term.screen_top())
+            .map(|(_, row)| row.text().trim_end().to_string())
+            .collect()
+    }
+
+    /// Inline, a resync's rows go into this terminal's scrollback over its
+    /// stale screen — the pane's alternate screen and scroll region there
+    /// or not, the rows fewer or more than the screen holds — after a line
+    /// on those left out, if any; then the snapshot is drawn on a blank
+    /// screen. The scrollback runs on from what scrolled before, nothing
+    /// missed and nothing twice.
+    #[test]
+    fn a_resyncs_rows_go_into_the_scrollback_before_its_snapshot() {
+        let lines = |n: usize| -> String { (0..n).map(|i| format!("L{i}\r\n")).collect() };
+        let names = |rows: std::ops::Range<usize>| rows.map(|i| format!("L{i}")).collect();
+        for (stale, printed, from, want) in [
+            ("", 8, 3, names(0..5)),
+            ("", 21, 3, names(0..18)),
+            ("\x1b[?1049h\x1b[2;3rvim", 21, 3, names(0..18)),
+            ("", 21, 10, {
+                let mut want: Vec<String> = names(0..3);
+                want.push("[pane 3: 7 lines not shown]".into());
+                want.extend(names(10..18));
+                want
+            }),
+        ] {
+            // The terminal had the pane up to its row 3 on screen; the pane
+            // went on to print `printed` lines, which the stream skipped.
+            let mut terminal = Terminal::new(4, 40, 100);
+            terminal.advance(lines(6).as_bytes());
+            terminal.advance(stale.as_bytes());
+            assert_eq!(scrollback(&terminal), names(0..3));
+            let mut pane = Terminal::new(4, 40, 100);
+            pane.advance(lines(printed).as_bytes());
+            let top = pane.screen_top();
+            let past = [
+                skip_note(PaneId(3), (from - 3) as u64),
+                pane.history(from as u64, top),
+            ]
+            .concat();
+            let mut mirror = Terminal::new(4, 40, 0);
+            mirror.advance(&pane.snapshot());
+
+            terminal.advance(&scroll_off(&past, (40, 4)));
+            terminal.advance(&primary(&mirror));
+            assert_eq!(scrollback(&terminal), want, "{stale:?}, {printed} printed");
+            assert_eq!(screen(&terminal), screen(&mirror), "{stale:?}");
+            assert!(!terminal.modes().alt_screen);
+        }
     }
 
     /// A read that goes there and back, a switch cut across two reads, and a

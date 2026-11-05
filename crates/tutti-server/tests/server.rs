@@ -2236,6 +2236,7 @@ fn pane_attach(pane: PaneId, rows: u16, cols: u16) -> Request {
         rows,
         cols,
         history: 0,
+        inline: false,
     }
 }
 
@@ -2255,6 +2256,7 @@ async fn a_pane_stream_starts_with_the_history_it_asks_for() {
             rows: 5,
             cols: 20,
             history: 10,
+            inline: false,
         })
         .await;
     let mut history = Vec::new();
@@ -2657,6 +2659,89 @@ async fn a_pane_stream_that_stops_reading_skips_ahead_to_the_screen() {
         screen.contents().ends_with("flood-42\nstill-2")
     })
     .await;
+
+    server.stop().await;
+}
+
+/// The rows `terminal` has scrolled into its scrollback, as text.
+fn scrolled(terminal: &Terminal) -> Vec<String> {
+    terminal
+        .rows(terminal.oldest_row(), terminal.screen_top())
+        .map(|(_, row)| row.text().trim_end().to_string())
+        .collect()
+}
+
+/// An inline stream that falls behind is handed, before each fresh
+/// snapshot, the rows that scrolled off the screen past what it last had —
+/// numbered by the `PaneRows` before them — so its terminal's scrollback,
+/// what scrolled in it then each resync's rows, misses no line and repeats
+/// none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_inline_stream_behind_is_handed_the_rows_it_skipped() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    // 3000 lines of a row each, padded with resets to 900 bytes: 2.7 MB,
+    // over twice the backlog, in fewer rows than a scrollback holds.
+    let script = "stty -echo; read go; awk 'BEGIN { for (j = 0; j < 300; j++) f = f \"\\033[m\"; \
+                  for (i = 1; i <= 3000; i++) printf \"%s%d\\r\\n\", f, i }'; echo flood-done; sleep 30";
+    let pane = run_marker(&mut control, script).await;
+    let mut stuck = server.connect().await;
+    stuck
+        .send(&Request::PaneAttach {
+            pane,
+            rows: 10,
+            cols: 40,
+            history: 0,
+            inline: true,
+        })
+        .await;
+    stuck
+        .write_frame(&Frame::Input {
+            pane,
+            bytes: b"go\r".to_vec(),
+        })
+        .await;
+    assert!(read_until(&mut control, pane, "flood-done").await);
+
+    let (mut terminal, mut transcript) = (Terminal::new(10, 40, 100_000), Vec::new());
+    let (mut numbered, mut past) = (Vec::new(), None::<Vec<u8>>);
+    timeout(DEADLINE, async {
+        while !terminal.contents().contains("flood-done") {
+            match stuck.read_frame().await {
+                Frame::Control(json) => {
+                    if let Ok(Event::PaneRows { top, skipped, .. }) = serde_json::from_slice(&json)
+                    {
+                        numbered.push((top, skipped));
+                        transcript.extend(scrolled(&terminal));
+                        past = Some(Vec::new());
+                    }
+                }
+                Frame::PaneRaw { bytes, .. } => match &mut past {
+                    Some(past) => past.extend(bytes),
+                    None => terminal.advance(&bytes),
+                },
+                Frame::PaneSnapshot(data) => {
+                    let past = String::from_utf8(past.take().expect("numbered")).unwrap();
+                    transcript.extend(past.lines().map(String::from));
+                    terminal = Terminal::new(data.rows, data.cols, 100_000);
+                    terminal.advance(&data.bytes);
+                }
+                other => panic!("a pane stream got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the stream never caught up");
+    transcript.extend(scrolled(&terminal));
+    transcript.extend(terminal.contents().lines().map(String::from));
+
+    assert!(numbered.len() > 1, "it was resynced: {numbered:?}");
+    assert!(
+        numbered.iter().all(|&(_, skipped)| skipped == 0),
+        "{numbered:?}"
+    );
+    let numbers: Vec<u32> = transcript.iter().filter_map(|l| l.parse().ok()).collect();
+    assert_eq!(numbers, (1..=3000).collect::<Vec<_>>());
 
     server.stop().await;
 }

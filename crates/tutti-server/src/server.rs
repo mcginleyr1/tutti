@@ -38,7 +38,7 @@ use crate::herdr;
 use crate::jj;
 use crate::keys;
 use crate::persist::{self, Saved, SavedPane};
-use crate::pty::{Feed, PaneSize, PtyPane, Signal, StatusReport};
+use crate::pty::{Feed, History, Kept, PaneSize, PtyPane, Rows, Signal, Start, StatusReport};
 use crate::session::{ForkMeta, Meta, ReportOutcome, Restored, RunTarget, Session};
 
 /// Cadence of the render tick: coalesced pane deltas to attached clients, and
@@ -69,6 +69,11 @@ const EXIT_GRACE: Duration = Duration::from_millis(250);
 /// (`Outbox`): past it, the stream is behind, and what is queued goes for a
 /// fresh snapshot.
 const STREAM_BACKLOG: usize = 1 << 20;
+/// The most scrollback rows a resync hands an inline pane stream: a pane's
+/// whole scrollback. Rows that scrolled off before the newest this many, or
+/// left the pane's scrollback before the stream caught up, never reach its
+/// terminal's: `PaneRows.skipped` counts them, and `pane attach` says so.
+const RESYNC_ROWS: u64 = 10_000;
 
 /// One pane's news, sent to every `pane wait` on it (`tell_waits`).
 #[derive(Debug, Clone, Copy)]
@@ -121,14 +126,32 @@ struct Watcher {
 /// — a tap never writes the log itself, under the lock.
 #[derive(Default)]
 struct Outbox {
-    queued: Mutex<Vec<u8>>,
+    queue: Mutex<Queue>,
     ready: Notify,
     resynced: AtomicBool,
 }
 
+/// What a pane stream has queued, and how far down the pane's rows it goes:
+/// `top`, the screen's absolute first row as of the end of what is queued,
+/// and `taken`, as of the end of what the writer took — the row the stream's
+/// terminal has reached, whatever is dropped after.
+#[derive(Default)]
+struct Queue {
+    bytes: Vec<u8>,
+    top: u64,
+    taken: u64,
+}
+
 impl Outbox {
-    fn queued(&self) -> MutexGuard<'_, Vec<u8>> {
-        self.queued.lock().unwrap_or_else(PoisonError::into_inner)
+    fn queue(&self) -> MutexGuard<'_, Queue> {
+        self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Everything queued, for the writer.
+    fn take(&self) -> Vec<u8> {
+        let mut queue = self.queue();
+        queue.taken = queue.top;
+        std::mem::take(&mut queue.bytes)
     }
 }
 
@@ -674,7 +697,7 @@ async fn writer_loop(
                 continue;
             }
         };
-        let stream = std::mem::take(&mut *outbox.queued());
+        let stream = outbox.take();
         if outbox.resynced.swap(false, Ordering::Relaxed) {
             eprintln!("tutti: a pane stream fell behind; it skips ahead to a fresh snapshot");
         }
@@ -780,6 +803,7 @@ fn handle_frame(
                 rows,
                 cols,
                 history,
+                inline,
             }) => pane_attach(
                 hub,
                 cid,
@@ -787,6 +811,7 @@ fn handle_frame(
                 stream,
                 PaneDims { pane, rows, cols },
                 history,
+                inline,
             ),
             Ok(Request::Watch) => {
                 hub.watchers().insert(
@@ -970,11 +995,14 @@ fn arbitrate(hub: &Hub, panes: impl IntoIterator<Item = PaneId>) {
 /// connection's read loop, which drains what is queued and closes. The
 /// reader never waits on a tap: one whose connection leaves more than
 /// `STREAM_BACKLOG` of the pane's output queued drops it all for a fresh
-/// snapshot, and a slow terminal skips ahead to the pane's screen. The
-/// `history` rows asked for go first, in frames short of the frame bound,
-/// and widen the backlog by their size: a long history is never behind. The
-/// child exiting is told once its last output is queued — unless the daemon
-/// is stopping, which killed it.
+/// snapshot, and a slow terminal skips ahead to the pane's screen — an
+/// `inline` one, which keeps a scrollback of the pane's, after the rows that
+/// scrolled off past what the writer last took (`Queue::taken`), up to
+/// `RESYNC_ROWS`. The `history` rows asked for go first, in frames short of
+/// the frame bound, and widen the backlog by their size: a long history is
+/// never behind — nor is a resync's. Inline, each snapshot follows a
+/// `PaneRows` naming its rows. The child exiting is told once its last
+/// output is queued — unless the daemon is stopping, which killed it.
 fn pane_attach(
     hub: &Arc<Hub>,
     cid: u64,
@@ -982,6 +1010,7 @@ fn pane_attach(
     stream: &mut Option<(oneshot::Sender<()>, Arc<Outbox>)>,
     dims: PaneDims,
     history: u32,
+    inline: bool,
 ) -> ControlFlow<()> {
     let refuse = |message: String| {
         send_reply(
@@ -1002,13 +1031,18 @@ fn pane_attach(
     hub.taps().insert(cid, dims);
     arbitrate(hub, [pane]);
     let mut backlog = STREAM_BACKLOG;
+    let mut started = false;
+    let rows = (inline || history > 0).then_some(Rows {
+        since: None,
+        at_most: history.into(),
+    });
     pty.tap(
         cid,
-        history,
+        rows,
         Box::new(move |feed| {
             // Named, so the tap owns `kick` and drops it with itself.
             let _owned = &kick;
-            let mut queued = outbox.queued();
+            let mut queue = outbox.queue();
             let raw = |bytes: &[u8]| {
                 Frame::PaneRaw {
                     pane,
@@ -1016,29 +1050,65 @@ fn pane_attach(
                 }
                 .encode()
             };
-            let frames = match feed {
-                Feed::Raw(_) if queued.len() > backlog => {
-                    queued.clear();
+            match feed {
+                Feed::Read { .. } if queue.bytes.len() > backlog => {
+                    queue.bytes.clear();
                     outbox.resynced.store(true, Ordering::Relaxed);
-                    return true;
+                    backlog = STREAM_BACKLOG;
+                    return Kept::Behind(inline.then_some(Rows {
+                        since: Some(queue.taken),
+                        at_most: RESYNC_ROWS,
+                    }));
                 }
-                Feed::Raw(bytes) => raw(bytes),
-                Feed::History(bytes) => {
-                    backlog += bytes.len();
-                    bytes.chunks(MAX_FRAME_LEN / 2).flat_map(raw).collect()
+                Feed::Read {
+                    raw: read,
+                    cuts,
+                    top,
+                } => {
+                    let mut from = 0;
+                    for to in cuts.iter().copied().chain([read.len()]) {
+                        if from < to {
+                            queue.bytes.extend(raw(&read[from..to]));
+                        }
+                        from = to;
+                    }
+                    queue.top = top;
                 }
-                Feed::Snapshot(size, bytes) => Frame::PaneSnapshot(PaneData {
-                    pane,
-                    rows: size.rows,
-                    cols: size.cols,
-                    seq: 0,
-                    bytes,
-                })
-                .encode(),
-            };
-            queued.extend(frames);
+                Feed::Snapshot(Start {
+                    size,
+                    top,
+                    screen,
+                    history,
+                }) => {
+                    if inline {
+                        let skipped = history.as_ref().map_or(0, |h| h.skipped);
+                        let rows = Event::PaneRows { pane, top, skipped };
+                        queue.bytes.extend(encode_json(&rows));
+                    }
+                    // Until the writer takes the first snapshot, the stream
+                    // has what comes before its history.
+                    if !std::mem::replace(&mut started, true) {
+                        queue.taken = history.as_ref().map_or(top, |h| h.from);
+                    }
+                    if let Some(History { bytes, .. }) = history {
+                        backlog += bytes.len();
+                        queue
+                            .bytes
+                            .extend(bytes.chunks(MAX_FRAME_LEN / 2).flat_map(raw));
+                    }
+                    let snapshot = Frame::PaneSnapshot(PaneData {
+                        pane,
+                        rows: size.rows,
+                        cols: size.cols,
+                        seq: 0,
+                        bytes: screen,
+                    });
+                    queue.bytes.extend(snapshot.encode());
+                    queue.top = top;
+                }
+            }
             outbox.ready.notify_one();
-            false
+            Kept::Up
         }),
     );
     let (hub, tx) = (Arc::clone(hub), reply.tx.clone());
@@ -3929,7 +3999,7 @@ mod tests {
         let outbox = Arc::new(Outbox::default());
         let writer = tokio::spawn(writer_loop(write, rx, hung_up, Arc::clone(&outbox)));
         let waiter = tx.clone();
-        outbox.queued().extend_from_slice(b"streamed, ");
+        outbox.queue().bytes.extend_from_slice(b"streamed, ");
         tx.send(b"queued".to_vec()).await.unwrap();
         drop((tx, hangup));
         let deadline = Duration::from_secs(5);

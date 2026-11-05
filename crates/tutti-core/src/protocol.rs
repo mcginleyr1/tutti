@@ -11,7 +11,7 @@ use crate::state::{AgentState, StateSource};
 /// Response / Event shapes (including additive fields): the daemon reports it
 /// on attach and mismatched clients tell the user to restart the daemon —
 /// binaries upgrade on install, running daemons do not.
-pub const WIRE_REV: u32 = 15;
+pub const WIRE_REV: u32 = 16;
 
 /// The most notes the daemon's notification history keeps, the oldest going
 /// first. A client caps its copy the same, so the two agree.
@@ -443,12 +443,19 @@ pub enum Request {
     /// scrollback come first, before the first snapshot only, as `PaneRaw`
     /// frames: its logical lines, for the terminal to print into its own
     /// scrollback (`pane attach --inline`).
+    ///
+    /// `inline`: the terminal keeps a scrollback of the pane's. Each snapshot
+    /// then comes after an `Event::PaneRows` numbering its rows, and a resync
+    /// hands on, before its snapshot, the rows that scrolled off the screen
+    /// while the stream was behind, as the history is.
     PaneAttach {
         pane: PaneId,
         rows: u16,
         cols: u16,
         #[serde(default)]
         history: u32,
+        #[serde(default)]
+        inline: bool,
     },
     /// The colours of the terminal a client shows panes on, which the daemon
     /// answers its panes' colour queries with — OSC 10/11/12 and mode 2031's
@@ -1057,6 +1064,19 @@ pub enum Event {
         pane: PaneId,
         code: i32,
     },
+    /// To an inline pane stream (`PaneAttach.inline`), before each of its
+    /// snapshots: the snapshot's screen starts at the pane's absolute row
+    /// `top`, and the `PaneRaw` frames between this and the snapshot are
+    /// scrollback rows up to it, as logical lines for the terminal's own
+    /// scrollback — the history asked for at attach, or after a resync the
+    /// rows that scrolled off while the stream was behind. `skipped`: rows the
+    /// stream lacks that come before those and are left out, gone from the
+    /// pane's scrollback or past the most a resync hands on.
+    PaneRows {
+        pane: PaneId,
+        top: u64,
+        skipped: u64,
+    },
     /// The workspace/tab/pane structure changed; carries the fresh view so the
     /// client re-lays-out without asking. Fresh pane snapshots follow on the tick.
     LayoutChanged {
@@ -1497,6 +1517,7 @@ mod tests {
             rows: 24,
             cols: 80,
             history: 1000,
+            inline: true,
         });
         roundtrip(&Request::HostColors(sample_colors()));
         roundtrip(&Request::HostColors(HostColors {
@@ -1980,6 +2001,11 @@ mod tests {
             pane: PaneId(1),
             code: 0,
         });
+        roundtrip(&Event::PaneRows {
+            pane: PaneId(1),
+            top: 10_120,
+            skipped: 3,
+        });
         roundtrip(&Event::LayoutChanged {
             workspaces: sample_view(),
         });
@@ -2101,9 +2127,10 @@ mod tests {
                 rows: 24,
                 cols: 80,
                 history: 0,
+                inline: false,
             })
             .unwrap(),
-            r#"{"type":"pane_attach","pane":3,"rows":24,"cols":80,"history":0}"#
+            r#"{"type":"pane_attach","pane":3,"rows":24,"cols":80,"history":0,"inline":false}"#
         );
         assert_eq!(
             serde_json::to_string(&Event::StateChanged {
@@ -2204,7 +2231,8 @@ mod tests {
                 sandbox: None,
             }
         );
-        // `pane_attach` without `history` replays none.
+        // `pane_attach` without `history` or `inline` replays none and
+        // numbers no rows.
         let attach: Request =
             serde_json::from_str(r#"{"type":"pane_attach","pane":3,"rows":24,"cols":80}"#).unwrap();
         assert_eq!(
@@ -2214,6 +2242,7 @@ mod tests {
                 rows: 24,
                 cols: 80,
                 history: 0,
+                inline: false,
             }
         );
         // A blocked event from before reminders is no reminder, and one that

@@ -1008,7 +1008,7 @@ impl App {
                     self.rtty_handoff(Handoff::Resize(toward), None);
                 }
             }
-            Event::PaneOutput { .. } | Event::Snapshot { .. } => {}
+            Event::PaneOutput { .. } | Event::PaneRows { .. } | Event::Snapshot { .. } => {}
         }
         Vec::new()
     }

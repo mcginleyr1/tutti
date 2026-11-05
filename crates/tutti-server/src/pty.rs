@@ -146,24 +146,87 @@ pub struct Look {
 }
 
 /// What a tap (`PtyPane::tap`) is handed, under the parser lock and in
-/// stream order: the history it asked for, then a snapshot of the screen to
-/// start from, at its size, then each read's bytes as the child wrote them,
-/// less the queries the daemon answered and the sequences it owns
-/// (`verdict`) — a tap's own terminal would answer or take them again — a
-/// switch of screens or a reset handed on its own between the bytes around
-/// it; and after a resize, a fresh snapshot at the new size.
+/// stream order: a snapshot of the screen to start from, with the scrollback
+/// rows it asked for, then each read as the child wrote it, less the queries
+/// the daemon answered and the sequences it owns (`verdict`) — a tap's own
+/// terminal would answer or take them again; and after a resize, or once it
+/// fell behind, a fresh snapshot.
 pub enum Feed<'a> {
-    /// The newest rows of the primary scrollback, as `Terminal::history`
-    /// prints them: once, before the first snapshot.
-    History(Vec<u8>),
-    Snapshot(PaneSize, Vec<u8>),
-    Raw(&'a [u8]),
+    Snapshot(Start),
+    /// One read, whole: a tap takes all of it or, behind, none. `cuts` part
+    /// it around each switch of screens or reset, which goes on alone between
+    /// the bytes around it; `top` is the screen's absolute first row as the
+    /// read left it.
+    Read {
+        raw: &'a [u8],
+        cuts: &'a [usize],
+        top: u64,
+    },
 }
 
-/// A subscriber to a pane's raw output. Returning true from a read says it
-/// fell behind and dropped what it held: it is handed a fresh snapshot, which
-/// covers the rest of that read.
-pub type Tap = Box<dyn FnMut(Feed<'_>) -> bool + Send>;
+/// A screen to start from: its size, the absolute index of its first row,
+/// the bytes that draw it, and the scrollback rows to print before it.
+pub struct Start {
+    pub size: PaneSize,
+    pub top: u64,
+    pub screen: Vec<u8>,
+    pub history: Option<History>,
+}
+
+/// Scrollback rows `from..` up to the screen, as `Terminal::history` prints
+/// them; `skipped`, how many of the rows asked for came before `from` and
+/// were left out (`Rows`).
+pub struct History {
+    pub from: u64,
+    pub bytes: Vec<u8>,
+    pub skipped: u64,
+}
+
+/// Which scrollback rows a tap wants before a snapshot: those from absolute
+/// row `since` — from the oldest held, with none — the newest `at_most` of
+/// them still held. Rows the cap or the ring leave out after `since` count
+/// as `skipped`.
+pub struct Rows {
+    pub since: Option<u64>,
+    pub at_most: u64,
+}
+
+/// What a tap says of a read.
+pub enum Kept {
+    /// It took the read.
+    Up,
+    /// It fell behind and dropped what it held: it is handed a fresh
+    /// snapshot, which covers the read, with the rows it asks for before it.
+    Behind(Option<Rows>),
+}
+
+/// A subscriber to a pane's raw output.
+pub type Tap = Box<dyn FnMut(Feed<'_>) -> Kept + Send>;
+
+/// The pane's screen as `vt` holds it, for a tap to start from, after the
+/// scrollback rows `rows` asks for.
+fn start(vt: &Terminal, rows: Option<Rows>) -> Start {
+    let (height, width) = vt.size();
+    let top = vt.screen_top();
+    let history = rows.map(|Rows { since, at_most }| {
+        let from = since
+            .unwrap_or(0)
+            .max(top.saturating_sub(at_most))
+            .max(vt.oldest_row())
+            .min(top);
+        History {
+            from,
+            bytes: vt.history(from, top),
+            skipped: since.map_or(0, |since| from.saturating_sub(since)),
+        }
+    });
+    Start {
+        size: PaneSize::new(height, width),
+        top,
+        screen: vt.snapshot(),
+        history,
+    }
+}
 
 /// What one read comes to.
 #[derive(Default)]
@@ -171,7 +234,7 @@ struct Processed {
     /// The read for the taps: less what the daemon answered or owns, the
     /// start of a sequence it may yet answer held until the next read.
     raw: Vec<u8>,
-    /// Where `raw` is cut into the reads a tap is handed: around each
+    /// Where `raw` is cut into the pieces a tap hands on apart: around each
     /// sequence that switches screens or resets the terminal (`switches`).
     /// `pane attach` redraws a read that does from its mirror, and so loses
     /// whatever else that read held — a bell, a cursor shape — unless the
@@ -246,9 +309,8 @@ impl Term {
             (Seq::Ground, false, None, true);
         self.synced = None;
         self.held.clear();
-        let (size, snapshot) = (PaneSize::new(rows, cols), self.vt.snapshot());
         for (_, tap) in &mut self.taps {
-            tap(Feed::Snapshot(size, snapshot.clone()));
+            tap(Feed::Snapshot(start(&self.vt, None)));
         }
     }
 
@@ -968,11 +1030,8 @@ impl PtyPane {
         let size = PaneSize { rows, cols };
         self.with(|term| {
             term.vt.resize(rows, cols);
-            if !term.taps.is_empty() {
-                let snapshot = term.vt.snapshot();
-                for (_, tap) in &mut term.taps {
-                    tap(Feed::Snapshot(size, snapshot.clone()));
-                }
+            for (_, tap) in &mut term.taps {
+                tap(Feed::Snapshot(start(&term.vt, None)));
             }
         });
         *lock(&self.size) = size;
@@ -981,24 +1040,15 @@ impl PtyPane {
 
     /// Stream the pane's raw output to `tap`, as subscriber `id`, until
     /// `untap` or the pane's end. Under one hold of the parser lock it is
-    /// handed up to `history` of the newest scrollback rows, then a snapshot
-    /// of the screen as it stands, and joins the reader, which hands it each
-    /// read in the same hold that parses it — so nothing is lost or repeated
-    /// between the three.
-    pub fn tap(&self, id: u64, history: u32, tap: Tap) {
-        let mut tap = Some(tap);
+    /// handed a snapshot of the screen as it stands, after the scrollback
+    /// `rows` it asks for, and joins the reader, which hands it each read in
+    /// the same hold that parses it — so nothing is lost or repeated between
+    /// them.
+    pub fn tap(&self, id: u64, rows: Option<Rows>, tap: Tap) {
+        let mut tap = Some((tap, rows));
         self.with(|term| {
-            let (rows, cols) = term.vt.size();
-            if let Some(mut tap) = tap.take() {
-                let top = term.vt.screen_top();
-                let past = term.vt.history(top.saturating_sub(history.into()), top);
-                if !past.is_empty() {
-                    tap(Feed::History(past));
-                }
-                tap(Feed::Snapshot(
-                    PaneSize::new(rows, cols),
-                    term.vt.snapshot(),
-                ));
+            if let Some((mut tap, rows)) = tap.take() {
+                tap(Feed::Snapshot(start(&term.vt, rows)));
                 term.taps.push((id, tap));
             }
         });
@@ -1278,18 +1328,20 @@ fn read_loop(
                         answers,
                         signals,
                     } = term.process(&buf[..n]);
-                    // A tap behind is handed the screen as this read left it,
-                    // and none of the read's pieces after.
-                    let Term { vt, taps, .. } = &mut *term;
-                    for (_, tap) in taps {
-                        let mut from = 0;
-                        for to in cuts.iter().copied().chain([raw.len()]) {
-                            if from < to && tap(Feed::Raw(&raw[from..to])) {
-                                let (rows, cols) = vt.size();
-                                tap(Feed::Snapshot(PaneSize::new(rows, cols), vt.snapshot()));
-                                break;
+                    // A tap behind is handed the screen as this read left it
+                    // instead of the read.
+                    if !raw.is_empty() {
+                        let Term { vt, taps, .. } = &mut *term;
+                        let top = vt.screen_top();
+                        for (_, tap) in taps {
+                            let read = Feed::Read {
+                                raw: &raw,
+                                cuts: &cuts,
+                                top,
+                            };
+                            if let Kept::Behind(rows) = tap(read) {
+                                tap(Feed::Snapshot(start(vt, rows)));
                             }
-                            from = to;
                         }
                     }
                     (answers, signals)
@@ -2928,7 +2980,7 @@ mod tests {
         let pane = PtyPane::spawn(spec, PaneSize::new(24, 80)).unwrap();
         wait_for(|| lock(&pane.term).vt.screen_top() > 1000, "no output");
         let (tx, rx) = std::sync::mpsc::channel();
-        pane.tap(7, 0, recorder(tx, |_| false));
+        pane.tap(7, None, recorder(tx, |_| false, |_| None));
         wait_for(
             || pane.output_receiver().has_changed().is_err(),
             "the output never ended",
@@ -2965,20 +3017,32 @@ mod tests {
         assert!(rx.recv().is_err(), "an untapped tap is dropped");
     }
 
-    /// A tap that sends each feed down `tx` — a snapshot with its size — and
-    /// says it is behind on the reads `behind` picks.
+    /// A tap that sends each feed down `tx` — a snapshot with its size, after
+    /// its history if any — and says it is behind on the reads `behind`
+    /// picks, asking for the rows `rows` makes of the read's top.
     fn recorder(
         tx: std::sync::mpsc::Sender<(Option<PaneSize>, Vec<u8>)>,
         behind: impl Fn(&[u8]) -> bool + Send + 'static,
+        rows: impl Fn(u64) -> Option<Rows> + Send + 'static,
     ) -> Tap {
-        Box::new(move |feed| {
-            let (fed, behind) = match feed {
-                Feed::History(bytes) => ((None, bytes), false),
-                Feed::Snapshot(size, bytes) => ((Some(size), bytes), false),
-                Feed::Raw(bytes) => ((None, bytes.to_vec()), behind(bytes)),
-            };
-            let _ = tx.send(fed);
-            behind
+        Box::new(move |feed| match feed {
+            Feed::Snapshot(Start {
+                size,
+                screen,
+                history,
+                ..
+            }) => {
+                if let Some(History { bytes, .. }) = history {
+                    let _ = tx.send((None, bytes));
+                }
+                let _ = tx.send((Some(size), screen));
+                Kept::Up
+            }
+            Feed::Read { raw, top, .. } if behind(raw) => Kept::Behind(rows(top)),
+            Feed::Read { raw, .. } => {
+                let _ = tx.send((None, raw.to_vec()));
+                Kept::Up
+            }
         })
     }
 
@@ -3001,7 +3065,11 @@ mod tests {
         };
         for (id, history, want) in [(7, 10, lines(87..=96)), (8, 1000, lines(1..=96))] {
             let (tx, rx) = std::sync::mpsc::channel();
-            pane.tap(id, history, recorder(tx, |_| false));
+            let rows = Rows {
+                since: None,
+                at_most: history,
+            };
+            pane.tap(id, Some(rows), recorder(tx, |_| false, |_| None));
             assert_eq!(rx.recv().unwrap(), (None, want), "{history} rows");
             let (size, snapshot) = rx.recv().unwrap();
             assert_eq!(size, Some(PaneSize::new(5, 20)));
@@ -3024,7 +3092,8 @@ mod tests {
         };
         let pane = PtyPane::spawn(spec, PaneSize::new(5, 20)).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        pane.tap(7, 0, recorder(tx, |read| read.starts_with(b"before")));
+        let behind = |read: &[u8]| read.starts_with(b"before");
+        pane.tap(7, None, recorder(tx, behind, |_| None));
         pane.write_input(b"go\r").unwrap();
         wait_for(|| pane.contents().contains("after"), "no output");
         let mut terminal = Terminal::new(5, 20, 0);
@@ -3040,6 +3109,74 @@ mod tests {
         let live = lock(&pane.term);
         level(&terminal, &client(5, 20, &live.vt.snapshot()), "level");
         assert!(terminal.modes().alt_screen);
+    }
+
+    /// A tap behind on a read that scrolled is handed the rows that read
+    /// took off the screen — from the top it had before it, which it names —
+    /// then the snapshot: its terminal's scrollback misses none.
+    #[test]
+    fn a_tap_behind_gets_the_rows_it_names_before_its_snapshot() {
+        let spec = PtySpec {
+            args: vec!["-c".into(), "read go; seq 1 12; read stay".into()],
+            ..PtySpec::new("/bin/sh")
+        };
+        let pane = PtyPane::spawn(spec, PaneSize::new(5, 20)).unwrap();
+        let had = lock(&pane.term).vt.screen_top();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let rows = move |_| {
+            Some(Rows {
+                since: Some(had),
+                at_most: 100,
+            })
+        };
+        pane.tap(
+            7,
+            None,
+            recorder(tx, |read| read.ends_with(b"12\r\n"), rows),
+        );
+        pane.write_input(b"go\r").unwrap();
+        wait_for(|| pane.contents().contains("12"), "no output");
+        let mut fed = Vec::new();
+        while let Ok(feed) = rx.recv_timeout(Duration::from_millis(200)) {
+            fed.push(feed);
+        }
+        let (_, history) = &fed[fed.len() - 2];
+        let rows: Vec<String> = String::from_utf8(history.clone())
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect();
+        assert_eq!(rows.last().map(String::as_str), Some("8"), "{rows:?}");
+        let (size, screen) = &fed[fed.len() - 1];
+        assert_eq!(*size, Some(PaneSize::new(5, 20)));
+        assert_eq!(client(5, 20, screen).contents(), "9\n10\n11\n12");
+    }
+
+    /// The rows asked for run from the row named up to the screen — none
+    /// before the oldest held or past the cap, which go as skipped — and,
+    /// naming none, the newest of all held up to the cap, skipping none.
+    #[test]
+    fn a_start_hands_the_rows_asked_for_up_to_its_screen() {
+        let mut vt = Terminal::new(4, 20, 10);
+        vt.advance(numbered(0, 30).as_bytes());
+        // `L0`..`L29` and a blank row: the ring holds rows 17..27, the
+        // screen 27..31.
+        assert_eq!((vt.oldest_row(), vt.screen_top()), (17, 27));
+        let rows = |since, at_most| {
+            let start = start(&vt, Some(Rows { since, at_most }));
+            assert_eq!(start.top, 27);
+            let history = start.history.unwrap();
+            let text = String::from_utf8(history.bytes).unwrap();
+            let lines: Vec<String> = text.lines().map(String::from).collect();
+            (history.from, lines, history.skipped)
+        };
+        assert_eq!(rows(Some(24), 100), (24, rows_of(24..27), 0));
+        assert_eq!(rows(Some(10), 100), (17, rows_of(17..27), 7), "the ring");
+        assert_eq!(rows(Some(20), 3), (24, rows_of(24..27), 4), "the cap");
+        assert_eq!(rows(Some(27), 100), (27, vec![], 0), "nothing scrolled");
+        assert_eq!(rows(Some(40), 100), (27, vec![], 0), "another numbering");
+        assert_eq!(rows(None, 5), (22, rows_of(22..27), 0));
+        assert!(start(&vt, None).history.is_none());
     }
 
     /// Poll `done` for up to three seconds.
