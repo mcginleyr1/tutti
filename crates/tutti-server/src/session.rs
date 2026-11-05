@@ -722,13 +722,11 @@ impl Session {
     /// Kill and forget a pane, collapsing the split that held it. Like every
     /// pane killed, it waits whole in `removed` for `take_removed`.
     pub fn pane_kill(&mut self, pane: PaneId) -> Result<WorkspaceId> {
-        let slot = self
+        let tab_id = self
             .panes
-            .remove(&pane)
-            .with_context(|| format!("no pane {pane}"))?;
-        let _ = slot.pty.kill();
-        let tab_id = slot.tab;
-        self.removed.push(slot);
+            .get(&pane)
+            .with_context(|| format!("no pane {pane}"))?
+            .tab;
         let workspace = self
             .workspace_of_tab(tab_id)
             .context("pane's tab vanished")?;
@@ -736,6 +734,10 @@ impl Session {
         tab.layout = tab.layout.as_ref().and_then(|l| l.remove(pane));
         if tab.active_pane == Some(pane) {
             tab.active_pane = tab.layout.as_ref().map(|l| l.panes()[0]);
+        }
+        if let Some(slot) = self.panes.remove(&pane) {
+            let _ = slot.pty.kill();
+            self.removed.push(slot);
         }
         Ok(workspace)
     }
@@ -2039,6 +2041,24 @@ mod tests {
             .pane_run(None, vec!["/bin/sleep".into(), "30".into()], false, None)
             .unwrap();
         (session, pane, tmp)
+    }
+
+    /// A kill that cannot find the pane's tab changes nothing: the pane is
+    /// still listed, still running, and nothing waits to be dropped.
+    #[test]
+    fn a_kill_that_fails_leaves_the_pane_as_it_was() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        s.workspaces[0].tabs.clear();
+        let err = s.pane_kill(pane).unwrap_err();
+        assert!(err.to_string().contains("tab vanished"), "{err}");
+        assert!(s.pane(pane).is_some(), "the pane left the session");
+        assert!(s.removed.is_empty(), "the pane went to be dropped");
+        assert_eq!(
+            s.pty(pane).unwrap().exit_status(),
+            None,
+            "the pane was killed"
+        );
+        s.kill_all();
     }
 
     fn report(source: StateSource, state: Option<AgentState>) -> StatusReport {
