@@ -167,6 +167,12 @@ pub enum Request {
         /// with `expect`.
         #[serde(default)]
         between_turns: bool,
+        /// With `between_turns`: the agent whose tutti hooks the caller found
+        /// installed. A pane running that agent is taken before its hooks
+        /// have reported anything — Codex and opencode report only from
+        /// their first turn on — rather than refused as one that never will.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hooks: Option<AgentKind>,
     },
     /// The pane's current `prompt_fingerprint`, answered with
     /// `Response::Fingerprint` — what a script passes back as a guarded
@@ -1232,6 +1238,7 @@ mod tests {
             keys: None,
             expect: None,
             between_turns: false,
+            hooks: None,
         });
         roundtrip(&Request::PaneSend {
             pane: PaneId(2),
@@ -1239,6 +1246,7 @@ mod tests {
             keys: Some("enter".into()),
             expect: Some("af63dc4c8601ec8c".into()),
             between_turns: false,
+            hooks: None,
         });
         roundtrip(&Request::PaneSend {
             pane: PaneId(2),
@@ -1246,6 +1254,15 @@ mod tests {
             keys: None,
             expect: None,
             between_turns: true,
+            hooks: None,
+        });
+        roundtrip(&Request::PaneSend {
+            pane: PaneId(2),
+            text: Some("reply with the word pong".into()),
+            keys: None,
+            expect: None,
+            between_turns: true,
+            hooks: Some(AgentKind("codex".into())),
         });
         roundtrip(&Request::PaneFingerprint { pane: PaneId(2) });
         roundtrip(&Request::PaneWait {
@@ -2337,8 +2354,8 @@ mod tests {
                 discard: false,
             }
         );
-        // `pane_send` from before `expect` and `between_turns` existed is a
-        // plain, unguarded send.
+        // `pane_send` from before `expect`, `between_turns` and `hooks`
+        // existed is a plain, unguarded send.
         let send: Request =
             serde_json::from_str(r#"{"type":"pane_send","pane":2,"text":"y","keys":null}"#)
                 .unwrap();
@@ -2350,6 +2367,7 @@ mod tests {
                 keys: None,
                 expect: None,
                 between_turns: false,
+                hooks: None,
             }
         );
         // `pane_read` from before `since`, `last_output` and `last_reply`

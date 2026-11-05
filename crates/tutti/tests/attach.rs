@@ -318,6 +318,7 @@ fn tty_hook_commands_report_through_the_panes_pty() {
             keys: None,
             expect: None,
             between_turns: false,
+            hooks: None,
         });
         assert_eq!(control.response(), Response::Ok);
         let deadline = Instant::now() + DEADLINE;

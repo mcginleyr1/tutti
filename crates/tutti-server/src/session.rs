@@ -978,9 +978,11 @@ impl Session {
     /// Refuse an ask's send unless `pane`'s agent is between turns — not
     /// working, blocked or exited — so its message never joins a running turn
     /// or answers a dialog, and unless its hooks have reported, as only a hook
-    /// reports the turn end the ask waits for. The caller writes under the
-    /// same session guard.
-    pub fn between_turns(&self, pane: PaneId) -> Result<()> {
+    /// reports the turn end the ask waits for, or the asker found them
+    /// installed for the very agent detected there (`hooks`): Codex and
+    /// opencode report only from their first turn on. The caller writes under
+    /// the same session guard.
+    pub fn between_turns(&self, pane: PaneId, hooks: Option<&AgentKind>) -> Result<()> {
         let slot = self
             .panes
             .get(&pane)
@@ -988,12 +990,12 @@ impl Session {
         if let Some(code) = slot.meta.exited {
             bail!("pane {pane} has exited (code {code})");
         }
-        if !slot.hooked {
+        if !slot.hooked && (hooks.is_none() || hooks != slot.meta.agent.as_ref()) {
             bail!(
                 "pane {pane}'s agent has not reported through tutti's hooks, so no turn end of \
                  its would ever reach an ask: install them (tutti hooks <agent> --install) and \
-                 restart the agent. Codex and opencode first report on their first turn: start \
-                 one with a first message and wait for it"
+                 restart the agent. A Codex or opencode with them installed is taken once tutti \
+                 has detected it, a second or so after it starts"
             );
         }
         match slot.meta.state {
@@ -2234,14 +2236,14 @@ mod tests {
     #[test]
     fn an_ask_needs_a_pane_its_hooks_reported_through_and_between_turns() {
         let (mut s, pane, _tmp) = session_with_pane();
-        let refused = |s: &Session| s.between_turns(pane).unwrap_err().to_string();
+        let refused = |s: &Session| s.between_turns(pane, None).unwrap_err().to_string();
         assert!(refused(&s).contains("has not reported through tutti's hooks"));
 
         hook(&mut s, pane, AgentHookEvent::SessionStarted);
-        assert!(s.between_turns(pane).is_ok(), "a fresh Claude passes");
+        assert!(s.between_turns(pane, None).is_ok(), "a fresh Claude passes");
         s.set_agent(pane, Some("claude".into()));
         assert!(
-            s.between_turns(pane).is_ok(),
+            s.between_turns(pane, None).is_ok(),
             "detection catching up keeps it"
         );
         hook(&mut s, pane, AgentHookEvent::Activity { detail: None });
@@ -2256,11 +2258,33 @@ mod tests {
         );
         assert!(refused(&s).contains("is blocked"));
         hook(&mut s, pane, AgentHookEvent::Done { reply: None });
-        assert!(s.between_turns(pane).is_ok());
+        assert!(s.between_turns(pane, None).is_ok());
 
         s.set_agent(pane, None);
         assert!(refused(&s).contains("has not reported through tutti's hooks"));
-        assert!(s.between_turns(PaneId(99)).is_err());
+        assert!(s.between_turns(PaneId(99), None).is_err());
+    }
+
+    /// A fresh Codex or opencode reports nothing before its first turn: an
+    /// asker that found the hooks installed for the agent detected there is
+    /// taken at once, and nobody else — not for another agent, nor for a
+    /// pane detection has not named yet.
+    #[test]
+    fn an_ask_takes_a_fresh_agent_whose_hooks_the_asker_found_installed() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let codex = super::AgentKind("codex".into());
+        let refused = |s: &Session, hooks| {
+            let err = s.between_turns(pane, hooks).unwrap_err().to_string();
+            err.contains("has not reported through tutti's hooks")
+        };
+        assert!(refused(&s, Some(&codex)), "no agent detected yet");
+        s.set_agent(pane, Some(codex.clone()));
+        assert!(refused(&s, None));
+        assert!(refused(&s, Some(&super::AgentKind("opencode".into()))));
+        assert!(s.between_turns(pane, Some(&codex)).is_ok());
+        hook(&mut s, pane, AgentHookEvent::Activity { detail: None });
+        let busy = s.between_turns(pane, Some(&codex)).unwrap_err();
+        assert!(busy.to_string().contains("is working"), "{busy}");
     }
 
     #[test]

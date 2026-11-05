@@ -408,6 +408,7 @@ fn ask_send(pane: PaneId, text: &str) -> Request {
         keys: None,
         expect: None,
         between_turns: true,
+        hooks: None,
     }
 }
 
@@ -517,6 +518,7 @@ async fn an_ask_reports_an_exit_mid_turn_and_refuses_a_busy_pane() {
         keys: Some("enter".into()),
         expect: None,
         between_turns: false,
+        hooks: None,
     };
 
     let pane = run_marker(
@@ -646,6 +648,7 @@ async fn a_child_exit_ends_a_wait() {
         keys: None,
         expect: None,
         between_turns: false,
+        hooks: None,
     };
 
     let done = run_marker(&mut control, "read code; exit $code").await;
@@ -1113,6 +1116,7 @@ async fn pane_send_echoes_into_grid() {
             keys: None,
             expect: None,
             between_turns: false,
+            hooks: None,
         })
         .await,
         Response::Ok
@@ -1160,6 +1164,7 @@ async fn pane_read_since_tails_scrolled_output() {
             keys: None,
             expect: None,
             between_turns: false,
+            hooks: None,
         })
         .await,
         Response::Ok
@@ -1273,6 +1278,7 @@ async fn a_split_starts_where_its_source_panes_shell_is() {
                 keys: None,
                 expect: None,
                 between_turns: false,
+                hooks: None,
             })
             .await;
         assert_eq!(sent, Response::Ok);
@@ -2528,6 +2534,7 @@ async fn a_2031_pane_hears_of_a_light_dark_flip() {
             keys: None,
             expect: None,
             between_turns: false,
+            hooks: None,
         };
         assert_eq!(control.request(go).await, Response::Ok);
     }
@@ -2682,6 +2689,7 @@ async fn a_pane_that_stops_reading_its_input_stalls_nobody() {
         keys: None,
         expect: None,
         between_turns: false,
+        hooks: None,
     };
     let prompt = Duration::from_secs(2);
 
@@ -2761,6 +2769,7 @@ async fn a_send_to_an_exited_pane_is_refused() {
                 keys: None,
                 expect: None,
                 between_turns: false,
+                hooks: None,
             })
             .await,
     );
@@ -3657,6 +3666,7 @@ async fn an_exiting_pane_drops_its_held_approvals() {
         keys: None,
         expect: None,
         between_turns: false,
+        hooks: None,
     };
     assert_eq!(control.request(enter).await, Response::Ok);
     assert!(
@@ -3982,6 +3992,7 @@ async fn the_history_caps_and_never_reuses_an_id() {
         keys: None,
         expect: None,
         between_turns: false,
+        hooks: None,
     };
     assert_eq!(conn.request(burst).await, Response::Ok);
     let history = timeout(DEADLINE, async {
@@ -4121,6 +4132,7 @@ async fn bells_land_once_and_never_from_the_pane_in_view() {
         keys: None,
         expect: None,
         between_turns: false,
+        hooks: None,
     };
     assert_eq!(control.request(bells).await, Response::Ok);
     let bell = noted(&mut viewer).await;
@@ -4151,6 +4163,7 @@ async fn bells_land_once_and_never_from_the_pane_in_view() {
         keys: None,
         expect: None,
         between_turns: false,
+        hooks: None,
     };
     assert_eq!(control.request(watched).await, Response::Ok);
     let note = noted(&mut viewer).await;
@@ -4296,6 +4309,7 @@ async fn hook_driven_pane_ignores_screen_classification() {
             keys: None,
             expect: None,
             between_turns: false,
+            hooks: None,
         })
         .await,
         Response::Ok
@@ -4347,6 +4361,7 @@ async fn a_dialog_answered_in_the_pane_ends_the_hooks_block() {
         keys: None,
         expect: None,
         between_turns: false,
+        hooks: None,
     };
     assert_eq!(
         conn.request(send("Do you want to proceed?\n".into())).await,
@@ -4397,6 +4412,7 @@ async fn printf_osc(conn: &mut Conn, pane: PaneId, body: &str) {
             keys: None,
             expect: None,
             between_turns: false,
+            hooks: None,
         })
         .await;
     assert_eq!(sent, Response::Ok);
@@ -4664,6 +4680,7 @@ async fn agent_state_changes_working_then_blocked() {
                 keys: None,
                 expect: None,
                 between_turns: false,
+                hooks: None,
             })
             .await,
         Response::Ok
@@ -4678,6 +4695,7 @@ async fn agent_state_changes_working_then_blocked() {
                 keys: None,
                 expect: None,
                 between_turns: false,
+                hooks: None,
             })
             .await,
         Response::Ok
@@ -4739,6 +4757,7 @@ fn guarded(pane: PaneId, text: &str, expect: &str) -> Request {
         keys: None,
         expect: Some(expect.into()),
         between_turns: false,
+        hooks: None,
     }
 }
 
@@ -4876,6 +4895,7 @@ async fn a_mirror_fingerprints_like_the_live_grid() {
                 keys: None,
                 expect: None,
                 between_turns: false,
+                hooks: None,
             })
             .await,
         Response::Ok

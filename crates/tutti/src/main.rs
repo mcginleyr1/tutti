@@ -7,8 +7,8 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use tutti_agents::Registry;
 use tutti_core::{
-    AgentHookEvent, AgentState, ApprovalDecision, Direction, Event, PaneId, Request, Response,
-    TabId, Toward, WaitFor, WorkspaceId, WorkspaceInfo,
+    AgentHookEvent, AgentKind, AgentState, ApprovalDecision, Direction, Event, PaneId, Request,
+    Response, TabId, Toward, WaitFor, WorkspaceId, WorkspaceInfo,
 };
 
 use tutti::client::{self, Client, StopOutcome};
@@ -1110,6 +1110,7 @@ fn to_request(command: Command) -> Result<Request> {
                 keys,
                 expect,
                 between_turns: false,
+                hooks: None,
             },
             PaneAction::Read {
                 pane,
@@ -1258,6 +1259,8 @@ const ENTER_AFTER: Duration = Duration::from_millis(150);
 /// later, then wait for a block or for the next turn end the hooks report.
 /// The wait counts turn ends, so one before it starts still counts, and no
 /// exit or screen-read state passes for one. Print the reply that turn left.
+/// A Codex or opencode whose hooks are installed is taken before they have
+/// reported (`installed_hooks`): its first turn is the one the ask starts.
 fn run_ask(
     session: &str,
     json: bool,
@@ -1280,6 +1283,7 @@ fn run_ask(
         keys: None,
         expect: None,
         between_turns: true,
+        hooks: installed_hooks(&mut client, pane)?,
     };
     let after = match client.request(&typed)? {
         Response::Sent { replies } => replies,
@@ -1296,6 +1300,7 @@ fn run_ask(
         keys: Some("enter".into()),
         expect: None,
         between_turns: false,
+        hooks: None,
     };
     match client.request(&enter)? {
         Response::Ok => {}
@@ -1347,6 +1352,45 @@ fn run_ask(
         }
         timed_out_or_error => Ok(emit(timed_out_or_error, json)),
     }
+}
+
+/// The agent detected in `pane` when it is one whose hooks report only from
+/// its first turn on — Codex (SessionStart comes with the first prompt),
+/// opencode (its plugin hears nothing before a turn) — and tutti's are
+/// installed for it, in the user's config or the pane's project. An ask's
+/// send names it, so the daemon takes the pane before the hooks have spoken.
+/// Installed is all tutti can see: Codex runs a hook only once it is trusted
+/// in its `/hooks`, so an untrusted one leaves the ask to its `--timeout`.
+fn installed_hooks(client: &mut Client, pane: PaneId) -> Result<Option<AgentKind>> {
+    let Response::Panes { panes } = client.request(&Request::PaneList)? else {
+        return Ok(None);
+    };
+    let Some(info) = panes.into_iter().find(|p| p.id == pane) else {
+        return Ok(None);
+    };
+    let integration = match info.agent.as_ref().map(|a| a.0.as_str()) {
+        Some("codex") => Integration::CodexHooks,
+        Some("opencode") => Integration::OpencodePlugin,
+        _ => return Ok(None),
+    };
+    let project = match client.request(&Request::WorkspaceList)? {
+        Response::Workspaces { workspaces } => workspaces
+            .into_iter()
+            .find(|w| Some(w.id) == info.workspace)
+            .map(|w| w.dir),
+        _ => None,
+    };
+    let user = Dirs::from_env();
+    let installed = [None, project].into_iter().any(|project| {
+        let dirs = Dirs {
+            project,
+            ..user.clone()
+        };
+        integration
+            .plan(&dirs)
+            .is_ok_and(|plan| plan.status == Status::Installed)
+    });
+    Ok(installed.then_some(info.agent).flatten())
 }
 
 /// `issue list` and `issue deploy`. A listing talks to the trackers alone,
@@ -2632,6 +2676,7 @@ mod tests {
                 keys: None,
                 expect: None,
                 between_turns: false,
+                hooks: None,
             }
         );
         assert_eq!(
@@ -2642,6 +2687,7 @@ mod tests {
                 keys: Some("C-c Enter".to_string()),
                 expect: None,
                 between_turns: false,
+                hooks: None,
             }
         );
         assert!(Cli::try_parse_from(["tutti", "pane", "send", "2"]).is_err());
@@ -2663,6 +2709,7 @@ mod tests {
                 keys: Some("enter".into()),
                 expect: Some("9f3a".into()),
                 between_turns: false,
+                hooks: None,
             }
         );
         // `--expect` guards a payload; it is not one.

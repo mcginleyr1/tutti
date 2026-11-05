@@ -243,12 +243,27 @@ fn pane_in(state: &str, approval: &str) -> tutti_core::PaneInfo {
     .unwrap()
 }
 
-/// Run `tutti ask 7 <message> --timeout 60` against a fake daemon that
-/// answers the ask's send with `sent`, its wait — on a connection of its own
-/// — with `waited`, and the read of the last reply with `reply`. Hands back
-/// the output, every request made, and the gap between typing and enter.
+/// What `ask` looks up before it types: the pane in `pane list`, then — for
+/// an agent whose hooks report only from its first turn — its workspace.
+fn ask_lookups(workspace: bool) -> Vec<Request> {
+    let mut lookups = vec![Request::PaneList];
+    if workspace {
+        lookups.push(Request::WorkspaceList);
+    }
+    lookups
+}
+
+/// Run `tutti ask 7 <message> --timeout 60` against a fake daemon that lists
+/// pane 7 running `agent` in workspace 1 at `<base>/project`, answers the
+/// ask's send with `sent`, its wait — on a connection of its own — with
+/// `waited`, and the read of the last reply with `reply`. `install` puts
+/// files under the scratch home (as `HOME`, `CODEX_HOME` and
+/// `XDG_CONFIG_HOME` all live there) and the project first. Hands back the
+/// output, every request made, and the gap between typing and enter.
 fn ask_scenario(
     label: &str,
+    agent: Option<&str>,
+    install: impl FnOnce(&std::path::Path, &std::path::Path),
     sent: Response,
     waited: tutti_core::PaneInfo,
     reply: Response,
@@ -256,14 +271,44 @@ fn ask_scenario(
     let base = unique_base(label);
     let sock_dir = base.join("tutti");
     std::fs::create_dir_all(&sock_dir).unwrap();
+    let (home, project) = (base.join("home"), base.join("project"));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    install(&home, &project);
     let listener = UnixListener::bind(sock_dir.join("tutti.sock")).unwrap();
+    let mut listed = pane_in("idle", "");
+    listed.agent = agent.map(|a| tutti_core::AgentKind(a.into()));
+    listed.workspace = Some(WorkspaceId(1));
+    let workspace = WorkspaceInfo {
+        id: WorkspaceId(1),
+        name: "project".into(),
+        dir: project.clone(),
+        parent: None,
+    };
     let server = thread::spawn(move || {
         let (mut ask, _) = listener.accept().unwrap();
-        let typed = read_request(&mut ask);
+        let mut asked = Vec::new();
+        loop {
+            let request = read_request(&mut ask);
+            let looked_up = match &request {
+                Request::PaneList => Response::Panes {
+                    panes: vec![listed.clone()],
+                },
+                Request::WorkspaceList => Response::Workspaces {
+                    workspaces: vec![workspace.clone()],
+                },
+                _ => {
+                    asked.push(request);
+                    break;
+                }
+            };
+            asked.push(request);
+            answer(&mut ask, looked_up);
+        }
         let refused = matches!(sent, Response::Error { .. });
         answer(&mut ask, sent);
         if refused {
-            return (vec![typed], std::time::Duration::ZERO);
+            return (asked, std::time::Duration::ZERO);
         }
         let at = std::time::Instant::now();
         let enter = read_request(&mut ask);
@@ -277,7 +322,7 @@ fn ask_scenario(
             timed_out: false,
         };
         answer(&mut waiter, waited);
-        let mut asked = vec![typed, enter, wait];
+        asked.extend([enter, wait]);
         if !blocked {
             asked.push(read_request(&mut ask));
             answer(&mut ask, reply);
@@ -287,6 +332,9 @@ fn ask_scenario(
     let output = Command::new(env!("CARGO_BIN_EXE_tutti"))
         .args(["ask", "7", "reply with the word pong", "--timeout", "60"])
         .env("XDG_RUNTIME_DIR", &base)
+        .env("HOME", &home)
+        .env("CODEX_HOME", home.join(".codex"))
+        .env("XDG_CONFIG_HOME", home.join(".config"))
         .env_remove("TUTTI_SESSION")
         .env_remove("TUTTI_PANE")
         .output()
@@ -304,6 +352,8 @@ fn ask_scenario(
 fn ask_types_waits_and_prints_the_reply() {
     let (output, asked, gap) = ask_scenario(
         "ask",
+        Some("claude"),
+        |_, _| {},
         Response::Sent { replies: 4 },
         pane_in("done", ""),
         Response::LastReply {
@@ -314,8 +364,9 @@ fn ask_types_waits_and_prints_the_reply() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(String::from_utf8_lossy(&output.stdout), "pong\n");
     let pane = PaneId(7);
+    assert_eq!(asked[..1], ask_lookups(false));
     assert_eq!(
-        asked,
+        asked[1..],
         [
             Request::PaneSend {
                 pane,
@@ -323,6 +374,7 @@ fn ask_types_waits_and_prints_the_reply() {
                 keys: None,
                 expect: None,
                 between_turns: true,
+                hooks: None,
             },
             Request::PaneSend {
                 pane,
@@ -330,6 +382,7 @@ fn ask_types_waits_and_prints_the_reply() {
                 keys: Some("enter".into()),
                 expect: None,
                 between_turns: false,
+                hooks: None,
             },
             Request::PaneWait {
                 pane,
@@ -362,6 +415,8 @@ fn ask_exits_3_on_a_block_and_stops_at_a_refused_send() {
     let held = r#","approval":{"id":4,"tool":"Bash","summary":"rm -rf build"}"#;
     let (output, asked, _) = ask_scenario(
         "askblock",
+        None,
+        |_, _| {},
         Response::Sent { replies: 0 },
         pane_in("blocked", held),
         Response::Ok,
@@ -377,15 +432,81 @@ fn ask_exits_3_on_a_block_and_stops_at_a_refused_send() {
         stderr.contains("tutti pane read 7 --last-reply"),
         "{stderr}"
     );
-    assert_eq!(asked.len(), 3, "no reply is read: {asked:?}");
+    assert_eq!(asked.len(), 4, "no reply is read: {asked:?}");
 
     let refused = Response::Error {
         message: "pane 7 is working: wait for it first".into(),
     };
-    let (output, asked, _) = ask_scenario("askbusy", refused, pane_in("done", ""), Response::Ok);
+    let (output, asked, _) = ask_scenario(
+        "askbusy",
+        None,
+        |_, _| {},
+        refused,
+        pane_in("done", ""),
+        Response::Ok,
+    );
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("pane 7 is working: wait for it"));
-    assert_eq!(asked.len(), 1, "the refused send alone: {asked:?}");
+    assert_eq!(asked.len(), 2, "the lookup and the refused send: {asked:?}");
+}
+
+/// The ask's send names the agent `ask` found tutti's hooks installed for —
+/// a Codex in the user's `CODEX_HOME` or the project, an opencode in its
+/// plugin dir — so the daemon takes the fresh pane before its hooks report;
+/// with none installed it names nothing and the daemon refuses as before.
+#[test]
+fn ask_names_a_fresh_codex_or_opencode_whose_hooks_are_installed() {
+    let codex_hooks = tutti::hooks::codex_hooks_json().to_string();
+    let user = |dir: &std::path::Path| {
+        let codex = dir.join(".codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        std::fs::write(codex.join("hooks.json"), &codex_hooks).unwrap();
+    };
+    let opencode = |home: &std::path::Path, _: &std::path::Path| {
+        let plugins = home.join(".config/opencode/plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+        std::fs::write(plugins.join("tutti.js"), tutti::hooks::OPENCODE_PLUGIN).unwrap();
+    };
+    let named = |label, agent, install: &dyn Fn(&std::path::Path, &std::path::Path)| {
+        let (output, asked, _) = ask_scenario(
+            label,
+            Some(agent),
+            install,
+            Response::Error {
+                message: "refused".into(),
+            },
+            pane_in("done", ""),
+            Response::Ok,
+        );
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert_eq!(asked[..2], ask_lookups(true));
+        match &asked[2] {
+            Request::PaneSend {
+                between_turns: true,
+                hooks,
+                ..
+            } => hooks.as_ref().map(|h| h.0.clone()),
+            other => panic!("expected the ask's send, got {other:?}"),
+        }
+    };
+    assert_eq!(
+        named("askcxuser", "codex", &|home, _| user(home)),
+        Some("codex".into())
+    );
+    assert_eq!(
+        named("askcxproj", "codex", &|_, project| user(project)),
+        Some("codex".into())
+    );
+    assert_eq!(
+        named("askoc", "opencode", &opencode),
+        Some("opencode".into())
+    );
+    assert_eq!(named("askcxnone", "codex", &|_, _| {}), None);
+    assert_eq!(
+        named("askcxoc", "codex", &opencode),
+        None,
+        "another agent's integration says nothing of this one's"
+    );
 }
 
 /// A Claude Code `PermissionRequest`, as the hooks reference records one.

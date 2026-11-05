@@ -2265,6 +2265,7 @@ impl App {
             keys: None,
             expect: Some(prompt_fingerprint(&screen_rows(&state.term))),
             between_turns: false,
+            hooks: None,
         })]
     }
 
@@ -7244,6 +7245,7 @@ mod tests {
             keys: None,
             expect: Some(prompt_fingerprint(&rows)),
             between_turns: false,
+            hooks: None,
         })
     }
 

@@ -833,7 +833,7 @@ fn handle_frame(
             ),
         },
         Frame::Input { pane, bytes } => {
-            let _ = pane_input(hub, pane, &bytes, false);
+            let _ = pane_input(hub, pane, &bytes, None);
             ControlFlow::Continue(())
         }
         Frame::PaneSnapshot(_) | Frame::PaneDelta(_) | Frame::PaneRaw { .. } => {
@@ -1133,6 +1133,7 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             keys: key_names,
             expect,
             between_turns,
+            hooks,
         } => {
             let mut bytes = Vec::new();
             if let Some(text) = &text {
@@ -1161,10 +1162,9 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
                     .session()
                     .pane_answer(pane, &bytes, expect)
                     .map(|()| Response::Ok),
-                None if between_turns => {
-                    pane_input(hub, pane, &bytes, true).map(|replies| Response::Sent { replies })
-                }
-                None => pane_input(hub, pane, &bytes, false).map(|_| Response::Ok),
+                None if between_turns => pane_input(hub, pane, &bytes, Some(hooks.as_ref()))
+                    .map(|replies| Response::Sent { replies }),
+                None => pane_input(hub, pane, &bytes, None).map(|_| Response::Ok),
             };
             r.unwrap_or_else(error)
         }
@@ -1363,14 +1363,20 @@ fn resize_split(hub: &Arc<Hub>, pane: PaneId, axis: Direction, delta: f32) -> Re
 
 /// Type `bytes` into `pane` (an `Input` frame or a plain `PaneSend`),
 /// rebroadcasting the view when that settled a finished program's report out
-/// of the agent surfaces (`Session::pane_send`). `between_turns` (an ask's
-/// send) first refuses, writing nothing, unless the agent is between turns,
-/// under the same session guard as the write. Returns the turn ends the
-/// pane's hooks have reported, for the ask's wait.
-fn pane_input(hub: &Hub, pane: PaneId, bytes: &[u8], between_turns: bool) -> Result<u64> {
+/// of the agent surfaces (`Session::pane_send`). An `ask` (an ask's send,
+/// naming the agent whose hooks its caller found installed) first refuses,
+/// writing nothing, unless the agent is between turns, under the same session
+/// guard as the write. Returns the turn ends the pane's hooks have reported,
+/// for the ask's wait.
+fn pane_input(
+    hub: &Hub,
+    pane: PaneId,
+    bytes: &[u8],
+    ask: Option<Option<&AgentKind>>,
+) -> Result<u64> {
     let mut session = hub.session();
-    if between_turns {
-        session.between_turns(pane)?;
+    if let Some(hooks) = ask {
+        session.between_turns(pane, hooks)?;
     }
     let view = session.pane_send(pane, bytes)?.then(|| session.view());
     let replies = session.replies(pane).unwrap_or_default();
@@ -3430,6 +3436,7 @@ mod tests {
             keys: None,
             expect: None,
             between_turns: false,
+            hooks: None,
         };
         assert_eq!(peer.request(&go).await, Response::Ok);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -3541,6 +3548,7 @@ mod tests {
             keys: None,
             expect: None,
             between_turns: false,
+            hooks: None,
         };
         let read = |pane| Request::PaneRead {
             pane,
