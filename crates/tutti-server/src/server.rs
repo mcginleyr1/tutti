@@ -39,7 +39,7 @@ use crate::jj;
 use crate::keys;
 use crate::persist::{self, Saved, SavedPane};
 use crate::pty::{Feed, PaneSize, PtyPane, Signal, StatusReport};
-use crate::session::{Meta, ReportOutcome, Restored, RunTarget, Session};
+use crate::session::{ForkMeta, Meta, ReportOutcome, Restored, RunTarget, Session};
 
 /// Cadence of the render tick: coalesced pane deltas to attached clients, and
 /// snapshots to watchers.
@@ -2910,17 +2910,23 @@ async fn record_checkpoint(
 /// released before the book is opened, and both before `refresh_changes`
 /// re-locks them.
 fn vcs_pass(hub: &Arc<Hub>) {
-    let workspaces: Vec<(WorkspaceId, PathBuf)> = {
+    let workspaces: Vec<(WorkspaceId, PathBuf, Option<ForkMeta>)> = {
         let session = hub.session();
         session
             .workspace_ids()
             .into_iter()
-            .filter_map(|id| session.workspace_dir(id).map(|dir| (id, dir)))
+            .filter_map(|id| {
+                let dir = session.workspace_dir(id)?;
+                Some((id, dir, session.workspace_fork_meta(id)))
+            })
             .collect()
     };
     let read: Vec<_> = workspaces
         .iter()
-        .map(|(id, dir)| (*id, Meta::read(dir), jj::op_heads_modified(dir)))
+        .map(|(id, dir, fork)| {
+            let meta = Meta::read(dir, fork.as_ref());
+            (*id, meta, jj::op_heads_modified(dir))
+        })
         .collect();
     let view = {
         let mut session = hub.session();
@@ -2935,7 +2941,7 @@ fn vcs_pass(hub: &Arc<Hub>) {
     }
     let moved: Vec<WorkspaceId> = {
         let mut vcs = hub.vcs();
-        vcs.retain(|id, _| workspaces.iter().any(|(w, _)| w == id));
+        vcs.retain(|id, _| workspaces.iter().any(|(w, ..)| w == id));
         read.into_iter()
             .filter_map(|(id, _, modified)| {
                 let modified = modified?;

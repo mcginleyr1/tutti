@@ -73,19 +73,24 @@ struct WorkspaceEntry {
     tabs: Vec<TabEntry>,
 }
 
-/// A workspace directory's jj repo root (the nearest ancestor holding `.jj`)
-/// and its git branch (`.git/HEAD`).
+/// A workspace directory's jj repo root (the nearest ancestor holding `.jj`),
+/// its git branch (`.git/HEAD`), and for a fork the root of the repo it was
+/// added from — both roots canonical, so a fork finds its project however
+/// either path was spelled (`/var` against `/private/var` on macOS).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Meta {
     root: Option<PathBuf>,
     branch: Option<String>,
+    origin: Option<PathBuf>,
 }
 
 impl Meta {
-    pub fn read(dir: &Path) -> Meta {
+    pub fn read(dir: &Path, fork: Option<&ForkMeta>) -> Meta {
+        let canonical = |path: PathBuf| std::fs::canonicalize(&path).unwrap_or(path);
         Meta {
-            root: crate::jj::workspace_root(dir),
+            root: crate::jj::workspace_root(dir).map(canonical),
             branch: git_branch(dir),
+            origin: fork.map(|fork| canonical(fork.origin_root.clone())),
         }
     }
 }
@@ -287,7 +292,7 @@ impl Session {
         self.workspaces.push(WorkspaceEntry {
             id,
             name,
-            meta: Meta::read(&dir),
+            meta: Meta::read(&dir, fork.as_ref()),
             dir,
             changes: None,
             changed_files: Vec::new(),
@@ -384,17 +389,16 @@ impl Session {
 
     /// Each workspace's parent, in workspace order: a forked child resolves to
     /// whichever workspace currently owns its origin repo, or `None` when that
-    /// origin has been killed — the child then stands top-level. Each jj repo
-    /// root is the one `meta` holds. The one answer `view` and
+    /// origin has been killed — the child then stands top-level. Both roots
+    /// are the canonical ones `meta` holds. The one answer `view` and
     /// `workspace_list` share.
     fn parents(&self) -> Vec<Option<WorkspaceId>> {
         self.workspaces
             .iter()
             .map(|w| {
-                w.fork.as_ref().and_then(|fork| {
+                w.meta.origin.as_ref().and_then(|origin| {
                     self.workspaces.iter().find_map(|o| {
-                        (o.id != w.id && o.meta.root.as_deref() == Some(fork.origin_root.as_path()))
-                            .then_some(o.id)
+                        (o.id != w.id && o.meta.root.as_ref() == Some(origin)).then_some(o.id)
                     })
                 })
             })
@@ -3350,10 +3354,35 @@ mod tests {
         std::fs::create_dir_all(origin.join(".jj")).unwrap();
         assert_eq!(seen(&session), [(main, None), (None, None)]);
 
-        assert!(session.set_meta(project, super::Meta::read(&origin)));
-        assert!(!session.set_meta(project, super::Meta::read(&origin)));
+        assert!(session.set_meta(project, super::Meta::read(&origin, None)));
+        assert!(!session.set_meta(project, super::Meta::read(&origin, None)));
         let topic = Some("topic".to_string());
         assert_eq!(seen(&session), [(topic, None), (None, Some(project))]);
         assert_eq!(session.workspace_list()[1].id, workspace);
+    }
+
+    /// A fork finds its project however either path is spelled: here the
+    /// project mounts through a symlink and the fork names the real path.
+    #[test]
+    fn a_fork_nests_under_its_project_through_a_symlinked_path() {
+        let tmp = TempDir::new();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("api/.jj")).unwrap();
+        std::fs::create_dir_all(real.join("api-fix/.jj")).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut session = Session::new(PaneSize::new(24, 80), "test");
+        let project = session.workspace_new(link.join("api"));
+        let fork = super::ForkMeta {
+            origin_root: std::fs::canonicalize(real.join("api")).unwrap(),
+            jj_name: "fix".into(),
+        };
+        let (workspace, _) = session.workspace_new_forked(real.join("api-fix"), fork);
+        let parents: Vec<_> = session
+            .workspace_list()
+            .into_iter()
+            .map(|w| (w.id, w.parent))
+            .collect();
+        assert_eq!(parents, [(project, None), (workspace, Some(project))]);
     }
 }
