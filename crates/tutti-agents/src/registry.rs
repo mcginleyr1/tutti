@@ -32,6 +32,13 @@ impl ProcessTree {
     }
 }
 
+/// The agents whose tutti hooks report nothing before their first turn:
+/// Codex sends SessionStart only with its first prompt, and opencode's plugin
+/// hears no event before a turn. An ask may take a fresh one on its caller's
+/// word that the hooks are installed; every other agent's hooks report as it
+/// starts, so one that has not reported never will.
+pub const FIRST_TURN_REPORTERS: &[&str] = &["codex", "opencode"];
+
 /// The name detection knows a process by: its executable's `name`, or — for
 /// a node program, which runs as `node [flags] <script>` — its script's,
 /// from `args` (the argv after the executable). Gemini CLI runs so, then

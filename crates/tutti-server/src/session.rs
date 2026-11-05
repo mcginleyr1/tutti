@@ -1054,9 +1054,10 @@ impl Session {
     /// working, blocked or exited — so its message never joins a running turn
     /// or answers a dialog, and unless its hooks have reported, as only a hook
     /// reports the turn end the ask waits for, or the asker found them
-    /// installed for the very agent detected there (`hooks`): Codex and
-    /// opencode report only from their first turn on. The caller writes under
-    /// the same session guard.
+    /// installed for the very agent detected there (`hooks`) and it is one
+    /// that reports only from its first turn on (`FIRST_TURN_REPORTERS`):
+    /// any other agent that has not reported never will. The caller writes
+    /// under the same session guard.
     pub fn between_turns(&self, pane: PaneId, hooks: Option<&AgentKind>) -> Result<()> {
         let slot = self
             .panes
@@ -1065,7 +1066,11 @@ impl Session {
         if let Some(code) = slot.meta.exited {
             bail!("pane {pane} has exited (code {code})");
         }
-        if !slot.hooked && (hooks.is_none() || hooks != slot.meta.agent.as_ref()) {
+        let vouched = hooks.is_some_and(|agent| {
+            tutti_agents::FIRST_TURN_REPORTERS.contains(&agent.0.as_str())
+                && slot.meta.agent.as_ref() == Some(agent)
+        });
+        if !slot.hooked && !vouched {
             bail!(
                 "pane {pane}'s agent has not reported through tutti's hooks, so no turn end of \
                  its would ever reach an ask: install them (tutti hooks <agent> --install) and \
@@ -2376,6 +2381,24 @@ mod tests {
         hook(&mut s, pane, AgentHookEvent::Activity { detail: None });
         let busy = s.between_turns(pane, Some(&codex)).unwrap_err();
         assert!(busy.to_string().contains("is working"), "{busy}");
+    }
+
+    /// Only an agent that reports from its first turn on is taken on the
+    /// asker's word: a Claude or Gemini reports as it starts, so one that has
+    /// not reported never will, whatever the asker says of its hooks.
+    #[test]
+    fn an_ask_takes_no_word_for_an_agent_that_reports_as_it_starts() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        for agent in ["claude", "gemini"] {
+            let agent = super::AgentKind(agent.into());
+            s.set_agent(pane, Some(agent.clone()));
+            let err = s.between_turns(pane, Some(&agent)).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("has not reported through tutti's hooks"),
+                "{err}"
+            );
+        }
     }
 
     #[test]
