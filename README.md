@@ -1578,9 +1578,10 @@ stdin, maps it, and forwards it to the pane's daemon:
   (see [Held approvals](#held-approvals));
 - a **Notification** that waits on you — a permission prompt, an MCP dialog, a
   background agent's question, an Enter after a usage limit — marks it
-  **blocked** too; idle reminders, auth and usage-limit reports don't (Stop
-  already marked the turn done), and a type tutti does not know yet blocks, to
-  be safe;
+  **blocked** too, as does one from an older Claude that names no type; idle
+  reminders (Stop already marked the turn done), auth, MCP results, background
+  agents finishing, usage-limit reports, a mod's notice and any type tutti
+  does not know yet don't;
 - **SessionStart** and every event's `session_id` record the conversation the
   pane holds — `conversation` in `tutti --json pane list`, resumable with
   `claude --resume <id>` and revived by a

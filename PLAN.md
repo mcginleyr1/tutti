@@ -463,7 +463,11 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    starts a turn) and session starts (the conversation id before the first tool
    use); a `PermissionRequest` blocks the pane the moment Claude would ask
    (item 9); Notifications block only when they wait on you — idle reminders,
-   auth and usage-limit reports don't, and an unknown type still blocks.
+   auth and usage-limit reports don't. ✅ Only the types the hooks reference
+   says wait on you block (permission, MCP form and URL dialogs,
+   `agent_needs_input`, `quota_auto_resume_stale`), and an untyped one from an
+   older Claude; a mod's `plugin_notification` and a type tutti does not know
+   yet do not (wave 12). Open: a mod's notice lands in no note.
    Re-running `--install` upgrades an older install with just the missing
    events. ✅ opencode joins through a JavaScript plugin (`tutti hooks opencode
    [--install]`, same confirm + backup flow) that forwards session

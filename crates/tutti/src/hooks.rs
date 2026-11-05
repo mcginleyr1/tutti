@@ -110,24 +110,15 @@ pub fn map_claude_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
             detail: tool_name(v).map(str::to_string),
         }),
         "SubagentStop" => Some(AgentHookEvent::SubagentStopped { id: subagent_id(v) }),
+        // Only a Notification that waits on you blocks (`WAITING`), and one
+        // from an older Claude, which names no type. The rest report: the
+        // idle reminder (a minute after Stop marked the pane done), auth,
+        // elicitation results, background agents, usage-limit resumes, a
+        // mod's `$.ui.notify` — and any type tutti does not know yet. A
+        // permission dialog's notice comes six seconds into a dialog its
+        // PermissionRequest reported.
         "Notification" => match v.get("notification_type").and_then(Value::as_str) {
-            // Reports, not requests. The idle reminder lands a minute after
-            // Stop marked the pane done: re-raising it would queue a pane you
-            // have already seen.
-            Some(
-                "idle_prompt"
-                | "auth_success"
-                | "elicitation_complete"
-                | "elicitation_response"
-                | "agent_completed"
-                | "quota_auto_resume_fired"
-                | "quota_auto_resume_disabled",
-            ) => None,
-            // Claude waits on you — a permission or MCP dialog, a question, an
-            // Enter after a usage limit (`quota_auto_resume_stale`). An older
-            // Claude names no type, and a type tutti does not know yet keeps
-            // the safe reading: blocked. A permission dialog's notice comes
-            // six seconds into a dialog its PermissionRequest reported.
+            Some(kind) if !WAITING.split('|').any(|waiting| waiting == kind) => None,
             kind => Some(AgentHookEvent::Blocked {
                 message: v.get("message").and_then(Value::as_str).map(str::to_string),
                 reminder: kind == Some("permission_prompt"),
@@ -442,11 +433,13 @@ pub fn gemini_hooks_json() -> Value {
     })
 }
 
-/// The Notification types that wait on you, as the `--tty` hooks' matcher. A
-/// matcher can only name types, so an unknown one cannot read as blocked the
-/// way it does through `tutti agent-event`.
-const WAITING: &str =
-    "permission_prompt|elicitation_dialog|elicitation_url_dialog|agent_needs_input";
+/// The Claude Notification types that wait on you, per the hooks reference:
+/// a permission dialog, an MCP form or URL, a background session's or
+/// teammate's question, and an Enter after a usage limit reset during sleep
+/// (`quota_auto_resume_stale`). Both `agent-event` and the `--tty` hooks'
+/// matcher block on these alone.
+const WAITING: &str = "permission_prompt|elicitation_dialog|elicitation_url_dialog|\
+    agent_needs_input|quota_auto_resume_stale";
 
 /// The settings.json `hooks` snippet for an agent with no route to the daemon
 /// — one in a k8s sandbox. Each hook writes an OSC 7501 report straight to its
@@ -686,7 +679,6 @@ mod tests {
             ("elicitation_url_dialog", false),
             ("agent_needs_input", false),
             ("quota_auto_resume_stale", false),
-            ("some_future_type", false),
         ] {
             assert_eq!(
                 notification(kind),
@@ -699,6 +691,9 @@ mod tests {
         }
     }
 
+    /// Every other type the hooks reference lists reports — a mod's notice
+    /// (`plugin_notification`) included — and so does one tutti does not
+    /// know yet: none of them marks the pane blocked.
     #[test]
     fn notifications_that_only_report_send_nothing() {
         for kind in [
@@ -709,6 +704,8 @@ mod tests {
             "agent_completed",
             "quota_auto_resume_fired",
             "quota_auto_resume_disabled",
+            "plugin_notification",
+            "some_future_type",
         ] {
             assert_eq!(notification(kind), None, "{kind}");
         }
@@ -1054,7 +1051,8 @@ mod tests {
                 "permission_prompt",
                 "elicitation_dialog",
                 "elicitation_url_dialog",
-                "agent_needs_input"
+                "agent_needs_input",
+                "quota_auto_resume_stale"
             ]
         );
         for kind in WAITING.split('|') {
