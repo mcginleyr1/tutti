@@ -39,7 +39,7 @@ use crate::jj;
 use crate::keys;
 use crate::persist::{self, Saved, SavedPane};
 use crate::pty::{Feed, PaneSize, PtyPane, Signal, StatusReport};
-use crate::session::{ReportOutcome, Restored, RunTarget, Session};
+use crate::session::{Meta, ReportOutcome, Restored, RunTarget, Session};
 
 /// Cadence of the render tick: coalesced pane deltas to attached clients, and
 /// snapshots to watchers.
@@ -2912,8 +2912,13 @@ async fn record_checkpoint(
 /// counts: the watch stands off while one is in flight, and the probe re-marks
 /// the repo behind itself. The first sighting of a workspace only records its
 /// mark (attach and creation already seed the stat); vanished workspaces are
-/// forgotten. The session guard is bound and released before the book is
-/// opened, and both before `refresh_changes` re-locks them.
+/// forgotten. Each pass also rereads the directories' repo root and branch
+/// (`session::Meta`), rebroadcasting the view when one moved. Every
+/// filesystem read is made with no lock held, so a workspace on a hung mount
+/// stalls this pass alone; a probe that ends between a read and the book
+/// costs one probe more, never a loop. The session guard is bound and
+/// released before the book is opened, and both before `refresh_changes`
+/// re-locks them.
 fn vcs_pass(hub: &Arc<Hub>) {
     let workspaces: Vec<(WorkspaceId, PathBuf)> = {
         let session = hub.session();
@@ -2923,19 +2928,33 @@ fn vcs_pass(hub: &Arc<Hub>) {
             .filter_map(|id| session.workspace_dir(id).map(|dir| (id, dir)))
             .collect()
     };
+    let read: Vec<_> = workspaces
+        .iter()
+        .map(|(id, dir)| (*id, Meta::read(dir), jj::op_heads_modified(dir)))
+        .collect();
+    let view = {
+        let mut session = hub.session();
+        let mut moved = false;
+        for (id, meta, _) in &read {
+            moved |= session.set_meta(*id, meta.clone());
+        }
+        moved.then(|| session.view())
+    };
+    if let Some(view) = view {
+        broadcast_event(hub, Event::LayoutChanged { workspaces: view });
+    }
     let moved: Vec<WorkspaceId> = {
         let mut vcs = hub.vcs();
         vcs.retain(|id, _| workspaces.iter().any(|(w, _)| w == id));
-        workspaces
-            .iter()
-            .filter_map(|(id, dir)| {
-                let modified = jj::op_heads_modified(dir)?;
-                let entry = vcs.entry(*id).or_default();
+        read.into_iter()
+            .filter_map(|(id, _, modified)| {
+                let modified = modified?;
+                let entry = vcs.entry(id).or_default();
                 if entry.in_flight > 0 {
                     return None;
                 }
                 let previous = entry.mark.replace(modified);
-                previous.is_some_and(|p| p != modified).then_some(*id)
+                previous.is_some_and(|p| p != modified).then_some(id)
             })
             .collect()
     };

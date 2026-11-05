@@ -65,7 +65,29 @@ struct WorkspaceEntry {
     /// Present when tutti created this workspace via `workspace fork`. Carries
     /// what a `--discard` kill needs to `jj workspace forget` it at its origin.
     fork: Option<ForkMeta>,
+    /// What the filesystem says of `dir`: read once as the workspace mounts,
+    /// then by the VCS watch each second off every lock (`set_meta`), never
+    /// by a view or a listing — on a hung network mount those would stall
+    /// every request behind the session lock.
+    meta: Meta,
     tabs: Vec<TabEntry>,
+}
+
+/// A workspace directory's jj repo root (the nearest ancestor holding `.jj`)
+/// and its git branch (`.git/HEAD`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Meta {
+    root: Option<PathBuf>,
+    branch: Option<String>,
+}
+
+impl Meta {
+    pub fn read(dir: &Path) -> Meta {
+        Meta {
+            root: crate::jj::workspace_root(dir),
+            branch: git_branch(dir),
+        }
+    }
 }
 
 /// What a forked workspace remembers about its origin, so `kill --discard` can
@@ -265,6 +287,7 @@ impl Session {
         self.workspaces.push(WorkspaceEntry {
             id,
             name,
+            meta: Meta::read(&dir),
             dir,
             changes: None,
             changed_files: Vec::new(),
@@ -273,6 +296,18 @@ impl Session {
             tabs: vec![tab],
         });
         (id, tab_id)
+    }
+
+    /// Store what the VCS watch read of workspace `id`'s directory, returning
+    /// whether it moved (so the caller rebroadcasts only on a real change).
+    pub fn set_meta(&mut self, id: WorkspaceId, meta: Meta) -> bool {
+        match self.workspaces.iter_mut().find(|w| w.id == id) {
+            Some(w) if w.meta != meta => {
+                w.meta = meta;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// The fork metadata for workspace `id`, or `None` for a plain (non-forked)
@@ -349,21 +384,17 @@ impl Session {
 
     /// Each workspace's parent, in workspace order: a forked child resolves to
     /// whichever workspace currently owns its origin repo, or `None` when that
-    /// origin has been killed — the child then stands top-level. Every jj repo
-    /// root is computed once. The one answer `view` and `workspace_list` share.
+    /// origin has been killed — the child then stands top-level. Each jj repo
+    /// root is the one `meta` holds. The one answer `view` and
+    /// `workspace_list` share.
     fn parents(&self) -> Vec<Option<WorkspaceId>> {
-        let roots: Vec<(WorkspaceId, Option<PathBuf>)> = self
-            .workspaces
-            .iter()
-            .map(|w| (w.id, crate::jj::workspace_root(&w.dir)))
-            .collect();
         self.workspaces
             .iter()
             .map(|w| {
                 w.fork.as_ref().and_then(|fork| {
-                    roots.iter().find_map(|(id, root)| {
-                        (*id != w.id && root.as_deref() == Some(fork.origin_root.as_path()))
-                            .then_some(*id)
+                    self.workspaces.iter().find_map(|o| {
+                        (o.id != w.id && o.meta.root.as_deref() == Some(fork.origin_root.as_path()))
+                            .then_some(o.id)
                     })
                 })
             })
@@ -603,7 +634,7 @@ impl Session {
                 id: w.id,
                 name: w.name.clone(),
                 dir: w.dir.clone(),
-                branch: git_branch(&w.dir),
+                branch: w.meta.branch.clone(),
                 changes: w.changes.clone(),
                 changed_files: w.changed_files.clone(),
                 stale: w.stale,
@@ -3263,5 +3294,43 @@ mod tests {
     fn git_branch_missing_head_is_none() {
         let tmp = TempDir::new();
         assert_eq!(git_branch(tmp.path()), None);
+    }
+
+    /// A view reads no file: the branch and the repo root it shows (the
+    /// root nests a workspace under its project) are what the workspace's
+    /// mount read, until the VCS watch stores a fresh reading.
+    #[test]
+    fn a_view_shows_the_directory_as_last_read_not_as_it_is() {
+        let tmp = TempDir::new();
+        let origin = tmp.path().join("api");
+        std::fs::create_dir_all(origin.join(".git")).unwrap();
+        std::fs::write(origin.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let child = tmp.path().join("api-fix");
+        std::fs::create_dir_all(child.join(".jj")).unwrap();
+        let mut session = Session::new(PaneSize::new(24, 80), "test");
+        let project = session.workspace_new(origin.clone());
+        let fork = super::ForkMeta {
+            origin_root: origin.clone(),
+            jj_name: "fix".into(),
+        };
+        let (workspace, _) = session.workspace_new_forked(child, fork);
+        let seen = |s: &Session| {
+            s.view()
+                .into_iter()
+                .map(|w| (w.branch, w.parent))
+                .collect::<Vec<_>>()
+        };
+        let main = Some("main".to_string());
+        assert_eq!(seen(&session), [(main.clone(), None), (None, None)]);
+
+        std::fs::write(origin.join(".git/HEAD"), "ref: refs/heads/topic\n").unwrap();
+        std::fs::create_dir_all(origin.join(".jj")).unwrap();
+        assert_eq!(seen(&session), [(main, None), (None, None)]);
+
+        assert!(session.set_meta(project, super::Meta::read(&origin)));
+        assert!(!session.set_meta(project, super::Meta::read(&origin)));
+        let topic = Some("topic".to_string());
+        assert_eq!(seen(&session), [(topic, None), (None, Some(project))]);
+        assert_eq!(session.workspace_list()[1].id, workspace);
     }
 }
