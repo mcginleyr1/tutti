@@ -32,6 +32,15 @@ const LET_GO_KEPT: usize = 8;
 /// classifier `Working` match before it reads as `Unknown`: a build killed
 /// mid-report never says clear, and a wedged agent never says done.
 pub const STALL_AFTER: Duration = Duration::from_secs(30);
+/// How long a fresh agent's rest — its prompt on screen, its own idle or
+/// done report — reads `Unknown` before any work, then `Idle`. Long enough
+/// for `tutti run`'s first message to show the agent working: Claude Code
+/// 2.1.318's UserPromptSubmit hook came 0.5–0.9 s after its pane opened
+/// (w12, three runs), and Codex 0.166.0 shows its startup as working (`esc
+/// to interrupt`) and reports working itself. Short enough that an agent
+/// given no work, or revived by a restore, settles `Idle` before anyone
+/// waits on it for long.
+pub const FRESH_GRACE: Duration = Duration::from_secs(5);
 /// The least gap between two OSC 7501 `msg` notifications from one pane (the
 /// program-status spec's rate limit).
 const REPORT_NOTIFY_EVERY: Duration = Duration::from_secs(30);
@@ -164,6 +173,12 @@ struct PaneSlot {
     /// turn's end (`observe`), which a `pane wait` right after `tutti run`
     /// would take.
     worked: bool,
+    /// When the pane's agent was detected (else the pane opened): what
+    /// `FRESH_GRACE` counts from.
+    started: Instant,
+    /// Whether the agent has shown itself at rest within its grace, before
+    /// any work: held as `Unknown`, it reads `Idle` once the grace is over.
+    rested: bool,
     /// How many turn ends the pane's hooks have reported, those that carried
     /// no reply included: what an ask waits to see pass (`reply_after`).
     replies: u64,
@@ -173,6 +188,19 @@ struct PaneSlot {
     reply: (String, bool),
     #[cfg(test)]
     _teardown: Teardown,
+}
+
+impl PaneSlot {
+    /// Where a fresh agent showing itself at rest lands: `Unknown` within
+    /// `FRESH_GRACE` of its start, held back (`rested`), else `Idle`.
+    fn rest(&mut self, now: Instant) -> AgentState {
+        self.rested = now.duration_since(self.started) < FRESH_GRACE;
+        if self.rested {
+            AgentState::Unknown
+        } else {
+            AgentState::Idle
+        }
+    }
 }
 
 /// Test builds only: a pause a pane's drop takes, then word that it ended
@@ -1202,6 +1230,10 @@ impl Session {
                     slot.hooked = false;
                     slot.worked = false;
                 }
+                if agent.is_some() {
+                    slot.started = Instant::now();
+                    slot.rested = false;
+                }
                 let kept = slot.herdr.as_ref().is_none_or(|(_, reporter)| {
                     agent.as_ref().is_some_and(|kind| kind.0 == *reporter)
                 });
@@ -1393,9 +1425,11 @@ impl Session {
     /// alive; a `Working` pane not held by a hook and silent for `STALL_AFTER`
     /// drops to `Unknown`, ending its claim. A `Done` match on a pane not yet
     /// seen working (`worked`: a `Working` match, hook or report — output
-    /// alone is the agent drawing) lands `Unknown`: a fresh agent at its
-    /// prompt, whose first frames come before its first message's hook says
-    /// it works, has finished nothing, and a wait for done takes `Idle` too.
+    /// alone is the agent drawing) is a fresh agent at its prompt, which has
+    /// finished nothing: within `FRESH_GRACE` of its start it stays
+    /// `Unknown` — its first frames come before its first message's hook
+    /// says it works, and a wait for done takes `Idle` too — and after it,
+    /// or once the grace runs out on a rest held back, it reads `Idle`.
     /// Returns the net transition.
     pub fn observe(
         &mut self,
@@ -1421,13 +1455,16 @@ impl Session {
             let Some(event) = event else { continue };
             let current = slot.meta.state;
             let next = match event {
-                StateEvent::Classified(Observation::Done) if !slot.worked => AgentState::Unknown,
+                StateEvent::Classified(Observation::Done) if !slot.worked => slot.rest(now),
                 event => current.apply(event),
             };
             if next != current && source.may_move(slot.meta.source, current, next) {
                 slot.meta.state = next;
                 slot.meta.source = Some(source);
             }
+        }
+        if slot.rested && !slot.worked && slot.meta.state == AgentState::Unknown {
+            slot.meta.state = slot.rest(now);
         }
         if slot.meta.source == Some(StateSource::Hook) && slot.meta.state == AgentState::Blocked {
             match classified {
@@ -1875,6 +1912,8 @@ impl Session {
                 asked_by: HashMap::new(),
                 let_go: Vec::new(),
                 worked: false,
+                started: Instant::now(),
+                rested: false,
                 replies: 0,
                 reply: (String::new(), false),
                 #[cfg(test)]
@@ -2109,7 +2148,7 @@ fn parse_head(contents: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ForkMeta, REPLY_CAP, STALL_AFTER, Session, git_branch, pane_title, parse_head,
+        FRESH_GRACE, ForkMeta, REPLY_CAP, STALL_AFTER, Session, git_branch, pane_title, parse_head,
         rename_leaves, sandbox_argv, sandbox_name, stop_subagent,
     };
     use crate::herdr;
@@ -2385,36 +2424,57 @@ mod tests {
         );
     }
 
-    /// Observed live (Claude Code 2.1.318): a fresh agent's first frame is
-    /// its prompt, before the hook for its first message says it works. That
-    /// frame is no finished turn, so a `pane wait --until done` issued right
-    /// after `tutti run` must not take it, nor the agent's later frames. A
-    /// startup dialog answered leaves it unknown too. Once the agent has
-    /// worked, its prompt is a turn's end again; a stall in between keeps
-    /// that.
+    /// A session's pane with `claude` detected in it, and when that was.
+    fn fresh_claude() -> (Session, PaneId, TempDir, Instant) {
+        let (mut s, pane, tmp) = session_with_pane();
+        s.set_agent(pane, Some("claude".into()));
+        (s, pane, tmp, Instant::now())
+    }
+
+    /// The race `tutti run` then `pane wait --until done,blocked` lost, live
+    /// on Claude Code 2.1.318: the agent's first frame is its prompt, drawn
+    /// before its first message's hook says it works. Within its grace that
+    /// frame, the frames after it and a startup dialog answered all leave the
+    /// pane unknown — a wait for done takes idle too — until the hook moves
+    /// it, and the turn's end is done.
     #[test]
-    fn a_fresh_agents_prompt_stays_unknown_until_it_has_worked() {
-        let (mut s, pane, _tmp) = session_with_pane();
-        let t0 = Instant::now();
+    fn a_run_agents_first_frames_stay_unknown_until_its_first_message_works() {
+        let (mut s, pane, _tmp, t0) = fresh_claude();
         let done = Some(Observation::Done);
         assert_eq!(s.observe(pane, true, done, t0), None);
+        assert_eq!(s.observe(pane, true, done, t0), None, "drawing is no work");
         assert_eq!(state_of(&s, pane).0, Unknown);
         let dialog = Some(Observation::Blocked);
         assert_eq!(s.observe(pane, true, dialog, t0), Some((Unknown, Blocked)));
         assert_eq!(s.observe(pane, true, done, t0), Some((Blocked, Unknown)));
         hook(&mut s, pane, prompt(Some("go".into()), "p1"));
+        assert_eq!(state_of(&s, pane), (Working, Some(Hook)));
         hook(&mut s, pane, AgentHookEvent::Done { reply: None });
         assert_eq!(state_of(&s, pane), (Done, Some(Hook)));
+    }
 
-        // A screen-read agent's turn: its spinner matched once, while output
-        // had already counted.
-        let (mut s, pane, _tmp) = session_with_pane();
-        let working = Some(Observation::Working);
+    /// An agent given no work is never stuck unknown, where a wait for done
+    /// or idle would never answer: its rest held back reads idle once the
+    /// grace is over, and its prompt after the grace reads idle at once —
+    /// never done, as it finished nothing. A turn read off its screen later
+    /// ends done; so does one a stall interrupted.
+    #[test]
+    fn an_agent_given_no_work_settles_idle_after_its_grace() {
+        let (mut s, pane, _tmp, t0) = fresh_claude();
+        let done = Some(Observation::Done);
         assert_eq!(s.observe(pane, true, done, t0), None);
-        assert_eq!(s.observe(pane, true, working, t0), Some((Unknown, Working)));
-        assert_eq!(s.observe(pane, true, done, t0), Some((Working, Done)));
+        let after = t0 + FRESH_GRACE;
+        assert_eq!(s.observe(pane, false, None, after), Some((Unknown, Idle)));
+        assert_eq!(s.observe(pane, true, done, after), None, "and stays idle");
 
-        let (mut s, pane, _tmp) = session_with_pane();
+        let (mut s, pane, _tmp, t0) = fresh_claude();
+        let after = t0 + FRESH_GRACE;
+        assert_eq!(s.observe(pane, true, done, after), Some((Unknown, Idle)));
+        let working = Some(Observation::Working);
+        assert_eq!(s.observe(pane, true, working, after), Some((Idle, Working)));
+        assert_eq!(s.observe(pane, true, done, after), Some((Working, Done)));
+
+        let (mut s, pane, _tmp, t0) = fresh_claude();
         assert_eq!(s.observe(pane, true, working, t0), Some((Unknown, Working)));
         let stalled = t0 + STALL_AFTER;
         assert_eq!(
@@ -2422,6 +2482,38 @@ mod tests {
             Some((Working, Unknown))
         );
         assert_eq!(s.observe(pane, true, done, stalled), Some((Unknown, Done)));
+    }
+
+    /// A restore revives an agent at its prompt, having done nothing since:
+    /// unknown within its grace, then idle — never a done nobody caused, and
+    /// never stuck where a wait never answers.
+    #[test]
+    fn a_revived_agent_settles_idle_not_done() {
+        let tmp = TempDir::new();
+        let mut s = Session::new(PaneSize::new(24, 80), "test");
+        s.workspace_new(tmp.path().to_path_buf());
+        let agent = s.pane_run(None, sleep_cmd(), false, None).unwrap();
+        s.set_agent(agent, Some("claude".into()));
+        s.apply_agent_event(agent, AgentHookEvent::SessionStarted, Some("c1".into()));
+        let mut r = Session::new(PaneSize::new(24, 80), "test");
+        assert_eq!(
+            r.restore(reread(s.snapshot().unwrap()), revive_as_sleep)
+                .revived,
+            1
+        );
+        let revived = r
+            .pane_list()
+            .into_iter()
+            .find(|p| p.conversation.as_deref() == Some("c1"))
+            .unwrap()
+            .id;
+        r.set_agent(revived, Some("claude".into()));
+        let t0 = Instant::now();
+        let done = Some(Observation::Done);
+        assert_eq!(r.observe(revived, true, done, t0), None);
+        assert_eq!(state_of(&r, revived).0, Unknown);
+        let after = t0 + FRESH_GRACE;
+        assert_eq!(r.observe(revived, true, done, after), Some((Unknown, Idle)));
     }
 
     #[test]
