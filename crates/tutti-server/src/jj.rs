@@ -312,8 +312,7 @@ pub async fn restore(dir: &Path, commit: &str) -> Result<String, String> {
 /// workspace and makes its checkout before it resolves one.
 ///
 /// `dest` is made here, and only if nothing is there yet, so a failed add can
-/// tell what it made: it removes that directory, and forgets `name` only while
-/// jj records the workspace at it — never a same-named one made elsewhere.
+/// tell what it made, and takes it away as `remove` does.
 pub async fn fork(
     repo_root: &Path,
     dest: &Path,
@@ -346,31 +345,56 @@ async fn fork_within(
     let Err(failed) = add(repo_root, dest, name, revision, budget).await else {
         return Ok(());
     };
-    let mut errors = vec![failed];
-    if registered_at(repo_root, name, dest).await
-        && let Err(e) = forget(repo_root, name).await
-    {
-        errors.push(format!("forget {name}: {e}"));
-    }
-    if let Err(e) = tokio::fs::remove_dir_all(dest).await {
-        errors.push(format!("remove {}: {e}", dest.display()));
-    }
-    Err(errors.join("; "))
+    Err(match remove(repo_root, name, dest).await {
+        Ok(()) => failed,
+        Err(left) => format!("{failed}; {left}"),
+    })
 }
 
-/// Whether jj records the workspace `name` at `dest`.
-async fn registered_at(repo_root: &Path, name: &str, dest: &Path) -> bool {
-    let args = ["--ignore-working-copy", "workspace", "root", "--name", name];
-    let Ok(output) = run(jj_cmd(repo_root, &args), TIMEOUT).await else {
-        return false;
+/// Take a workspace's checkout `dir` away: forget `name` at `repo_root` when
+/// jj records that workspace at `dir` — never a same-named one elsewhere —
+/// then remove `dir`. When jj cannot say where it records `name` (it failed,
+/// or timed out), or the forget fails, both are left as they are, so jj never
+/// keeps a workspace whose checkout is gone, and the error says so.
+pub async fn remove(repo_root: &Path, name: &str, dir: &Path) -> Result<(), String> {
+    let left = |why: String| {
+        format!(
+            "{why}; the jj workspace {name} and {} are left as they are",
+            dir.display()
+        )
     };
-    let root = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-    output.status.success()
-        && (root == dest
+    match recorded_at(repo_root, name, dir).await {
+        Err(e) => return Err(left(format!("jj did not say where it records {name}: {e}"))),
+        Ok(true) => forget(repo_root, name)
+            .await
+            .map_err(|e| left(format!("forget {name}: {e}")))?,
+        Ok(false) => {}
+    }
+    tokio::fs::remove_dir_all(dir)
+        .await
+        .map_err(|e| format!("remove {}: {e}", dir.display()))
+}
+
+/// Whether jj records the workspace `name` at `dir`, as `jj workspace list`
+/// answers; an error when it gives no answer.
+async fn recorded_at(repo_root: &Path, name: &str, dir: &Path) -> Result<bool, String> {
+    let template = r#"name ++ "\t" ++ root ++ "\n""#;
+    let args = ["--ignore-working-copy", "workspace", "list", "-T", template];
+    let output = run(jj_cmd(repo_root, &args), TIMEOUT).await?;
+    if !output.status.success() {
+        return Err(stderr_or(&output, "jj workspace list failed"));
+    }
+    let at_dir = |root: &str| {
+        Path::new(root) == dir
             || matches!(
-                (std::fs::canonicalize(&root), std::fs::canonicalize(dest)),
+                (std::fs::canonicalize(root), std::fs::canonicalize(dir)),
                 (Ok(a), Ok(b)) if a == b
-            ))
+            )
+    };
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .any(|(listed, root)| listed == name && at_dir(root)))
 }
 
 /// `jj workspace add` itself. Past `budget` the add is given up on, but jj is
@@ -1009,6 +1033,26 @@ Binary files a/img.png and b/img.png differ
         }
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// When jj gives no answer to where it records the workspace — here no
+    /// repo at all answers — a failed add's cleanup takes nothing away: the
+    /// checkout stays, nothing is forgotten, and the error says so.
+    #[tokio::test]
+    async fn no_answer_from_jj_leaves_the_checkout_and_says_so() {
+        let not_a_repo = scratch("jjadd-norepo");
+        let dir = scratch("jjadd-dest");
+        std::fs::create_dir_all(&not_a_repo).unwrap();
+        std::fs::create_dir_all(dir.join(".jj")).unwrap();
+        let err = remove(&not_a_repo, "late", &dir).await.unwrap_err();
+        assert!(
+            err.contains("jj did not say where it records late"),
+            "{err}"
+        );
+        assert!(err.contains("left as they are"), "{err}");
+        assert!(dir.join(".jj").exists(), "the checkout was removed");
+        let _ = std::fs::remove_dir_all(&not_a_repo);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
