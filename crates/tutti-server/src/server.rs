@@ -2300,11 +2300,13 @@ fn wait_verdict(info: PaneInfo, until: &[WaitFor], level: bool) -> Option<Respon
 
 /// Kill a workspace. `--discard` additionally scrubs a *forked* checkout from
 /// disk: the panes die and tutti drops the workspace right away (a half-cleaned
-/// fork must still disappear), then a spawned task runs `jj workspace forget` at
-/// the origin and removes the directory, replying once cleanup finishes. Discard
-/// on a non-fork is refused outright — tutti never deletes a checkout it did not
-/// create. The plain (non-discard) path keeps the old behaviour: panes die,
-/// tutti forgets the entry, the checkout stays on disk.
+/// fork must still disappear), then a spawned task takes the checkout away as a
+/// failed add does (`jj::remove`: the jj workspace forgotten at the origin only
+/// while jj records it at that directory, never a same-named one made since),
+/// replying once cleanup finishes. Discard on a non-fork is refused outright —
+/// tutti never deletes a checkout it did not create. The plain (non-discard)
+/// path keeps the old behaviour: panes die, tutti forgets the entry, the
+/// checkout stays on disk.
 fn workspace_kill(
     hub: &Arc<Hub>,
     cid: u64,
@@ -2314,8 +2316,9 @@ fn workspace_kill(
 ) -> ControlFlow<()> {
     let mut session = hub.session();
     // Read what discard needs *before* the kill removes the entry.
-    let fork = session.workspace_fork_meta(id);
-    let dir = session.workspace_dir(id);
+    let fork = session
+        .workspace_fork_meta(id)
+        .zip(session.workspace_dir(id));
     if discard && fork.is_none() {
         drop(session);
         return send_reply(
@@ -2341,27 +2344,14 @@ fn workspace_kill(
             if !discard {
                 return send_reply(hub, cid, &reply.tx, reply.encode(&Response::Ok));
             }
-            // Fork discard: forget at the origin, then remove the checkout. Each
-            // failure is surfaced but neither aborts the other, so a half-cleaned
-            // fork has still left tutti (the LayoutChanged above already dropped
-            // it). The reply follows the cleanup on the requester's channel.
-            let fork = fork.expect("discard on a non-fork was rejected above");
+            // Fork discard: a failure is surfaced, but the fork has left tutti
+            // all the same (the LayoutChanged above already dropped it). The
+            // reply follows the cleanup on the requester's channel.
+            let (fork, dir) = fork.expect("discard on a non-fork was rejected above");
             reply.spawn(|reply| async move {
-                let mut errors = Vec::new();
-                if let Err(e) = jj::forget(&fork.origin_root, &fork.jj_name).await {
-                    errors.push(e);
-                }
-                if let Some(dir) = dir
-                    && let Err(e) = tokio::fs::remove_dir_all(&dir).await
-                {
-                    errors.push(format!("remove {}: {e}", dir.display()));
-                }
-                let response = if errors.is_empty() {
-                    Response::Ok
-                } else {
-                    Response::Error {
-                        message: errors.join("; "),
-                    }
+                let response = match jj::remove(&fork.origin_root, &fork.jj_name, &dir).await {
+                    Ok(()) => Response::Ok,
+                    Err(message) => Response::Error { message },
                 };
                 reply.send(response).await;
             });

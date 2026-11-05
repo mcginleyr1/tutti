@@ -6279,6 +6279,66 @@ async fn discard_removes_and_forgets_a_fork() {
     server.stop().await;
 }
 
+/// A workspace forgotten outside tutti and added again elsewhere under the
+/// same name is someone else's: discarding tutti's checkout removes that
+/// checkout and forgets nothing. Skips without `jj`.
+#[tokio::test]
+async fn discard_never_forgets_a_same_named_workspace_added_since() {
+    let Some(origin) = init_jj_repo() else {
+        return;
+    };
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let ws = workspace_id(
+        conn.request(Request::WorkspaceNew {
+            dir: origin.clone(),
+        })
+        .await,
+    );
+    let fork = workspace_id(
+        conn.request(Request::WorkspaceFork {
+            id: ws,
+            name: "gone".into(),
+            revision: None,
+            dest: None,
+        })
+        .await,
+    );
+    let dest = fork_sibling(&origin, "gone");
+    assert!(
+        run_jj(&origin, &["workspace", "forget", "gone"])
+            .status
+            .success()
+    );
+    let parent = fresh_dir("theirs");
+    let theirs = parent.join("gone");
+    let add = [
+        "workspace",
+        "add",
+        "--name",
+        "gone",
+        theirs.to_str().unwrap(),
+    ];
+    assert!(run_jj(&origin, &add).status.success());
+
+    assert_eq!(
+        conn.request(Request::WorkspaceKill {
+            id: fork,
+            discard: true,
+        })
+        .await,
+        Response::Ok
+    );
+    assert!(!dest.exists(), "discard should remove tutti's checkout");
+    let listed = jj_out(&origin, &["workspace", "list"]);
+    assert!(listed.contains("gone:"), "theirs was forgotten: {listed}");
+    assert!(theirs.join(".jj").exists(), "theirs was touched");
+
+    let _ = std::fs::remove_dir_all(&origin);
+    let _ = std::fs::remove_dir_all(&parent);
+    server.stop().await;
+}
+
 /// `kill --discard` on a workspace tutti did not fork is refused outright, and
 /// nothing on disk is touched — tutti never deletes a checkout it did not create.
 #[tokio::test]
