@@ -1257,10 +1257,12 @@ since it becomes both a path component and a jj workspace name; the project
 must live under a `.jj` repo, and the destination must not already exist.
 tutti makes the destination itself, so an add that fails anyway (a timeout,
 jj or git refusing) removes exactly what it made: that directory, and the jj
-workspace only when jj records it there — a same-named workspace elsewhere is
-never forgotten. An add past its 15 s is given up on but left to finish (up to
-a minute), then undone whole: a jj stopped halfway can leave a Git worktree
-registered that git then refuses the next add over.
+workspace only when `jj workspace list` records it there — a same-named
+workspace elsewhere is never forgotten. When jj gives no answer, or the
+forget fails, both stay and the error says so: jj never keeps a workspace
+whose checkout is gone. An add past its 15 s is given up on but left to
+finish (up to a minute), then undone whole: a jj stopped halfway can leave a
+Git worktree registered that git then refuses the next add over.
 `tutti workspace list` shows every entry with the PARENT it is nested under,
 `tutti project list` just the projects. Merge is scriptable too
 (`tutti workspace merge <id> [--push]`), keeping the "every TUI action is a CLI
@@ -1300,9 +1302,12 @@ Two ways to remove a workspace, differing only in what happens on disk:
   the jj workspace and its directory stay on disk. It is your checkout and your
   call; nothing is deleted.
 - `tutti workspace kill <id> --discard` — additionally `jj workspace forget`s the
-  checkout at its origin and removes its directory. `--discard` is **only**
-  honoured for a workspace tutti created; it is a hard error on any other
-  workspace, so tutti never deletes a checkout it did not create.
+  checkout at its origin and removes its directory, as a failed add does: the
+  forget only while jj records the workspace at that directory, so a
+  same-named one added since elsewhere stays, and nothing when jj gives no
+  answer. `--discard` is **only** honoured for a workspace tutti created; it
+  is a hard error on any other workspace, so tutti never deletes a checkout
+  it did not create.
 
 Both are reachable from the sidebar: focus it, select the workspace (or one of
 its agents), and press `x` — `y` is the plain kill, `D` is the `--discard`

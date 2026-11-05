@@ -444,9 +444,13 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    ✅ An add that fails after that point cleans up exactly what it made
    (wave 12): tutti makes the destination itself (`create_dir`, never over
    anything), then on a failure forgets the name only while `jj workspace
-   root --name` records it at that very directory, and removes the
-   directory — a same-named workspace elsewhere, or another recorded at the
-   same path, is left alone. An add past its 15 s is given up on but left a
+   list` records it at that very directory, and removes the directory — a
+   same-named workspace elsewhere, or another recorded at the same path, is
+   left alone. When jj gives no answer (a timeout, an error) or the forget
+   fails, both stay and the error says so (`jj::remove`); `workspace kill
+   --discard` takes a fork's checkout away the same way, so a same-named
+   workspace added since elsewhere survives it. An add past its 15 s is given
+   up on but left a
    minute to end on its own, then undone whole: jj 0.47 makes a Git worktree
    per workspace in a colocated repo, and one killed halfway (measured: from
    about 10 ms into a 130 ms add to its registering the path) leaves that
