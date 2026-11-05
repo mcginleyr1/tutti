@@ -585,6 +585,23 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    (`background_tasks`, the hooks reference). An answer that comes after
    the release is refused saying so. Live, only the main agent's case ran;
    a background subagent's request surviving the main Stop is unverified.
+   ✅ (w12 round 5, wire rev 18) A run lets go of a held request by the
+   call's identity (`ApprovalHold.call`, `AgentHookEvent::Activity::detail`),
+   no longer by its `tool · summary`, which one line of input could share:
+   the asking agent's `agent_id`, the tool and its whole input as canonical
+   JSON, FNV-1a hashed (`hooks::call_key`). Captured live (Claude 2.1.318,
+   Codex 0.166.0, scratch repos), a `PermissionRequest` has no
+   `tool_use_id`, the input is the same on all three events but for the
+   `description` Codex's request alone adds, and a subagent's events carry
+   its `agent_id`. So a main agent's run never lets go of a subagent's
+   request, or the other way round. Calls alike in agent, tool and input
+   stay ambiguous: the oldest such request goes, passed to the agent's own
+   dialog. opencode's `permission.replied` names its request
+   (`requestID`, the `permission.asked` `id`) and lets go of that hold
+   alone; a reply or activity naming no call moves the pane as before.
+   Live (Claude 2.1.318, a scratch session): a held Bash request answered
+   in Claude's own dialog was let go at its `PostToolUse`, a second before
+   `Stop`, its hook exiting with no answer.
    ✅ The sidebar and
    changes-panel keys are table-driven (`config::SIDEBAR_TABLE` /
    `CHANGES_TABLE`): dispatch, the help overlay and the footer hints all render
@@ -1001,6 +1018,16 @@ In order; each lands its TUI path in the same wave as its verbs.
 - Codex runs per-invocation hooks (`-c hooks.<Event>=[…]`, its "session
   flags" source) only once trusted in its `/hooks`, which persists the
   trust (w12);
+- three state edges found in the w12 review, left open (round 5). A
+  `UserPromptSubmit` the daemon takes in more than `agent-event`'s 2 s still
+  lands, and could let go of a request the new turn already holds (passed to
+  the agent's own dialog: safe, but the hold is lost). A fresh pane's grace
+  counts from detection, else from the pane's start, so a 7501 idle report
+  from an agent that detection names more than 5 s after the pane opened
+  reads idle at once. `PaneSlot::rest` marks a rest held back before
+  `may_move` decides whether the report or match may move the pane at all.
+  No path is known where that matters: a pane with a higher claim is not
+  both unworked and `unknown`;
 - a restore to a checkpoint whose commit `jj util gc` pruned fails with
   jj's `Revision … doesn't exist`, leaving the working copy as it was, but
   records a `before restore` checkpoint first (w12).
@@ -1103,9 +1130,10 @@ were. The checks:
   by fixtures, the writes only by stubs);
 - Codex: the ancestry guard dropping a shared-daemon hook (unit-tested
   only);
-- a held Claude request answered in Claude's own dialog, let go by its
-  tool's run or a new prompt (tested only; round 4 ran Codex, which keeps
-  its dialog back);
+- a held request let go by a new prompt, a subagent's request let go by
+  its own call's run, and an opencode hold let go by its
+  `permission.replied` (tested only; round 5 ran the main agent's call's
+  run live);
 - Gemini CLI's tool and permission events, `--resume`, and its `AfterAgent`
   reply for `--last-reply`: they need the user's Gemini login (SessionStart
   and a prompt's BeforeAgent → AfterAgent ran live);

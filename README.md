@@ -1092,9 +1092,15 @@ dialog, which you answer in the pane or through a peek. Set `approvals =
 Claude Code 2.1.318 shows its own dialog beside the hold (Codex 0.166.0
 keeps its back while the hook runs). An answer from tutti closes that dialog
 (`Allowed by PermissionRequest hook`). A request answered in the dialog
-instead leaves its hook waiting: tutti lets go of it when that tool's run
-reports (its `PreToolUse`/`PostToolUse` naming the same tool and input), a
-new prompt comes, or the turn of the agent that asked ends:
+instead leaves its hook waiting: tutti lets go of it when that call's run
+reports, a new prompt comes, or the turn of the agent that asked ends. A run
+names its call as the request does: the agent asking (the main agent, or a
+subagent by the hook's `agent_id`), the tool and its whole input — less the
+`description` Codex's request alone adds, its reason for asking — so another
+agent's run, or a parallel call's, lets go of nothing. Calls alike in all
+three can't be told apart: a run lets go of the oldest such request, and if
+that one's own call has not run yet, the agent's own dialog asks for it
+(and the pane may read working meanwhile):
 
 - The agent's waiting row reads `Bash · rm -rf build`, and a held approval
   leads the queue whatever the pane's state. A pane holds every request its
@@ -1153,8 +1159,9 @@ your next prompt.
 and an allow or a deny from the overlay or `pane approve` becomes opencode's
 reply (a deny's reason reaches the agent). opencode gives a plugin no way to
 keep its dialog back, so its own dialog shows meanwhile: answered there first,
-the plugin drops tutti's hold; `esc`, a timeout or no attached TUI leave it to
-that dialog.
+the plugin drops tutti's hold, and the `permission.replied` naming that
+request (its `requestID`) lets go of it alone; `esc`, a timeout or no attached
+TUI leave it to that dialog.
 
 ### Changed files panel
 
@@ -1790,8 +1797,10 @@ agent-event opencode` (outside one it does nothing):
   sends none: re-run `--install`);
 - `permission.asked` and `question.asked` mark it **blocked**; the matching
   `permission.replied` / `question.replied` / `question.rejected` puts it back
-  to **working**. With `approvals = "hold"` a permission request also waits on
-  tutti for an answer, which the plugin posts as opencode's reply (see
+  to **working** — a `permission.replied` only once no other request tutti
+  holds there still waits. With `approvals = "hold"` a permission request
+  also waits on tutti for an answer, which the plugin posts as opencode's
+  reply (see
   [Held approvals](#held-approvals));
 - a subagent's child session never moves the pane on its own busy/idle (its
   permission prompts still block it);
