@@ -1498,8 +1498,9 @@ A pane's state can come from five sources, ranked highest first:
    Ghostty).
 4. **screen** — the classifier reading a detected agent's screen. An agent
    not yet seen working since it started (a working match, a hook, a report;
-   output alone is it drawing) is never done at its prompt, having finished
-   nothing: for its first 5 seconds it reads **unknown** — its first frames
+   output alone is it drawing) is never done at its prompt, nor by its own
+   idle or done report (Codex 0.166.0 reports idle as it starts), having
+   finished nothing: for its first 5 seconds it reads **unknown** — its first frames
    come before its first message's hook, and a `pane wait --until done`
    right after `tutti run` must wait for the real turn — then **idle**, as an
    agent given no work, or revived by a restore, settles.

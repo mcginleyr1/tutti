@@ -1291,7 +1291,9 @@ impl Session {
     /// (Working/Blocked) settles to Idle, an outcome (Done) stays until seen.
     /// An accepted report labels a pane with no detected agent (its `app`, else
     /// the title) so it shows where agent state does, and a `msg` on a move to
-    /// Done/Blocked becomes a notification at most every 30s.
+    /// Done/Blocked becomes a notification at most every 30s. A detected
+    /// agent's done or idle before any work (Codex 0.166.0 reports idle as it
+    /// starts) is a fresh rest, as its prompt on screen is (`observe`).
     pub fn apply_report(
         &mut self,
         pane: PaneId,
@@ -1309,6 +1311,11 @@ impl Session {
         };
         let (from, held) = (slot.meta.state, slot.meta.source);
         let to = match report.state {
+            Some(AgentState::Done | AgentState::Idle)
+                if slot.meta.agent.is_some() && !slot.worked =>
+            {
+                slot.rest(now)
+            }
             Some(state) => state,
             None if held == Some(report.source) => match from {
                 AgentState::Working | AgentState::Blocked => AgentState::Idle,
@@ -2482,6 +2489,34 @@ mod tests {
             Some((Working, Unknown))
         );
         assert_eq!(s.observe(pane, true, done, stalled), Some((Unknown, Done)));
+    }
+
+    /// Codex 0.166.0 reports its own state over OSC 7501, idle as it starts.
+    /// Before any work a detected agent's own idle or done report is a fresh
+    /// rest, as its prompt on screen is: unknown within its grace — a wait
+    /// right after `tutti run` would take idle as done — then idle. Its
+    /// working report ends that, and its done is a turn's end. A program in a
+    /// pane with no agent detected still reports done as it always did.
+    #[test]
+    fn an_agents_own_rest_report_before_any_work_waits_out_its_grace() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        s.set_agent(pane, Some("codex".into()));
+        let t0 = Instant::now();
+        let at = |s: &mut Session, state, now| {
+            s.apply_report(pane, report(Program, Some(state)), now)
+                .transition
+        };
+        assert_eq!(at(&mut s, Idle, t0), None);
+        assert_eq!(state_of(&s, pane), (Unknown, Some(Program)));
+        assert_eq!(at(&mut s, Done, t0), None);
+        let after = t0 + FRESH_GRACE;
+        assert_eq!(s.observe(pane, false, None, after), Some((Unknown, Idle)));
+        assert_eq!(at(&mut s, Working, after), Some((Idle, Working)));
+        assert_eq!(at(&mut s, Done, after), Some((Working, Done)));
+
+        let (mut s, shell, _tmp) = session_with_pane();
+        let done = s.apply_report(shell, report(Program, Some(Done)), t0);
+        assert_eq!(done.transition, Some((Unknown, Done)));
     }
 
     /// A restore revives an agent at its prompt, having done nothing since:
