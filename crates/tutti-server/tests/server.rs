@@ -2719,25 +2719,42 @@ async fn an_inline_stream_behind_is_handed_the_rows_it_skipped() {
         .await;
     assert!(read_until(&mut control, pane, "flood-done").await);
 
+    let (transcript, numbered) = inline_transcript(&mut stuck, "flood-done").await;
+    assert!(numbered.len() > 1, "it was resynced: {numbered:?}");
+    assert!(
+        numbered.iter().all(|&(skipped, _)| skipped == 0),
+        "{numbered:?}"
+    );
+    let numbers: Vec<u32> = transcript.iter().filter_map(|l| l.parse().ok()).collect();
+    assert_eq!(numbers, (1..=3000).collect::<Vec<_>>());
+
+    server.stop().await;
+}
+
+/// What an inline stream's terminal would hold once its screen shows
+/// `done`: what scrolled in it, each resync's rows where they came, then
+/// the screen — and, for each `PaneRows`, its `skipped` and how many rows
+/// came after it.
+async fn inline_transcript(stream: &mut Conn, done: &str) -> (Vec<String>, Vec<(u64, usize)>) {
     let (mut terminal, mut transcript) = (Terminal::new(10, 40, 100_000), Vec::new());
-    let (mut numbered, mut past) = (Vec::new(), None::<Vec<u8>>);
+    let (mut numbered, mut past) = (Vec::new(), None::<(u64, Vec<u8>)>);
     timeout(DEADLINE, async {
-        while !terminal.contents().contains("flood-done") {
-            match stuck.read_frame().await {
+        while !terminal.contents().contains(done) {
+            match stream.read_frame().await {
                 Frame::Control(json) => {
-                    if let Ok(Event::PaneRows { top, skipped, .. }) = serde_json::from_slice(&json)
-                    {
-                        numbered.push((top, skipped));
+                    if let Ok(Event::PaneRows { skipped, .. }) = serde_json::from_slice(&json) {
                         transcript.extend(scrolled(&terminal));
-                        past = Some(Vec::new());
+                        past = Some((skipped, Vec::new()));
                     }
                 }
                 Frame::PaneRaw { bytes, .. } => match &mut past {
-                    Some(past) => past.extend(bytes),
+                    Some((_, past)) => past.extend(bytes),
                     None => terminal.advance(&bytes),
                 },
                 Frame::PaneSnapshot(data) => {
-                    let past = String::from_utf8(past.take().expect("numbered")).unwrap();
+                    let (skipped, past) = past.take().expect("numbered");
+                    let past = String::from_utf8(past).unwrap();
+                    numbered.push((skipped, past.lines().count()));
                     transcript.extend(past.lines().map(String::from));
                     terminal = Terminal::new(data.rows, data.cols, 100_000);
                     terminal.advance(&data.bytes);
@@ -2750,14 +2767,48 @@ async fn an_inline_stream_behind_is_handed_the_rows_it_skipped() {
     .expect("the stream never caught up");
     transcript.extend(scrolled(&terminal));
     transcript.extend(terminal.contents().lines().map(String::from));
+    (transcript, numbered)
+}
 
-    assert!(numbered.len() > 1, "it was resynced: {numbered:?}");
+/// A stream behind by more rows than a resync hands on gets the newest
+/// `RESYNC_ROWS` (10 000) of them — a pane's whole scrollback — and
+/// `skipped` counts exactly the rows its terminal never gets: no row comes
+/// twice, and the ones missing are as many as were said skipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resync_hands_on_at_most_a_scrollback_and_counts_the_rest() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    // 20 000 lines of a row each, padded with resets to 120 bytes: 2.4 MB,
+    // over twice the backlog, in twice the rows a scrollback holds.
+    let script = "stty -echo; read go; awk 'BEGIN { for (j = 0; j < 40; j++) f = f \"\\033[m\"; \
+                  for (i = 1; i <= 20000; i++) printf \"%s%d\\r\\n\", f, i }'; echo flood-done; sleep 30";
+    let pane = run_marker(&mut control, script).await;
+    let mut stuck = server.connect().await;
+    stuck.send(&inline_attach(pane, 0, None)).await;
+    stuck
+        .write_frame(&Frame::Input {
+            pane,
+            bytes: b"go\r".to_vec(),
+        })
+        .await;
+    assert!(read_until(&mut control, pane, "flood-done").await);
+
+    let (transcript, numbered) = inline_transcript(&mut stuck, "flood-done").await;
+    let skipped: u64 = numbered.iter().map(|&(skipped, _)| skipped).sum();
     assert!(
-        numbered.iter().all(|&(_, skipped)| skipped == 0),
+        skipped > 0,
+        "rows past a scrollback were skipped: {numbered:?}"
+    );
+    assert!(
+        numbered.iter().all(|&(_, rows)| rows <= 10_000),
         "{numbered:?}"
     );
-    let numbers: Vec<u32> = transcript.iter().filter_map(|l| l.parse().ok()).collect();
-    assert_eq!(numbers, (1..=3000).collect::<Vec<_>>());
+    let numbers: Vec<u64> = transcript.iter().filter_map(|l| l.parse().ok()).collect();
+    assert!(
+        numbers.windows(2).all(|w| w[0] < w[1]),
+        "no row twice, none out of order"
+    );
+    assert_eq!(20_000 - numbers.len() as u64, skipped, "{numbered:?}");
 
     server.stop().await;
 }
