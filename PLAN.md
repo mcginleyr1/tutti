@@ -234,8 +234,18 @@ Goal: the differentiator. Tutti knows which panes are agents and what state they
    CLI (`node …/gemini`) reads as `gemini`. ✅ A node flag's value given as
    the next argument (`--require x`) is skipped: the value-taking flags `node
    --help` lists, but for the profiler, report, test-runner and TLS ones
-   (wave 11). Open: Cursor's docs now name its binary `agent`, but the
-   catalog still detects and runs `cursor-agent`.
+   (wave 11). ✅ Cursor CLI under its documented name, `agent` (wave 12).
+   Its installer links `agent` and the legacy `cursor-agent` to a bash
+   script that execs its bundled `node` on `…/cursor-agent/versions/<v>/
+   index.js`, so the process was never `cursor-agent`. Detection now
+   matches that script by its path's end, never the bare name `agent`: a
+   process name with a `/` matches a path's end, with `*` standing for any
+   one directory. A spec's `binaries` are what the launcher looks for on
+   PATH, the preferred one first. One that detection doesn't know by name
+   (`agent`) counts only if it resolves to a file detection knows. The
+   launcher and `issue deploy` run `agent` where it is Cursor's, else
+   `cursor-agent`, and a sandbox runs `cursor-agent`, the name its pane's
+   declared agent is read from.
 2. **State classification** per pane, using layered signals (most→least reliable):
    - agent-specific integrations (e.g. Claude Code hooks writing to a tutti-known
      location, or parsing its status line)
@@ -600,9 +610,21 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    takes it; a sandbox deploy of one is refused. ✅ Every catalog row says how
    it takes a first message and from where that is known: Pi joins from its
    `--help`; Goose, Qwen Code, Cursor CLI, Copilot CLI, Factory Droid, Augment
-   Code and Amazon Q from their docs; Crush, Aider and Amp take none. Open:
-   the native file inputs (Ori's `--prompt-file`, Pi's and Augment's `@file`,
-   Goose's `--instructions`) go unused for long prompts.
+   Code and Amazon Q from their docs; Crush, Aider and Amp take none. ✅ The
+   native file inputs carry long prompts (wave 12), each checked in its
+   docs. From 16 KiB (`FILE_PROMPT`, an eighth of the per-argument limit)
+   a first message rides an agent's own file input:
+   - Ori: `--interactive --prompt-file`.
+   - Goose: `run --interactive --instructions`.
+   - Pi and Augment: `@<file>` beside a message pointing at it.
+
+   The 128 KiB fallback's file, and these files, are now written 0600 into
+   `<session>.prompts` beside the socket (0700), not the temp dir. The
+   daemon removes the files a pane's argv names once its program exits,
+   killed or not, and clears the directory as it starts and stops. A
+   restore never re-runs a first message. `issues::deploy_argv` builds the
+   argv for `issue deploy` and the TUI's armed launcher alike. No wire
+   change.
 
 **Acceptance:** a script (or an agent) can: create 3 worktree workspaces, launch an
 agent in each, `wait --until done` on all three, read back each diff summary.
@@ -919,7 +941,10 @@ is private, so install stays `cargo install --path` from a checkout.
   `--last-reply`;
 - the first-message data for Goose, Qwen Code, Cursor, Copilot, Factory
   Droid, Augment and Amazon Q, from their docs only and unrun (Amazon Q's
-  from a search excerpt of its reference page);
+  from a search excerpt of its reference page). The same goes for the file
+  inputs of Goose, Pi and Augment; Ori's has only its 0.13.0 `--help` and
+  changelog. Cursor's detection and `agent` launch come from its install
+  script and the 2026.11.05 package's launcher, unrun;
 - kitty key reports against a real kitty, WezTerm or Ghostty (only a harness
   played kitty), and `pane attach --inline` in Emacs vterm or eat;
 - `tutti attach --view` on a real second terminal; the inline history in

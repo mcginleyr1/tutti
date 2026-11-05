@@ -1339,13 +1339,32 @@ by the id, title, body and link; set `prompt` per source to change it (`{id}`,
 project itself instead; a project that isn't a jj repo always does. The footer
 chip reads `ISSUES`.
 
-A message too long for one command-line argument — Linux takes 128 KiB —
-goes to a file only you can read, in your temp directory, and the agent's
-first message names that file instead, for it to read as it reads any file
-(it may ask to: the file lies outside the project). tutti leaves the file for
-the agent to come back to; the OS's temp cleanup takes it. A sandbox's agent
-can't read this machine's files, so a sandbox deploy of such an issue is
-refused.
+A long message goes to a file instead of the command line. The file is
+readable only by you (0600), in a directory private to you beside the
+session's socket (`<session>.prompts`, 0700), not in `$TMPDIR`.
+
+- **From 16 KiB, for an agent that reads a first message from a file:**
+  the agent gets the file through its own option.
+  - Ori: `--interactive --prompt-file <file>`.
+  - Goose: `run --interactive --instructions <file>`.
+  - Pi and Augment Code: `@<file>`, plus a short message pointing at it.
+- **Any other agent, from 128 KiB (all that Linux's exec takes in one
+  argument):** its first message names the file instead, for the agent to
+  read as it reads any file. It may ask first: the file lies outside the
+  project.
+
+16 KiB is an eighth of Linux's 128 KiB limit, so an argument that size is
+safe on Linux and macOS alike. Past it, a message is a document of some 300
+lines, and putting it in a file also keeps it out of `ps` and out of the
+saved layout.
+
+The daemon deletes the file once the agent that was given it exits, whether
+the agent quit or its pane was killed. Stopping the daemon deletes any that
+are left, and so does starting one after a daemon crashed. A
+[restore](#restoring-after-a-restart) never needs them, because it revives
+each agent in its own conversation rather than on its first message. A
+sandbox's agent can't read this machine's files, so a sandbox deploy sends
+up to 128 KiB on the command line and refuses anything longer.
 
 The agent's sidebar row and pane title carry the issue id (`claude #123`),
 `tutti --json pane list` and [`tutti watch`](#watching-state-from-other-tools)
@@ -1393,7 +1412,16 @@ they block or finish. Detection covers the whole catalog under
 [Install](#install), with screen patterns tuned per agent where they have been
 checked live; adding an agent is one data-table row in
 `crates/tutti-agents/src/registry.rs`. It matches the process's executable
-name, or a node program's script — Gemini CLI runs as `node …/gemini`.
+name, or a node program's script — Gemini CLI runs as `node …/gemini`, and
+Cursor CLI as `node …/cursor-agent/versions/<version>/index.js`, matched by
+where that script lives, since its name says nothing.
+
+Cursor CLI's installer puts two names on your `PATH`: `agent`, the one its
+docs use now, and `cursor-agent`, the old one. The launcher and `issue
+deploy` run `agent` when it is Cursor's own (a link into Cursor's install),
+and `cursor-agent` otherwise, so an unrelated `agent` on your `PATH` never
+stands in for Cursor. A sandbox's image can't be looked into, so there it
+runs `cursor-agent`.
 
 ### Agent state sources
 
