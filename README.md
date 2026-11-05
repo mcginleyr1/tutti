@@ -1707,7 +1707,8 @@ another pane's events would land on it. `agent-event codex` therefore drops an
 event unless the session's tutti-server is among its ancestors, with a note on
 stderr. So a `codex` you type into a pane yourself, without `--no-daemon`,
 runs in that shared app-server and its hooks never reach tutti: the pane falls
-back to screen detection, its turns unlabelled and its conversation unrecorded.
+back to Codex's own OSC 7501 reports (0.166.0 sends working, blocked and done)
+and screen detection, its turns unlabelled and its conversation unrecorded.
 Type `codex --no-daemon` (passing Codex a `-c` override also keeps it
 embedded). Otherwise `agent-event codex` is fail-safe as Claude's is.
 

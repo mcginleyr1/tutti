@@ -501,7 +501,12 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    when the session's pid file is missing. ✅ Claude's `StopFailure` ends the
    turn as done with no reply and `PostToolUseFailure` reads as activity, in
    `agent-event` and the `--tty` hooks (wave 11; re-run `hooks claude
-   --install`).
+   --install`). ✅ Both ran live (w12, Claude Code 2.1.318). Codex 0.166.0
+   reports its own state over OSC 7501 (working, blocked, done), so a
+   hook-less Codex pane is a program claim. Its screen markers (the `›`
+   composer; the approval, folder-trust and hook-review dialogs) are now the
+   ones observed. The bare `approve` marker matched the transcript an
+   answered approval leaves, so it is gone (w12).
 7. **Conversation resume**: ✅ wave 1 — the launcher harvests resumable
    conversations for its target workspace from the agent tools' own session
    stores (read-only; each candidate verified against the working directory
@@ -564,7 +569,12 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    (`approval_timeout_secs`, default 120) or on hook hang-up. An allow or a deny
    sets the pane Working at once (Claude sends no hook until the tool is done);
    an overlay that opened itself over the pane in view ignores keys for 800 ms,
-   so a `y`/`n` already on its way into the pane can't answer it. ✅ The sidebar and
+   so a `y`/`n` already on its way into the pane can't answer it. ✅ (w12)
+   Claude Code 2.1.318 shows its own dialog beside a hold; tutti's answer
+   closes it (`Allowed by PermissionRequest hook`). One answered in the dialog
+   left its hook holding past the turn, so a hook-reported turn end (Stop,
+   StopFailure, Codex's Interrupt) now passes whatever the pane still holds.
+   ✅ The sidebar and
    changes-panel keys are table-driven (`config::SIDEBAR_TABLE` /
    `CHANGES_TABLE`): dispatch, the help overlay and the footer hints all render
    from them. ✅ Replies carry their request's id: a control frame may carry a
@@ -659,8 +669,9 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
 **Acceptance:** a script (or an agent) can: create 3 worktree workspaces, launch an
 agent in each, `wait --until done` on all three, read back each diff summary.
 Runnable now that items 1 and 3 have landed (`workspace add`, `run
---workspace`, `pane wait --until done,blocked`, `workspace diff --stat`); open
-until it has been run for real against live agents.
+--workspace`, `pane wait --until done,blocked`, `workspace diff --stat`). ✅
+Run for real against live agents on 2026-11-05 (w12: two Claude Code
+2.1.318, one Codex 0.166.0; see "Live acceptance" under Next waves).
 
 ### Next waves (as of 2026-11-04)
 
@@ -668,8 +679,11 @@ In order; each lands its TUI path in the same wave as its verbs.
 
 1. ✅ **Finish Phase 4** — `pane wait`, `pane read --since`, `tutti run`
    (`--workspace`/`--dir`, or beside its caller) and the agent skill landed.
-   Open: close the wave by running the acceptance script above for real,
-   against live agents.
+   ✅ The acceptance ran for real against live Claude Code and Codex (w12,
+   below the Open list). It turned up three bugs, now fixed: a wait right
+   after `run` answered done on the agent's first frame; Codex 0.166's screen
+   markers were stale; and a hold answered in Claude's own dialog lingered
+   on a finished pane.
 2. ✅ **State follow-ups** (Phase 3 item 2) — typing ends a Done/Idle program
    claim; `OSC 9;N` subcommands never surface as notifications.
 3. ✅ **Debts against the ground rules** — a TUI path for installing the hooks,
@@ -952,9 +966,21 @@ In order; each lands its TUI path in the same wave as its verbs.
   trusted in `/hooks`, so such an ask runs to its timeout; a pane detection
   has not named yet (its first second) is refused. A turn Claude's Esc
   interrupts sends no Stop, so an `ask` on it runs to its timeout; a fresh
-  pane can read as working while it draws (refused until it settles) or
-  `unknown` behind a startup dialog (`ask` types into the dialog); replies are
-  not kept across a daemon restart.
+  pane can read as working while it draws (refused until it settles);
+  replies are not kept across a daemon restart. ✅ (w12) Startup dialogs
+  read blocked (Claude's folder trust, Codex's folder trust and hook
+  review), and a fresh agent's prompt stays `unknown` until it has worked,
+  so a `pane wait` right after `tutti run` no longer answers done before the
+  turn;
+- a view-only client (`attach --view`) counts as attached, so with only a
+  view attached a held approval waits for `pane approve` or its timeout,
+  though the view cannot answer it (seen live, w12);
+- Codex runs per-invocation hooks (`-c hooks.<Event>=[…]`, its "session
+  flags" source) only once trusted in its `/hooks`, which persists the
+  trust (w12);
+- a restore to a checkpoint whose commit `jj util gc` pruned fails with
+  jj's `Revision … doesn't exist`, leaving the working copy as it was, but
+  records a `before restore` checkpoint first (w12).
 
 ✅ Wave 11: a pane send only queues its input; a full queue (64) refuses it,
 so a program that stops reading stalls nobody, and a send to an exited pane
@@ -977,21 +1003,45 @@ its note unread where a plain attach marks both seen.
 **Deliberately not done:** packaging and distribution (Phase 5) — the project
 is private, so install stays `cargo install --path` from a checkout.
 
-**Unverified live** — cover these in the acceptance run:
-- checkpoints through the screen-classifier, agent-exit and focus paths (a
-  real Claude Code and Codex turn's hook path ran live in wave 9); `jj util
-  gc` pruning a checkpoint's commit; a turn-end probe racing a restore;
-- whether Claude Code emits its own OSC 9;4 (a hook-less claude pane would
-  then hold off `Done` until the progress clears);
+✅ **Live acceptance (w12, 2026-11-05)**, Claude Code 2.1.318 and Codex
+0.166.0 on a scratch session: three `workspace add` checkouts, `tutti run
+--dir` an agent in each (two Claude, one Codex; Gemini CLI 0.66.0 asked for
+a login and was skipped), `pane wait --until done`, and `workspace diff
+--stat` read back each one's change. Verified there, and dropped from the
+list below:
+- checkpoints through the screen path (a hook-less Codex turn checkpointed
+  `done`, 2 files +13), the agent-exit path (Claude quit mid-turn with
+  Ctrl-C twice: the turn's edits checkpointed under its prompt, exit 0), and
+  focus (Done → Idle, no checkpoint); `jj util gc` pruning one (Open above);
+- Claude Code 2.1.318 emits no OSC 9;4: a hook-less turn read `screen` and
+  `activity` only;
+- Claude's conversation ids, and a restore reviving `claude --resume <id>`
+  with its checkpoints kept (Phase 4 item 7);
+- a held Claude request passed with `esc` to Claude's dialog, timed out to
+  it (5 s), allowed and denied (`--message` reached the model) with `pane
+  approve`. Claude 2.1.318 shows its own dialog beside every hold; one
+  answered there left the hold on a done pane until its timeout, now
+  passed at the turn's end (Phase 4 item 9);
+- `tutti ask`: a reply, exit 3 on a held approval, exit 124 on a 2 s
+  timeout;
+- `tutti attach --view` as a second client, under a pty: `view` in the
+  footer, typed keys reach no pane, a 100×30 view left a 130×20 pane alone,
+  navigation and detach work, and no daemon is started for it;
+- Claude's `StopFailure` (a nonexistent model: `model_not_found`, done with
+  no reply) and `PostToolUseFailure` (a Read of a missing file; a Bash
+  command exiting 1 is a plain `PostToolUse`);
+- Codex 0.166.0 reports its own state over OSC 7501 (working, blocked on
+  its approval dialog, done), so a hook-less Codex is a program claim; its
+  screen markers are now its own (`›` idle, the approval, trust and
+  hook-review dialogs blocked).
+
+**Unverified live** — cover these in the next live run:
+- a turn-end probe racing a restore;
 - opencode's question/error/retry events;
-- conversation ids from a real Claude Code and opencode, and prompt labels
-  from a real opencode (checked against the hooks reference and the opencode
-  1.18.5 bundle);
-- a restore reviving a real `claude --resume` / `opencode --session` (proven
-  with a stand-in recipe);
-- a held Claude request passed with `esc`, or timed out, falling through to
-  Claude's own dialog (holds answered from tutti, the dialog kept back, ran
-  live in wave 9);
+- conversation ids from a real opencode, and prompt labels from a real
+  opencode (checked against the opencode 1.18.5 bundle);
+- a restore reviving a real `opencode --session` (proven with a stand-in
+  recipe);
 - a real Claude in a sandbox pod running the `hooks claude --tty` commands with
   the session's tty, so `/dev/tty` resolves (checked only by typing the
   commands into a busybox pod);
@@ -1000,12 +1050,13 @@ is private, so install stays `cargo install --path` from a checkout.
   document against Linear's published schema; the replies are covered only
   by fixtures, the writes only by stubs);
 - Codex: a held approval answered from tutti; SubagentStart/Stop rows; the
-  ancestry guard dropping a shared-daemon hook (unit-tested only);
+  ancestry guard dropping a shared-daemon hook (unit-tested only). They need
+  tutti's hooks trusted in Codex's `/hooks`, which writes the user's Codex
+  state (w12 did not);
 - Gemini CLI's tool and permission events, `--resume`, and its `AfterAgent`
   reply for `--last-reply`: they need the user's Gemini login (SessionStart
   and a prompt's BeforeAgent → AfterAgent ran live);
-- `tutti ask` against a real blocked or slow agent (exit 3, exit 124), and an
-  opencode `session.error` or Codex `Interrupt` turn read with
+- an opencode `session.error` or Codex `Interrupt` turn read with
   `--last-reply`;
 - the first-message data for Goose, Qwen Code, Cursor, Copilot, Factory
   Droid, Augment and Amazon Q, from their docs only and unrun (Amazon Q's
@@ -1015,12 +1066,10 @@ is private, so install stays `cargo install --path` from a checkout.
   script and the 2026.11.05 package's launcher, unrun;
 - kitty key reports against a real kitty, WezTerm or Ghostty (only a harness
   played kitty), and `pane attach --inline` in Emacs vterm or eat;
-- `tutti attach --view` on a real second terminal; the inline history, a
-  resync's rows and a second attach's in Neovim's `:terminal` and Emacs
-  vterm/eat (run only with a tutti pane as the host: getsid and the tty
-  there are those of a pane's shell);
-- Claude's `StopFailure` and `PostToolUseFailure` hooks (from the hooks
-  reference only).
+- `tutti attach --view` in a real terminal app (w12 drove it under a pty);
+  the inline history, a resync's rows and a second attach's in Neovim's
+  `:terminal` and Emacs vterm/eat (run only with a tutti pane as the host:
+  getsid and the tty there are those of a pane's shell).
 
 ## Phase 5 — Hardening & distribution
 
