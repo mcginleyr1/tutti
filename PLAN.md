@@ -307,9 +307,15 @@ Goal: the differentiator. Tutti knows which panes are agents and what state they
    7501 or herdr report's `msg` under its app — one note, not two; a note
    carrying text keeps its pane's 🔔 as a notification does. ✅ A permission
    request held on a pane already Blocked makes a note of its own (wave 11).
-   Open: any other second blocked event there (a Notification) still lands
-   in no note — noting it would also note Claude's `permission_prompt` for a
-   request already noted.
+   ✅ So does any other blocked event there — a request in watch mode, an MCP
+   elicitation, a question — but Claude's `permission_prompt` Notification,
+   which comes about six seconds into a dialog whose PermissionRequest was
+   reported already: `agent-event` marks it a reminder
+   (`AgentHookEvent::Blocked.reminder`, wire rev 15), noted only as the move
+   into Blocked (wave 12). Open: a hooks install without PermissionRequest
+   (one from before it, never re-run) notes a second dialog's reminder in
+   the same blocked spell not at all; so does a sandboxed command's network
+   prompt while the pane is blocked, if no PermissionRequest reports those.
 4. **API**: `pane list --json` includes agent + state; emit state-change events on the
    socket event stream. ✅ For tools outside tutti (a notch app): `tutti watch`
    (the socket's `Watch`) streams whole-session snapshots, one per change,
@@ -432,10 +438,20 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    name. ✅ A `-r` naming no commit — missing, or a revset resolving to none —
    is refused before `jj workspace add` runs (`jj::fork`); jj 0.46 registers
    the workspace and makes its checkout before it resolves the revision.
-   Open: an add that fails after that point for another reason (a timeout;
-   `-r 'root() | @'`, a merge with the root the Git backend refuses) still
-   leaves a half-made checkout, and tutti does not clean it up: `jj workspace
-   forget <name>` could remove a same-named workspace tutti never made.
+   ✅ An add that fails after that point cleans up exactly what it made
+   (wave 12): tutti makes the destination itself (`create_dir`, never over
+   anything), then on a failure forgets the name only while `jj workspace
+   root --name` records it at that very directory, and removes the
+   directory — a same-named workspace elsewhere, or another recorded at the
+   same path, is left alone. An add past its 15 s is given up on but left a
+   minute to end on its own, then undone whole: jj 0.47 makes a Git worktree
+   per workspace in a colocated repo, and one killed halfway (measured: from
+   about 10 ms into a 130 ms add to its registering the path) leaves that
+   worktree registered, and git then refuses the next add there. jj 0.47.1
+   drops the root from a merge's parents, so `-r 'root() | @'` no longer
+   fails; the tests refuse an add with git's own stale-worktree refusal
+   instead. Open: a jj still running after that minute is killed, and what it
+   leaves (a Git worktree, a name with no recorded path) stays.
 6. **Agent-event ingest + Claude Code hook integration**: ✅ panes get
    `TUTTI_PANE`/`TUTTI_SESSION` in their env; `tutti hooks claude` prints a hook
    config that makes the agent call `tutti agent-event claude` on subagent
@@ -895,14 +911,19 @@ In order; each lands its TUI path in the same wave as its verbs.
   and a second attach in the same terminal prints the history again; a
   view's focus is the session's, so a view focusing a done agent marks it
   seen;
-- `tutti ask` needs a pane its agent's hooks have reported through: Codex
-  sends SessionStart only with its first prompt and opencode's plugin nothing
-  before a turn, so a fresh Codex or opencode is refused until its first turn
-  (start them with a first message). A turn Claude's Esc interrupts sends no
-  Stop, so an `ask` on it runs to its timeout; a fresh pane can read as
-  working while it draws (refused until it settles) or `unknown` behind a
-  startup dialog (`ask` types into the dialog); replies are not kept across a
-  daemon restart.
+- `tutti ask` needs a pane its agent's hooks have reported through. ✅ A
+  fresh Codex or opencode (Codex sends SessionStart only with its first
+  prompt, opencode's plugin nothing before a turn) is taken when `ask` finds
+  tutti's integration for it installed, in the user's config or the pane's
+  project: the send names the agent (`PaneSend.hooks`, wire rev 15) and the
+  daemon takes an unhooked pane only when that is the agent detected there
+  (wave 12). Open: installed is all tutti sees — Codex skips a hook not yet
+  trusted in `/hooks`, so such an ask runs to its timeout; a pane detection
+  has not named yet (its first second) is refused. A turn Claude's Esc
+  interrupts sends no Stop, so an `ask` on it runs to its timeout; a fresh
+  pane can read as working while it draws (refused until it settles) or
+  `unknown` behind a startup dialog (`ask` types into the dialog); replies are
+  not kept across a daemon restart.
 
 ✅ Wave 11: a pane send only queues its input; a full queue (64) refuses it,
 so a program that stops reading stalls nobody, and a send to an exited pane
@@ -986,14 +1007,19 @@ is private, so install stays `cargo install --path` from a checkout.
   stay unbounded, and an approval hold keeps its `approval_timeout_secs`.
   ✅ A probe's count in the VCS watch and a held approval are let go of on
   every exit, a panic included (drop guards); the TUI gives up on its
-  follow-ups at the CLI's deadlines, saying so (wave 11). Open: `pane
-  kill`/`workspace kill` drop an exited pane's last handle under the session
-  lock; on Linux, with a background job of its own process group holding the
-  pty, `PtyPane::drop` would wait out its 2 s join there (measured fine on
-  macOS, whose session-leader exit revokes the tty; unverified on Linux).
-  `Session::view` and the VCS watch read workspace metadata (`.jj` lookup,
-  `.git/HEAD`, op-heads mtime) under the session and VCS locks, so a
-  workspace on a hung network mount would stall them.
+  follow-ups at the CLI's deadlines, saying so (wave 11). ✅ A killed pane —
+  `pane kill`, `workspace kill`, an ephemeral pane's exit, the shutdown's
+  `kill_all` — goes whole into `Session::removed`, and the hub's session guard
+  (`SessionGuard`) drops it after unlocking, on a `tutti-teardown` thread: on
+  Linux, with a background job of its own process group holding the pty,
+  `PtyPane::drop` can wait out its 2 s join, and now stalls neither the
+  session nor the request that killed the pane (a test build's slow drop
+  holds both under 500 ms). ✅ A view and a listing read no file: each
+  workspace keeps its jj root and git branch (`session::Meta`), read as it
+  mounts and by the VCS watch each second with no lock held, which also
+  reads the op-heads mark before opening its book (wave 12). Open: a mount
+  still reads them once under the session lock, so a project added on a
+  hung network mount stalls the session that once.
 - Perf targets: 60fps redraw with 8 busy panes; `pane read` on 10k-line scrollback
   < 50ms; input latency indistinguishable from raw terminal. ✅ The render tick
   formats only what changed: it takes each pane's damage (`PtyPane::look`)

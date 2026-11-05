@@ -1212,8 +1212,10 @@ attention transition — an agent blocking, or finishing a turn (working →
 done). A transition's note carries what came with it — a hook's blocked
 message (`Bash · rm -rf build`), or an OSC 7501 or herdr report's `msg` under
 its app — so a report that finishes a pane with a message makes one note, not
-two. A permission request tutti holds on a pane already blocked — parallel
-subagents ask at once — makes a note of its own. Each keeps the pane's title
+two. Anything else an agent already blocked waits on — another permission
+request (parallel subagents ask at once), an MCP form, a question — makes a
+note of its own; Claude's `permission_prompt` reminder of a dialog whose
+request is noted already makes none. Each keeps the pane's title
 and workspace as they were, so it outlives
 the pane. `Ctrl+B N` opens the **notifications panel**, newest first: an
 unread dot, the age, the pane, a dim `workspace · kind`, and the text. `j`/`k`
@@ -1250,6 +1252,12 @@ workspace add` and places the checkout beside the project's repo
 commit is refused before anything is made). The name must be `[A-Za-z0-9_-]+`,
 since it becomes both a path component and a jj workspace name; the project
 must live under a `.jj` repo, and the destination must not already exist.
+tutti makes the destination itself, so an add that fails anyway (a timeout,
+jj or git refusing) removes exactly what it made: that directory, and the jj
+workspace only when jj records it there — a same-named workspace elsewhere is
+never forgotten. An add past its 15 s is given up on but left to finish (up to
+a minute), then undone whole: a jj stopped halfway can leave a Git worktree
+registered that git then refuses the next add over.
 `tutti workspace list` shows every entry with the PARENT it is nested under,
 `tutti project list` just the projects. Merge is scriptable too
 (`tutti workspace merge <id> [--push]`), keeping the "every TUI action is a CLI
@@ -1874,8 +1882,13 @@ It also refuses a pane whose agent has not reported through tutti's hooks —
 a plain shell, or an agent without `tutti hooks <agent> --install` — since no
 turn end of its would ever reach the wait. Claude Code and Gemini CLI report
 as they start (SessionStart); Codex and opencode only from their first turn,
-so start one with a first message (`tutti run -- codex --no-daemon "…"`) and
-wait for it before you ask.
+so for a fresh one `ask` checks tutti's integration itself — Codex's hooks in
+`$CODEX_HOME` (else `~/.codex`) or the pane's project, opencode's plugin in
+its user or project plugin dir — and, installed, the daemon takes the pane
+once detection names its agent (within a second of its start): the ask's
+message is its first turn. Codex runs a hook only once it is trusted in its
+`/hooks`, which tutti cannot see, so an untrusted one leaves the ask to its
+`--timeout`.
 `ask` then presses enter (150 ms later: an agent can take text and an enter
 that land together as a paste) and waits for the next turn end the agent's
 hooks report, or a block. It counts turn ends from its own send, so a turn
@@ -2090,8 +2103,10 @@ tutti is alpha; PLAN.md tracks what is open.
   screen, tuned live only for some.
 - **Replies come from the same four hooks.** `pane read --last-reply`, `tutti
   ask` and the sidebar's reply panel have nothing to show for any other
-  agent, and `ask` refuses its pane; it refuses a fresh Codex or opencode
-  too, until its first turn (their hooks first fire then). Gemini CLI's reply is wired from its docs and source and not yet run
+  agent, and `ask` refuses its pane; a fresh Codex or opencode it takes on
+  the strength of tutti's installed integration, so a Codex whose hooks are
+  installed but not yet trusted in `/hooks` runs an ask to its `--timeout`.
+  Gemini CLI's reply is wired from its docs and source and not yet run
   live; it is the whole turn's text, not only the last message. A turn
   interrupted with Esc in Claude Code sends no Stop: it leaves the previous
   turn's reply in place, and an `ask` waiting on it runs to its `--timeout`.

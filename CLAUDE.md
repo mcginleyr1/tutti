@@ -36,6 +36,12 @@ cargo fmt --all --check
   `for`-iterator expression or `if let` scrutinee — both extend the guard
   across the body while inner calls re-lock the same non-reentrant mutex.
   Bind with a plain `let` first.
+- **A pane leaves the session through `Session::removed`**, never dropped in
+  place: its last handle joins its pty threads (`PtyPane::drop`, up to 2 s
+  on Linux), and `hub.session()`'s `SessionGuard` drops what a hold removed
+  only after unlocking, on a thread of its own. Nor does a view or listing
+  read a file under the lock: a workspace's root and branch live in
+  `session::Meta`, which the VCS watch rereads off every lock.
 - **`WIRE_REV`** (tutti-core/src/protocol.rs): bump on ANY protocol shape
   change, additive included. Daemons outlive binary upgrades; the attach
   handshake warning is the only thing standing between users and silent
