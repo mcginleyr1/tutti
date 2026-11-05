@@ -1048,88 +1048,21 @@ fn pane_attach(
     };
     hub.taps().insert(cid, dims);
     arbitrate(hub, [pane]);
-    let mut backlog = STREAM_BACKLOG;
-    let mut started = false;
-    let epoch = hub.epoch;
+    let mut tap = StreamTap {
+        pane,
+        inline,
+        epoch: hub.epoch,
+        outbox,
+        backlog: STREAM_BACKLOG,
+        started: false,
+    };
     pty.tap(
         cid,
         rows,
         Box::new(move |feed| {
             // Named, so the tap owns `kick` and drops it with itself.
             let _owned = &kick;
-            let mut queue = outbox.queue();
-            let raw = |bytes: &[u8]| {
-                Frame::PaneRaw {
-                    pane,
-                    bytes: bytes.to_vec(),
-                }
-                .encode()
-            };
-            match feed {
-                Feed::Read { .. } if queue.bytes.len() > backlog => {
-                    queue.bytes.clear();
-                    outbox.resynced.store(true, Ordering::Relaxed);
-                    backlog = STREAM_BACKLOG;
-                    return Kept::Behind(inline.then(|| Rows {
-                        since: Some(queue.taken),
-                        held: Vec::new(),
-                        at_most: RESYNC_ROWS,
-                    }));
-                }
-                Feed::Read {
-                    raw: read,
-                    cuts,
-                    top,
-                } => {
-                    let mut from = 0;
-                    for to in cuts.iter().copied().chain([read.len()]) {
-                        if from < to {
-                            queue.bytes.extend(raw(&read[from..to]));
-                        }
-                        from = to;
-                    }
-                    queue.top = top;
-                }
-                Feed::Snapshot(Start {
-                    size,
-                    top,
-                    screen,
-                    history,
-                }) => {
-                    if inline {
-                        let skipped = history.as_ref().map_or(0, |h| h.skipped);
-                        let rows = Event::PaneRows {
-                            pane,
-                            epoch,
-                            top,
-                            skipped,
-                        };
-                        queue.bytes.extend(encode_json(&rows));
-                    }
-                    // Until the writer takes the first snapshot, the stream
-                    // has what comes before its history.
-                    if !std::mem::replace(&mut started, true) {
-                        queue.taken = history.as_ref().map_or(top, |h| h.from);
-                    }
-                    if let Some(History { bytes, .. }) = history {
-                        backlog += bytes.len();
-                        queue
-                            .bytes
-                            .extend(bytes.chunks(MAX_FRAME_LEN / 2).flat_map(raw));
-                    }
-                    let snapshot = Frame::PaneSnapshot(PaneData {
-                        pane,
-                        rows: size.rows,
-                        cols: size.cols,
-                        seq: 0,
-                        bytes: screen,
-                    });
-                    queue.bytes.extend(snapshot.encode());
-                    queue.top = top;
-                }
-            }
-            outbox.ready.notify_one();
-            Kept::Up
+            tap.feed(feed)
         }),
     );
     let (hub, tx) = (Arc::clone(hub), reply.tx.clone());
@@ -1151,6 +1084,106 @@ fn pane_attach(
         pty.untap(cid);
     });
     ControlFlow::Continue(())
+}
+
+/// A pane stream's tap (`pane_attach`), run under the pane's parser lock:
+/// it queues each read and snapshot in its connection's outbox, and past
+/// `backlog` drops what is queued for a fresh snapshot — an `inline`
+/// stream's after the rows past what the writer took.
+struct StreamTap {
+    pane: PaneId,
+    inline: bool,
+    /// The daemon run the pane's rows are numbered in (`Hub::epoch`).
+    epoch: u64,
+    outbox: Arc<Outbox>,
+    /// How much may be queued before the stream is behind:
+    /// `STREAM_BACKLOG`, widened by the history last queued.
+    backlog: usize,
+    /// Whether the first snapshot is queued.
+    started: bool,
+}
+
+impl StreamTap {
+    fn feed(&mut self, feed: Feed<'_>) -> Kept {
+        let pane = self.pane;
+        let mut queue = self.outbox.queue();
+        let raw = |bytes: &[u8]| {
+            Frame::PaneRaw {
+                pane,
+                bytes: bytes.to_vec(),
+            }
+            .encode()
+        };
+        match feed {
+            Feed::Read { .. } if queue.bytes.len() > self.backlog => {
+                queue.bytes.clear();
+                // What was queued is gone: the stream has reached only what
+                // the writer took, and a take before the snapshot this asks
+                // for must leave it there.
+                queue.top = queue.taken;
+                self.outbox.resynced.store(true, Ordering::Relaxed);
+                self.backlog = STREAM_BACKLOG;
+                return Kept::Behind(self.inline.then(|| Rows {
+                    since: Some(queue.taken),
+                    held: Vec::new(),
+                    at_most: RESYNC_ROWS,
+                }));
+            }
+            Feed::Read {
+                raw: read,
+                cuts,
+                top,
+            } => {
+                let mut from = 0;
+                for to in cuts.iter().copied().chain([read.len()]) {
+                    if from < to {
+                        queue.bytes.extend(raw(&read[from..to]));
+                    }
+                    from = to;
+                }
+                queue.top = top;
+            }
+            Feed::Snapshot(Start {
+                size,
+                top,
+                screen,
+                history,
+            }) => {
+                if self.inline {
+                    let skipped = history.as_ref().map_or(0, |h| h.skipped);
+                    let rows = Event::PaneRows {
+                        pane,
+                        epoch: self.epoch,
+                        top,
+                        skipped,
+                    };
+                    queue.bytes.extend(encode_json(&rows));
+                }
+                // Until the writer takes the first snapshot, the stream has
+                // what comes before its history.
+                if !std::mem::replace(&mut self.started, true) {
+                    queue.taken = history.as_ref().map_or(top, |h| h.from);
+                }
+                if let Some(History { bytes, .. }) = history {
+                    self.backlog += bytes.len();
+                    queue
+                        .bytes
+                        .extend(bytes.chunks(MAX_FRAME_LEN / 2).flat_map(raw));
+                }
+                let snapshot = Frame::PaneSnapshot(PaneData {
+                    pane,
+                    rows: size.rows,
+                    cols: size.cols,
+                    seq: 0,
+                    bytes: screen,
+                });
+                queue.bytes.extend(snapshot.encode());
+                queue.top = top;
+            }
+        }
+        self.outbox.ready.notify_one();
+        Kept::Up
+    }
 }
 
 fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
@@ -4069,5 +4102,68 @@ mod tests {
             written, b"streamed, queued",
             "what was queued still drained"
         );
+    }
+
+    /// An inline stream behind asks for the rows past what its writer took
+    /// — before the first take, past what its history began at — and a take
+    /// of the emptied outbox before the resync's snapshot is queued leaves
+    /// that row where it was: the rows dropped are asked for again, never
+    /// passed over.
+    #[test]
+    fn a_resync_asks_for_the_rows_past_what_the_writer_took() {
+        let outbox = Arc::new(Outbox::default());
+        let mut tap = StreamTap {
+            pane: PaneId(1),
+            inline: true,
+            epoch: 7,
+            outbox: Arc::clone(&outbox),
+            backlog: STREAM_BACKLOG,
+            started: false,
+        };
+        let start = |top, from: Option<u64>| {
+            Feed::Snapshot(Start {
+                size: PaneSize::new(4, 20),
+                top,
+                screen: Vec::new(),
+                history: from.map(|from| History {
+                    from,
+                    bytes: Vec::new(),
+                    skipped: 0,
+                }),
+            })
+        };
+        let flood = vec![b'x'; STREAM_BACKLOG + 1];
+        let behind = |tap: &mut StreamTap, top| {
+            let read = Feed::Read {
+                raw: &flood,
+                cuts: &[],
+                top,
+            };
+            assert!(matches!(tap.feed(read), Kept::Up));
+            let more = Feed::Read {
+                raw: b"more",
+                cuts: &[],
+                top: top + 1,
+            };
+            match tap.feed(more) {
+                Kept::Behind(Some(rows)) => {
+                    assert_eq!(rows.at_most, RESYNC_ROWS);
+                    rows.since
+                }
+                _ => panic!("the stream was not behind"),
+            }
+        };
+
+        // Nothing taken yet: the stream has what came before its history.
+        assert!(matches!(tap.feed(start(10, Some(4))), Kept::Up));
+        assert_eq!(behind(&mut tap, 50), Some(4));
+        assert!(matches!(tap.feed(start(51, Some(4))), Kept::Up));
+        outbox.take();
+        assert_eq!(behind(&mut tap, 80), Some(51), "past what the writer took");
+        // The writer takes the emptied outbox before the snapshot is queued.
+        assert!(outbox.take().is_empty());
+        assert!(matches!(tap.feed(start(81, Some(51))), Kept::Up));
+        let again = behind(&mut tap, 90);
+        assert_eq!(again, Some(51), "the rows dropped asked for again");
     }
 }
