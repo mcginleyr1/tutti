@@ -10,7 +10,7 @@
 //! lives on.
 
 use std::collections::{HashMap, HashSet};
-use std::ops::ControlFlow;
+use std::ops::{ControlFlow, Deref, DerefMut};
 use std::os::unix::fs::DirBuilderExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -293,8 +293,8 @@ impl Hub {
         }
     }
 
-    fn session(&self) -> MutexGuard<'_, Session> {
-        lock(&self.session)
+    fn session(&self) -> SessionGuard<'_> {
+        SessionGuard(Some(lock(&self.session)))
     }
 
     fn clients(&self) -> MutexGuard<'_, HashMap<u64, Client>> {
@@ -327,6 +327,37 @@ impl Hub {
 
     fn notes(&self) -> MutexGuard<'_, Notes> {
         lock(&self.notes)
+    }
+}
+
+/// The session, locked (`Hub::session`). Let go, it drops the panes the hold
+/// killed (`Session::take_removed`) after unlocking, on a thread of their
+/// own: a pane's last handle joins its pty threads (`PtyPane::drop`), up to
+/// 2 s where a job of its own process group holds the pty on Linux, and must
+/// stall neither every other request behind the lock nor whoever let it go.
+struct SessionGuard<'a>(Option<MutexGuard<'a, Session>>);
+
+impl Deref for SessionGuard<'_> {
+    type Target = Session;
+    fn deref(&self) -> &Session {
+        self.0.as_ref().expect("held until dropped")
+    }
+}
+
+impl DerefMut for SessionGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Session {
+        self.0.as_mut().expect("held until dropped")
+    }
+}
+
+impl Drop for SessionGuard<'_> {
+    fn drop(&mut self) {
+        let removed = self.0.as_mut().map(|session| session.take_removed());
+        self.0 = None;
+        if let Some(removed) = removed.filter(|r| !r.is_empty()) {
+            let teardown = std::thread::Builder::new().name("tutti-teardown".into());
+            let _ = teardown.spawn(move || drop(removed));
+        }
     }
 }
 
@@ -3779,6 +3810,62 @@ mod tests {
         let kept = hub.waits().len();
         assert!(kept <= 1, "{kept} queues kept for one live wait at most");
         hub.session().kill_all();
+    }
+
+    /// A pane's teardown runs once the session lock is let go, off the thread
+    /// that let it go: a slow one — `PtyPane::drop` waiting out its 2 s join,
+    /// as it may on Linux — holds up neither the request that killed it nor
+    /// any other, whichever way the pane left (`pane kill`, its workspace's
+    /// kill, the shutdown's `kill_all`), and still runs to its end.
+    #[tokio::test]
+    async fn a_slow_pane_teardown_holds_no_lock() {
+        let hub = Arc::new(Hub::new(
+            PaneSize::new(24, 80),
+            "teardown".into(),
+            None,
+            PathBuf::new(),
+        ));
+        let (done, ended) = std::sync::mpsc::channel();
+        let pause = Duration::from_millis(1500);
+        let spawn = || {
+            let mut session = hub.session();
+            let workspace = session.workspace_new(std::env::temp_dir());
+            let pane = session.pane_run(None, vec!["/bin/cat".into()], false, None);
+            let pane = pane.unwrap();
+            session.slow_teardown(pane, pause, done.clone());
+            (workspace, pane)
+        };
+        let quick = |what: &str, at: Instant| {
+            let took = at.elapsed();
+            assert!(took < Duration::from_millis(500), "{what} took {took:?}");
+        };
+        let (_, killed) = spawn();
+        let (workspace, in_workspace) = spawn();
+        let (_, at_shutdown) = spawn();
+
+        let at = Instant::now();
+        assert_eq!(
+            dispatch(&hub, Request::PaneKill { pane: killed }),
+            Response::Ok
+        );
+        quick("pane kill", at);
+        let (tx, _rx) = mpsc::channel(1);
+        let reply = Reply { tx, req: None };
+        let at = Instant::now();
+        assert!(workspace_kill(&hub, 0, &reply, workspace, false).is_continue());
+        quick("workspace kill", at);
+        let at = Instant::now();
+        hub.session().kill_all();
+        quick("kill_all", at);
+        let at = Instant::now();
+        assert!(hub.session().pane_list().is_empty());
+        quick("the next request", at);
+
+        let mut torn_down: Vec<PaneId> = (0..3)
+            .map(|_| ended.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect();
+        torn_down.sort_by_key(|p| p.0);
+        assert_eq!(torn_down, [killed, in_workspace, at_shutdown]);
     }
 
     /// A process is a pane's when it is that pane's own process or descends

@@ -129,6 +129,25 @@ struct PaneSlot {
     /// cut to `REPLY_CAP`, and whether it was. Neither is persisted: a
     /// restored agent has ended no turn.
     reply: (String, bool),
+    #[cfg(test)]
+    _teardown: Teardown,
+}
+
+/// Test builds only: a pause a pane's drop takes, then word that it ended
+/// (`Session::slow_teardown`) — standing in for `PtyPane::drop` waiting out
+/// its 2 s join, as it may on Linux.
+#[cfg(test)]
+#[derive(Default)]
+struct Teardown(Option<(PaneId, Duration, std::sync::mpsc::Sender<PaneId>)>);
+
+#[cfg(test)]
+impl Drop for Teardown {
+    fn drop(&mut self) {
+        if let Some((pane, pause, done)) = self.0.take() {
+            std::thread::sleep(pause);
+            let _ = done.send(pane);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -173,6 +192,20 @@ pub struct Session {
     /// The host terminal's colours, the newest client report's: every pane
     /// spawned from then on answers its colour queries with them.
     colors: Option<HostColors>,
+    /// The panes killed since `take_removed` last emptied this, kept whole:
+    /// a pane's last handle joins its pty threads as it drops (up to 2 s,
+    /// `PtyPane::drop`), which the hub leaves until it has let go of the
+    /// session lock.
+    removed: Vec<PaneSlot>,
+}
+
+/// Panes out of the session, to drop with no lock held (`take_removed`).
+pub struct Removed(Vec<PaneSlot>);
+
+impl Removed {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 impl Session {
@@ -186,7 +219,14 @@ impl Session {
             name: name.into(),
             herdr: None,
             colors: None,
+            removed: Vec::new(),
         }
+    }
+
+    /// The panes killed since the last call, for the caller to drop once it
+    /// holds no lock.
+    pub fn take_removed(&mut self) -> Removed {
+        Removed(std::mem::take(&mut self.removed))
     }
 
     /// Point every pane spawned from now on at herdr's socket, `socket`.
@@ -331,7 +371,8 @@ impl Session {
     }
 
     /// Remove a workspace and every pane it owns. Returns the killed panes so
-    /// the caller can tear down their reaper tasks / broadcast state.
+    /// the caller can tear down their reaper tasks / broadcast state; the
+    /// panes themselves wait in `removed` for `take_removed`.
     pub fn workspace_kill(&mut self, id: WorkspaceId) -> Result<Vec<PaneId>> {
         let index = self
             .workspaces
@@ -344,6 +385,7 @@ impl Session {
             for pane in tab.layout.as_ref().map(Layout::panes).unwrap_or_default() {
                 if let Some(slot) = self.panes.remove(&pane) {
                     let _ = slot.pty.kill();
+                    self.removed.push(slot);
                     killed.push(pane);
                 }
             }
@@ -642,7 +684,8 @@ impl Session {
         panes.into_iter().map(pane_info).collect()
     }
 
-    /// Kill and forget a pane, collapsing the split that held it.
+    /// Kill and forget a pane, collapsing the split that held it. Like every
+    /// pane killed, it waits whole in `removed` for `take_removed`.
     pub fn pane_kill(&mut self, pane: PaneId) -> Result<WorkspaceId> {
         let slot = self
             .panes
@@ -650,6 +693,7 @@ impl Session {
             .with_context(|| format!("no pane {pane}"))?;
         let _ = slot.pty.kill();
         let tab_id = slot.tab;
+        self.removed.push(slot);
         let workspace = self
             .workspace_of_tab(tab_id)
             .context("pane's tab vanished")?;
@@ -1390,10 +1434,10 @@ impl Session {
     }
 
     pub fn kill_all(&mut self) {
-        for slot in self.panes.values() {
+        for (_, slot) in self.panes.drain() {
             let _ = slot.pty.kill();
+            self.removed.push(slot);
         }
-        self.panes.clear();
     }
 
     /// The session as `persist` saves it: each workspace's directory, name and
@@ -1723,9 +1767,25 @@ impl Session {
                 hooked: false,
                 replies: 0,
                 reply: (String::new(), false),
+                #[cfg(test)]
+                _teardown: Teardown::default(),
             },
         );
         Ok(id)
+    }
+
+    /// Test builds only: make dropping `pane` take `pause`, then send its id
+    /// down `done`.
+    #[cfg(test)]
+    pub(crate) fn slow_teardown(
+        &mut self,
+        pane: PaneId,
+        pause: Duration,
+        done: std::sync::mpsc::Sender<PaneId>,
+    ) {
+        if let Some(slot) = self.panes.get_mut(&pane) {
+            slot._teardown = Teardown(Some((pane, pause, done)));
+        }
     }
 }
 
