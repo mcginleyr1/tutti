@@ -1491,7 +1491,11 @@ A pane's state can come from five sources, ranked highest first:
 2. **program** — the pane's program reporting itself with OSC 7501.
 3. **progress** — an OSC 9;4 progress report (ConEmu / Windows Terminal /
    Ghostty).
-4. **screen** — the classifier reading a detected agent's screen.
+4. **screen** — the classifier reading a detected agent's screen. An agent
+   not yet seen working since it started (a working match, a hook, a report;
+   output alone is it drawing) stays **unknown** at its prompt, never done:
+   its first frames come before its first message's hook, and a `pane wait
+   --until done` right after `tutti run` must wait for the real turn.
 5. **activity** — output flowing (a finished agent that prints again is working).
 
 Hook, program and progress are *claims*: a claim holds the state until its own

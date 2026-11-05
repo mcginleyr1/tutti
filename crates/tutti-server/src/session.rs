@@ -149,6 +149,12 @@ struct PaneSlot {
     /// pane since its agent started; an agent leaving clears it. An ask needs
     /// it: only a hook reports the turn end its wait is for.
     hooked: bool,
+    /// Whether the pane has been seen working since its agent started — a
+    /// `Working` screen match, hook or report; output alone is the agent
+    /// drawing. Until then its idle prompt on screen is a fresh start, not a
+    /// turn's end (`observe`), which a `pane wait` right after `tutti run`
+    /// would take.
+    worked: bool,
     /// How many turn ends the pane's hooks have reported, those that carried
     /// no reply included: what an ask waits to see pass (`reply_after`).
     replies: u64,
@@ -1026,6 +1032,7 @@ impl Session {
             let from = slot.meta.state;
             let to = from.apply(StateEvent::Classified(obs));
             slot.meta.state = to;
+            slot.worked |= to == AgentState::Working;
             (from != to).then_some((from, to))
         });
         Some(AgentEventOutcome {
@@ -1155,6 +1162,7 @@ impl Session {
                     slot.meta.conversation = None;
                     slot.turns.forget();
                     slot.hooked = false;
+                    slot.worked = false;
                 }
                 let kept = slot.herdr.as_ref().is_none_or(|(_, reporter)| {
                     agent.as_ref().is_some_and(|kind| kind.0 == *reporter)
@@ -1243,6 +1251,7 @@ impl Session {
         }
         slot.alive = now;
         slot.meta.state = to;
+        slot.worked |= to == AgentState::Working;
         slot.meta.source = report.state.map(|_| report.source);
         let mut relisted = false;
         if report.state.is_some() {
@@ -1344,7 +1353,12 @@ impl Session {
     /// sends no hook when you answer it, and the screen working again is the
     /// tool you approved running. Output or a `Working` match keeps the pane
     /// alive; a `Working` pane not held by a hook and silent for `STALL_AFTER`
-    /// drops to `Unknown`, ending its claim. Returns the net transition.
+    /// drops to `Unknown`, ending its claim. A `Done` match on a pane not yet
+    /// seen working (`worked`: a `Working` match, hook or report — output
+    /// alone is the agent drawing) lands `Unknown`: a fresh agent at its
+    /// prompt, whose first frames come before its first message's hook says
+    /// it works, has finished nothing, and a wait for done takes `Idle` too.
+    /// Returns the net transition.
     pub fn observe(
         &mut self,
         pane: PaneId,
@@ -1356,6 +1370,7 @@ impl Session {
         if advanced || classified == Some(Observation::Working) {
             slot.alive = now;
         }
+        slot.worked |= classified == Some(Observation::Working);
         let from = slot.meta.state;
         let signals = [
             (
@@ -1366,7 +1381,11 @@ impl Session {
         ];
         for (source, event) in signals {
             let Some(event) = event else { continue };
-            let (current, next) = (slot.meta.state, slot.meta.state.apply(event));
+            let current = slot.meta.state;
+            let next = match event {
+                StateEvent::Classified(Observation::Done) if !slot.worked => AgentState::Unknown,
+                event => current.apply(event),
+            };
             if next != current && source.may_move(slot.meta.source, current, next) {
                 slot.meta.state = next;
                 slot.meta.source = Some(source);
@@ -1814,6 +1833,7 @@ impl Session {
                 dialog: false,
                 passed: false,
                 hooked: false,
+                worked: false,
                 replies: 0,
                 reply: (String::new(), false),
                 #[cfg(test)]
@@ -2298,6 +2318,45 @@ mod tests {
             s.settle(pane),
             "a stalled self-reported pane leaves the surfaces"
         );
+    }
+
+    /// Observed live (Claude Code 2.1.318): a fresh agent's first frame is
+    /// its prompt, before the hook for its first message says it works. That
+    /// frame is no finished turn, so a `pane wait --until done` issued right
+    /// after `tutti run` must not take it, nor the agent's later frames. A
+    /// startup dialog answered leaves it unknown too. Once the agent has
+    /// worked, its prompt is a turn's end again; a stall in between keeps
+    /// that.
+    #[test]
+    fn a_fresh_agents_prompt_stays_unknown_until_it_has_worked() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let t0 = Instant::now();
+        let done = Some(Observation::Done);
+        assert_eq!(s.observe(pane, true, done, t0), None);
+        assert_eq!(state_of(&s, pane).0, Unknown);
+        let dialog = Some(Observation::Blocked);
+        assert_eq!(s.observe(pane, true, dialog, t0), Some((Unknown, Blocked)));
+        assert_eq!(s.observe(pane, true, done, t0), Some((Blocked, Unknown)));
+        hook(&mut s, pane, prompt(Some("go".into()), "p1"));
+        hook(&mut s, pane, AgentHookEvent::Done { reply: None });
+        assert_eq!(state_of(&s, pane), (Done, Some(Hook)));
+
+        // A screen-read agent's turn: its spinner matched once, while output
+        // had already counted.
+        let (mut s, pane, _tmp) = session_with_pane();
+        let working = Some(Observation::Working);
+        assert_eq!(s.observe(pane, true, done, t0), None);
+        assert_eq!(s.observe(pane, true, working, t0), Some((Unknown, Working)));
+        assert_eq!(s.observe(pane, true, done, t0), Some((Working, Done)));
+
+        let (mut s, pane, _tmp) = session_with_pane();
+        assert_eq!(s.observe(pane, true, working, t0), Some((Unknown, Working)));
+        let stalled = t0 + STALL_AFTER;
+        assert_eq!(
+            s.observe(pane, false, None, stalled),
+            Some((Working, Unknown))
+        );
+        assert_eq!(s.observe(pane, true, done, stalled), Some((Unknown, Done)));
     }
 
     #[test]
