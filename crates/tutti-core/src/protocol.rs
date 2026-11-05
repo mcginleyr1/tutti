@@ -448,6 +448,12 @@ pub enum Request {
     /// then comes after an `Event::PaneRows` numbering its rows, and a resync
     /// hands on, before its snapshot, the rows that scrolled off the screen
     /// while the stream was behind, as the history is.
+    ///
+    /// `since`: what the terminal already holds of the pane, from an earlier
+    /// stream: the history starts after it — still no more than `history`
+    /// rows, and none the pane no longer holds — and rows it lacks before
+    /// that count as `PaneRows.skipped`. A record from another numbering, or
+    /// past the pane's screen, counts for nothing.
     PaneAttach {
         pane: PaneId,
         rows: u16,
@@ -456,6 +462,8 @@ pub enum Request {
         history: u32,
         #[serde(default)]
         inline: bool,
+        #[serde(default)]
+        since: Option<Printed>,
     },
     /// The colours of the terminal a client shows panes on, which the daemon
     /// answers its panes' colour queries with — OSC 10/11/12 and mode 2031's
@@ -463,6 +471,30 @@ pub enum Request {
     /// last, whoever sent it, and a change of light/dark is told to every pane
     /// that asked (`CSI ? 2031 h`). Answered `Ok`.
     HostColors(HostColors),
+}
+
+/// What a terminal holds of a pane's rows, from an inline stream it showed
+/// (`PaneAttach.since`): every row before absolute row `row`, numbered in
+/// `epoch` (`Event::PaneRows`), then — as they stood when it left — the rows
+/// from `row` on whose text hashes to `held` (`row_hash`). A row the pane
+/// has changed since is one the terminal lacks, and so is every row after
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Printed {
+    pub epoch: u64,
+    pub row: u64,
+    #[serde(default)]
+    pub held: Vec<u64>,
+}
+
+/// A row's text as `Printed.held` keeps it: its trailing blanks trimmed,
+/// FNV-1a hashed.
+pub fn row_hash(text: &str) -> u64 {
+    text.trim_end()
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        })
 }
 
 /// A client terminal's colours (`Request::HostColors`), 16 bits a channel as
@@ -1071,9 +1103,11 @@ pub enum Event {
     /// scrollback — the history asked for at attach, or after a resync the
     /// rows that scrolled off while the stream was behind. `skipped`: rows the
     /// stream lacks that come before those and are left out, gone from the
-    /// pane's scrollback or past the most a resync hands on.
+    /// pane's scrollback or past the most asked for or handed on. `epoch`
+    /// names the numbering — one daemon's run — for a later `Printed`.
     PaneRows {
         pane: PaneId,
+        epoch: u64,
         top: u64,
         skipped: u64,
     },
@@ -1518,6 +1552,19 @@ mod tests {
             cols: 80,
             history: 1000,
             inline: true,
+            since: None,
+        });
+        roundtrip(&Request::PaneAttach {
+            pane: PaneId(3),
+            rows: 24,
+            cols: 80,
+            history: 1000,
+            inline: true,
+            since: Some(Printed {
+                epoch: 1_762_300_000_000_000_000,
+                row: 4_210,
+                held: vec![row_hash("$ make"), row_hash("")],
+            }),
         });
         roundtrip(&Request::HostColors(sample_colors()));
         roundtrip(&Request::HostColors(HostColors {
@@ -1989,6 +2036,16 @@ mod tests {
         });
     }
 
+    /// A row's hash is FNV-1a's, the same from every build of client and
+    /// daemon, and a row's trailing blanks never count.
+    #[test]
+    fn a_rows_hash_is_fnv1a_of_its_trimmed_text() {
+        assert_eq!(row_hash(""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(row_hash("a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(row_hash("$ make   "), row_hash("$ make"));
+        assert_ne!(row_hash("$ make"), row_hash("$ mak"));
+    }
+
     #[test]
     fn event_roundtrip() {
         roundtrip(&Event::PaneOutput { pane: PaneId(1) });
@@ -2003,6 +2060,7 @@ mod tests {
         });
         roundtrip(&Event::PaneRows {
             pane: PaneId(1),
+            epoch: 1_762_300_000_000_000_000,
             top: 10_120,
             skipped: 3,
         });
@@ -2128,9 +2186,10 @@ mod tests {
                 cols: 80,
                 history: 0,
                 inline: false,
+                since: None,
             })
             .unwrap(),
-            r#"{"type":"pane_attach","pane":3,"rows":24,"cols":80,"history":0,"inline":false}"#
+            r#"{"type":"pane_attach","pane":3,"rows":24,"cols":80,"history":0,"inline":false,"since":null}"#
         );
         assert_eq!(
             serde_json::to_string(&Event::StateChanged {
@@ -2231,8 +2290,9 @@ mod tests {
                 sandbox: None,
             }
         );
-        // `pane_attach` without `history` or `inline` replays none and
-        // numbers no rows.
+        // `pane_attach` without `history`, `inline` or `since` replays none,
+        // numbers no rows and knows of nothing printed before; a record
+        // without `held` holds no row past its own.
         let attach: Request =
             serde_json::from_str(r#"{"type":"pane_attach","pane":3,"rows":24,"cols":80}"#).unwrap();
         assert_eq!(
@@ -2243,6 +2303,16 @@ mod tests {
                 cols: 80,
                 history: 0,
                 inline: false,
+                since: None,
+            }
+        );
+        let printed: Printed = serde_json::from_str(r#"{"epoch":7,"row":40}"#).unwrap();
+        assert_eq!(
+            printed,
+            Printed {
+                epoch: 7,
+                row: 40,
+                held: Vec::new()
             }
         );
         // A blocked event from before reminders is no reminder, and one that

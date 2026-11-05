@@ -527,7 +527,8 @@ enum PaneAction {
         #[arg(long)]
         inline: bool,
         /// Inline, print up to this many of the pane's newest scrollback
-        /// lines first, into this terminal's scrollback; 0 for none.
+        /// lines first, into this terminal's scrollback — only those past
+        /// what an earlier inline attach here left in it; 0 for none.
         #[arg(long, value_name = "ROWS", default_value_t = 1000, requires = "inline")]
         history: u32,
     },

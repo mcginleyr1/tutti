@@ -16,7 +16,8 @@ use tokio::time::{sleep, timeout};
 use tutti_core::{
     AgentHookEvent, AgentState, ApprovalDecision, Checkpoint, Direction, Event, Frame, HostColors,
     IssueRef, Layout, Note, NoteKind, PaneData, PaneDims, PaneId, PaneInfo, PendingApproval,
-    Request, Response, Rgb, StateSource, SubagentInfo, Tagged, Toward, WatchPane, WorkspaceId,
+    Printed, Request, Response, Rgb, StateSource, SubagentInfo, Tagged, Toward, WatchPane,
+    WorkspaceId, row_hash,
 };
 use tutti_server::{PaneSize, serve};
 
@@ -2237,6 +2238,20 @@ fn pane_attach(pane: PaneId, rows: u16, cols: u16) -> Request {
         cols,
         history: 0,
         inline: false,
+        since: None,
+    }
+}
+
+/// An inline `pane attach`'s, 10×40, for up to `history` rows past what
+/// `since` holds.
+fn inline_attach(pane: PaneId, history: u32, since: Option<Printed>) -> Request {
+    Request::PaneAttach {
+        pane,
+        rows: 10,
+        cols: 40,
+        history,
+        inline: true,
+        since,
     }
 }
 
@@ -2257,6 +2272,7 @@ async fn a_pane_stream_starts_with_the_history_it_asks_for() {
             cols: 20,
             history: 10,
             inline: false,
+            since: None,
         })
         .await;
     let mut history = Vec::new();
@@ -2686,15 +2702,7 @@ async fn an_inline_stream_behind_is_handed_the_rows_it_skipped() {
                   for (i = 1; i <= 3000; i++) printf \"%s%d\\r\\n\", f, i }'; echo flood-done; sleep 30";
     let pane = run_marker(&mut control, script).await;
     let mut stuck = server.connect().await;
-    stuck
-        .send(&Request::PaneAttach {
-            pane,
-            rows: 10,
-            cols: 40,
-            history: 0,
-            inline: true,
-        })
-        .await;
+    stuck.send(&inline_attach(pane, 0, None)).await;
     stuck
         .write_frame(&Frame::Input {
             pane,
@@ -2742,6 +2750,138 @@ async fn an_inline_stream_behind_is_handed_the_rows_it_skipped() {
     );
     let numbers: Vec<u32> = transcript.iter().filter_map(|l| l.parse().ok()).collect();
     assert_eq!(numbers, (1..=3000).collect::<Vec<_>>());
+
+    server.stop().await;
+}
+
+/// How an inline stream opens: its `PaneRows`, the history lines before
+/// its snapshot, and what a terminal seeded by the snapshot holds of it
+/// once it leaves — the screen's rows down to its last text or cursor.
+async fn inline_opening(stream: &mut Conn) -> (Event, Vec<String>, Printed) {
+    let rows = loop {
+        if let Frame::Control(json) = stream.read_frame().await
+            && let Ok(rows @ Event::PaneRows { .. }) = serde_json::from_slice(&json)
+        {
+            break rows;
+        }
+    };
+    let mut history = Vec::new();
+    let snapshot = loop {
+        match stream.read_frame().await {
+            Frame::PaneRaw { bytes, .. } => history.extend(bytes),
+            Frame::PaneSnapshot(data) => break data,
+            other => panic!("a pane stream got {other:?} before its snapshot"),
+        }
+    };
+    let mut terminal = Terminal::new(snapshot.rows, snapshot.cols, 0);
+    terminal.advance(&snapshot.bytes);
+    let last = (0..snapshot.rows)
+        .rev()
+        .find(|&row| !terminal.screen_row(row).text().trim_end().is_empty())
+        .unwrap_or(0)
+        .max(terminal.cursor_position().0);
+    let Event::PaneRows { epoch, top, .. } = rows else {
+        unreachable!()
+    };
+    let held = (0..=last)
+        .map(|row| row_hash(&terminal.screen_row(row).text()))
+        .collect();
+    let history = String::from_utf8(history).unwrap();
+    let history = history.lines().map(String::from).collect();
+    (
+        rows,
+        history,
+        Printed {
+            epoch,
+            row: top,
+            held,
+        },
+    )
+}
+
+/// A second inline stream into the terminal the first left starts its
+/// history past what that terminal holds — a row it holds that has changed
+/// since (the prompt typed on) and every row after come again; a record
+/// from another daemon run counts for nothing; once the pane cleared its
+/// scrollback the history starts where the pane's does, the rows between
+/// counted as skipped, and so are those past `--history`.
+#[tokio::test]
+async fn a_second_inline_stream_starts_past_what_its_terminal_holds() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let script = "stty -echo; seq 1 30; printf '$ '; read a; printf '%s\\n' \"$a\"; seq 31 45; \
+                  read b; printf '\\033[3J'; seq 46 50; sleep 30";
+    let pane = run_marker(&mut control, script).await;
+    assert!(read_until(&mut control, pane, "$").await);
+    let mut first = server.connect().await;
+    first.send(&inline_attach(pane, 1000, None)).await;
+    let (rows, history, printed) = inline_opening(&mut first).await;
+    let Event::PaneRows {
+        epoch,
+        top,
+        skipped,
+        ..
+    } = rows
+    else {
+        unreachable!()
+    };
+    assert_eq!((top, skipped), (21, 0));
+    assert_eq!(history, (1..=21).map(|n| n.to_string()).collect::<Vec<_>>());
+    assert_eq!(printed.held.len(), 10, "down to the prompt");
+    drop(first);
+
+    let send = |text: &str| Request::PaneSend {
+        pane,
+        text: Some(text.into()),
+        keys: None,
+        expect: None,
+        between_turns: false,
+        hooks: None,
+    };
+    assert_eq!(control.request(send("ls\r")).await, Response::Ok);
+    assert!(read_until(&mut control, pane, "45").await);
+    let numbers = |range: std::ops::RangeInclusive<u32>| -> Vec<String> {
+        range.map(|n| n.to_string()).collect()
+    };
+    let served = &server;
+    let opening = move |since| async move {
+        let mut stream = served.connect().await;
+        stream.send(&inline_attach(pane, 1000, since)).await;
+        let (rows, history, _) = inline_opening(&mut stream).await;
+        let Event::PaneRows { epoch, skipped, .. } = rows else {
+            unreachable!()
+        };
+        (epoch, skipped, history)
+    };
+    let (again, skipped, history) = opening(Some(printed.clone())).await;
+    assert_eq!((again, skipped), (epoch, 0), "the same run");
+    let mut want = vec!["$ ls".to_string()];
+    want.extend(numbers(31..=36));
+    assert_eq!(history, want, "from the changed prompt on");
+
+    let other = Printed {
+        epoch: epoch + 1,
+        ..printed.clone()
+    };
+    let (_, skipped, history) = opening(Some(other)).await;
+    assert_eq!(
+        (skipped, history.len()),
+        (0, 37),
+        "another run's counts for nothing"
+    );
+
+    assert_eq!(control.request(send("go\r")).await, Response::Ok);
+    assert!(read_until(&mut control, pane, "50").await);
+    let (_, skipped, history) = opening(Some(printed.clone())).await;
+    assert_eq!((skipped, history), (16, numbers(37..=41)), "cleared");
+    let mut capped = server.connect().await;
+    capped.send(&inline_attach(pane, 3, Some(printed))).await;
+    let (rows, history, _) = inline_opening(&mut capped).await;
+    assert!(
+        matches!(rows, Event::PaneRows { skipped: 18, .. }),
+        "{rows:?}"
+    );
+    assert_eq!(history, numbers(39..=41), "past --history");
 
     server.stop().await;
 }

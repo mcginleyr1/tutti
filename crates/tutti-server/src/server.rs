@@ -228,6 +228,9 @@ pub struct Hub {
     approvals: Mutex<HashMap<u64, oneshot::Sender<ApprovalDecision>>>,
     /// The notification history, for clients that missed a note to catch up.
     notes: Mutex<Notes>,
+    /// This run of the daemon, in which its panes' rows are numbered (its
+    /// start, in ns): a `Printed` from another run counts for nothing.
+    epoch: u64,
 }
 
 /// What the render tick last broadcast of a pane: the screen's size and
@@ -313,6 +316,9 @@ impl Hub {
             prompts,
             notes: Mutex::new(notes),
             approvals: Mutex::new(HashMap::new()),
+            epoch: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos() as u64),
         }
     }
 
@@ -804,15 +810,18 @@ fn handle_frame(
                 cols,
                 history,
                 inline,
-            }) => pane_attach(
-                hub,
-                cid,
-                &reply,
-                stream,
-                PaneDims { pane, rows, cols },
-                history,
-                inline,
-            ),
+                since,
+            }) => {
+                let dims = PaneDims { pane, rows, cols };
+                // A record from another run numbers other rows.
+                let since = since.filter(|printed| printed.epoch == hub.epoch);
+                let scrollback = (inline || history > 0).then(|| Rows {
+                    since: since.as_ref().map(|printed| printed.row),
+                    held: since.map(|printed| printed.held).unwrap_or_default(),
+                    at_most: history.into(),
+                });
+                pane_attach(hub, cid, &reply, stream, dims, scrollback, inline)
+            }
             Ok(Request::Watch) => {
                 hub.watchers().insert(
                     cid,
@@ -998,9 +1007,9 @@ fn arbitrate(hub: &Hub, panes: impl IntoIterator<Item = PaneId>) {
 /// snapshot, and a slow terminal skips ahead to the pane's screen — an
 /// `inline` one, which keeps a scrollback of the pane's, after the rows that
 /// scrolled off past what the writer last took (`Queue::taken`), up to
-/// `RESYNC_ROWS`. The `history` rows asked for go first, in frames short of
-/// the frame bound, and widen the backlog by their size: a long history is
-/// never behind — nor is a resync's. Inline, each snapshot follows a
+/// `RESYNC_ROWS`. The scrollback `rows` asked for go first, in frames short
+/// of the frame bound, and widen the backlog by their size: a long history
+/// is never behind — nor is a resync's. Inline, each snapshot follows a
 /// `PaneRows` naming its rows. The child exiting is told once its last
 /// output is queued — unless the daemon is stopping, which killed it.
 fn pane_attach(
@@ -1009,7 +1018,7 @@ fn pane_attach(
     reply: &Reply,
     stream: &mut Option<(oneshot::Sender<()>, Arc<Outbox>)>,
     dims: PaneDims,
-    history: u32,
+    rows: Option<Rows>,
     inline: bool,
 ) -> ControlFlow<()> {
     let refuse = |message: String| {
@@ -1032,10 +1041,7 @@ fn pane_attach(
     arbitrate(hub, [pane]);
     let mut backlog = STREAM_BACKLOG;
     let mut started = false;
-    let rows = (inline || history > 0).then_some(Rows {
-        since: None,
-        at_most: history.into(),
-    });
+    let epoch = hub.epoch;
     pty.tap(
         cid,
         rows,
@@ -1055,8 +1061,9 @@ fn pane_attach(
                     queue.bytes.clear();
                     outbox.resynced.store(true, Ordering::Relaxed);
                     backlog = STREAM_BACKLOG;
-                    return Kept::Behind(inline.then_some(Rows {
+                    return Kept::Behind(inline.then(|| Rows {
                         since: Some(queue.taken),
+                        held: Vec::new(),
                         at_most: RESYNC_ROWS,
                     }));
                 }
@@ -1082,7 +1089,12 @@ fn pane_attach(
                 }) => {
                     if inline {
                         let skipped = history.as_ref().map_or(0, |h| h.skipped);
-                        let rows = Event::PaneRows { pane, top, skipped };
+                        let rows = Event::PaneRows {
+                            pane,
+                            epoch,
+                            top,
+                            skipped,
+                        };
                         queue.bytes.extend(encode_json(&rows));
                     }
                     // Until the writer takes the first snapshot, the stream

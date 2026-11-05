@@ -19,7 +19,7 @@ use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtyPair, PtySize, native_pty_system};
 use rtty_vt::{ColorScheme, Event, MarkKind, ModeChange, Terminal};
 use tokio::sync::watch;
-use tutti_core::{AgentState, HostColors, Rgb, StateSource};
+use tutti_core::{AgentState, HostColors, Rgb, StateSource, row_hash};
 
 const SCROLLBACK_LINES: usize = 10_000;
 /// Writes waiting for a pane's writer thread: a read's answers, a light/dark
@@ -184,10 +184,12 @@ pub struct History {
 
 /// Which scrollback rows a tap wants before a snapshot: those from absolute
 /// row `since` — from the oldest held, with none — the newest `at_most` of
-/// them still held. Rows the cap or the ring leave out after `since` count
-/// as `skipped`.
+/// them still held. `held` hashes (`row_hash`) the rows from `since` on its
+/// terminal holds already: those the pane still has as they were go too.
+/// Rows the cap or the ring leave out after those count as `skipped`.
 pub struct Rows {
     pub since: Option<u64>,
+    pub held: Vec<u64>,
     pub at_most: u64,
 }
 
@@ -208,18 +210,30 @@ pub type Tap = Box<dyn FnMut(Feed<'_>) -> Kept + Send>;
 fn start(vt: &Terminal, rows: Option<Rows>) -> Start {
     let (height, width) = vt.size();
     let top = vt.screen_top();
-    let history = rows.map(|Rows { since, at_most }| {
-        let from = since
-            .unwrap_or(0)
-            .max(top.saturating_sub(at_most))
-            .max(vt.oldest_row())
-            .min(top);
-        History {
-            from,
-            bytes: vt.history(from, top),
-            skipped: since.map_or(0, |since| from.saturating_sub(since)),
-        }
-    });
+    let history = rows.map(
+        |Rows {
+             since,
+             held,
+             at_most,
+         }| {
+            let since = since.map(|since| {
+                let same = |&(&hash, row): &(&u64, u64)| {
+                    vt.row(row).is_some_and(|row| row_hash(&row.text()) == hash)
+                };
+                since + held.iter().zip(since..top).take_while(same).count() as u64
+            });
+            let from = since
+                .unwrap_or(0)
+                .max(top.saturating_sub(at_most))
+                .max(vt.oldest_row())
+                .min(top);
+            History {
+                from,
+                bytes: vt.history(from, top),
+                skipped: since.map_or(0, |since| from.saturating_sub(since)),
+            }
+        },
+    );
     Start {
         size: PaneSize::new(height, width),
         top,
@@ -3067,6 +3081,7 @@ mod tests {
             let (tx, rx) = std::sync::mpsc::channel();
             let rows = Rows {
                 since: None,
+                held: Vec::new(),
                 at_most: history,
             };
             pane.tap(id, Some(rows), recorder(tx, |_| false, |_| None));
@@ -3126,6 +3141,7 @@ mod tests {
         let rows = move |_| {
             Some(Rows {
                 since: Some(had),
+                held: Vec::new(),
                 at_most: 100,
             })
         };
@@ -3152,9 +3168,10 @@ mod tests {
         assert_eq!(client(5, 20, screen).contents(), "9\n10\n11\n12");
     }
 
-    /// The rows asked for run from the row named up to the screen — none
-    /// before the oldest held or past the cap, which go as skipped — and,
-    /// naming none, the newest of all held up to the cap, skipping none.
+    /// The rows asked for run from the row named up to the screen — past
+    /// those after it the terminal holds as they still are, and none before
+    /// the oldest held or past the cap, which go as skipped — and, naming
+    /// none, the newest of all held up to the cap, skipping none.
     #[test]
     fn a_start_hands_the_rows_asked_for_up_to_its_screen() {
         let mut vt = Terminal::new(4, 20, 10);
@@ -3162,21 +3179,50 @@ mod tests {
         // `L0`..`L29` and a blank row: the ring holds rows 17..27, the
         // screen 27..31.
         assert_eq!((vt.oldest_row(), vt.screen_top()), (17, 27));
-        let rows = |since, at_most| {
-            let start = start(&vt, Some(Rows { since, at_most }));
+        let rows = |since, held: &[&str], at_most| {
+            let held = held.iter().map(|text| row_hash(text)).collect();
+            let start = start(
+                &vt,
+                Some(Rows {
+                    since,
+                    held,
+                    at_most,
+                }),
+            );
             assert_eq!(start.top, 27);
             let history = start.history.unwrap();
             let text = String::from_utf8(history.bytes).unwrap();
             let lines: Vec<String> = text.lines().map(String::from).collect();
             (history.from, lines, history.skipped)
         };
-        assert_eq!(rows(Some(24), 100), (24, rows_of(24..27), 0));
-        assert_eq!(rows(Some(10), 100), (17, rows_of(17..27), 7), "the ring");
-        assert_eq!(rows(Some(20), 3), (24, rows_of(24..27), 4), "the cap");
-        assert_eq!(rows(Some(27), 100), (27, vec![], 0), "nothing scrolled");
-        assert_eq!(rows(Some(40), 100), (27, vec![], 0), "another numbering");
-        assert_eq!(rows(None, 5), (22, rows_of(22..27), 0));
+        assert_eq!(rows(Some(24), &[], 100), (24, rows_of(24..27), 0));
+        assert_eq!(
+            rows(Some(10), &[], 100),
+            (17, rows_of(17..27), 7),
+            "the ring"
+        );
+        assert_eq!(rows(Some(20), &[], 3), (24, rows_of(24..27), 4), "the cap");
+        assert_eq!(
+            rows(Some(27), &[], 100),
+            (27, vec![], 0),
+            "nothing scrolled"
+        );
+        assert_eq!(
+            rows(Some(40), &[], 100),
+            (27, vec![], 0),
+            "another numbering"
+        );
+        assert_eq!(rows(None, &[], 5), (22, rows_of(22..27), 0));
         assert!(start(&vt, None).history.is_none());
+
+        // Held as they still are, rows go; from the first that changed — a
+        // prompt typed on since — every row comes, the same or not.
+        let held = ["L20", "L21", "$ ", "L23"];
+        assert_eq!(rows(Some(20), &held, 100), (22, rows_of(22..27), 0));
+        assert_eq!(rows(Some(20), &held[..2], 3), (24, rows_of(24..27), 2));
+        let screen = ["L24", "L25", "L26", "L27", "L28", "L29"];
+        assert_eq!(rows(Some(24), &screen, 100), (27, vec![], 0), "up to it");
+        assert_eq!(rows(Some(10), &["L10"], 100), (17, rows_of(17..27), 7));
     }
 
     /// Poll `done` for up to three seconds.

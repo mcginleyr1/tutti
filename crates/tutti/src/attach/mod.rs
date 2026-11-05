@@ -10,6 +10,7 @@ mod input;
 mod launcher;
 mod layout;
 mod navigate;
+mod printed;
 pub mod raw;
 mod reader;
 mod render;

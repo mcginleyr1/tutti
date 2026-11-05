@@ -29,6 +29,12 @@
 //! into the scrollback over the stale screen (`scroll_off`): it misses no
 //! line the pane still holds, and a line tells of any it no longer did.
 //!
+//! Inline, what the terminal holds of the pane as it leaves — the rows up to
+//! the screen, in the pane's numbering, and the screen's down to the last
+//! drawn — is kept for this terminal (`printed`), so the next inline attach
+//! in it asks for history only past that: from the first of those screen
+//! rows the pane has changed since, or the first row after them.
+//!
 //! This terminal's keys stay plain: the daemon keeps the pane's keyboard
 //! protocols (kitty's, modifyOtherKeys) out of the stream, and the mirror's
 //! redraws leave them out too — the prefix is watched for in plain bytes,
@@ -52,9 +58,12 @@ use ratatui::crossterm::{cursor, terminal};
 use rtty_vt::Terminal;
 use signal_hook::consts::SIGWINCH;
 use signal_hook::iterator::Signals;
-use tutti_core::{Event, Frame, HostColors, PaneDims, PaneId, Request, Response, socket_path};
+use tutti_core::{
+    Event, Frame, HostColors, PaneDims, PaneId, Printed, Request, Response, row_hash, socket_path,
+};
 
 use super::input::{Keyboard, encode_key};
+use super::printed;
 use super::theme::host_colors;
 use crate::client;
 use crate::config::{Chord, Config, Theme};
@@ -91,8 +100,10 @@ const REPORTS: [(&[u8], bool); 2] = [(b"\x1b[?997;1n", true), (b"\x1b[?997;2n", 
 /// Show `pane` of `session` in this terminal until the config's prefix and
 /// `d` detach it, the pane exits (`[pane N exited: CODE]`), or the daemon
 /// goes away (an error) — on the alternate screen, or `inline` on the
-/// primary one, after up to `history` of the pane's newest scrollback lines.
-/// Never starts a daemon: with none running there is no pane to show.
+/// primary one, after up to `history` of the pane's newest scrollback lines:
+/// those this terminal lacks, by what the last inline attach in it left
+/// (`printed`), which this one then leaves in its place. Never starts a
+/// daemon: with none running there is no pane to show.
 pub fn run(
     session: &str,
     pane: PaneId,
@@ -117,12 +128,20 @@ pub fn run(
         stream.write_all(&control(&Request::HostColors(colors)))?;
     }
     let (cols, rows) = terminal::size().context("reading the terminal size")?;
+    let kept = inline
+        .then(printed::terminal)
+        .flatten()
+        .zip(printed::file());
+    let since = kept
+        .as_ref()
+        .and_then(|(terminal, file)| printed::load(file, terminal, session, pane));
     let attach = Request::PaneAttach {
         pane,
         rows,
         cols,
         history,
         inline,
+        since,
     };
     stream.write_all(&control(&attach))?;
     // A refusal — no such pane — lands before the terminal is touched; the
@@ -130,6 +149,7 @@ pub fn run(
     // the first snapshot, gathered — after a line on what was skipped.
     let mut buf = Vec::new();
     let mut past = Vec::new();
+    let mut numbering = None;
     let first = loop {
         let frame =
             read_frame(&mut stream, &mut buf)?.context("tutti-server closed the connection")?;
@@ -147,8 +167,15 @@ pub fn run(
             (Some(Response::Error { message }), _) => bail!(message),
             (_, Frame::PaneRaw { bytes, .. }) => past.extend(bytes),
             (_, Frame::Control(json)) => {
-                if let Ok(Event::PaneRows { skipped, .. }) = serde_json::from_slice(&json) {
+                if let Ok(Event::PaneRows {
+                    epoch,
+                    top,
+                    skipped,
+                    ..
+                }) = serde_json::from_slice(&json)
+                {
                     past = skip_note(pane, skipped);
+                    numbering = Some(Numbering::new(epoch, top));
                 }
             }
             (_, frame) => break frame,
@@ -192,12 +219,30 @@ pub fn run(
     let enter = [ENTER, if inline { b"" } else { ALTERNATE_SCREEN }].concat();
     let shown = emit(&enter).and_then(|()| {
         let lift = lift.into_bytes();
-        show(pane, first, &mut stream, &mut buf, &mut mirror, lift)
+        show(
+            pane,
+            first,
+            &mut stream,
+            &mut buf,
+            &mut mirror,
+            lift,
+            &mut numbering,
+        )
     });
-    if inline {
-        let _ = emit(&below(&mut mirror));
-    }
+    let left = inline.then(|| {
+        let (leave, last) = below(&mut mirror);
+        let _ = emit(&leave);
+        last
+    });
     restore();
+    let holds = numbering
+        .zip(left)
+        .and_then(|(numbering, last)| numbering.holds(&mirror, last));
+    if let (Some((terminal, file)), Some(holds)) = (&kept, holds)
+        && let Err(err) = printed::save(file, terminal, session, pane, holds)
+    {
+        eprintln!("tutti: cannot keep what this terminal holds of pane {pane}: {err}");
+    }
     match shown? {
         Some(code) => println!("[pane {pane} exited: {code}]"),
         None if detached.load(Ordering::SeqCst) => println!("[detached from pane {pane}]"),
@@ -206,11 +251,46 @@ pub fn run(
     Ok(0)
 }
 
+/// Where an inline view stands in the pane's numbered rows (`PaneRows`):
+/// the daemon run they are numbered in, the absolute row at which the screen
+/// of the snapshot they came before starts, and the mirror's own count of
+/// rows once that snapshot seeded it — `None` until it has.
+struct Numbering {
+    epoch: u64,
+    top: u64,
+    base: Option<u64>,
+}
+
+impl Numbering {
+    fn new(epoch: u64, top: u64) -> Self {
+        Self {
+            epoch,
+            top,
+            base: None,
+        }
+    }
+
+    /// What a terminal holds of the pane once `mirror` leaves it, drawn down
+    /// to its row `last`: every row before the screen, which starts at the
+    /// absolute row the mirror's count says, and the screen's rows to `last`
+    /// as they stand.
+    fn holds(&self, mirror: &Terminal, last: u16) -> Option<Printed> {
+        Some(Printed {
+            epoch: self.epoch,
+            row: self.top + mirror.screen_top().checked_sub(self.base?)?,
+            held: (0..=last)
+                .map(|row| row_hash(&mirror.screen_row(row).text()))
+                .collect(),
+        })
+    }
+}
+
 /// Draw `pane`'s stream, `first` frame on, until the pane exits (its code)
 /// or the connection closes (`None`), with `mirror` following it. `lift`
 /// goes out before the first snapshot. Inline, the rows a resync hands on —
 /// the raw frames between its `PaneRows` and its snapshot — go into this
-/// terminal's scrollback first (`scroll_off`). A refusal on the way is the
+/// terminal's scrollback first (`scroll_off`), and `numbering` follows each
+/// snapshot's `PaneRows`, if it came after one. A refusal on the way is the
 /// error.
 fn show(
     pane: PaneId,
@@ -219,6 +299,7 @@ fn show(
     buf: &mut Vec<u8>,
     mirror: &mut Terminal,
     mut lift: Vec<u8>,
+    numbering: &mut Option<Numbering>,
 ) -> Result<Option<i32>> {
     let inline = INLINE.load(Ordering::SeqCst);
     let view = |mirror: &Terminal| {
@@ -244,6 +325,13 @@ fn show(
                 *mirror = Terminal::new(data.rows, data.cols, 0);
                 mirror.advance(&data.bytes);
                 mirror.take_events();
+                *numbering = numbering
+                    .take()
+                    .filter(|numbered| numbered.base.is_none())
+                    .map(|numbered| Numbering {
+                        base: Some(mirror.screen_top()),
+                        ..numbered
+                    });
                 let past = past.take().unwrap_or_default();
                 let scrolled = if past.is_empty() {
                     Vec::new()
@@ -263,8 +351,15 @@ fn show(
                 if let Ok(Event::PaneExited { code, .. }) = serde_json::from_slice(&json) {
                     return Ok(Some(code));
                 }
-                if let Ok(Event::PaneRows { skipped, .. }) = serde_json::from_slice(&json) {
+                if let Ok(Event::PaneRows {
+                    epoch,
+                    top,
+                    skipped,
+                    ..
+                }) = serde_json::from_slice(&json)
+                {
                     past = Some(skip_note(pane, skipped));
+                    *numbering = Some(Numbering::new(epoch, top));
                 }
                 if let Ok(Response::Error { message }) = serde_json::from_slice(&json) {
                     bail!(message);
@@ -371,8 +466,9 @@ fn strip(drawing: Vec<u8>) -> Vec<u8> {
 
 /// Where an inline view leaves this terminal: the pane's alternate screen
 /// left, the scroll region whole, and the cursor on the line under the last
-/// of the primary screen's text or its cursor, whichever is lower.
-fn below(mirror: &mut Terminal) -> Vec<u8> {
+/// of the primary screen's text or its cursor, whichever is lower — that
+/// row, the last the terminal keeps, with the bytes.
+fn below(mirror: &mut Terminal) -> (Vec<u8>, u16) {
     let leave = if ALTERNATE.swap(false, Ordering::SeqCst) {
         mirror.advance(LEAVE_ALTERNATE);
         LEAVE_ALTERNATE
@@ -385,7 +481,8 @@ fn below(mirror: &mut Terminal) -> Vec<u8> {
         .find(|&r| !mirror.screen_row(r).text().trim_end().is_empty())
         .unwrap_or(0)
         .max(mirror.cursor_position().0);
-    [leave, format!("\x1b[r\x1b[{};1H\r\n", last + 1).as_bytes()].concat()
+    let to = format!("\x1b[r\x1b[{};1H\r\n", last + 1);
+    ([leave, to.as_bytes()].concat(), last)
 }
 
 /// The keys typed into the pane, watched for the prefix chord's bytes — the
@@ -917,9 +1014,41 @@ mod tests {
         mirror.advance(b"\x1b[?1049hless");
         terminal.advance(b"\x1b[?1049hless");
         ALTERNATE.store(true, Ordering::SeqCst);
-        terminal.advance(&below(&mut mirror));
+        let (leave, last) = below(&mut mirror);
+        terminal.advance(&leave);
         assert!(!terminal.modes().alt_screen && !ALTERNATE.load(Ordering::SeqCst));
         assert_eq!(terminal.cursor_position(), (1, 0), "under `after`");
+        assert_eq!(last, 0, "the row of `after` is the last kept");
+    }
+
+    /// What a terminal holds once an inline view leaves it is numbered as
+    /// the pane's rows are: the screen starts at the row the pane's does,
+    /// however far the stream scrolled it past the snapshot that numbered
+    /// it, with the screen's rows as the pane has them down to the last
+    /// drawn — none before a numbered snapshot seeded the mirror.
+    #[test]
+    fn what_a_terminal_holds_is_numbered_as_the_panes_rows() {
+        let mut pane = Terminal::new(4, 20, 100);
+        pane.advance(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n");
+        let mut numbering = Numbering::new(7, pane.screen_top());
+        let mut mirror = Terminal::new(4, 20, 0);
+        assert_eq!(numbering.holds(&mirror, 0), None, "not seeded yet");
+        mirror.advance(&pane.snapshot());
+        numbering.base = Some(mirror.screen_top());
+        for read in [&b"six\r\nseven\r\n"[..], b"$ ls"] {
+            pane.advance(read);
+            let mut last = 0;
+            feed(&mut mirror, &mut last, read, true);
+        }
+        // `below`'s: the row of `$ ls`, at the bottom.
+        let last = 3;
+        let holds = numbering.holds(&mirror, last).unwrap();
+        assert_eq!((holds.epoch, holds.row), (7, pane.screen_top()));
+        let screen: Vec<u64> = (0..=last)
+            .map(|row| row_hash(&pane.screen_row(row).text()))
+            .collect();
+        assert_eq!(holds.held, screen);
+        assert_eq!(holds.held.last(), Some(&row_hash("$ ls")));
     }
 
     /// The rows `term` has scrolled into its scrollback, as text.

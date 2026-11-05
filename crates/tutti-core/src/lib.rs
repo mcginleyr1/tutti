@@ -14,9 +14,9 @@ pub use paths::{log_path, prompts_dir, socket_dir, socket_path, state_dir};
 pub use prompt::{PROMPT_LINES, prompt_fingerprint, prompt_rows};
 pub use protocol::{
     AgentHookEvent, ApprovalDecision, Checkpoint, DIFF_RANGE, Event, FileStat, HostColors,
-    IssueRef, NOTES_CAP, Note, NoteKind, PaneDims, PaneInfo, PendingApproval, Request, Response,
-    RestoreSummary, Rgb, SubagentInfo, TabInfo, TabView, Tagged, WIRE_REV, WaitFor, WatchPane,
-    WorkspaceInfo, WorkspaceView,
+    IssueRef, NOTES_CAP, Note, NoteKind, PaneDims, PaneInfo, PendingApproval, Printed, Request,
+    Response, RestoreSummary, Rgb, SubagentInfo, TabInfo, TabView, Tagged, WIRE_REV, WaitFor,
+    WatchPane, WorkspaceInfo, WorkspaceView, row_hash,
 };
 pub use sandbox::{pick_remote, sandbox_branch};
 pub use state::{AgentState, Observation, StateEvent, StateSource};
