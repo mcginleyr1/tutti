@@ -1014,25 +1014,28 @@ Binary files a/img.png and b/img.png differ
     /// A workspace whose checkout was deleted unforgotten leaves its Git
     /// worktree registered, so git refuses an add at that path after jj made
     /// the directory: the add removes its own directory and forgets nothing,
-    /// the other workspace recorded at the very same path included.
+    /// the other workspace recorded at the very same path included. A jj
+    /// that makes no Git worktree (before 0.47, or a repo not colocated)
+    /// leaves git nothing to refuse with: the test skips there, saying so.
     #[tokio::test]
     async fn a_refused_add_leaves_a_workspace_recorded_at_its_path_alone() {
         let Some(repo) = repo() else { return };
         let dest = scratch("jjadd-dest");
         fork(&repo, &dest, "other", None).await.unwrap();
-        std::fs::remove_dir_all(&dest).unwrap();
-        match fork(&repo, &dest, "mine", None).await {
-            Ok(()) => eprintln!("this jj made no Git worktree to refuse the add"),
-            Err(err) => {
-                assert!(err.contains("worktree"), "{err}");
-                assert!(!dest.exists());
-                let listed = workspaces(&repo);
-                assert!(listed.lines().any(|l| l == "other"), "{listed}");
-                assert!(!listed.lines().any(|l| l == "mine"), "{listed}");
-            }
+        if git_worktrees(&repo) == 0 {
+            eprintln!("skipping: this jj made no Git worktree, so git has no add to refuse");
+            let _ = std::fs::remove_dir_all(&repo);
+            let _ = std::fs::remove_dir_all(&dest);
+            return;
         }
+        std::fs::remove_dir_all(&dest).unwrap();
+        let err = fork(&repo, &dest, "mine", None).await.unwrap_err();
+        assert!(err.contains("worktree"), "{err}");
+        assert!(!dest.exists());
+        let listed = workspaces(&repo);
+        assert!(listed.lines().any(|l| l == "other"), "{listed}");
+        assert!(!listed.lines().any(|l| l == "mine"), "{listed}");
         let _ = std::fs::remove_dir_all(&repo);
-        let _ = std::fs::remove_dir_all(&dest);
     }
 
     /// When jj gives no answer to where it records the workspace — here no
