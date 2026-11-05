@@ -1031,6 +1031,15 @@ In order; each lands its TUI path in the same wave as its verbs.
   `may_move` decides whether the report or match may move the pane at all.
   No path is known where that matters: a pane with a higher claim is not
   both unworked and `unknown`;
+- Claude fires `PreToolUse` before its permission check, so a held request
+  answered in Claude's own dialog is known only at that tool's
+  `PostToolUse`: the pane reads blocked until the tool is done. For an
+  `Agent`/`Task` call that is the subagent's whole run, whose own tool calls
+  name the subagent and so release nothing (w12 review);
+- a subagent's held request is let go at its stop by its `agent_id`, but a
+  `SubagentStop` with no `agent_id` names its `agent_type` instead (Codex's
+  rows read `default`), so such a hold waits for an answer or the approval
+  timeout. Not checked live (w12 review);
 - a restore to a checkpoint whose commit `jj util gc` pruned fails with
   jj's `Revision … doesn't exist`, leaving the working copy as it was, but
   records a `before restore` checkpoint first (w12).
