@@ -354,7 +354,8 @@ pub fn deploy_argv(
 }
 
 /// `prompt` in a fresh file of `dir`, which is made private to the user
-/// (0700) if it is new; the file only the user can read (0600).
+/// (0700) if it is new; the file only the user can read (0600). A file the
+/// prompt could not be written into whole is removed, never left half full.
 fn write_prompt(dir: &Path, prompt: &str) -> Result<PathBuf> {
     DirBuilder::new()
         .recursive(true)
@@ -365,13 +366,17 @@ fn write_prompt(dir: &Path, prompt: &str) -> Result<PathBuf> {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     let path = dir.join(format!("prompt-{}-{nanos}.md", std::process::id()));
-    OpenOptions::new()
+    let writing = || format!("writing the prompt to {}", path.display());
+    let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&path)
-        .and_then(|mut file| file.write_all(prompt.as_bytes()))
-        .with_context(|| format!("writing the prompt to {}", path.display()))?;
+        .with_context(writing)?;
+    if let Err(e) = file.write_all(prompt.as_bytes()) {
+        let _ = std::fs::remove_file(&path);
+        return Err(e).with_context(writing);
+    }
     Ok(path)
 }
 
@@ -903,6 +908,54 @@ mod tests {
         );
         assert!(!base.join("none").exists(), "refused before writing");
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Run by `a_prompt_file_written_short_is_removed` under a one-block
+    /// file-size limit, never on its own: a prompt past the limit fails part
+    /// way, and no file of it is left.
+    #[test]
+    #[ignore = "run by a_prompt_file_written_short_is_removed, under a file-size limit"]
+    fn write_a_prompt_past_the_file_size_limit() {
+        let Some(dir) = std::env::var_os("TUTTI_PROMPTS_UNDER_LIMIT") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let failed = write_prompt(&dir, &"x".repeat(64 * 1024)).unwrap_err();
+        assert!(
+            format!("{failed:#}").contains("writing the prompt"),
+            "{failed:#}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "a partial file"
+        );
+    }
+
+    /// A prompt file that can't be written whole — a full disk, a quota — is
+    /// removed, never left half written. The write fails for real: this test
+    /// runs the one above in a child under `ulimit -f 1` with SIGXFSZ
+    /// ignored, so writing past the limit returns EFBIG.
+    #[test]
+    fn a_prompt_file_written_short_is_removed() {
+        let dir = scratch("short");
+        let output = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "trap '' XFSZ; ulimit -f 1; exec \"$0\" --exact --ignored \
+                 issues::tests::write_a_prompt_past_the_file_size_limit",
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .env("TUTTI_PROMPTS_UNDER_LIMIT", dir.join("t.prompts"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
