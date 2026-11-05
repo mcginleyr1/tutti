@@ -1359,8 +1359,10 @@ lines, and putting it in a file also keeps it out of `ps` and out of the
 saved layout.
 
 The daemon deletes the file once the agent that was given it exits, whether
-the agent quit or its pane was killed. Stopping the daemon deletes any that
-are left, and so does starting one after a daemon crashed. A
+the agent quit or its pane was killed. A deploy that ends with no pane
+running deletes its own file at once: its workspace or its run was refused,
+or the daemon hung up or never answered. Stopping the daemon deletes any
+that are left, and so does starting one after a daemon crashed. A
 [restore](#restoring-after-a-restart) never needs them, because it revives
 each agent in its own conversation rather than on its first message. A
 sandbox's agent can't read this machine's files, so a sandbox deploy sends

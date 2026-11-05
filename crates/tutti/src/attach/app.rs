@@ -143,10 +143,13 @@ enum FollowUp {
     /// A `WorkspaceMerge` of this workspace: `Merged` offers its cleanup.
     Merge(WorkspaceId),
     /// A `WorkspaceFork` made for an issue: `WorkspaceCreated` sends this,
-    /// the `Run` of the agent deployed on it, into the new workspace.
-    Deploy(Box<Request>),
-    /// A deploy's `Run`: `Ran` jumps to the agent.
-    Deployed,
+    /// the `Run` of the agent deployed on it, into the new workspace. With
+    /// the prompt file the run names (`issues::deploy_argv`), which a
+    /// refusal removes: no pane got it.
+    Deploy(Box<Request>, Option<PathBuf>),
+    /// A deploy's `Run`, with its prompt file as above: `Ran` jumps to the
+    /// agent, and the daemon owns the file from then on.
+    Deployed(Option<PathBuf>),
     /// A `PaneRead` of this pane's last reply: `LastReply` opens the reply
     /// overlay over the sidebar it was asked from.
     Reply(PaneId),
@@ -1103,7 +1106,7 @@ impl App {
                 // open the launcher over it, and flash what it made and where. A
                 // deploy waited for its issue's workspace: run the agent there.
                 let creates = |f: &FollowUp| {
-                    matches!(f, FollowUp::Mount | FollowUp::Fork | FollowUp::Deploy(_))
+                    matches!(f, FollowUp::Mount | FollowUp::Fork | FollowUp::Deploy(..))
                 };
                 match self.take_follow_up(req, creates) {
                     Some(FollowUp::Fork) => {
@@ -1125,11 +1128,11 @@ impl App {
                             self.set_status(format!("workspace {name} → {}", dir.display()));
                         }
                     }
-                    Some(FollowUp::Deploy(mut run)) => {
+                    Some(FollowUp::Deploy(mut run, file)) => {
                         if let Request::Run { workspace, .. } = run.as_mut() {
                             *workspace = Some(id);
                         }
-                        return vec![self.follow(&run, FollowUp::Deployed)];
+                        return vec![self.follow(&run, FollowUp::Deployed(file))];
                     }
                     _ => {}
                 }
@@ -1155,8 +1158,8 @@ impl App {
                 tab,
                 pane,
             } => {
-                let deploys = |f: &FollowUp| *f == FollowUp::Deployed;
-                if self.take_follow_up(req, deploys) == Some(FollowUp::Deployed) {
+                let deploys = |f: &FollowUp| matches!(f, FollowUp::Deployed(_));
+                if let Some(FollowUp::Deployed(_)) = self.take_follow_up(req, deploys) {
                     let frames = self.jump_to(tab, Some(pane));
                     let deployed = self.panes.get(&pane).and_then(|s| {
                         let issue = s.info.issue.as_ref()?;
@@ -1210,19 +1213,27 @@ impl App {
                 // confirm, or another workspace — and cancels only its own: a
                 // refused answer leaves a merge's cleanup offer standing. An old
                 // daemon names no request, so its refusal cancels them all.
-                let mounted = match req {
+                let cancelled: Vec<FollowUp> = match req {
                     Some(req) => self
                         .pending
                         .remove(&req)
-                        .is_some_and(|(follow_up, ..)| follow_up == FollowUp::Mount),
-                    None if self.old_daemon => {
-                        self.pending.clear();
-                        true
-                    }
-                    None => false,
+                        .map(|(f, ..)| f)
+                        .into_iter()
+                        .collect(),
+                    None if self.old_daemon => self.pending.drain().map(|(_, (f, ..))| f).collect(),
+                    None => Vec::new(),
                 };
-                if mounted {
+                if (req.is_none() && self.old_daemon) || cancelled.contains(&FollowUp::Mount) {
                     self.adopt_active_view = false;
+                }
+                // A cancelled deploy's prompt file went to no pane, so nothing
+                // else would remove it before the daemon stops.
+                for follow_up in cancelled {
+                    if let FollowUp::Deploy(_, Some(file)) | FollowUp::Deployed(Some(file)) =
+                        follow_up
+                    {
+                        let _ = std::fs::remove_file(file);
+                    }
                 }
                 self.set_status(format!("error: {message}"));
             }
@@ -3496,8 +3507,8 @@ impl App {
                 .clone()
                 .unwrap_or_else(|| tutti_core::prompts_dir(&self.session))
         });
-        let cmd = match issues::deploy_argv(spec, argv, prompt, files.as_deref()) {
-            Ok(cmd) => cmd,
+        let (cmd, written) = match issues::deploy_argv(spec, argv, prompt, files.as_deref()) {
+            Ok(deploy) => deploy,
             Err(e) => {
                 self.set_status(format!("{e:#}"));
                 return Vec::new();
@@ -3513,7 +3524,7 @@ impl App {
             from: None,
         };
         if self.issues_deploy_here() {
-            return vec![self.follow(&run, FollowUp::Deployed)];
+            return vec![self.follow(&run, FollowUp::Deployed(written))];
         }
         let name = issues::workspace_name(&issue.source, &issue.id);
         self.set_status(format!("creating workspace {name}…"));
@@ -3523,7 +3534,7 @@ impl App {
             revision: None,
             dest: None,
         };
-        vec![self.follow(&fork, FollowUp::Deploy(Box::new(run)))]
+        vec![self.follow(&fork, FollowUp::Deploy(Box::new(run), written))]
     }
 
     /// Dismiss the launcher back to terminal mode, dropping its transient state.
@@ -12445,6 +12456,69 @@ mod tests {
             assert_eq!(std::fs::read_to_string(file).unwrap(), prompt);
         }
         std::fs::remove_dir_all(&files).unwrap();
+    }
+
+    /// A deploy that no pane ends up with — its fork or its run refused, or
+    /// left unanswered past its deadline — removes the prompt file it wrote,
+    /// which nothing else would before the daemon stops. One whose run lands
+    /// leaves it to the daemon, which removes it as the agent exits.
+    #[test]
+    fn a_deploy_no_pane_took_removes_its_prompt_file() {
+        let files =
+            std::env::temp_dir().join(format!("tutti-app-{}-refused.prompts", std::process::id()));
+        let count = || std::fs::read_dir(&files).map_or(0, |dir| dir.count());
+        let refused = || Response::Error {
+            message: "refused".into(),
+        };
+        for (dir, forks) in [
+            (PathBuf::from("/tmp/w"), false),
+            (jj_project("refused"), true),
+        ] {
+            let mut app = issues_panel(&dir);
+            app.prompts_dir = Some(files.clone());
+            let mut long = gh_issue("7", "Long");
+            long.body = "a".repeat(issues::FILE_PROMPT);
+            app.issues_loaded(app.issues_generation, 0, Ok(vec![long]));
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            let (issue, prompt) = app.launcher_issue.take().unwrap();
+            let deploy = |app: &mut App| {
+                let argv = vec!["ori".into(), "code".into()];
+                assert_eq!(app.deploy_frames(&issue, "ori", &prompt, argv).len(), 1);
+                assert_eq!(count(), 1, "the prompt file is written");
+                app.last_req
+            };
+            // The run's own request: sent once the fork lands, if any.
+            let run = |app: &mut App, req: u64| {
+                if forks {
+                    let created = Response::WorkspaceCreated { id: WorkspaceId(2) };
+                    assert_eq!(app.handle_response(Some(req), created).len(), 1);
+                }
+                app.last_req
+            };
+
+            let req = deploy(&mut app);
+            app.handle_response(Some(req), refused());
+            assert_eq!(count(), 0, "refused at once (forks: {forks})");
+            let req = deploy(&mut app);
+            let req = run(&mut app, req);
+            app.handle_response(Some(req), refused());
+            assert_eq!(count(), 0, "its run refused (forks: {forks})");
+            deploy(&mut app);
+            assert!(app.expire_follow_ups(Instant::now() + Duration::from_secs(181)));
+            assert_eq!(count(), 0, "never answered (forks: {forks})");
+
+            let req = deploy(&mut app);
+            let req = run(&mut app, req);
+            let ran = Response::Ran {
+                workspace: WorkspaceId(2),
+                tab: TabId(1),
+                pane: PaneId(9),
+            };
+            app.handle_response(Some(req), ran);
+            assert_eq!(count(), 1, "a landed run's file is the daemon's");
+            std::fs::remove_dir_all(&files).unwrap();
+        }
+        std::fs::remove_dir_all(jj_project("refused")).ok();
     }
 
     #[test]

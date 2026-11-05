@@ -317,33 +317,40 @@ pub const FILE_PROMPT: usize = 16 * 1024;
 /// input where it has one; one too long for an argument (`MAX_ARG`) goes to a
 /// file a short message names, for the agent to read as it reads any file.
 /// Either file is written 0600 into `files`, the session's private prompt
-/// directory (`tutti_core::prompts_dir`), which the daemon clears of it once
-/// the agent exits. A sandbox (`files` `None`) can't read this machine's
-/// files: there a prompt rides as itself, and one too long for that is
-/// refused.
+/// directory (`tutti_core::prompts_dir`), and returned beside the argv: the
+/// caller removes it should no pane end up with it (a fork or run refused,
+/// the daemon gone); once a run lands, the daemon removes it as the agent
+/// exits. A sandbox (`files`
+/// `None`) can't read this machine's files: there a prompt rides as itself,
+/// and one too long for that is refused.
 pub fn deploy_argv(
     spec: &AgentSpec,
     argv: Vec<String>,
     prompt: &str,
     files: Option<&Path>,
-) -> Result<Vec<String>> {
+) -> Result<(Vec<String>, Option<PathBuf>)> {
     let refuse = || format!("{} takes no first message on its command line", spec.kind);
     let inline = spec.prompt_args(prompt).with_context(refuse)?;
-    let args = match files {
+    let (args, file) = match files {
         Some(dir) if prompt.len() >= FILE_PROMPT && spec.prompt_file.is_some() => {
-            spec.prompt_file_args(&write_prompt(dir, prompt)?)
+            let file = write_prompt(dir, prompt)?;
+            (spec.prompt_file_args(&file), Some(file))
         }
-        Some(dir) if prompt.len() >= MAX_ARG => spec.prompt_args(&format!(
-            "Your task is too long for a command line, so it is in the file {}. Read that file and do what it says.",
-            write_prompt(dir, prompt)?.display()
-        )),
+        Some(dir) if prompt.len() >= MAX_ARG => {
+            let file = write_prompt(dir, prompt)?;
+            let message = format!(
+                "Your task is too long for a command line, so it is in the file {}. Read that file and do what it says.",
+                file.display()
+            );
+            (spec.prompt_args(&message), Some(file))
+        }
         None if prompt.len() >= MAX_ARG => bail!(
             "the issue's prompt is {} bytes, too long for a command line ({MAX_ARG}), and a sandbox can't read it from a file here",
             prompt.len()
         ),
-        _ => Some(inline),
+        _ => (Some(inline), None),
     };
-    Ok([argv, args.with_context(refuse)?].concat())
+    Ok(([argv, args.with_context(refuse)?].concat(), file))
 }
 
 /// `prompt` in a fresh file of `dir`, which is made private to the user
@@ -829,9 +836,15 @@ mod tests {
         let registry = Registry::default();
         let base = scratch("prompts");
         let dir = base.join("t.prompts");
+        // The file returned is the one the argv names, and none when it
+        // names none.
         let deploy = |kind: &str, prompt: &str, files: Option<&Path>| {
             let spec = registry.spec(&kind.into()).unwrap();
-            deploy_argv(spec, spec.argv(None), prompt, files)
+            deploy_argv(spec, spec.argv(None), prompt, files).map(|(argv, file)| {
+                let names = |path: &Path| argv.iter().any(|a| a.contains(&*path.to_string_lossy()));
+                assert_eq!(file.as_deref().is_some_and(names), names(&dir), "{argv:?}");
+                argv
+            })
         };
         let read = |file: &str| {
             let file = Path::new(file.strip_prefix('@').unwrap_or(file));

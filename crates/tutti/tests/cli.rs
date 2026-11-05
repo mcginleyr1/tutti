@@ -1169,9 +1169,20 @@ fn a_prompt_too_long_for_one_argument_deploys_through_a_file() {
         ),
     )
     .unwrap();
-    let deploy = |extra: &[&str], n: usize| {
+    // The fake daemon answers `n` requests, refusing those `refuse` picks,
+    // then hangs up.
+    let deploy_refusing = |extra: &[&str], n: usize, refuse: fn(&Request) -> bool| {
         let listener = UnixListener::bind(base.join("tutti/tutti.sock")).unwrap();
-        let server = serve_requests(listener, n, answer_deploy(project.clone()));
+        let answer = answer_deploy(project.clone());
+        let server = serve_requests(listener, n, move |request| {
+            if refuse(request) {
+                Response::Error {
+                    message: "refused".into(),
+                }
+            } else {
+                answer(request)
+            }
+        });
         let output = Command::new(env!("CARGO_BIN_EXE_tutti"))
             .args(["issue", "deploy", "jira", "PROJ-7", "--project", "1"])
             .args(extra)
@@ -1185,6 +1196,7 @@ fn a_prompt_too_long_for_one_argument_deploys_through_a_file() {
         std::fs::remove_file(base.join("tutti/tutti.sock")).unwrap();
         (output, server.join().unwrap())
     };
+    let deploy = |extra: &[&str], n: usize| deploy_refusing(extra, n, |_| false);
 
     let ran = |extra: &[&str]| {
         let (output, requests) = deploy(extra, 2);
@@ -1243,6 +1255,25 @@ fn a_prompt_too_long_for_one_argument_deploys_through_a_file() {
         String::from_utf8_lossy(&refused.stderr)
     );
     assert_eq!(requests, [Request::WorkspaceList], "nothing ran");
+
+    // A deploy no pane ended up with removes the file it wrote: nothing else
+    // would before the daemon stops.
+    let left = || std::fs::read_dir(&files).unwrap().count();
+    let before = left();
+    let (refused, requests) = deploy_refusing(&[], 2, |r| matches!(r, Request::Run { .. }));
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(matches!(requests[1], Request::Run { .. }));
+    assert_eq!(left(), before, "its run refused");
+    let (dropped, requests) = deploy(&[], 1);
+    assert_ne!(dropped.status.code(), Some(0));
+    assert_eq!(requests, [Request::WorkspaceList]);
+    assert_eq!(left(), before, "the daemon hung up on its run");
+    std::fs::create_dir_all(project.join(".jj")).unwrap();
+    let fork = |r: &Request| matches!(r, Request::WorkspaceFork { .. });
+    let (refused, requests) = deploy_refusing(&[], 2, fork);
+    assert_ne!(refused.status.code(), Some(0));
+    assert!(fork(&requests[1]), "{requests:?}");
+    assert_eq!(left(), before, "its workspace refused");
     let _ = std::fs::remove_dir_all(&base);
 }
 

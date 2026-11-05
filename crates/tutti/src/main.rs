@@ -1427,31 +1427,41 @@ fn run_issue(action: IssueAction, session: &str, json: bool) -> Result<i32> {
                 .flatten();
             let files = sandbox.is_none().then(|| tutti_core::prompts_dir(session));
             let argv = spec.argv(path.as_deref());
-            let cmd = issues::deploy_argv(spec, argv, &prompt, files.as_deref())?;
+            let (cmd, written) = issues::deploy_argv(spec, argv, &prompt, files.as_deref())?;
             let into = (!here && project.dir.ancestors().any(|d| d.join(".jj").exists()))
                 .then(|| issues::workspace_name(&issue.source, &issue.id));
-            let workspace = match &into {
-                None => project.id,
-                Some(name) => match client.request(&Request::WorkspaceFork {
-                    id: project.id,
-                    name: name.clone(),
-                    revision: None,
-                    dest: None,
-                })? {
-                    Response::WorkspaceCreated { id } => id,
-                    Response::Error { message } => bail!("{message}"),
-                    other => bail!("unexpected reply to workspace add: {other:?}"),
-                },
-            };
-            let response = client.request(&Request::Run {
-                workspace: Some(workspace),
-                dir: None,
-                cmd,
-                sandbox: sandbox.clone(),
-                title: None,
-                issue: Some(issue.link()),
-                from: None,
-            })?;
+            let response = (|| -> Result<Response> {
+                let workspace = match &into {
+                    None => project.id,
+                    Some(name) => match client.request(&Request::WorkspaceFork {
+                        id: project.id,
+                        name: name.clone(),
+                        revision: None,
+                        dest: None,
+                    })? {
+                        Response::WorkspaceCreated { id } => id,
+                        Response::Error { message } => bail!("{message}"),
+                        other => bail!("unexpected reply to workspace add: {other:?}"),
+                    },
+                };
+                client.request(&Request::Run {
+                    workspace: Some(workspace),
+                    dir: None,
+                    cmd,
+                    sandbox: sandbox.clone(),
+                    title: None,
+                    issue: Some(issue.link()),
+                    from: None,
+                })
+            })();
+            // No pane took the prompt file, so nothing else would remove it
+            // before the daemon stops.
+            if !matches!(response, Ok(Response::Ran { .. }))
+                && let Some(file) = &written
+            {
+                let _ = std::fs::remove_file(file);
+            }
+            let response = response?;
             let ran = match response {
                 Response::Ran { pane, .. } => Some(pane),
                 _ => None,
