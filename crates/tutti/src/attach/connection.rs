@@ -151,6 +151,7 @@ mod tests {
             Request::Attach {
                 terminal: None,
                 handoff: false,
+                view: false,
             },
             Request::Detach,
             Request::PaneFocus { pane },

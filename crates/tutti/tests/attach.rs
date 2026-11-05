@@ -166,6 +166,7 @@ fn attach_seeds_app_and_input_updates_grid() {
     viewer.send(&Request::Attach {
         terminal: None,
         handoff: false,
+        view: false,
     });
 
     let mut app = App::new();
@@ -240,6 +241,7 @@ fn a_scripted_pane_focus_jumps_the_attached_client() {
     viewer.send(&Request::Attach {
         terminal: None,
         handoff: false,
+        view: false,
     });
     let mut app = App::new();
     let response = viewer.response();

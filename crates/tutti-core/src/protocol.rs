@@ -409,12 +409,17 @@ pub enum Request {
     /// a terminal of panes of its own (rtty) and hands a move past tutti's
     /// edge on to it — at any edge, so it is handed top and bottom ones too
     /// (`Event::FocusEdge`), and resizes no split of tutti's takes
-    /// (`Event::ResizeEdge`).
+    /// (`Event::ResizeEdge`). `view`: the client only watches (`tutti
+    /// attach --view`): its focus is its own — it moves no pane of the
+    /// session's, marks no `Done` pane seen and no note read — and it is "the"
+    /// attached client only while no other is.
     Attach {
         #[serde(default)]
         terminal: Option<String>,
         #[serde(default)]
         handoff: bool,
+        #[serde(default)]
+        view: bool,
     },
     Detach,
     /// Subscribe this connection to `Event::Snapshot`s: one at once, then one
@@ -1160,8 +1165,9 @@ pub enum Event {
     },
     /// The whole session as a watcher (`Request::Watch`) sees it, replacing
     /// the previous snapshot: every pane flat, in sidebar order.
-    /// `attached_terminal` is the newest attached client's `terminal` — `None`
-    /// with nobody attached — and `focused` marks that client's pane.
+    /// `attached_terminal` is the newest attached client's `terminal` — the
+    /// newest view's only with no other client, `None` with nobody attached —
+    /// and `focused` marks that client's pane.
     Snapshot {
         session: String,
         wire_rev: u32,
@@ -1540,10 +1546,17 @@ mod tests {
         roundtrip(&Request::Attach {
             terminal: None,
             handoff: false,
+            view: false,
         });
         roundtrip(&Request::Attach {
             terminal: Some("com.mitchellh.ghostty".into()),
             handoff: true,
+            view: false,
+        });
+        roundtrip(&Request::Attach {
+            terminal: None,
+            handoff: false,
+            view: true,
         });
         roundtrip(&Request::Watch);
         roundtrip(&Request::PaneAttach {
@@ -2485,14 +2498,15 @@ mod tests {
                 last_reply: false,
             }
         );
-        // `attach` from before `terminal` and `handoff` existed names no
-        // terminal and hands nothing on.
+        // `attach` from before `terminal`, `handoff` and `view` existed names
+        // no terminal, hands nothing on, and is no mere view.
         let attach: Request = serde_json::from_str(r#"{"type":"attach"}"#).unwrap();
         assert_eq!(
             attach,
             Request::Attach {
                 terminal: None,
-                handoff: false
+                handoff: false,
+                view: false,
             }
         );
         // ...and an older daemon, whose `Attach` is a unit variant, still

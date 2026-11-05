@@ -1405,6 +1405,7 @@ async fn attach_receives_snapshot_then_delta() {
         .send(&Request::Attach {
             terminal: None,
             handoff: false,
+            view: false,
         })
         .await;
     match viewer.response().await {
@@ -1465,6 +1466,7 @@ async fn snapshot_carries_mouse_reporting_mode() {
         .send(&Request::Attach {
             terminal: None,
             handoff: false,
+            view: false,
         })
         .await;
     let _ = viewer.response().await;
@@ -1507,6 +1509,7 @@ async fn attach_resize_reseeds_at_new_size() {
         .send(&Request::Attach {
             terminal: None,
             handoff: false,
+            view: false,
         })
         .await;
     let _ = viewer.response().await;
@@ -1567,6 +1570,7 @@ async fn attach(
     conn.send(&Request::Attach {
         terminal: None,
         handoff: false,
+        view: false,
     })
     .await;
     loop {
@@ -1855,6 +1859,7 @@ async fn resize_split_adjusts_ratio_and_broadcasts() {
         .send(&Request::Attach {
             terminal: None,
             handoff: false,
+            view: false,
         })
         .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
@@ -1910,6 +1915,7 @@ async fn split_ratio_sets_the_separating_split_and_broadcasts() {
         .send(&Request::Attach {
             terminal: None,
             handoff: false,
+            view: false,
         })
         .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
@@ -2002,6 +2008,7 @@ async fn wedged_client_is_dropped_but_others_keep_flowing() {
         .send(&Request::Attach {
             terminal: None,
             handoff: false,
+            view: false,
         })
         .await;
 
@@ -2010,6 +2017,7 @@ async fn wedged_client_is_dropped_but_others_keep_flowing() {
     good.send(&Request::Attach {
         terminal: None,
         handoff: false,
+        view: false,
     })
     .await;
     assert!(matches!(good.response().await, Response::Attached { .. }));
@@ -3053,6 +3061,7 @@ async fn a_requests_req_rides_back_on_its_answer() {
             Request::Attach {
                 terminal: None,
                 handoff: false,
+                view: false,
             },
         ))
         .await;
@@ -3531,6 +3540,7 @@ async fn agent_event_blocks_and_broadcasts() {
         .send(&Request::Attach {
             terminal: None,
             handoff: false,
+            view: false,
         })
         .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
@@ -3580,6 +3590,7 @@ async fn attached_viewer(server: &TestServer) -> Conn {
         .send(&Request::Attach {
             terminal: None,
             handoff: false,
+            view: false,
         })
         .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
@@ -4139,6 +4150,7 @@ async fn notifications_and_attention_transitions_land_in_the_history() {
     late.send(&Request::Attach {
         terminal: None,
         handoff: false,
+        view: false,
     })
     .await;
     let caught_up = timeout(DEADLINE, async {
@@ -4668,6 +4680,7 @@ async fn a_shell_panes_own_status_reports_drive_its_state() {
         .send(&Request::Attach {
             terminal: None,
             handoff: false,
+            view: false,
         })
         .await;
     let label = |p: &PaneInfo| p.agent.as_ref().map(ToString::to_string);
@@ -4893,6 +4906,7 @@ async fn agent_state_changes_working_then_blocked() {
         .send(&Request::Attach {
             terminal: None,
             handoff: false,
+            view: false,
         })
         .await;
 
@@ -5107,6 +5121,7 @@ async fn a_mirror_fingerprints_like_the_live_grid() {
         .send(&Request::Attach {
             terminal: None,
             handoff: false,
+            view: false,
         })
         .await;
     let mut mirror = None;
@@ -5349,6 +5364,7 @@ async fn ephemeral_pane_vanishes_on_child_exit() {
         .send(&Request::Attach {
             terminal: None,
             handoff: false,
+            view: false,
         })
         .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
@@ -5447,6 +5463,108 @@ async fn focus_transitions_done_pane_to_idle() {
     server.stop().await;
 }
 
+/// Focus `pane` from `conn`, an attached client, waiting for the answer.
+async fn focus(conn: &mut Conn, pane: PaneId) {
+    conn.send(&Request::PaneFocus { pane }).await;
+    read_until_control(conn, |r: &Response| *r == Response::Ok).await;
+}
+
+/// A view's focus is its own: a done pane it focuses stays done and an
+/// unread note on one stays unread, for everybody; a bell from the pane it
+/// looks at lands; it is "the" attached client only with no other. Yet the
+/// daemon knows where it looks: a move past that pane's edge is handed to
+/// it. An attached client's focus then marks both seen.
+#[tokio::test]
+async fn a_views_focus_marks_nothing_seen() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    new_workspace(&mut control).await;
+    let run = Request::PaneRun {
+        tab: None,
+        cmd: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+        ephemeral: false,
+        sandbox: None,
+    };
+    let done = pane_id(control.request(run).await);
+    assert!(wait_state(&mut control, done, AgentState::Done).await);
+    let shell = run_shell(&mut control).await;
+    let other = run_shell(&mut control).await;
+    printf_osc(&mut control, shell, "9;look").await;
+    timeout(DEADLINE, async {
+        while list_notes(&mut control, true).await.is_empty() {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the note never landed");
+    let attach = |view| Request::Attach {
+        terminal: None,
+        handoff: false,
+        view,
+    };
+    let mut tui = server.connect().await;
+    tui.send(&attach(false)).await;
+    focus(&mut tui, other).await;
+    let mut viewer = server.connect().await;
+    viewer.send(&attach(true)).await;
+    focus(&mut viewer, done).await;
+    focus(&mut viewer, shell).await;
+
+    let bell = Request::PaneSend {
+        pane: shell,
+        text: Some("printf '\\a'\n".into()),
+        keys: None,
+        expect: None,
+        between_turns: false,
+        hooks: None,
+    };
+    assert_eq!(control.request(bell).await, Response::Ok);
+    assert_eq!(noted(&mut tui).await.kind, NoteKind::Bell);
+    let unread = |notes: Vec<Note>| -> Vec<(PaneId, NoteKind)> {
+        notes.iter().map(|n| (n.pane, n.kind)).collect()
+    };
+    assert_eq!(
+        unread(list_notes(&mut control, true).await),
+        [(shell, NoteKind::Notify), (shell, NoteKind::Bell)]
+    );
+    assert!(wait_state(&mut control, done, AgentState::Done).await);
+    let toward = |from| Request::PaneFocusToward {
+        from,
+        toward: Toward::Left,
+        wrap: false,
+    };
+    let Response::Neighbor { from, relayed, .. } = control.request(toward(None)).await else {
+        panic!("no neighbor answer");
+    };
+    assert_eq!(
+        (from, relayed),
+        (other, true),
+        "the attached client's focus"
+    );
+    let Response::Neighbor { relayed, .. } = control.request(toward(Some(shell))).await else {
+        panic!("no neighbor answer");
+    };
+    assert!(relayed, "the view looks at the pane");
+    let edge = read_until_control(&mut viewer, |e: &Event| {
+        matches!(e, Event::FocusEdge { .. })
+    })
+    .await;
+    assert_eq!(
+        edge,
+        Event::FocusEdge {
+            pane: shell,
+            toward: Toward::Left
+        }
+    );
+
+    focus(&mut tui, done).await;
+    focus(&mut tui, shell).await;
+    assert!(wait_state(&mut control, done, AgentState::Idle).await);
+    assert!(list_notes(&mut control, true).await.is_empty());
+
+    server.stop().await;
+}
+
 /// Snapshots off a watcher until one satisfies `want`, returning it as
 /// `(attached_terminal, panes)`. A watcher must be sent nothing else — no pane
 /// frame, no event — so anything else fails the test.
@@ -5530,6 +5648,7 @@ async fn a_watcher_snapshots_the_session_beside_an_attached_client() {
         .send(&Request::Attach {
             terminal: Some("com.mitchellh.ghostty".into()),
             handoff: false,
+            view: false,
         })
         .await;
     viewer.send(&Request::PaneFocus { pane }).await;
@@ -5648,6 +5767,7 @@ async fn a_scripted_focus_is_relayed_to_the_attached_client() {
         .send(&Request::Attach {
             terminal: None,
             handoff: false,
+            view: false,
         })
         .await;
     viewer.send(&Request::PaneFocus { pane: own }).await;
@@ -5748,6 +5868,7 @@ async fn directional_focus_and_resize_start_from_the_named_or_attached_pane() {
         .send(&Request::Attach {
             terminal: None,
             handoff: false,
+            view: false,
         })
         .await;
     viewer.send(&Request::PaneFocus { pane: left }).await;
@@ -5866,6 +5987,7 @@ async fn a_handoff_client_takes_every_edge_and_unsplit_resizes() {
         .send(&Request::Attach {
             terminal: None,
             handoff: true,
+            view: false,
         })
         .await;
     viewer.send(&Request::PaneFocus { pane: right }).await;
@@ -5933,6 +6055,7 @@ async fn a_panes_user_vars_reach_its_listing_view_and_watchers() {
         .send(&Request::Attach {
             terminal: None,
             handoff: false,
+            view: false,
         })
         .await;
     let mut watcher = server.connect().await;
@@ -6047,6 +6170,7 @@ async fn a_shell_side_jj_operation_refreshes_the_change_stat() {
         .send(&Request::Attach {
             terminal: None,
             handoff: false,
+            view: false,
         })
         .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
@@ -6089,6 +6213,7 @@ async fn the_watch_ignores_the_probes_own_snapshot() {
         .send(&Request::Attach {
             terminal: None,
             handoff: false,
+            view: false,
         })
         .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
@@ -6106,6 +6231,7 @@ async fn the_watch_ignores_the_probes_own_snapshot() {
         .send(&Request::Attach {
             terminal: None,
             handoff: false,
+            view: false,
         })
         .await;
     assert!(matches!(second.response().await, Response::Attached { .. }));
@@ -6220,6 +6346,7 @@ async fn fork_creates_sibling_checkout_with_a_shell_pane() {
         .send(&Request::Attach {
             terminal: None,
             handoff: false,
+            view: false,
         })
         .await;
     let workspaces = match viewer.response().await {
@@ -6432,6 +6559,7 @@ async fn fork_goes_stale_then_update_clears_it() {
         .send(&Request::Attach {
             terminal: None,
             handoff: false,
+            view: false,
         })
         .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
@@ -7210,6 +7338,7 @@ async fn a_turn_checkpoints_its_diff_and_restores_round_trip() {
         .send(&Request::Attach {
             terminal: None,
             handoff: false,
+            view: false,
         })
         .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));

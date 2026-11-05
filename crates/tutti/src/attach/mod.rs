@@ -55,7 +55,8 @@ const POLL: Duration = Duration::from_millis(16);
 /// it sends the daemon nothing but navigation (`Connection::send`), so no
 /// key, size vote or colour of its terminal reaches a pane — the panes keep
 /// the sizes the other clients vote, or, with none, the size they have —
-/// and opens no file in a pane's editor.
+/// and opens no file in a pane's editor. It attaches as a view, so its
+/// focus marks no agent seen and no note read.
 pub fn run(
     session: &str,
     config: Config,
@@ -73,6 +74,7 @@ pub fn run(
     let attach = Request::Attach {
         terminal,
         handoff: rtty.is_some(),
+        view,
     };
     conn.send(&tagged(&attach, 0))
         .context("send attach request")?;

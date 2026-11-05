@@ -107,6 +107,10 @@ struct Client {
     /// The client hands a move past tutti's edge on to the terminal it runs
     /// in (rtty), from its `Attach`: it takes top, bottom and resize edges too.
     handoff: bool,
+    /// The client is a view (`tutti attach --view`), from its `Attach`: it
+    /// only watches, its focus its own, seeing nothing for the user
+    /// (`focus_pane`).
+    watching: bool,
     /// The pane the client last reported focused — what it shows, for watchers.
     focused: Option<PaneId>,
 }
@@ -756,7 +760,11 @@ fn handle_frame(
     };
     match frame {
         Frame::Control(json) => match serde_json::from_slice::<Request>(&json) {
-            Ok(Request::Attach { terminal, handoff }) => {
+            Ok(Request::Attach {
+                terminal,
+                handoff,
+                view,
+            }) => {
                 // Register this client before snapshotting the view, so a
                 // StateChanged/LayoutChanged broadcast in the gap is delivered
                 // (an early or duplicate event the client applies idempotently)
@@ -774,6 +782,7 @@ fn handle_frame(
                         view: Vec::new(),
                         terminal,
                         handoff,
+                        watching: view,
                         focused: None,
                     },
                 );
@@ -1521,8 +1530,27 @@ fn split_ratio(hub: &Arc<Hub>, a: PaneId, b: PaneId, ratio: f32) -> Response {
 /// transition if it changed — and the view, when that settles a self-reported
 /// pane out of the agent surfaces. An attached client's focus is recorded as
 /// what it shows; anyone else's (a script, a notch app's click) is relayed as
-/// `PaneFocused`, so the attached client jumps there.
+/// `PaneFocused`, so the attached client jumps there. A view's is only what
+/// it shows: it moves no pane of the session's, and sees nothing for the
+/// user, who may not be watching it.
 fn focus_pane(hub: &Arc<Hub>, cid: u64, pane: PaneId) -> Response {
+    let watching = hub
+        .clients()
+        .get(&cid)
+        .is_some_and(|client| client.watching);
+    if watching {
+        let known = hub.session().pane_state(pane).is_some();
+        let mut clients = hub.clients();
+        return match clients.get_mut(&cid) {
+            Some(client) if known => {
+                client.focused = Some(pane);
+                Response::Ok
+            }
+            _ => Response::Error {
+                message: format!("no pane {pane}"),
+            },
+        };
+    }
     let mut session = hub.session();
     if session.set_active_pane(pane).is_err() {
         return Response::Error {
@@ -1616,16 +1644,22 @@ fn relay_edge(hub: &Hub, pane: PaneId, edge: Event, takes: impl Fn(&Client) -> b
 }
 
 /// The pane a directional request starts from: `from`, else the attached
-/// client's focused pane — the newest client's, as a watcher's snapshot
-/// names it.
+/// client's focused pane — "the" client's (`the_client`), as a watcher's
+/// snapshot names it.
 fn source_pane(hub: &Hub, from: Option<PaneId>) -> Result<PaneId> {
     from.or_else(|| {
         hub.clients()
             .iter()
-            .max_by_key(|(cid, _)| **cid)
+            .max_by_key(the_client)
             .and_then(|(_, client)| client.focused)
     })
     .context("no pane to start from: name one, or focus one in an attached client")
+}
+
+/// Which attached client is "the" one, the greatest by this key: the newest
+/// that is no view, else the newest view.
+fn the_client((cid, client): &(&u64, &Client)) -> (bool, u64) {
+    (!client.watching, **cid)
 }
 
 /// Publish one pane's state transition — the single funnel every transition
@@ -1687,7 +1721,8 @@ fn pane_notification(hub: &Hub, pane: PaneId, title: Option<String>, body: Optio
 /// the pane. A note about a pane an attached client is looking at lands read —
 /// and a bell there, which says nothing more, lands not at all; nor does a
 /// bell repeating its pane's newest note, an unread bell, so a bell storm
-/// cannot flush the history. Each lock is taken and released on its own.
+/// cannot flush the history. A view looking at it sees nothing for the user.
+/// Each lock is taken and released on its own.
 fn add_note(hub: &Hub, pane: PaneId, kind: NoteKind, title: Option<String>, body: Option<String>) {
     // Read straight off the model, as a watcher's snapshot is.
     let names = hub
@@ -1698,7 +1733,10 @@ fn add_note(hub: &Hub, pane: PaneId, kind: NoteKind, title: Option<String>, body
     let Some(names) = names else {
         return;
     };
-    let seen = hub.clients().values().any(|c| c.focused == Some(pane));
+    let seen = hub
+        .clients()
+        .values()
+        .any(|c| !c.watching && c.focused == Some(pane));
     let bell = kind == NoteKind::Bell;
     if bell && seen {
         return;
@@ -3175,8 +3213,8 @@ fn broadcast_tick(hub: &Arc<Hub>) {
 /// Send each watcher the session's snapshot when it differs from the last one
 /// that watcher got. Run on the render tick, so a burst of changes coalesces
 /// into one snapshot, and on `Watch`, so the first goes out at once. "The"
-/// attached client is the newest. A watcher whose queue is full is dropped,
-/// as a wedged client is.
+/// attached client is the newest, a view only with no other (`the_client`).
+/// A watcher whose queue is full is dropped, as a wedged client is.
 fn snapshot_watchers(hub: &Hub) {
     if hub.watchers().is_empty() {
         return;
@@ -3184,7 +3222,7 @@ fn snapshot_watchers(hub: &Hub) {
     let (attached_terminal, focused) = hub
         .clients()
         .iter()
-        .max_by_key(|(cid, _)| **cid)
+        .max_by_key(the_client)
         .map_or((None, None), |(_, client)| {
             (client.terminal.clone(), client.focused)
         });
@@ -3496,6 +3534,7 @@ mod tests {
         let attach = Request::Attach {
             terminal: None,
             handoff: false,
+            view: false,
         };
         viewer.request(&attach).await;
         assert_eq!(viewer.request(&vote(20, 60)).await, Response::Ok);
@@ -3600,6 +3639,7 @@ mod tests {
         peer.request(&Request::Attach {
             terminal: None,
             handoff: false,
+            view: false,
         })
         .await;
         peer.until(|frame| match frame {
@@ -3668,6 +3708,7 @@ mod tests {
             .request(&Request::Attach {
                 terminal: None,
                 handoff: false,
+                view: false,
             })
             .await;
         let send = |pane, text: &str| Request::PaneSend {
