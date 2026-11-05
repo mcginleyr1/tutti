@@ -19,6 +19,12 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// restore rewrites the checkout the same way and shares it.
 const FORK_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long an add given up on at `FORK_TIMEOUT` may run on before it is
+/// killed. A jj stopped mid-add can leave a Git worktree registered at the
+/// checkout (jj 0.47, a colocated repo) that no jj command removes, and git
+/// then refuses the next add there; one left to end can be undone whole.
+const ADD_WIND_DOWN: Duration = Duration::from_secs(60);
+
 /// Cap on each `jj` invocation in the merge sequence — rebase, conflict probe,
 /// bookmark move, optional push — each of which can touch the store or network,
 /// and on a sandbox pull's fetch.
@@ -302,20 +308,81 @@ pub async fn restore(dir: &Path, commit: &str) -> Result<String, String> {
 /// Fork the jj repo rooted at `repo_root` into a new workspace at `dest`, named
 /// `name` (optionally checked out at `revision`). Runs `jj workspace add` from
 /// the repo root. `Ok(())` on success; the jj stderr (or a spawn/timeout error)
-/// otherwise. The caller has already verified `dest` does not exist. A
-/// `revision` naming no commit is refused first: jj registers the workspace
-/// and makes its checkout before it resolves one, and would leave both behind.
+/// otherwise. A `revision` naming no commit is refused first: jj registers the
+/// workspace and makes its checkout before it resolves one.
+///
+/// `dest` is made here, and only if nothing is there yet, so a failed add can
+/// tell what it made: it removes that directory, and forgets `name` only while
+/// jj records the workspace at it — never a same-named one made elsewhere.
 pub async fn fork(
     repo_root: &Path,
     dest: &Path,
     name: &str,
     revision: Option<&str>,
 ) -> Result<(), String> {
+    fork_within(repo_root, dest, name, revision, FORK_TIMEOUT).await
+}
+
+async fn fork_within(
+    repo_root: &Path,
+    dest: &Path,
+    name: &str,
+    revision: Option<&str>,
+    budget: Duration,
+) -> Result<(), String> {
     if let Some(rev) = revision
         && log_template(repo_root, rev, "commit_id").await?.is_empty()
     {
         return Err(format!("revision {rev:?} names no commit"));
     }
+    tokio::fs::create_dir(dest)
+        .await
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => {
+                format!("workspace destination already exists: {}", dest.display())
+            }
+            _ => format!("create {}: {e}", dest.display()),
+        })?;
+    let Err(failed) = add(repo_root, dest, name, revision, budget).await else {
+        return Ok(());
+    };
+    let mut errors = vec![failed];
+    if registered_at(repo_root, name, dest).await
+        && let Err(e) = forget(repo_root, name).await
+    {
+        errors.push(format!("forget {name}: {e}"));
+    }
+    if let Err(e) = tokio::fs::remove_dir_all(dest).await {
+        errors.push(format!("remove {}: {e}", dest.display()));
+    }
+    Err(errors.join("; "))
+}
+
+/// Whether jj records the workspace `name` at `dest`.
+async fn registered_at(repo_root: &Path, name: &str, dest: &Path) -> bool {
+    let args = ["--ignore-working-copy", "workspace", "root", "--name", name];
+    let Ok(output) = run(jj_cmd(repo_root, &args), TIMEOUT).await else {
+        return false;
+    };
+    let root = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    output.status.success()
+        && (root == dest
+            || matches!(
+                (std::fs::canonicalize(&root), std::fs::canonicalize(dest)),
+                (Ok(a), Ok(b)) if a == b
+            ))
+}
+
+/// `jj workspace add` itself. Past `budget` the add is given up on, but jj is
+/// left `ADD_WIND_DOWN` to end on its own, so `fork_within` undoes a whole
+/// workspace rather than one stopped halfway.
+async fn add(
+    repo_root: &Path,
+    dest: &Path,
+    name: &str,
+    revision: Option<&str>,
+    budget: Duration,
+) -> Result<(), String> {
     let mut cmd = Command::new("jj");
     cmd.arg("--no-pager")
         .arg("workspace")
@@ -331,10 +398,16 @@ pub async fn fork(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    match run(cmd, FORK_TIMEOUT).await {
-        Ok(output) if output.status.success() => Ok(()),
-        Ok(output) => Err(stderr_or(&output, "jj workspace add failed")),
-        Err(message) => Err(message),
+    let child = cmd.spawn().map_err(|e| format!("spawn jj: {e}"))?;
+    let mut ended = std::pin::pin!(child.wait_with_output());
+    match tokio::time::timeout(budget, ended.as_mut()).await {
+        Ok(Ok(output)) if output.status.success() => Ok(()),
+        Ok(Ok(output)) => Err(stderr_or(&output, "jj workspace add failed")),
+        Ok(Err(e)) => Err(format!("jj failed: {e}")),
+        Err(_) => {
+            let _ = tokio::time::timeout(ADD_WIND_DOWN, ended).await;
+            Err(format!("jj timed out after {}s", budget.as_secs()))
+        }
     }
 }
 
@@ -830,6 +903,112 @@ Binary files a/img.png and b/img.png differ
         assert!(!valid_fork_name("has space"));
         assert!(!valid_fork_name("has/slash"));
         assert!(!valid_fork_name("dots.bad"));
+    }
+
+    /// A fresh path in the temp dir, not yet made.
+    fn scratch(prefix: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("tutti-{prefix}-{}-{n}", std::process::id()))
+    }
+
+    /// A throwaway jj repo with one commit, or `None` when jj is not on PATH.
+    fn repo() -> Option<PathBuf> {
+        let dir = scratch("jjadd");
+        let jj = |args: &[&str]| {
+            std::process::Command::new("jj")
+                .arg("--no-pager")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        if !jj(&["git", "init"]) {
+            eprintln!("skipping: jj is not on PATH");
+            return None;
+        }
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        assert!(jj(&["config", "set", "--repo", "signing.behavior", "drop"]));
+        assert!(jj(&["commit", "-m", "a"]));
+        Some(dir)
+    }
+
+    fn workspaces(repo: &Path) -> String {
+        let out = std::process::Command::new("jj")
+            .args(["--no-pager", "workspace", "list", "-T", "name ++ \"\\n\""])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// A Git worktree a colocated repo still registers (jj 0.47 makes one per
+    /// workspace): git refuses a later add at its checkout while it stays.
+    fn git_worktrees(repo: &Path) -> usize {
+        std::fs::read_dir(repo.join(".git").join("worktrees")).map_or(0, |d| d.count())
+    }
+
+    #[tokio::test]
+    async fn an_add_given_up_on_is_undone_whole_once_jj_ends() {
+        let Some(repo) = repo() else { return };
+        let dest = scratch("jjadd-dest");
+        let err = fork_within(&repo, &dest, "late", None, Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(
+            !dest.exists(),
+            "the checkout was left at {}",
+            dest.display()
+        );
+        assert!(!workspaces(&repo).lines().any(|l| l == "late"));
+        assert_eq!(git_worktrees(&repo), 0);
+
+        fork(&repo, &dest, "late", None).await.unwrap();
+        assert!(dest.join(".jj").exists());
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[tokio::test]
+    async fn a_failed_add_never_forgets_a_same_named_workspace() {
+        let Some(repo) = repo() else { return };
+        let theirs = scratch("jjadd-theirs");
+        fork(&repo, &theirs, "feature", None).await.unwrap();
+        let dest = scratch("jjadd-dest");
+        let err = fork(&repo, &dest, "feature", None).await.unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert!(!dest.exists());
+        assert!(workspaces(&repo).lines().any(|l| l == "feature"));
+        assert!(theirs.join("a.txt").exists());
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&theirs);
+    }
+
+    /// A workspace whose checkout was deleted unforgotten leaves its Git
+    /// worktree registered, so git refuses an add at that path after jj made
+    /// the directory: the add removes its own directory and forgets nothing,
+    /// the other workspace recorded at the very same path included.
+    #[tokio::test]
+    async fn a_refused_add_leaves_a_workspace_recorded_at_its_path_alone() {
+        let Some(repo) = repo() else { return };
+        let dest = scratch("jjadd-dest");
+        fork(&repo, &dest, "other", None).await.unwrap();
+        std::fs::remove_dir_all(&dest).unwrap();
+        match fork(&repo, &dest, "mine", None).await {
+            Ok(()) => eprintln!("this jj made no Git worktree to refuse the add"),
+            Err(err) => {
+                assert!(err.contains("worktree"), "{err}");
+                assert!(!dest.exists());
+                let listed = workspaces(&repo);
+                assert!(listed.lines().any(|l| l == "other"), "{listed}");
+                assert!(!listed.lines().any(|l| l == "mine"), "{listed}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&dest);
     }
 
     #[test]
