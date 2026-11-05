@@ -362,13 +362,20 @@ impl Default for Registry {
                 // renderers: no `esc to interrupt` any more; a running turn's
                 // spinner reads `✶ Dilly-dallying… (12s · ↓ 98 tokens)` or
                 // `(3s · ↓ 345 tokens · thinking)` once tokens flow, an ended
-                // one `✻ Brewed for 23s · done 9:43 AM`.
+                // one `✻ Brewed for 23s · done 9:43 AM`. A new folder's
+                // trust dialog (`❯ Yes, I trust this folder`) waits on you.
                 AgentSpec::new(
                     "claude",
                     "Claude Code",
                     "https://claude.com/claude-code",
                     &["claude"],
-                    &["Do you want", "y/n", "Waiting for your input", "permission"],
+                    &[
+                        "Do you want",
+                        "y/n",
+                        "Waiting for your input",
+                        "permission",
+                        "trust this folder",
+                    ],
                     &["esc to interrupt", "Thinking", "Running", "· ↓ "],
                     &["❯"],
                 )
@@ -378,7 +385,11 @@ impl Default for Registry {
                 // `--no-daemon`: Codex's shared app-server (its default since
                 // 0.16x) runs every session's hooks with the environment of
                 // whichever codex started it, so their `TUTTI_PANE` would be
-                // another pane's. Embedded, they are this pane's.
+                // another pane's. Embedded, they are this pane's. Observed
+                // live, 0.166.0: the composer's `›` is the idle prompt; its
+                // dialogs (approval, folder trust, hook review) wait on you;
+                // an answered approval leaves `✔ You approved codex to run …`
+                // in the transcript, so no bare `approve`.
                 AgentSpec {
                     launch_args: owned(&["--no-daemon"]),
                     ..AgentSpec::new(
@@ -386,9 +397,15 @@ impl Default for Registry {
                         "Codex CLI",
                         "https://github.com/openai/codex",
                         &["codex"],
-                        &["Allow command", "approve", "y/n"],
+                        &[
+                            "Allow command",
+                            "y/n",
+                            "Press enter to confirm or esc to cancel",
+                            "Trust this folder",
+                            "Hooks need review",
+                        ],
                         &["esc to interrupt", "Working", "Thinking"],
-                        &["»"],
+                        &["›"],
                     )
                 }
                 // `--help` (0.166.0): `codex [PROMPT]`, "Optional user prompt
@@ -675,6 +692,34 @@ mod tests {
         assert_eq!(claude().classify(classic), Some(Observation::Working));
         assert_eq!(claude().classify(dialog), Some(Observation::Blocked));
         assert_eq!(claude().classify(ended), Some(Observation::Done));
+    }
+
+    /// Claude Code 2.1.318 in a folder it has not been trusted in: the
+    /// trust dialog waits on you, its `❯` menu cursor no turn's end.
+    #[test]
+    fn claudes_folder_trust_dialog_reads_blocked() {
+        let trust = " Quick safety check: Is this a project you created or one you trust?\n\n Claude Code'll be able to read, edit, and execute files here.\n\n Security guide\n\n ❯ No, exit\n   Yes, I trust this folder\n\n Enter to confirm · Esc to cancel";
+        assert_eq!(claude().classify(trust), Some(Observation::Blocked));
+    }
+
+    /// Codex 0.166.0's screens as observed live: a running turn, its end at
+    /// the `›` composer, its approval, folder-trust and hook-review dialogs,
+    /// and the transcript an answered approval leaves, which is no dialog.
+    #[test]
+    fn codex_screen_markers_classify_working_done_and_blocked() {
+        let spec = Registry::default().match_process("codex").unwrap().clone();
+        let working = "• I’ll add sq(x) to calc.py without running commands.\n\n• Working (4s • esc to interrupt)\n\n\n› Ask Codex to do anything\n\n  GPT · ~/repo-b\n  ? for shortcuts";
+        let ended = "• Added sq(x) returning x * x in calc.py without running commands.\n\n  Worked for 19s • 10:01 AM\n\n\n› Ask Codex to do anything\n\n  GPT · ~/repo-b\n  ? for shortcuts";
+        let approval = "• Running touch hello.txt\n\n\n  Would you like to run the following command?\n\n  Reason: May I run touch hello.txt outside the read-only sandbox?\n\n  $ touch hello.txt\n\n\n› 1. Yes, proceed (y)\n  2. Yes, and don't ask again for commands that start with `touch hello.txt` (p)\n  3. No, and tell Codex what to do differently (esc)\n\n  Press enter to confirm or esc to cancel";
+        let trust = "  Trust this folder? Codex can read, edit, and run files here, subject to your\n  permission settings. Your trust decision will be saved.\n\n› 1. Trust and continue\n  2. Quit\n\n  enter continue · esc quit";
+        let hooks = "  Hooks need review\n  15 hooks are new or changed.\n  Hooks can run outside the sandbox after you trust them.\n\n\n› 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting (hooks won't run)\n\n  enter confirm · esc skip";
+        let approved = "✔ You approved codex to run touch hello.txt this time\n\n• Ran touch hello.txt\n  └ (no output)\n\n• Created hello.txt after approval.\n\n  Worked for 25s • 10:03 AM\n\n\n› Ask Codex to do anything\n\n  GPT · ~/repo-b\n  ? for shortcuts";
+        assert_eq!(spec.classify(working), Some(Observation::Working));
+        assert_eq!(spec.classify(ended), Some(Observation::Done));
+        assert_eq!(spec.classify(approval), Some(Observation::Blocked));
+        assert_eq!(spec.classify(trust), Some(Observation::Blocked));
+        assert_eq!(spec.classify(hooks), Some(Observation::Blocked));
+        assert_eq!(spec.classify(approved), Some(Observation::Done));
     }
 
     #[test]
