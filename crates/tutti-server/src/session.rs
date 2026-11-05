@@ -25,6 +25,9 @@ use crate::pty::{PaneSize, PtyPane, PtySpec, StatusReport};
 /// The most subagent rows kept per pane before the oldest is dropped, bounding
 /// the list even for an agent that spawns many short-lived subagents.
 const SUBAGENT_CAP: usize = 16;
+/// How many approvals released at turn ends a pane remembers, for the answer
+/// that loses the race to one (`Session::let_go`).
+const LET_GO_KEPT: usize = 8;
 /// How long a `Working` pane not held by a hook may go without PTY output or a
 /// classifier `Working` match before it reads as `Unknown`: a build killed
 /// mid-report never says clear, and a wedged agent never says done.
@@ -149,6 +152,12 @@ struct PaneSlot {
     /// pane since its agent started; an agent leaving clears it. An ask needs
     /// it: only a hook reports the turn end its wait is for.
     hooked: bool,
+    /// The subagent that raised each held approval, by approval id; the main
+    /// agent's are absent. A turn's end lets go only of its own agent's.
+    asked_by: HashMap<u64, String>,
+    /// The approvals turn ends let go of, newest last, so an answer that
+    /// lost that race hears what became of its approval.
+    let_go: Vec<u64>,
     /// Whether the pane has been seen working since its agent started — a
     /// `Working` screen match, hook or report; output alone is the agent
     /// drawing. Until then its idle prompt on screen is a fresh start, not a
@@ -992,6 +1001,7 @@ impl Session {
             }
             AgentHookEvent::SubagentStopped { id } => {
                 relisted |= stop_subagent(subs, &id);
+                stale = release_holds(&mut slot.meta.approvals, &mut slot.asked_by, Some(&id));
             }
             AgentHookEvent::Activity { .. } => {
                 classified = Some(Observation::Working);
@@ -1017,16 +1027,21 @@ impl Session {
                 let before = subs.len();
                 subs.retain(|s| s.running);
                 relisted |= subs.len() != before;
-                // The agent asks nothing once its turn is over, so a request
-                // still held was answered in its own dialog, which Claude
-                // (2.1.318) shows beside the hold, leaving the hook waiting.
-                stale = slot.meta.approvals.drain(..).map(|a| a.id).collect();
-                relisted |= !stale.is_empty();
+                stale = release_holds(&mut slot.meta.approvals, &mut slot.asked_by, None);
             }
             AgentHookEvent::SessionStarted => {}
         }
         if matches!(classified, Some(Observation::Working | Observation::Done)) {
             slot.passed = false;
+        }
+        if !stale.is_empty() {
+            // Each goes on to the agent's dialog, as a timed-out or passed
+            // request does, should it still show there.
+            slot.passed = true;
+            slot.let_go.extend(&stale);
+            let excess = slot.let_go.len().saturating_sub(LET_GO_KEPT);
+            slot.let_go.drain(..excess);
+            relisted = true;
         }
         let transition = classified.and_then(|obs| {
             let from = slot.meta.state;
@@ -1110,14 +1125,24 @@ impl Session {
     /// Hold a permission request on `pane` for an answer from tutti: a
     /// pending approval its view carries, queued behind any it holds already
     /// (parallel subagents ask at once), under a fresh id an answer must
-    /// name. `None` — the request goes straight on to Claude's own dialog —
-    /// for an unknown pane.
-    pub fn hold_approval(&mut self, pane: PaneId, tool: String, summary: String) -> Option<u64> {
+    /// name. `agent` is the subagent asking, `None` for the main agent: the
+    /// turn end that releases it (`release_holds`). `None` — the request goes
+    /// straight on to Claude's own dialog — for an unknown pane.
+    pub fn hold_approval(
+        &mut self,
+        pane: PaneId,
+        tool: String,
+        summary: String,
+        agent: Option<String>,
+    ) -> Option<u64> {
         let slot = self.panes.get_mut(&pane)?;
         let id = self.ids.approval();
         slot.meta
             .approvals
             .push(PendingApproval { id, tool, summary });
+        if let Some(agent) = agent {
+            slot.asked_by.insert(id, agent);
+        }
         Some(id)
     }
 
@@ -1130,7 +1155,20 @@ impl Session {
         let held = &mut slot.meta.approvals;
         let at = held.iter().position(|a| id.is_none_or(|id| id == a.id))?;
         let taken = held.remove(at).id;
+        slot.asked_by.remove(&taken);
         Some((taken, !held.is_empty() || slot.passed))
+    }
+
+    /// The approval an answer for `pane` came too late for: `id`, when a
+    /// turn end released it, or — answering the oldest of none held — the
+    /// last one released. `None` when it was never held or went otherwise.
+    pub fn let_go(&self, pane: PaneId, id: Option<u64>) -> Option<u64> {
+        let slot = self.panes.get(&pane)?;
+        match id {
+            Some(id) => slot.let_go.contains(&id).then_some(id),
+            None if slot.meta.approvals.is_empty() => slot.let_go.last().copied(),
+            None => None,
+        }
     }
 
     /// Note that one of `pane`'s permission requests went on to the agent's
@@ -1495,6 +1533,7 @@ impl Session {
                 slot.meta.source = None;
                 slot.herdr = None;
                 slot.meta.approvals.clear();
+                slot.asked_by.clear();
                 Some((from, to))
             }
             _ => None,
@@ -1833,6 +1872,8 @@ impl Session {
                 dialog: false,
                 passed: false,
                 hooked: false,
+                asked_by: HashMap::new(),
+                let_go: Vec::new(),
                 worked: false,
                 replies: 0,
                 reply: (String::new(), false),
@@ -1926,6 +1967,30 @@ fn stop_subagent(subs: &mut [SubagentInfo], id: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Take off a pane the held approvals one agent's turn end leaves stale —
+/// the main agent's (`agent` `None`) at its Stop, a subagent's at its
+/// SubagentStop — returning their ids. An agent asks nothing once its turn
+/// is over, so a request of its own still held was answered in its dialog,
+/// which Claude Code (2.1.318) shows beside a hold, leaving the hook waiting.
+/// A background subagent can still run, and ask, past the main agent's Stop
+/// (Stop's `background_tasks`), so its requests wait for its own stop.
+fn release_holds(
+    approvals: &mut Vec<PendingApproval>,
+    asked_by: &mut HashMap<u64, String>,
+    agent: Option<&str>,
+) -> Vec<u64> {
+    let mut released = Vec::new();
+    approvals.retain(|a| {
+        let stale = asked_by.get(&a.id).map(String::as_str) == agent;
+        if stale {
+            asked_by.remove(&a.id);
+            released.push(a.id);
+        }
+        !stale
+    });
+    released
 }
 
 /// A pane's wire metadata, with the cwd its shell last reported. One with no
@@ -2214,7 +2279,7 @@ mod tests {
             classified(&s),
             "blocked, its dialog's answer is the screen's"
         );
-        s.hold_approval(pane, "Bash".into(), "ls".into());
+        s.hold_approval(pane, "Bash".into(), "ls".into(), None);
         assert!(!classified(&s), "not while tutti holds a request");
         s.take_approval(pane, None);
         s.apply_agent_event(pane, AgentHookEvent::Activity { detail: None }, None);
@@ -2545,10 +2610,10 @@ mod tests {
             summary: "src/main.rs".into(),
         };
         let first = s
-            .hold_approval(pane, "Bash".into(), "rm -rf build".into())
+            .hold_approval(pane, "Bash".into(), "rm -rf build".into(), None)
             .unwrap();
         let second = s
-            .hold_approval(pane, "Edit".into(), "src/main.rs".into())
+            .hold_approval(pane, "Edit".into(), "src/main.rs".into(), None)
             .unwrap();
         assert!(second > first, "ids count up");
         assert_eq!(
@@ -2569,10 +2634,10 @@ mod tests {
         assert_eq!(s.take_approval(pane, None), None, "nothing left to take");
 
         let third = s
-            .hold_approval(pane, "Edit".into(), "src/main.rs".into())
+            .hold_approval(pane, "Edit".into(), "src/main.rs".into(), None)
             .unwrap();
         let fourth = s
-            .hold_approval(pane, "Bash".into(), "rm -rf build".into())
+            .hold_approval(pane, "Bash".into(), "rm -rf build".into(), None)
             .unwrap();
         assert_eq!(
             s.take_approval(pane, None),
@@ -2581,13 +2646,15 @@ mod tests {
         );
         assert!(fourth > third, "an id is never reused");
         assert_eq!(
-            s.hold_approval(PaneId(99), "Bash".into(), "ls".into()),
+            s.hold_approval(PaneId(99), "Bash".into(), "ls".into(), None),
             None,
             "an unknown pane holds nothing"
         );
 
         s.passed_to_dialog(pane);
-        let fifth = s.hold_approval(pane, "Bash".into(), "ls".into()).unwrap();
+        let fifth = s
+            .hold_approval(pane, "Bash".into(), "ls".into(), None)
+            .unwrap();
         assert_eq!(
             s.take_approval(pane, None),
             Some((fourth, true)),

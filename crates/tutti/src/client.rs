@@ -254,6 +254,7 @@ mod tests {
             conversation: None,
             tool: "Bash".into(),
             summary: "ls".into(),
+            agent: None,
         };
         assert_eq!((deadline(&wait), deadline(&hold)), (None, None));
         let merge = Request::WorkspaceMerge {

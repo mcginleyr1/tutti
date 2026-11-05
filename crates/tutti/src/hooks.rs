@@ -241,6 +241,18 @@ fn subagent_id(v: &Value) -> String {
         .to_string()
 }
 
+/// The subagent a hook fired in: its `agent_id`, which Claude Code's hooks
+/// reference puts on every event inside a subagent; `None` for the main
+/// agent. A held request keeps it, so the main agent's turn end — Stop can
+/// come while a background subagent still runs (its `background_tasks`) —
+/// lets go only of the main agent's own requests.
+pub fn asking_subagent(v: &Value) -> Option<String> {
+    v.get("agent_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
 /// What a `PermissionRequest` asks to run: its tool, and the tool's input on
 /// one line (`input_summary`). `None` for any other event.
 pub fn permission_request(v: &Value) -> Option<(String, String)> {
@@ -805,6 +817,23 @@ mod tests {
             permission_request(&json!({ "hook_event_name": "PreToolUse", "tool_name": "Bash" })),
             None
         );
+    }
+
+    /// A request names the subagent asking by its `agent_id` (the hooks
+    /// reference's common field inside a subagent); the main agent's carries
+    /// none, as live Claude Code 2.1.318 requests did not.
+    #[test]
+    fn a_request_names_the_subagent_asking() {
+        let asked = |v| asking_subagent(&v);
+        assert_eq!(
+            asked(json!({ "hook_event_name": "PermissionRequest", "agent_id": "a1" })),
+            Some("a1".into())
+        );
+        assert_eq!(
+            asked(json!({ "hook_event_name": "PermissionRequest" })),
+            None
+        );
+        assert_eq!(asked(json!({ "agent_id": "" })), None);
     }
 
     /// A held approval's answer goes back to Claude as the documented

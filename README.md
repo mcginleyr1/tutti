@@ -1092,7 +1092,7 @@ dialog, which you answer in the pane or through a peek. Set `approvals =
 Claude Code 2.1.318 shows its own dialog beside the hold. An answer from
 tutti closes that dialog (`Allowed by PermissionRequest hook`). A request
 answered in the dialog instead leaves its hook waiting, and tutti lets go of
-it when the turn ends:
+it when the turn of the agent that asked ends:
 
 - The agent's waiting row reads `Bash · rm -rf build`, and a held approval
   leads the queue whatever the pane's state. A pane holds every request its
@@ -1124,10 +1124,15 @@ it when the turn ends:
 A held request falls through to Claude's own dialog — the hook printing
 nothing and exiting 0 — when no TUI is attached to answer it, on `esc`, and
 when nobody answers within `approval_timeout_secs` (default 120, at most 599:
-Claude stops a hook at 600 s). The agent's turn ending (Stop, StopFailure,
-Codex's Interrupt) also lets go of whatever its pane still holds, so a
-request answered in Claude's dialog never lingers on a finished pane. The
-hook never fails a Claude session. An allow
+Claude stops a hook at 600 s). An agent's turn ending also lets go of the
+requests that agent raised, as a fall-through to its dialog: the main
+agent's Stop, StopFailure or Codex's Interrupt lets go of the main agent's,
+and a SubagentStop lets go of that subagent's (a request names its subagent
+by the hook's `agent_id`). A background subagent can still run, and ask,
+after the main agent's Stop, so its requests wait for its own stop. A
+request answered in Claude's dialog therefore never lingers on a finished
+pane, and an answer from tutti that comes after the turn end is refused
+with a message saying so. The hook never fails a Claude session. An allow
 or a deny from tutti sets the pane **working** at once — the tool runs, or the
 agent hears the refusal — unless another request still waits on you: held in
 tutti, or one that fell through to Claude's dialog, until a hook (or the
@@ -1625,8 +1630,9 @@ stdin, maps it, and forwards it to the pane's daemon:
 - a **PermissionRequest** marks it **blocked** the moment Claude is about to
   ask, naming the tool and its input (`Bash · rm -rf build`); with `approvals =
   "hold"` the request also waits for an answer from tutti, beside Claude's
-  dialog (see [Held approvals](#held-approvals)); a turn's end (Stop or
-  StopFailure) lets go of any request still held;
+  dialog (see [Held approvals](#held-approvals)); an agent's turn end (Stop
+  or StopFailure for the main agent, SubagentStop for a subagent) lets go of
+  the requests that agent still holds;
 - a **Notification** that waits on you — a permission prompt, an MCP dialog, a
   background agent's question, an Enter after a usage limit — marks it
   **blocked** too, as does one from an older Claude that names no type; idle

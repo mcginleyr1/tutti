@@ -3624,6 +3624,7 @@ fn hold(pane: PaneId) -> Request {
         conversation: Some("c1".into()),
         tool: "Bash".into(),
         summary: "rm -rf build".into(),
+        agent: None,
     }
 }
 
@@ -3784,33 +3785,83 @@ async fn a_hook_hanging_up_drops_its_approval() {
 }
 
 /// Claude (2.1.318) shows its own dialog beside a held request. Answered
-/// there, the tool runs and the turn ends while the hook still holds. The
-/// turn's end passes what the pane still holds, since the agent asks nothing
-/// after its turn, so no stale request is left for tutti to answer.
+/// there, the tool runs and the turn ends while the hook still holds. An
+/// agent's turn end passes the requests that agent raised — the main agent's
+/// at Stop, a subagent's at its SubagentStop — and no other: a background
+/// subagent can still run, and ask, past the main agent's Stop. Each passed
+/// request counts as gone to the agent's dialog, as a timed-out one does, and
+/// an answer that lost the race to the turn end is told so.
 #[tokio::test]
-async fn a_turns_end_passes_the_requests_its_pane_still_holds() {
+async fn a_turns_end_passes_the_requests_its_own_agent_raised() {
     let server = TestServer::start();
     let mut control = server.connect().await;
     let pane = run_sleeper(&mut control).await;
-    let mut viewer = attached_viewer(&server).await;
+    let _viewer = attached_viewer(&server).await;
 
-    let mut holding = server.connect().await;
-    holding.send(&hold(pane)).await;
-    view_approval(&mut viewer, pane, true).await.unwrap();
+    let mut main = server.connect().await;
+    main.send(&hold(pane)).await;
+    assert!(wait_pane(&mut control, pane, |p| p.approvals.len() == 1).await);
+    let mut background = server.connect().await;
+    background
+        .send(&Request::ApprovalHold {
+            pane,
+            conversation: None,
+            tool: "Bash".into(),
+            summary: "touch b.txt".into(),
+            agent: Some("sub1".into()),
+        })
+        .await;
+    assert!(wait_pane(&mut control, pane, |p| p.approvals.len() == 2).await);
+    let held = held_approvals(&mut control, pane).await;
     let ran = AgentHookEvent::Activity { detail: None };
     hook(&mut control, pane, ran).await;
-    assert_eq!(held_approvals(&mut control, pane).await.len(), 1);
 
     let done = AgentHookEvent::Done {
         reply: Some("done".into()),
     };
     hook(&mut control, pane, done).await;
-    assert_eq!(approval(holding.response().await), ApprovalDecision::Pass);
-    assert_eq!(view_approval(&mut viewer, pane, false).await, None);
-    assert!(
-        wait_pane(&mut control, pane, |p| p.approvals.is_empty()
-            && p.state == AgentState::Done)
-        .await
+    assert_eq!(approval(main.response().await), ApprovalDecision::Pass);
+    assert_eq!(
+        held_approvals(&mut control, pane).await,
+        [held[1].clone()],
+        "the background subagent's request still waits"
+    );
+    let late = control
+        .request(Request::ApprovalAnswer {
+            pane,
+            id: Some(held[0].id),
+            decision: ApprovalDecision::Allow,
+        })
+        .await;
+    let message = error_message(late);
+    assert!(message.contains("ended with its agent's turn"), "{message}");
+
+    let stopped = AgentHookEvent::SubagentStopped { id: "sub1".into() };
+    hook(&mut control, pane, stopped).await;
+    assert_eq!(
+        approval(background.response().await),
+        ApprovalDecision::Pass
+    );
+    assert!(held_approvals(&mut control, pane).await.is_empty());
+
+    let mut next = server.connect().await;
+    next.send(&hold(pane)).await;
+    assert!(wait_pane(&mut control, pane, |p| p.approvals.len() == 1).await);
+    let allow = Request::ApprovalAnswer {
+        pane,
+        id: None,
+        decision: ApprovalDecision::Allow,
+    };
+    assert_eq!(control.request(allow).await, Response::Ok);
+    assert_eq!(approval(next.response().await), ApprovalDecision::Allow);
+    let Response::Panes { panes } = control.request(Request::PaneList).await else {
+        panic!("expected the panes");
+    };
+    assert_eq!(
+        panes.iter().find(|p| p.id == pane).map(|p| p.state),
+        Some(AgentState::Blocked),
+        "a released request may still show in the agent's dialog, so tutti's \
+         answer to the next one keeps the pane blocked until a hook moves it"
     );
 
     server.stop().await;
@@ -3879,6 +3930,7 @@ async fn a_pane_holds_parallel_approvals_each_answered_on_its_own() {
             conversation: None,
             tool: "Bash".into(),
             summary: summary.into(),
+            agent: None,
         })
         .await;
         hooks.push(hook);

@@ -594,6 +594,7 @@ fn agent_event_claude_holds_a_permission_request_for_its_answer() {
                         conversation: Some("abc123".into()),
                         tool: "Bash".into(),
                         summary: "rm -rf build".into(),
+                        agent: None,
                     }
                 );
             },
@@ -653,6 +654,7 @@ fn agent_event_opencode_holds_a_permission_request_for_its_answer() {
                         conversation: None,
                         tool: "bash".into(),
                         summary: "rm -rf build".into(),
+                        agent: None,
                     }
                 );
             },

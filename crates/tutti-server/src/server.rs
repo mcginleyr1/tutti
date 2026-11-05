@@ -859,7 +859,8 @@ fn handle_frame(
                 conversation,
                 tool,
                 summary,
-            }) => approval_hold(hub, cid, &reply, pane, conversation, tool, summary),
+                agent,
+            }) => approval_hold(hub, cid, &reply, pane, conversation, tool, summary, agent),
             Ok(Request::PaneWait {
                 pane,
                 until,
@@ -1983,6 +1984,7 @@ fn agent_event(
 /// on, each until its own answer or hang-up. With no client attached that
 /// could answer — a view cannot — the reply is `Pass` at once, as it is for
 /// an unknown pane.
+#[allow(clippy::too_many_arguments)]
 fn approval_hold(
     hub: &Arc<Hub>,
     cid: u64,
@@ -1991,11 +1993,12 @@ fn approval_hold(
     conversation: Option<String>,
     tool: String,
     summary: String,
+    agent: Option<String>,
 ) -> ControlFlow<()> {
     let message = Some(format!("{tool} · {summary}"));
     let attached = hub.clients().values().any(|client| !client.watching);
     let held = if attached {
-        hub.session().hold_approval(pane, tool, summary)
+        hub.session().hold_approval(pane, tool, summary, agent)
     } else {
         None
     };
@@ -2076,7 +2079,7 @@ impl Drop for Held {
 /// than sitting Blocked through it — unless the pane still waits on you,
 /// holding another or with one in the agent's own dialog; a pass hands the
 /// request to that dialog, still blocked. Error when the pane holds no such
-/// approval.
+/// approval, saying so plainly when its agent's turn end let go of it first.
 fn approval_answer(
     hub: &Arc<Hub>,
     pane: PaneId,
@@ -2085,10 +2088,17 @@ fn approval_answer(
 ) -> Response {
     let mut session = hub.session();
     let Some((held, waiting)) = session.take_approval(pane, id) else {
-        let which = id.map_or_else(String::new, |id| format!(" #{id}"));
-        return Response::Error {
-            message: format!("pane {pane} has no pending approval{which}"),
+        let message = match session.let_go(pane, id) {
+            Some(gone) => format!(
+                "pane {pane}'s approval #{gone} ended with its agent's turn, so this answer \
+                 reached nobody: the agent's own dialog had it"
+            ),
+            None => {
+                let which = id.map_or_else(String::new, |id| format!(" #{id}"));
+                format!("pane {pane} has no pending approval{which}")
+            }
         };
+        return Response::Error { message };
     };
     let passed = matches!(decision, ApprovalDecision::Pass);
     if passed {
@@ -3893,7 +3903,7 @@ mod tests {
         .unwrap();
         let id = hub
             .session()
-            .hold_approval(pane, "Bash".into(), "ls".into())
+            .hold_approval(pane, "Bash".into(), "ls".into(), None)
             .unwrap();
         let (answer, _answered) = oneshot::channel();
         hub.approvals().insert(id, answer);
@@ -3912,7 +3922,7 @@ mod tests {
         assert_eq!(hub.session().pane(pane).unwrap().approval, None);
         let next = hub
             .session()
-            .hold_approval(pane, "Bash".into(), "pwd".into());
+            .hold_approval(pane, "Bash".into(), "pwd".into(), None);
         let taken = hub.session().take_approval(pane, None);
         assert_eq!(
             taken,

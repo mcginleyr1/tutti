@@ -1682,7 +1682,16 @@ fn run_agent_event(session: &str, agent: HookAgent) -> Result<i32> {
     if let Some((tool, summary)) = request
         && let Some(timeout) = approval_hold_timeout()
     {
-        let held = hold_approval(&session, PaneId(pane), conversation, tool, summary, timeout);
+        let asking = hooks::asking_subagent(&value);
+        let held = hold_approval(
+            &session,
+            PaneId(pane),
+            conversation,
+            tool,
+            summary,
+            asking,
+            timeout,
+        );
         let answer = held.map(|decision| match agent {
             HookAgent::Claude | HookAgent::Codex | HookAgent::Gemini => {
                 hooks::permission_decision(&decision)
@@ -1753,13 +1762,15 @@ fn approval_hold_timeout() -> Option<Duration> {
 /// Hold a permission request on the session's daemon until it is answered —
 /// in place of its `AgentEvent`, which the hold blocks the pane for just the
 /// same. `timeout` running out is an error, as is any failure: Claude's own
-/// dialog then appears. Never auto-starts a server.
+/// dialog then appears. `agent` is the subagent asking, `None` for the main
+/// agent. Never auto-starts a server.
 fn hold_approval(
     session: &str,
     pane: PaneId,
     conversation: Option<String>,
     tool: String,
     summary: String,
+    agent: Option<String>,
     timeout: Duration,
 ) -> Result<ApprovalDecision> {
     let mut client = Client::connect(session).context("connecting to tutti-server")?;
@@ -1769,6 +1780,7 @@ fn hold_approval(
         conversation,
         tool,
         summary,
+        agent,
     };
     match client.request(&hold)? {
         Response::Approval { decision } => Ok(decision),

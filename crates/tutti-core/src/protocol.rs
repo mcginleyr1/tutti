@@ -11,7 +11,7 @@ use crate::state::{AgentState, StateSource};
 /// Response / Event shapes (including additive fields): the daemon reports it
 /// on attach and mismatched clients tell the user to restart the daemon —
 /// binaries upgrade on install, running daemons do not.
-pub const WIRE_REV: u32 = 16;
+pub const WIRE_REV: u32 = 17;
 
 /// The most notes the daemon's notification history keeps, the oldest going
 /// first. A client caps its copy the same, so the two agree.
@@ -349,12 +349,17 @@ pub enum Request {
     /// dialog — when no client is attached to answer or the pane is unknown. A pane holds every request its agent raises (its
     /// subagents ask in parallel), queued behind the ones before. The
     /// approval lives as long as this connection: hanging up drops it.
+    /// `agent` is the subagent asking — the request's `agent_id` — `None`
+    /// for the main agent and from older clients: the main agent's turn end
+    /// lets go of its own requests, a subagent's stop of that subagent's.
     ApprovalHold {
         pane: PaneId,
         #[serde(default)]
         conversation: Option<String>,
         tool: String,
         summary: String,
+        #[serde(default)]
+        agent: Option<String>,
     },
     /// Answer one of `pane`'s held approvals: `id` names the one the sender
     /// looked at (`PaneInfo::approvals`), `None` the oldest. Error when the
@@ -1506,6 +1511,7 @@ mod tests {
             conversation: Some("ses_1".into()),
             tool: "Bash".into(),
             summary: "rm -rf build".into(),
+            agent: Some("a1b2".into()),
         });
         roundtrip(&Request::ApprovalAnswer {
             pane: PaneId(3),
@@ -1777,7 +1783,9 @@ mod tests {
                 conversation: None,
                 tool: "Edit".into(),
                 summary: "src/main.rs".into(),
-            }
+                agent: None,
+            },
+            "an older client's hold is the main agent's"
         );
         let answer: Request = serde_json::from_str(
             r#"{"type":"approval_answer","pane":3,"decision":{"behavior":"deny"}}"#,
