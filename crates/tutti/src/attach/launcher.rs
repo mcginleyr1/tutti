@@ -1,10 +1,10 @@
-//! The agent launcher's model: the selectable "what should run here?" rows and
-//! a pure PATH probe for agent availability. No rendering and no app state, so
-//! the row construction, the availability check, and the selection arithmetic
-//! are unit-tested in isolation.
+//! The agent launcher's model: the selectable "what should run here?" rows,
+//! each agent's availability probed on a PATH passed in
+//! (`AgentSpec::installed`). No rendering and no app state, so the row
+//! construction, the availability check, and the selection arithmetic are
+//! unit-tested in isolation.
 
 use std::ffi::OsStr;
-use std::path::Path;
 use std::time::SystemTime;
 
 use tutti_agents::{Registry, ResumeSession};
@@ -59,12 +59,11 @@ pub fn build_rows(registry: &Registry, path: Option<&OsStr>) -> Vec<LauncherRow>
         LauncherRow {
             name: spec.kind.to_string(),
             role,
-            kind: LaunchKind::Agent(spec.argv()),
+            kind: LaunchKind::Agent(spec.argv(path)),
             available,
         }
     };
-    let installed =
-        |spec: &&tutti_agents::AgentSpec| spec.process_names.iter().any(|n| on_path(n, path));
+    let installed = |spec: &&tutti_agents::AgentSpec| spec.installed(path).is_some();
 
     let mut rows: Vec<LauncherRow> = registry
         .specs()
@@ -104,7 +103,7 @@ pub fn sandbox_rows(registry: &Registry) -> Vec<LauncherRow> {
         .map(|spec| LauncherRow {
             name: spec.kind.to_string(),
             role: spec.display.clone(),
-            kind: LaunchKind::Agent(spec.argv()),
+            kind: LaunchKind::Agent(spec.argv(None)),
             available: true,
         })
         .chain([
@@ -126,16 +125,19 @@ pub fn sandbox_rows(registry: &Registry) -> Vec<LauncherRow> {
 
 /// The rows of a launcher armed to deploy an issue on `prompt`: the rows of
 /// the agents that take a first message (a shell, command or resume row names
-/// no agent), each running its agent on the prompt — still dim when it is not
-/// installed.
+/// no agent), each running its agent — the binary the row found — on the
+/// prompt, still dim when it is not installed.
 pub fn armed_rows(rows: Vec<LauncherRow>, registry: &Registry, prompt: &str) -> Vec<LauncherRow> {
     rows.into_iter()
         .filter_map(|row| {
-            let argv = registry
+            let args = registry
                 .spec(&row.name.as_str().into())?
-                .prompted_argv(prompt)?;
+                .prompt_args(prompt)?;
+            let LaunchKind::Agent(argv) = row.kind else {
+                return None;
+            };
             Some(LauncherRow {
-                kind: LaunchKind::Agent(argv),
+                kind: LaunchKind::Agent([argv, args].concat()),
                 ..row
             })
         })
@@ -212,23 +214,6 @@ pub fn login_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
 }
 
-/// Whether `name` resolves to an executable file on `path` — the `PATH` value,
-/// os-split. Pure over the passed value (it reads no global env), so a test can
-/// point it at a fake PATH; an unset (`None`) path finds nothing.
-pub fn on_path(name: &str, path: Option<&OsStr>) -> bool {
-    let Some(path) = path else {
-        return false;
-    };
-    std::env::split_paths(path).any(|dir| is_executable(&dir.join(name)))
-}
-
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
 /// The first selectable row's index, or 0 when none is (there is always at
 /// least the shell row, so this only falls back for an empty list).
 pub fn first_selectable(rows: &[LauncherRow]) -> usize {
@@ -264,7 +249,7 @@ pub fn prev_selectable(rows: &[LauncherRow], from: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn temp_dir_unique() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -287,26 +272,6 @@ mod tests {
             kind: LaunchKind::Agent(vec![name.into()]),
             available,
         }
-    }
-
-    #[test]
-    fn on_path_finds_only_executables_present_on_the_fake_path() {
-        let dir = temp_dir_unique();
-        std::fs::create_dir_all(&dir).unwrap();
-        let bin = dir.join("myagent");
-        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
-        make_executable(&bin);
-        // A present-but-not-executable file must not count.
-        let plain = dir.join("plainfile");
-        std::fs::write(&plain, b"x").unwrap();
-        let path = std::ffi::OsString::from(&dir);
-
-        assert!(on_path("myagent", Some(path.as_os_str())));
-        assert!(!on_path("missing", Some(path.as_os_str())));
-        assert!(!on_path("plainfile", Some(path.as_os_str())));
-        assert!(!on_path("myagent", None), "an unset PATH finds nothing");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

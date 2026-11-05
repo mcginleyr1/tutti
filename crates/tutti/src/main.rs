@@ -1397,31 +1397,39 @@ fn run_issue(action: IssueAction, session: &str, json: bool) -> Result<i32> {
             if let Some(name) = &sandbox {
                 config.sandbox(name)?;
             }
-            // The agent's argv on `prompt`, or why it can't take an issue.
+            // The agent, or why it can't take an issue — before fetching
+            // anything.
             let registry = Registry::default();
-            let on = |prompt: &str| {
-                registry
-                    .spec(&agent.as_str().into())
-                    .and_then(|spec| spec.prompted_argv(prompt))
-                    .with_context(|| {
-                        let able: Vec<String> = registry
-                            .specs()
-                            .iter()
-                            .filter(|s| s.prompt_flags.is_some())
-                            .map(|s| s.kind.to_string())
-                            .collect();
-                        format!(
-                            "{agent:?} can't take an issue: a deploy needs an agent that takes its first message on the command line ({})",
-                            able.join(", ")
-                        )
-                    })
-            };
-            on("")?; // before fetching anything
+            let spec = registry
+                .spec(&agent.as_str().into())
+                .filter(|spec| spec.prompt_flags.is_some())
+                .with_context(|| {
+                    let able: Vec<String> = registry
+                        .specs()
+                        .iter()
+                        .filter(|s| s.prompt_flags.is_some())
+                        .map(|s| s.kind.to_string())
+                        .collect();
+                    format!(
+                        "{agent:?} can't take an issue: a deploy needs an agent that takes its first message on the command line ({})",
+                        able.join(", ")
+                    )
+                })?;
             let mut client = Client::connect_or_start(session)?;
             let project = deploy_project(&mut client, project)?;
             let issue = issues::fetch(source, &id, &project.dir)?;
             let prompt = issues::prompt(&source.prompt, &issue);
-            let cmd = on(&issues::fit_arg(prompt, sandbox.is_some())?)?;
+            // The binary installed here; a sandbox's image can't be looked in.
+            let path = sandbox
+                .is_none()
+                .then(|| std::env::var_os("PATH"))
+                .flatten();
+            let message = issues::fit_arg(prompt, sandbox.is_some())?;
+            let cmd = [
+                spec.argv(path.as_deref()),
+                spec.prompt_args(&message).unwrap_or_default(),
+            ]
+            .concat();
             let into = (!here && project.dir.ancestors().any(|d| d.join(".jj").exists()))
                 .then(|| issues::workspace_name(&issue.source, &issue.id));
             let workspace = match &into {

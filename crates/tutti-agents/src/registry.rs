@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 use tutti_core::{AgentKind, Observation};
 
@@ -94,7 +95,13 @@ pub struct AgentSpec {
     /// The project's home, shown on a dim launcher row when the binary is not
     /// installed so the catalog doubles as a "where to get it" pointer.
     pub url: String,
+    /// What detection knows the agent's process by (`names`): a basename,
+    /// or — with a `/` — the end of a node program's script path, `*`
+    /// standing for any one directory.
     pub process_names: Vec<String>,
+    /// The commands launching it, the preferred first (`installed`): its
+    /// process names, unless it is installed under others.
+    pub binaries: Vec<String>,
     /// Argv after the binary for the launcher — empty for agents that open
     /// on a bare run; `ori` needs `code` or it just prints its help.
     pub launch_args: Vec<String>,
@@ -133,6 +140,7 @@ impl AgentSpec {
             display: display.into(),
             url: url.into(),
             process_names: owned(process_names),
+            binaries: owned(process_names),
             launch_args: Vec::new(),
             prompt_flags: None,
             blocked_patterns: owned(blocked_patterns),
@@ -149,29 +157,61 @@ impl AgentSpec {
         }
     }
 
-    /// The argv launching the agent: its binary, then any launch args.
-    pub fn argv(&self) -> Vec<String> {
+    /// Whether `program` is this agent's: a process's name as detection
+    /// knows it (`program_name`), or a path. A process name without a `/`
+    /// matches the basename; one with a `/` matches the path's end, so
+    /// Cursor's script — `node …/cursor-agent/versions/<version>/index.js` —
+    /// is Cursor's while a bare `index.js` is nobody's.
+    pub fn names(&self, program: &str) -> bool {
+        self.process_names.iter().any(|name| {
+            let mut have = Path::new(program).components().rev();
+            Path::new(name).components().rev().all(|want| {
+                have.next()
+                    .is_some_and(|got| want.as_os_str() == "*" || got == want)
+            })
+        })
+    }
+
+    /// The first of its binaries installed on `path` (`which`) as this
+    /// agent's: one detection knows by name counts as found; any other —
+    /// Cursor's `agent`, a name plenty of programs answer to — only when the
+    /// file it resolves to is one detection knows (Cursor's installer links
+    /// `agent` to its `cursor-agent`).
+    pub fn installed(&self, path: Option<&OsStr>) -> Option<&str> {
+        self.binaries.iter().map(String::as_str).find(|&binary| {
+            which(binary, path).is_some_and(|found| {
+                self.names(binary)
+                    || found
+                        .canonicalize()
+                        .is_ok_and(|real| self.names(&real.to_string_lossy()))
+            })
+        })
+    }
+
+    /// The argv launching the agent from `path`, the `PATH` value: the binary
+    /// installed there (`installed`) — or, with none, or no PATH to look on
+    /// (a sandbox's image), the first one detection knows by name, which is
+    /// what declares a sandbox pane's agent — then its launch args.
+    pub fn argv(&self, path: Option<&OsStr>) -> Vec<String> {
         let binary = self
-            .process_names
-            .first()
-            .cloned()
-            .unwrap_or_else(|| self.kind.to_string());
+            .installed(path)
+            .or_else(|| {
+                self.binaries
+                    .iter()
+                    .map(String::as_str)
+                    .find(|b| self.names(b))
+            })
+            .map_or_else(|| self.kind.to_string(), String::from);
         std::iter::once(binary)
             .chain(self.launch_args.iter().cloned())
             .collect()
     }
 
-    /// The argv launching the agent with `prompt` as its first message, or
-    /// `None` when it takes no prompt.
-    pub fn prompted_argv(&self, prompt: &str) -> Option<Vec<String>> {
+    /// The args after its argv handing the agent `prompt` as its first
+    /// message, or `None` when it takes no prompt.
+    pub fn prompt_args(&self, prompt: &str) -> Option<Vec<String>> {
         let flags = self.prompt_flags.as_ref()?;
-        Some(
-            self.argv()
-                .into_iter()
-                .chain(flags.iter().cloned())
-                .chain([prompt.to_string()])
-                .collect(),
-        )
+        Some(flags.iter().cloned().chain([prompt.to_string()]).collect())
     }
 
     /// Blocked (needs input) outranks Working (active task) outranks Done, so the
@@ -207,16 +247,10 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Look up the spec for a process by its basename, so an absolute path like
-    /// `/usr/local/bin/claude` matches the `claude` entry.
+    /// Look up the spec for a process by its name (`AgentSpec::names`), so an
+    /// absolute path like `/usr/local/bin/claude` matches the `claude` entry.
     pub fn match_process(&self, process_name: &str) -> Option<&AgentSpec> {
-        let basename = Path::new(process_name)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(process_name);
-        self.specs
-            .iter()
-            .find(|spec| spec.process_names.iter().any(|n| n == basename))
+        self.specs.iter().find(|spec| spec.names(process_name))
     }
 
     /// The spec for an already-identified agent kind, for classifying its state.
@@ -379,15 +413,26 @@ impl Default for Registry {
                     &["qwen"],
                 )
                 .prompted(&["--prompt-interactive"]),
-                // Docs (cursor.com/docs/cli/reference/parameters): `prompt`,
-                // "Initial prompt for the agent", in the agent mode it starts
-                // interactively by default. Not run here.
-                guess(
-                    "cursor",
-                    "Cursor CLI",
-                    "https://cursor.com/cli",
-                    &["cursor-agent"],
-                )
+                // Cursor's installer (cursor.com/install, read 2026-11-05)
+                // links `~/.local/bin/agent` ("primary") and `cursor-agent`
+                // ("legacy") to `~/.local/share/cursor-agent/versions/<v>/
+                // cursor-agent`, a bash script that `exec -a "$0"`s its
+                // bundled `node` on the `index.js` beside it: the process is
+                // `node` on that script, whichever name started it. The
+                // launcher runs `agent` where it is Cursor's (`installed`),
+                // else `cursor-agent`. Docs (cursor.com/docs/cli/reference/
+                // parameters): `prompt`, "Initial prompt for the agent", in
+                // the agent mode it starts interactively by default. Not run
+                // here.
+                AgentSpec {
+                    binaries: owned(&["agent", "cursor-agent"]),
+                    ..guess(
+                        "cursor",
+                        "Cursor CLI",
+                        "https://cursor.com/cli",
+                        &["cursor-agent", "cursor-agent/versions/*/index.js"],
+                    )
+                }
                 .prompted(&[]),
                 // Docs (GitHub's Copilot CLI command reference): `-i PROMPT`,
                 // "Start an interactive session and automatically execute this
@@ -493,6 +538,19 @@ impl Default for Registry {
 
 fn owned(patterns: &[&str]) -> Vec<String> {
     patterns.iter().map(|s| s.to_string()).collect()
+}
+
+/// The executable file `name` finds on `path` — the `PATH` value, os-split —
+/// as a shell would. Pure over the passed value (it reads no global env), so
+/// a test can point it at a fake PATH; an unset (`None`) path finds nothing.
+fn which(name: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(path?)
+        .map(|dir| dir.join(name))
+        .find(|file| {
+            std::fs::metadata(file)
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
 }
 
 /// The trailing slice of `text` holding at most its last `max_lines` lines.
@@ -786,7 +844,10 @@ mod tests {
     #[test]
     fn agents_take_a_first_message_their_own_way() {
         let reg = Registry::default();
-        let argv = |kind: &str| reg.spec(&AgentKind::from(kind))?.prompted_argv("fix it");
+        let argv = |kind: &str| {
+            let spec = reg.spec(&AgentKind::from(kind))?;
+            Some([spec.argv(None), spec.prompt_args("fix it")?].concat())
+        };
         for (kind, expected) in [
             ("claude", &["claude", "fix it"][..]),
             ("codex", &["codex", "--no-daemon", "fix it"]),
@@ -816,10 +877,118 @@ mod tests {
             assert_eq!(argv(kind), None, "{kind}");
         }
         assert_eq!(
-            reg.spec(&AgentKind::from("ori")).unwrap().argv(),
+            reg.spec(&AgentKind::from("ori")).unwrap().argv(None),
             ["ori", "code"],
             "a plain launch runs the binary and its launch args"
         );
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tutti-registry-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn which_finds_only_executables_on_the_path_given() {
+        let dir = scratch("which");
+        executable(&dir.join("myagent"));
+        std::fs::write(dir.join("plainfile"), b"x").unwrap();
+        let path = std::ffi::OsString::from(&dir);
+        let path = Some(path.as_os_str());
+
+        assert_eq!(which("myagent", path), Some(dir.join("myagent")));
+        assert_eq!(which("missing", path), None);
+        assert_eq!(which("plainfile", path), None, "not executable");
+        assert_eq!(which("myagent", None), None, "an unset PATH finds nothing");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Cursor's process as its installer's launcher leaves it (read from
+    /// the 2026.11.05 package): `exec -a "$0"` of its bundled `node` on the
+    /// `index.js` beside it, argv[0] the name that started it. Detection
+    /// knows it by that script's place, never by the generic name.
+    #[test]
+    fn cursor_is_known_by_its_scripts_place_never_by_a_name_like_agent() {
+        let reg = Registry::default();
+        let script = "/home/u/.local/share/cursor-agent/versions/2026.11.05-86047df/index.js";
+        let argv = ["--use-system-ca", script, "fix it"];
+        assert_eq!(program_name("node", argv.into_iter()), script);
+        let mut tree = ProcessTree::default();
+        tree.insert(100, None, "zsh");
+        tree.insert(101, Some(100), program_name("node", argv.into_iter()));
+        assert_eq!(reg.detect(&tree, 100), Some(AgentKind::from("cursor")));
+
+        for nobody in [
+            "agent",
+            "/usr/local/bin/agent",
+            "/srv/app/index.js",
+            "index.js",
+            "/opt/cursor-agent/index.js",
+            "versions/1/index.js",
+        ] {
+            assert_eq!(reg.match_process(nobody).map(|s| &s.kind), None, "{nobody}");
+        }
+        assert_eq!(
+            reg.match_process("/usr/bin/cursor-agent").map(|s| &s.kind),
+            Some(&AgentKind::from("cursor"))
+        );
+    }
+
+    /// The launcher runs `agent` where it is Cursor's — linked into Cursor's
+    /// install as its installer leaves it — else `cursor-agent`; an unrelated
+    /// `agent` never stands in for Cursor. With nothing to look on (a
+    /// sandbox's image) it runs `cursor-agent`, the name that declares the
+    /// pane's agent.
+    #[test]
+    fn cursor_launches_as_agent_only_where_agent_is_cursors() {
+        let cursor = Registry::default()
+            .spec(&AgentKind::from("cursor"))
+            .unwrap()
+            .clone();
+        let base = scratch("cursor");
+        let real = base.join("share/cursor-agent/versions/2026.11.05-86047df/cursor-agent");
+        executable(&real);
+        let (current, legacy, other) = (
+            base.join("current"),
+            base.join("legacy"),
+            base.join("other"),
+        );
+        for dir in [&current, &legacy, &other] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::os::unix::fs::symlink(&real, current.join("agent")).unwrap();
+        std::os::unix::fs::symlink(&real, current.join("cursor-agent")).unwrap();
+        std::os::unix::fs::symlink(&real, legacy.join("cursor-agent")).unwrap();
+        executable(&other.join("agent"));
+        let path = |dirs: &[&PathBuf]| std::env::join_paths(dirs).unwrap();
+        let (both, old) = (path(&[&current]), path(&[&legacy]));
+        let (shadowed, unrelated) = (path(&[&other, &legacy]), path(&[&other]));
+
+        assert_eq!(cursor.installed(Some(both.as_os_str())), Some("agent"));
+        assert_eq!(cursor.argv(Some(both.as_os_str())), ["agent"]);
+        assert_eq!(
+            cursor.installed(Some(old.as_os_str())),
+            Some("cursor-agent")
+        );
+        assert_eq!(
+            cursor.installed(Some(shadowed.as_os_str())),
+            Some("cursor-agent"),
+            "the `agent` a shell would run is not Cursor's"
+        );
+        assert_eq!(cursor.installed(Some(unrelated.as_os_str())), None);
+        assert_eq!(cursor.argv(Some(unrelated.as_os_str())), ["cursor-agent"]);
+        assert_eq!(cursor.argv(None), ["cursor-agent"]);
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
