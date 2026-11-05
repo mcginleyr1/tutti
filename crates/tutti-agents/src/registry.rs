@@ -135,6 +135,12 @@ pub struct AgentSpec {
     /// How its interactive mode takes a first message from a file, for one
     /// too long to ride an argument well; `None` when it can't.
     pub prompt_file: Option<PromptFile>,
+    /// What the screen's tail shows in each state. A pattern of several
+    /// lines (`\n`-separated) is a dialog's phrase or option over the footer
+    /// it is drawn with, or an idle prompt over its footer: its last line
+    /// must show on the tail's bottom line and the lines before it above, in
+    /// order. A transcript quoting the phrase sits above the agent's own
+    /// prompt and footer, so it matches nothing.
     pub blocked_patterns: Vec<String>,
     pub working_patterns: Vec<String>,
     pub done_patterns: Vec<String>,
@@ -267,19 +273,12 @@ impl AgentSpec {
     /// pattern matched and the caller should fall back to activity heuristics.
     pub fn classify(&self, screen_text: &str) -> Option<Observation> {
         let tail = tail(screen_text, Self::TAIL_LINES);
-        if self
-            .blocked_patterns
-            .iter()
-            .any(|p| tail.contains(p.as_str()))
-        {
+        let shows = |patterns: &[String]| patterns.iter().any(|p| drawn(tail, p));
+        if shows(&self.blocked_patterns) {
             Some(Observation::Blocked)
-        } else if self
-            .working_patterns
-            .iter()
-            .any(|p| tail.contains(p.as_str()))
-        {
+        } else if shows(&self.working_patterns) {
             Some(Observation::Working)
-        } else if self.done_patterns.iter().any(|p| tail.contains(p.as_str())) {
+        } else if shows(&self.done_patterns) {
             Some(Observation::Done)
         } else {
             None
@@ -363,7 +362,8 @@ impl Default for Registry {
                 // spinner reads `✶ Dilly-dallying… (12s · ↓ 98 tokens)` or
                 // `(3s · ↓ 345 tokens · thinking)` once tokens flow, an ended
                 // one `✻ Brewed for 23s · done 9:43 AM`. A new folder's
-                // trust dialog (`❯ Yes, I trust this folder`) waits on you.
+                // trust dialog waits on you: its option `Yes, I trust this
+                // folder` over its footer `Enter to confirm · Esc to cancel`.
                 AgentSpec::new(
                     "claude",
                     "Claude Code",
@@ -374,7 +374,7 @@ impl Default for Registry {
                         "y/n",
                         "Waiting for your input",
                         "permission",
-                        "trust this folder",
+                        "Yes, I trust this folder\nEnter to confirm · Esc to cancel",
                     ],
                     &["esc to interrupt", "Thinking", "Running", "· ↓ "],
                     &["❯"],
@@ -386,10 +386,19 @@ impl Default for Registry {
                 // 0.16x) runs every session's hooks with the environment of
                 // whichever codex started it, so their `TUTTI_PANE` would be
                 // another pane's. Embedded, they are this pane's. Observed
-                // live, 0.166.0: the composer's `›` is the idle prompt; its
-                // dialogs (approval, folder trust, hook review) wait on you;
-                // an answered approval leaves `✔ You approved codex to run …`
-                // in the transcript, so no bare `approve`.
+                // live, 0.166.0: idle, the composer (`› Ask Codex to do
+                // anything`, or what you typed) over its `? for shortcuts`
+                // footer on the bottom line — its dialogs and its hooks
+                // browser draw `›` over other footers. Each dialog waits on you, matched by an
+                // option over its footer: the approval (`3. No, and tell Codex
+                // what to do differently (esc)` / `Press enter to confirm or
+                // esc to cancel`), folder trust (`1. Trust and continue` /
+                // `enter continue · esc quit`), hook review (`Hooks need
+                // review` / `3. Continue without trusting` / `enter confirm ·
+                // esc skip`), each footer the screen's bottom line. An answered
+                // approval leaves `✔ You approved codex to run …` in the
+                // transcript, so no bare `approve`, and a lone phrase quoted
+                // in a reply matches nothing.
                 AgentSpec {
                     launch_args: owned(&["--no-daemon"]),
                     ..AgentSpec::new(
@@ -398,14 +407,13 @@ impl Default for Registry {
                         "https://github.com/openai/codex",
                         &["codex"],
                         &[
-                            "Allow command",
                             "y/n",
-                            "Press enter to confirm or esc to cancel",
-                            "Trust this folder",
-                            "Hooks need review",
+                            "tell Codex what to do differently\nPress enter to confirm or esc to cancel",
+                            "Trust and continue\nenter continue · esc quit",
+                            "Hooks need review\nContinue without trusting\nenter confirm · esc skip",
                         ],
                         &["esc to interrupt", "Working", "Thinking"],
-                        &["›"],
+                        &["› \n? for shortcuts"],
                     )
                 }
                 // `--help` (0.166.0): `codex [PROMPT]`, "Optional user prompt
@@ -647,6 +655,25 @@ fn tail(text: &str, max_lines: usize) -> &str {
         .map_or(text, |(idx, _)| &text[idx + 1..])
 }
 
+/// Whether `tail` shows `pattern` (see `AgentSpec::blocked_patterns`): one
+/// line anywhere, or several — the last on the tail's bottom line, the ones
+/// before it in their order.
+fn drawn(tail: &str, pattern: &str) -> bool {
+    let Some((above, bottom)) = pattern.rsplit_once('\n') else {
+        return tail.contains(pattern);
+    };
+    let mut rest = tail;
+    let last = tail.trim_end().rsplit('\n').next().unwrap_or_default();
+    last.contains(bottom)
+        && above.split('\n').all(|line| match rest.find(line) {
+            Some(at) => {
+                rest = &rest[at + line.len()..];
+                true
+            }
+            None => false,
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,6 +747,31 @@ mod tests {
         assert_eq!(spec.classify(trust), Some(Observation::Blocked));
         assert_eq!(spec.classify(hooks), Some(Observation::Blocked));
         assert_eq!(spec.classify(approved), Some(Observation::Done));
+    }
+
+    /// A dialog's words quoted in a reply — option and footer both, in the
+    /// last lines of a finished turn, its idle prompt below — are no dialog:
+    /// each blocked marker needs the live dialog's footer on the screen's
+    /// bottom line. Codex's `›` over another footer, as its dialogs and its
+    /// hooks browser draw it, is no idle composer either.
+    #[test]
+    fn a_reply_quoting_a_dialog_reads_as_the_screen_it_is() {
+        let claude_reply = "⏺ Its dialog offers \"Yes, I trust this folder\" over\n  \"Enter to confirm · Esc to cancel\".\n\n✻ Brewed for 3s · done 9:43 AM\n\n────\n❯ \n────";
+        assert_eq!(claude().classify(claude_reply), Some(Observation::Done));
+        let codex = Registry::default().match_process("codex").unwrap().clone();
+        for quoted in [
+            "3. No, and tell Codex what to do differently (esc)\n  Press enter to confirm or esc to cancel",
+            "Trust this folder? 1. Trust and continue\n  enter continue · esc quit",
+            "Hooks need review\n  3. Continue without trusting\n  enter confirm · esc skip",
+            "Allow command?",
+        ] {
+            let reply = format!(
+                "• Codex's dialog reads \"{quoted}\".\n\n  Worked for 3s • 10:01 AM\n\n\n› Ask Codex to do anything\n\n  GPT · ~/repo-b\n  ? for shortcuts"
+            );
+            assert_eq!(codex.classify(&reply), Some(Observation::Done), "{quoted}");
+        }
+        let browser = "  PreToolUse hooks\n  2 hooks need review before they can run.\n\n› [!]  1  Unnamed hook · new\n  [!]  2  Unnamed hook · new\n\n  t trust · esc back";
+        assert_eq!(codex.classify(browser), None);
     }
 
     #[test]
