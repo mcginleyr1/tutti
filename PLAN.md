@@ -625,7 +625,9 @@ Goal: agents can drive Tutti — spawn siblings, wait on them, read their output
    killed or not, and clears the directory as it starts and stops. A
    restore never re-runs a first message. `issues::deploy_argv` builds the
    argv for `issue deploy` and the TUI's armed launcher alike. No wire
-   change.
+   change. Open: a prompt starting with `-` reads as an option to an agent
+   that takes it as a plain argument (Claude, Codex, Pi, Vibe, Muse, Droid,
+   Augment, Cursor); only Pi's docs name `--` to end its options.
 
 **Acceptance:** a script (or an agent) can: create 3 worktree workspaces, launch an
 agent in each, `wait --until done` on all three, read back each diff summary.
