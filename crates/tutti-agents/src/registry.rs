@@ -192,18 +192,21 @@ impl AgentSpec {
     }
 
     /// The first of its binaries installed on `path` (`which`) as this
-    /// agent's: one detection knows by name counts as found; any other —
-    /// Cursor's `agent`, a name plenty of programs answer to — only when the
-    /// file it resolves to is one detection knows (Cursor's installer links
-    /// `agent` to its `cursor-agent`).
-    pub fn installed(&self, path: Option<&OsStr>) -> Option<&str> {
-        self.binaries.iter().map(String::as_str).find(|&binary| {
-            which(binary, path).is_some_and(|found| {
-                self.names(binary)
-                    || found
-                        .canonicalize()
-                        .is_ok_and(|real| self.names(&real.to_string_lossy()))
-            })
+    /// agent's, as an argv names it. One detection knows by name counts as
+    /// found and stays bare. Any other — Cursor's `agent`, a name plenty of
+    /// programs answer to — counts only when the file it resolves to is one
+    /// detection knows (Cursor's installer links `agent` to its
+    /// `cursor-agent`), and is named by the path checked here: the daemon
+    /// spawns the argv on its own PATH, which may find another `agent`.
+    pub fn installed(&self, path: Option<&OsStr>) -> Option<String> {
+        self.binaries.iter().find_map(|binary| {
+            let found = which(binary, path)?;
+            if self.names(binary) {
+                return Some(binary.clone());
+            }
+            let real = found.canonicalize().ok()?;
+            self.names(&real.to_string_lossy())
+                .then(|| found.to_string_lossy().into_owned())
         })
     }
 
@@ -214,13 +217,8 @@ impl AgentSpec {
     pub fn argv(&self, path: Option<&OsStr>) -> Vec<String> {
         let binary = self
             .installed(path)
-            .or_else(|| {
-                self.binaries
-                    .iter()
-                    .map(String::as_str)
-                    .find(|b| self.names(b))
-            })
-            .map_or_else(|| self.kind.to_string(), String::from);
+            .or_else(|| self.binaries.iter().find(|b| self.names(b)).cloned())
+            .unwrap_or_else(|| self.kind.to_string());
         std::iter::once(binary)
             .chain(self.launch_args.iter().cloned())
             .collect()
@@ -475,7 +473,7 @@ impl Default for Registry {
                 // bundled `node` on the `index.js` beside it: the process is
                 // `node` on that script, whichever name started it. The
                 // launcher runs `agent` where it is Cursor's (`installed`),
-                // else `cursor-agent`. Docs (cursor.com/docs/cli/reference/
+                // by the path it checked, else `cursor-agent`. Docs (cursor.com/docs/cli/reference/
                 // parameters): `prompt`, "Initial prompt for the agent", in
                 // the agent mode it starts interactively by default. Not run
                 // here.
@@ -1055,16 +1053,15 @@ mod tests {
     }
 
     /// The launcher runs `agent` where it is Cursor's — linked into Cursor's
-    /// install as its installer leaves it — else `cursor-agent`; an unrelated
-    /// `agent` never stands in for Cursor. With nothing to look on (a
-    /// sandbox's image) it runs `cursor-agent`, the name that declares the
-    /// pane's agent.
+    /// install as its installer leaves it — by the path it checked, so a
+    /// daemon on another PATH runs that same `agent`; else `cursor-agent`,
+    /// bare like every name detection knows. An unrelated `agent` never
+    /// stands in for Cursor. With nothing to look on (a sandbox's image) it
+    /// runs `cursor-agent`, the name that declares the pane's agent.
     #[test]
     fn cursor_launches_as_agent_only_where_agent_is_cursors() {
-        let cursor = Registry::default()
-            .spec(&AgentKind::from("cursor"))
-            .unwrap()
-            .clone();
+        let reg = Registry::default();
+        let cursor = reg.spec(&AgentKind::from("cursor")).unwrap().clone();
         let base = scratch("cursor");
         let real = base.join("share/cursor-agent/versions/2026.11.05-86047df/cursor-agent");
         executable(&real);
@@ -1084,20 +1081,30 @@ mod tests {
         let (both, old) = (path(&[&current]), path(&[&legacy]));
         let (shadowed, unrelated) = (path(&[&other, &legacy]), path(&[&other]));
 
-        assert_eq!(cursor.installed(Some(both.as_os_str())), Some("agent"));
-        assert_eq!(cursor.argv(Some(both.as_os_str())), ["agent"]);
+        let checked = current.join("agent").to_string_lossy().into_owned();
         assert_eq!(
-            cursor.installed(Some(old.as_os_str())),
+            cursor.installed(Some(both.as_os_str())),
+            Some(checked.clone())
+        );
+        assert_eq!(cursor.argv(Some(both.as_os_str())), [checked]);
+        assert_eq!(
+            cursor.installed(Some(old.as_os_str())).as_deref(),
             Some("cursor-agent")
         );
         assert_eq!(
-            cursor.installed(Some(shadowed.as_os_str())),
+            cursor.installed(Some(shadowed.as_os_str())).as_deref(),
             Some("cursor-agent"),
             "the `agent` a shell would run is not Cursor's"
         );
         assert_eq!(cursor.installed(Some(unrelated.as_os_str())), None);
         assert_eq!(cursor.argv(Some(unrelated.as_os_str())), ["cursor-agent"]);
-        assert_eq!(cursor.argv(None), ["cursor-agent"]);
+        let sandboxed = cursor.argv(None);
+        assert_eq!(sandboxed, ["cursor-agent"]);
+        assert_eq!(
+            reg.match_process(&sandboxed[0]).map(|s| &s.kind),
+            Some(&cursor.kind),
+            "a sandbox pane's agent is declared from its program"
+        );
         std::fs::remove_dir_all(&base).ok();
     }
 

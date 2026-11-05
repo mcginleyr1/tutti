@@ -243,9 +243,10 @@ Goal: the differentiator. Tutti knows which panes are agents and what state they
    one directory. A spec's `binaries` are what the launcher looks for on
    PATH, the preferred one first. One that detection doesn't know by name
    (`agent`) counts only if it resolves to a file detection knows. The
-   launcher and `issue deploy` run `agent` where it is Cursor's, else
-   `cursor-agent`, and a sandbox runs `cursor-agent`, the name its pane's
-   declared agent is read from.
+   launcher and `issue deploy` run `agent` where it is Cursor's, by the path
+   they checked (the daemon spawns on its own PATH), else `cursor-agent`,
+   and a sandbox runs `cursor-agent`, the name its pane's declared agent is
+   read from.
 2. **State classification** per pane, using layered signals (most→least reliable):
    - agent-specific integrations (e.g. Claude Code hooks writing to a tutti-known
      location, or parsing its status line)

@@ -1420,8 +1420,9 @@ Cursor CLI's installer puts two names on your `PATH`: `agent`, the one its
 docs use now, and `cursor-agent`, the old one. The launcher and `issue
 deploy` run `agent` when it is Cursor's own (a link into Cursor's install),
 and `cursor-agent` otherwise, so an unrelated `agent` on your `PATH` never
-stands in for Cursor. A sandbox's image can't be looked into, so there it
-runs `cursor-agent`.
+stands in for Cursor. They run `agent` by the full path they found it at, so
+a daemon started with a different `PATH` still runs that same `agent`. A
+sandbox's image can't be looked into, so there it runs `cursor-agent`.
 
 ### Agent state sources
 
