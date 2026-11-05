@@ -1948,6 +1948,12 @@ fn agent_event(
     };
     let view = outcome.relisted.then(|| session.view());
     drop(session);
+    for id in &outcome.stale {
+        let answer = hub.approvals().remove(id);
+        if let Some(answer) = answer {
+            let _ = answer.send(ApprovalDecision::Pass);
+        }
+    }
     if let Some(view) = view {
         broadcast_event(hub, Event::LayoutChanged { workspaces: view });
     }

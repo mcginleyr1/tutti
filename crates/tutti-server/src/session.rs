@@ -971,6 +971,7 @@ impl Session {
         let mut classified = None;
         let mut noted = false;
         let mut replied = false;
+        let mut stale = Vec::new();
         match event {
             AgentHookEvent::SubagentStarted { id, desc } => {
                 subs.push(SubagentInfo {
@@ -1010,6 +1011,11 @@ impl Session {
                 let before = subs.len();
                 subs.retain(|s| s.running);
                 relisted |= subs.len() != before;
+                // The agent asks nothing once its turn is over, so a request
+                // still held was answered in its own dialog, which Claude
+                // (2.1.318) shows beside the hold, leaving the hook waiting.
+                stale = slot.meta.approvals.drain(..).map(|a| a.id).collect();
+                relisted |= !stale.is_empty();
             }
             AgentHookEvent::SessionStarted => {}
         }
@@ -1027,6 +1033,7 @@ impl Session {
             relisted,
             noted,
             replied,
+            stale,
         })
     }
 
@@ -1843,6 +1850,9 @@ pub struct AgentEventOutcome {
     pub noted: bool,
     /// Whether the hooks reported a turn's end, so an ask's wait looks again.
     pub replied: bool,
+    /// The approvals a turn's end took off the pane, whose hooks still wait
+    /// for an answer: each is passed, so its hook lets go.
+    pub stale: Vec<u64>,
 }
 
 /// What `apply_report` changed, so the server broadcasts the right events.

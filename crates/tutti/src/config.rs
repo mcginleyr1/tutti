@@ -115,8 +115,8 @@ pub enum Theme {
 /// What a Claude or opencode permission request does to tutti. `Watch` (the
 /// default) only learns of it: the pane blocks with the tool named and the
 /// agent shows its own dialog. `Hold` waits for an answer from tutti's queue
-/// or `pane approve` — keeping Claude's dialog back; opencode's shows beside
-/// it — handing it on to the agent's own after `approval_timeout`.
+/// or `pane approve` — the agent's own dialog shows beside it (Claude Code
+/// 2.1.318's too) — handing it on to that dialog after `approval_timeout`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Approvals {
     Watch,

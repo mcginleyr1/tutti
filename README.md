@@ -1088,8 +1088,11 @@ With the [Claude Code hooks](#claude-code-integration) installed, a permission
 request blocks its pane the moment Claude is about to ask, naming the tool and
 its input. By default (`approvals = "watch"`) that is all: Claude shows its own
 dialog, which you answer in the pane or through a peek. Set `approvals =
-"hold"` and the hook holds the request for an answer from tutti instead,
-keeping Claude's dialog back:
+"hold"` and the hook also holds the request for an answer from tutti.
+Claude Code 2.1.318 shows its own dialog beside the hold. An answer from
+tutti closes that dialog (`Allowed by PermissionRequest hook`). A request
+answered in the dialog instead leaves its hook waiting, and tutti lets go of
+it when the turn ends:
 
 - The agent's waiting row reads `Bash · rm -rf build`, and a held approval
   leads the queue whatever the pane's state. A pane holds every request its
@@ -1121,7 +1124,10 @@ keeping Claude's dialog back:
 A held request falls through to Claude's own dialog — the hook printing
 nothing and exiting 0 — when no TUI is attached to answer it, on `esc`, and
 when nobody answers within `approval_timeout_secs` (default 120, at most 599:
-Claude stops a hook at 600 s). The hook never fails a Claude session. An allow
+Claude stops a hook at 600 s). The agent's turn ending (Stop, StopFailure,
+Codex's Interrupt) also lets go of whatever its pane still holds, so a
+request answered in Claude's dialog never lingers on a finished pane. The
+hook never fails a Claude session. An allow
 or a deny from tutti sets the pane **working** at once — the tool runs, or the
 agent hears the refusal — unless another request still waits on you: held in
 tutti, or one that fell through to Claude's dialog, until a hook (or the
@@ -1614,8 +1620,9 @@ stdin, maps it, and forwards it to the pane's daemon:
   ended the turn — marks it done with no reply;
 - a **PermissionRequest** marks it **blocked** the moment Claude is about to
   ask, naming the tool and its input (`Bash · rm -rf build`); with `approvals =
-  "hold"` the request waits for an answer from tutti instead of Claude's dialog
-  (see [Held approvals](#held-approvals));
+  "hold"` the request also waits for an answer from tutti, beside Claude's
+  dialog (see [Held approvals](#held-approvals)); a turn's end (Stop or
+  StopFailure) lets go of any request still held;
 - a **Notification** that waits on you — a permission prompt, an MCP dialog, a
   background agent's question, an Enter after a usage limit — marks it
   **blocked** too, as does one from an older Claude that names no type; idle

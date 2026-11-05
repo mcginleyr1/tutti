@@ -3783,6 +3783,39 @@ async fn a_hook_hanging_up_drops_its_approval() {
     server.stop().await;
 }
 
+/// Claude (2.1.318) shows its own dialog beside a held request. Answered
+/// there, the tool runs and the turn ends while the hook still holds. The
+/// turn's end passes what the pane still holds, since the agent asks nothing
+/// after its turn, so no stale request is left for tutti to answer.
+#[tokio::test]
+async fn a_turns_end_passes_the_requests_its_pane_still_holds() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let pane = run_sleeper(&mut control).await;
+    let mut viewer = attached_viewer(&server).await;
+
+    let mut holding = server.connect().await;
+    holding.send(&hold(pane)).await;
+    view_approval(&mut viewer, pane, true).await.unwrap();
+    let ran = AgentHookEvent::Activity { detail: None };
+    hook(&mut control, pane, ran).await;
+    assert_eq!(held_approvals(&mut control, pane).await.len(), 1);
+
+    let done = AgentHookEvent::Done {
+        reply: Some("done".into()),
+    };
+    hook(&mut control, pane, done).await;
+    assert_eq!(approval(holding.response().await), ApprovalDecision::Pass);
+    assert_eq!(view_approval(&mut viewer, pane, false).await, None);
+    assert!(
+        wait_pane(&mut control, pane, |p| p.approvals.is_empty()
+            && p.state == AgentState::Done)
+        .await
+    );
+
+    server.stop().await;
+}
+
 /// An answer lands only on the approval it names: a stale id is refused, as
 /// is any answer once nothing is held, while `None` answers the oldest.
 #[tokio::test]
