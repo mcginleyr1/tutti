@@ -177,6 +177,11 @@ cargo fmt --all --check
   `Outbox` (server.rs), a leaf the writer holds only to take what is queued.
   A tap past its backlog asks for a fresh snapshot instead of waiting, and
   leaves its log line to the writer: a stalled stderr would stall the pane.
+  A tap is handed each read whole (`Feed::Read`) and the writer takes the
+  outbox whole, so `Queue::taken` is exactly the row a stream's terminal has
+  reached, and an inline resync hands on exactly the rows it skipped: hand a
+  tap a read in pieces again, or take part of the outbox, and it loses or
+  repeats rows.
 - **A command's end (OSC 133;D) turns off the modes the command left on**
   (rtty-vt's `set_command_end_reset`, on in `Term::new`; the taps hear of it
   through `LEFT_ON_TAPS`, `Term::drain`, pty.rs):

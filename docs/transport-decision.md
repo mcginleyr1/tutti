@@ -302,6 +302,17 @@ find at tutti's edge:
 A missing `handoff` reads as `false`. An older client hands nothing on, and is
 never sent `resize_edge`.
 
+## Views (wire rev 16)
+
+An attach may say `"view": true` (`tutti attach --view`): the client only
+watches. Its `pane_focus` is recorded as where it looks — an edge past that
+pane is still handed to it — and nothing else: no pane becomes the session's
+active one, no `Focused` event moves a `Done` pane to `Idle`, no note is marked
+read, and a note about the pane it looks at lands unread (a bell there too).
+"The" attached client — whose focus a `pane_focus_toward` without `from`
+starts from, and a watcher's snapshot names — is the newest that is no view,
+else the newest view. A missing `view` reads as `false`.
+
 ## Raw pane streams for real terminals (wire rev 10)
 
 Option C rests on one premise: the client "is not a real terminal" — the TUI draws a
@@ -339,7 +350,18 @@ moves its size vote with `ViewSizes` naming the pane, and detaches by closing th
 (or `detach`). A client that falls behind — more than 1 MiB of the pane's output queued
 for it — has what is queued dropped and a fresh `PaneSnapshot` sent in its place, taken
 in the hold that parsed the read it fell behind on, and streams on after it: a slow
-terminal skips ahead to the pane's screen. The stream ends with `Event::PaneExited` once
+terminal skips ahead to the pane's screen. A tap takes a read whole or not at all, and
+the outbox records the pane's screen top as of what its writer last took, so the rows a
+skip passes over are exactly known: with `"inline":true` (wire rev 16), every snapshot
+follows an `Event::PaneRows { pane, epoch, top, skipped }` — `top` the absolute row its
+screen starts at, `epoch` the daemon run the rows are numbered in — and a resync's
+snapshot comes after the rows from there up to `top` (at most 10 000, a pane's whole
+scrollback), as `PaneRaw` frames of logical lines like the history; `skipped` counts
+rows left out before them. `"since":{"epoch":E,"row":R,"held":[hashes]}` (wire rev 16)
+starts the history past what the client's terminal already holds — every row before
+`R`, then the rows from `R` whose text still hashes (FNV-1a, trailing blanks trimmed) to
+`held` — within `"history"`, a record from another epoch or past the screen counting
+for nothing. The stream ends with `Event::PaneExited` once
 the child's last output is queued (up to 250 ms is spent letting the reader drain the pty
 first), and the daemon then closes the connection.
 A daemon that stops just closes it: its own shutdown killed the pane, which did not exit.
@@ -407,7 +429,16 @@ three things:
   cursor put on the line under the primary screen's last text (or its cursor, if lower),
   so the shell goes on below the pane.
 
-The pane's history from before the attach is not replayed: the snapshot carries none.
+The snapshot carries no history: the pane's history from before the attach comes
+ahead of it (`"history"`), once. A resync's rows go into the terminal's scrollback over
+its stale screen — a plain primary screen cleared from the top with ED 0, the rows,
+then as many newlines at the bottom as the rows fill of the screen, counted by a
+scratch rtty-vt terminal of the terminal's size (the keys' thread reads the terminal,
+so no CPR can be asked) — before the snapshot is drawn. On exit the CLI keeps what the
+terminal holds of the pane (its `PaneRows` numbering, the mirror's screen top, and the
+hashes of the screen rows down to the last drawn) in `$XDG_STATE_HOME/tutti/inline.json`,
+0600, keyed by the terminal's tty and the session owning it, for the next attach's
+`since`.
 
 ## Terminal queries: the daemon answers what it can
 

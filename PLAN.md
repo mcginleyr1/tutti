@@ -761,7 +761,14 @@ In order; each lands its TUI path in the same wave as its verbs.
      primary scrollback's newest rows, as logical lines the editor's terminal
      wraps itself (rtty-vt's `Terminal::history`) — and a redraw erases with
      ED 0, so a terminal that scrolls ED 2 into its scrollback keeps no copy
-     of the screen per resize (verified with a tutti pane as the host);
+     of the screen per resize (verified with a tutti pane as the host).
+     ✅ wave 12 (wire rev 16): a resync hands an inline stream the rows that
+     scrolled off past what its writer last took, at most 10 000, before its
+     snapshot (`PaneRows`), printed over the stale screen into the
+     scrollback; a second inline attach in the same terminal (its tty and
+     session, `$XDG_STATE_HOME/tutti/inline.json`) prints only the history
+     past what that terminal holds — rows up to the screen it left, then
+     those screen rows the pane has not changed since (row hashes);
    - ✅ the escape time (wave 9): `escape_time_ms` (default 15, 0–1000),
      tmux's escape-time — a lone ESC waits it for the key after it, which
      goes with it as Alt — in the TUI's reader and in `pane attach`, which
@@ -902,7 +909,10 @@ In order; each lands its TUI path in the same wave as its verbs.
      vote, colours or session change; its footer leads with `view`; it never
      starts a daemon and is offered no restore; panes keep the other
      clients' sizes, else their own. `pane attach --view` is not done: a raw
-     stream draws right only at the pane's size, which its vote guarantees;
+     stream draws right only at the pane's size, which its vote guarantees.
+     ✅ wave 12: it attaches as a view (`Attach.view`), so its focus is its
+     own — no done agent marked seen, no note read, no pane of the
+     session's moved — and it is "the" attached client only with no other;
    - ✅ snapshots carry scrollback: rtty-vt's `Terminal::history` (rtty
      13fb35b9), `PaneAttach.history` (wire rev 14), `pane attach --inline
      --history ROWS`; the pin moved to rtty main, whose marks sit past the
@@ -918,10 +928,11 @@ In order; each lands its TUI path in the same wave as its verbs.
 - under a terminal without kitty's keyboard protocol, a pane that asked for
   releases, repeats or text gets presses only (its text derived from the
   key);
-- inline, a resync drops from the host's scrollback the lines it skipped,
-  and a second attach in the same terminal prints the history again; a
-  view's focus is the session's, so a view focusing a done agent marks it
-  seen;
+- ✅ (wave 12) inline, a resync hands the host's scrollback the lines it
+  skipped (up to the pane's 10 000; past them a line says how many are not
+  shown), and a second attach in the same terminal prints only the history
+  that terminal lacks; ✅ a view's focus is its own, so a view focusing a
+  done agent marks nothing seen;
 - `tutti ask` needs a pane its agent's hooks have reported through. ✅ A
   fresh Codex or opencode (Codex sends SessionStart only with its first
   prompt, opencode's plugin nothing before a turn) is taken when `ask` finds
@@ -940,6 +951,16 @@ In order; each lands its TUI path in the same wave as its verbs.
 so a program that stops reading stalls nobody, and a send to an exited pane
 is refused. A launcher row shows a number only where a digit launches it
 (rows 1–9), never a later row or the dim catalog.
+
+✅ Wave 12 (inline and view, wire rev 16): a tap takes a read whole, and the
+stream outbox knows the row its terminal reached, so an inline resync hands
+on exactly the rows it skipped (`PaneRows`); `pane attach --inline` keeps
+what each terminal holds of each pane (`PaneAttach.since`) and prints only
+the history past it; `attach --view`'s focus marks nothing seen. Live, with
+tutti panes as the hosts (a scratch session): 21/21 — two inline attaches
+print 1..150 once each, a client stopped through a 2.7 MB flood resyncs and
+its terminal holds all 3000 lines once, a view leaves a done pane done and
+its note unread where a plain attach marks both seen.
 
 **Deliberately not done:** packaging and distribution (Phase 5) — the project
 is private, so install stays `cargo install --path` from a checkout.
@@ -982,9 +1003,10 @@ is private, so install stays `cargo install --path` from a checkout.
   script and the 2026.11.05 package's launcher, unrun;
 - kitty key reports against a real kitty, WezTerm or Ghostty (only a harness
   played kitty), and `pane attach --inline` in Emacs vterm or eat;
-- `tutti attach --view` on a real second terminal; the inline history in
-  Neovim's `:terminal` and Emacs vterm/eat (run only with a tutti pane as
-  the host);
+- `tutti attach --view` on a real second terminal; the inline history, a
+  resync's rows and a second attach's in Neovim's `:terminal` and Emacs
+  vterm/eat (run only with a tutti pane as the host: getsid and the tty
+  there are those of a pane's shell);
 - Claude's `StopFailure` and `PostToolUseFailure` hooks (from the hooks
   reference only).
 
