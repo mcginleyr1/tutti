@@ -311,11 +311,14 @@ Goal: the differentiator. Tutti knows which panes are agents and what state they
    elicitation, a question — but Claude's `permission_prompt` Notification,
    which comes about six seconds into a dialog whose PermissionRequest was
    reported already: `agent-event` marks it a reminder
-   (`AgentHookEvent::Blocked.reminder`, wire rev 15), noted only as the move
-   into Blocked (wave 12). Open: a hooks install without PermissionRequest
-   (one from before it, never re-run) notes a second dialog's reminder in
-   the same blocked spell not at all; so does a sandboxed command's network
-   prompt while the pane is blocked, if no PermissionRequest reports those.
+   (`AgentHookEvent::Blocked.reminder`, wire rev 15), which makes no note on
+   a pane already blocked and is noted when it is itself the move into
+   Blocked (wave 12). Open: a hooks install without PermissionRequest (one
+   from before it, never re-run) notes a second dialog's reminder in the
+   same blocked spell not at all; so does a sandboxed command's network
+   prompt while the pane is blocked, if no PermissionRequest reports those;
+   and a reminder arriving after its dialog was answered and the pane went
+   back to work blocks the pane again, with a note, as before wave 12.
 4. **API**: `pane list --json` includes agent + state; emit state-change events on the
    socket event stream. ✅ For tools outside tutti (a notch app): `tutti watch`
    (the socket's `Watch`) streams whole-session snapshots, one per change,

@@ -1214,8 +1214,11 @@ message (`Bash · rm -rf build`), or an OSC 7501 or herdr report's `msg` under
 its app — so a report that finishes a pane with a message makes one note, not
 two. Anything else an agent already blocked waits on — another permission
 request (parallel subagents ask at once), an MCP form, a question — makes a
-note of its own; Claude's `permission_prompt` reminder of a dialog whose
-request is noted already makes none. Each keeps the pane's title
+note of its own. Claude's `permission_prompt` — its reminder, six seconds
+into a dialog — makes none on a pane already blocked, where its request is
+noted already; one that blocks the pane itself (a late one arriving after
+the pane went back to work included) is noted as that move. Each keeps the
+pane's title
 and workspace as they were, so it outlives
 the pane. `Ctrl+B N` opens the **notifications panel**, newest first: an
 unread dot, the age, the pane, a dim `workspace · kind`, and the text. `j`/`k`

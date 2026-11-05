@@ -3933,11 +3933,12 @@ async fn notifications_and_attention_transitions_land_in_the_history() {
 }
 
 /// A pane already blocked notes each further thing its agent waits on — a
-/// second request, a question — but never Claude's `permission_prompt`
-/// reminder of a dialog whose request is noted. A reminder that is the first
-/// word of a block (no PermissionRequest hook wired) still notes the move.
+/// second request, a question — but not Claude's `permission_prompt`
+/// reminder of a dialog whose request is noted. A reminder that blocks a
+/// working pane itself — the first word of a block with no PermissionRequest
+/// hook wired, or a late one after the dialog's answer — notes that move.
 #[tokio::test]
-async fn a_second_blocked_event_notes_what_is_new_never_a_reminder() {
+async fn a_second_blocked_event_notes_what_is_new_but_not_a_reminder() {
     let server = TestServer::start();
     let mut control = server.connect().await;
     let pane = run_shell(&mut control).await;
