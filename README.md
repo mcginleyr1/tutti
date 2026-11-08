@@ -334,7 +334,8 @@ A program's keyboard protocol is the pane's own: the daemon answers kitty's
 keyboard query and keeps the flags a program pushes, and the level of xterm's
 modifyOtherKeys it asks for (Neovim pushes kitty's flags; Emacs asks for
 modifyOtherKeys). The TUI encodes each key for the focused pane as its program
-asked — under kitty's flags Ctrl+I is not Tab, Esc not the start of Alt — and
+asked, with rtty-vt's key and mouse encoders (`rtty_vt::input`, the ones rtty
+uses) — under kitty's flags Ctrl+I is not Tab, Esc not the start of Alt — and
 asks your terminal for kitty's disambiguated keys when it speaks the protocol,
 so it can tell them apart in the first place; it hands the terminal back as it
 was on detach. Under a terminal without it, keys still reach a kitty pane in

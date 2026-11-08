@@ -6,7 +6,7 @@
 mod app;
 mod connection;
 mod host;
-mod input;
+mod keys;
 mod launcher;
 mod layout;
 mod navigate;
@@ -184,7 +184,7 @@ static RTTY_CLAIMED: AtomicBool = AtomicBool::new(false);
 /// - Kitty's keyboard flags, on the terminal's own stack: it then tells keys
 ///   apart that plain bytes cannot — Ctrl+I from Tab, Esc from Alt — and
 ///   reports what the focused pane's program asked for beyond
-///   (`App::key_flags`), for the panes that asked (`input::encode_key`).
+///   (`App::key_flags`), for the panes that asked (`keys::encode_key`).
 /// - rtty's keys: rtty's `keys = "tutti"` Ctrl/Alt+h/j/k/l then reach tutti,
 ///   which hands a move past its own edge back to rtty (`rtty`).
 /// - Light/dark reports (2031), so the TUI follows the terminal's flips.

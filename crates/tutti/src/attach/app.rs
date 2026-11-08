@@ -15,6 +15,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::Rect;
 use ratatui::text::Span;
 use rtty_vt::Terminal;
+use rtty_vt::input::{self, Button, Code, Key, Mouse};
 use tutti_core::{
     AgentKind, AgentState, ApprovalDecision, Checkpoint, DIFF_RANGE, Direction, Event, FileStat,
     Frame as WireFrame, Layout, NOTES_CAP, Note, NoteKind, PaneDims, PaneId, PaneInfo,
@@ -24,7 +25,7 @@ use tutti_core::{
 
 use tutti_agents::Registry;
 
-use super::input;
+use super::keys;
 use super::launcher::{self, LaunchKind, LauncherRow};
 use super::layout::{Boundary, boundaries, pane_rects};
 use super::navigate;
@@ -792,18 +793,18 @@ impl App {
     /// program waits to hear released is held (`pressed`), wherever the
     /// focus went.
     pub fn key_flags(&self) -> u8 {
-        let pane = self.keyboard().kitty;
-        let all = if pane & input::ALL_AS_ESCAPES != 0 {
-            input::ALL_AS_ESCAPES | input::TEXT
+        let pane = self.focused_term().map_or(0, Terminal::kitty_keyboard);
+        let all = if pane & input::ALL_KEYS != 0 {
+            input::ALL_KEYS | input::ASSOCIATED_TEXT
         } else {
             0
         };
         let held = if self.pressed.is_empty() {
             0
         } else {
-            input::EVENTS
+            input::EVENT_TYPES
         };
-        input::DISAMBIGUATE | input::ALTERNATES | (pane & input::EVENTS) | held | all
+        input::DISAMBIGUATE | input::ALTERNATE_KEYS | (pane & input::EVENT_TYPES) | held | all
     }
 
     /// Whether a bell is pending (a non-focused pane just blocked or finished),
@@ -1370,7 +1371,7 @@ impl App {
         self.panes
             .get(&pane)
             .filter(|s| s.info.exited.is_none())
-            .and_then(|s| input::encode_key(key, report, input::Keyboard::of(&s.term)))
+            .and_then(|s| keys::encode_key(key, report, Some(&s.term)))
             .map(|bytes| vec![WireFrame::Input { pane, bytes }])
             .unwrap_or_default()
     }
@@ -1489,15 +1490,15 @@ impl App {
                 _ => {}
             }
         }
-        let keyboard = self.keyboard();
-        match (self.focused, input::encode_key(key, report, keyboard)) {
+        let term = self.focused_term();
+        match (self.focused, keys::encode_key(key, report, term)) {
             (Some(pane), Some(bytes)) => {
                 let release = KeyEvent {
                     kind: KeyEventKind::Release,
                     ..key
                 };
                 if key.kind == KeyEventKind::Press
-                    && input::encode_key(release, report, keyboard).is_some()
+                    && keys::encode_key(release, report, term).is_some()
                 {
                     self.pressed.insert(held(key, report), pane);
                 }
@@ -1514,11 +1515,11 @@ impl App {
         }
     }
 
-    /// How the focused pane's program asked for its keys.
-    fn keyboard(&self) -> input::Keyboard {
+    /// The focused pane's terminal, which says how its program asked for its keys.
+    fn focused_term(&self) -> Option<&Terminal> {
         self.focused
             .and_then(|pane| self.panes.get(&pane))
-            .map_or_else(input::Keyboard::default, |s| input::Keyboard::of(&s.term))
+            .map(|s| &s.term)
     }
 
     /// Enter prefix mode if `key` is the prefix chord, returning whether it was.
@@ -1561,7 +1562,8 @@ impl App {
         }
         // The prefix pressed twice forwards the literal prefix chord to the pane.
         if self.config.prefix.matches(key) {
-            return match (self.focused, input::encode_key(key, None, self.keyboard())) {
+            let bytes = keys::encode_key(key, None, self.focused_term());
+            return match (self.focused, bytes) {
                 (Some(pane), Some(bytes)) => vec![WireFrame::Input { pane, bytes }],
                 _ => Vec::new(),
             };
@@ -2253,7 +2255,7 @@ impl App {
         // Answer keys are text the guarded send types: plain, as a prompt
         // takes them whatever keyboard protocol its program asked for.
         let text = answer
-            .then(|| input::encode_key(key, None, input::Keyboard::default()))
+            .then(|| keys::encode_key(key, None, None))
             .flatten()
             .and_then(|bytes| String::from_utf8(bytes).ok());
         let (Some(text), Some(state)) = (text, self.panes.get(&pane)) else {
@@ -4201,7 +4203,6 @@ impl App {
     /// there too, wherever the pointer is — reported when the program asked
     /// for them, dropped when it did not.
     fn forward_mouse(&mut self, mouse: MouseEvent) -> Option<Vec<WireFrame>> {
-        use rtty_vt::MouseMode::{Drag, Motion, None as Off, X10};
         let (col, row) = (mouse.column, mouse.row);
         let pane = match mouse.kind {
             MouseEventKind::Down(_)
@@ -4211,45 +4212,44 @@ impl App {
                 self.pane_cell_at(col, row)?.0
             }
             MouseEventKind::Moved if self.mode == Mode::Terminal => self.pane_cell_at(col, row)?.0,
-            MouseEventKind::Drag(_) | MouseEventKind::Up(_) => self.mouse_grab?,
+            MouseEventKind::Drag(_) => self.mouse_grab?,
+            MouseEventKind::Up(_) => self.mouse_grab.take()?,
             _ => return None,
         };
-        let (mode, encoding) = {
+        let (button, action) = match mouse.kind {
+            MouseEventKind::Down(b) => (mouse_button(b), input::Action::Press),
+            MouseEventKind::Drag(b) => (mouse_button(b), input::Action::Motion),
+            MouseEventKind::Up(b) => (mouse_button(b), input::Action::Release),
+            _ => (Button::None, input::Action::Motion),
+        };
+        let held = |m, bit| bit * u8::from(mouse.modifiers.contains(m));
+        let mods = held(KeyModifiers::ALT, input::ALT) | held(KeyModifiers::CONTROL, input::CTRL);
+        let (r, c) = self.clamp_to_pane(pane, col, row)?;
+        let report = Mouse {
+            button,
+            action,
+            mods,
+            cell: (r, c),
+            pixel: (c.into(), r.into()),
+        };
+        let bytes = {
             let state = self
                 .panes
                 .get(&pane)
                 .filter(|s| s.scroll.is_none() && s.info.exited.is_none())?;
-            let modes = state.term.modes();
-            (modes.mouse, modes.mouse_encoding)
+            input::encode_mouse(&report, state.term.modes())
         };
-        let (button, release) = match mouse.kind {
-            MouseEventKind::Down(b) if mode != Off => (button_code(b), false),
-            MouseEventKind::Drag(b) if matches!(mode, Drag | Motion) => {
-                (button_code(b) + 32, false)
-            }
-            MouseEventKind::Up(b) if !matches!(mode, Off | X10) => (button_code(b), true),
-            MouseEventKind::Moved if mode == Motion => (3 + 32, false),
-            MouseEventKind::Drag(_) => return Some(Vec::new()),
-            MouseEventKind::Up(_) => {
-                self.mouse_grab = None;
-                return Some(Vec::new());
-            }
-            _ => return None,
-        };
-        let held = |m| u16::from(mouse.modifiers.contains(m));
-        let mods = held(KeyModifiers::ALT) * 8 + held(KeyModifiers::CONTROL) * 16;
-        let (r, c) = self.clamp_to_pane(pane, col, row)?;
         let mut frames = Vec::new();
-        if matches!(mouse.kind, MouseEventKind::Down(_)) {
-            self.selection = None;
-            self.mouse_grab = Some(pane);
-            frames = self.mouse_focus(pane);
+        match (mouse.kind, &bytes) {
+            (MouseEventKind::Down(_), Some(_)) => {
+                self.selection = None;
+                self.mouse_grab = Some(pane);
+                frames = self.mouse_focus(pane);
+            }
+            (MouseEventKind::Down(_) | MouseEventKind::Moved, None) => return None,
+            _ => {}
         }
-        if release {
-            self.mouse_grab = None;
-        }
-        let bytes = input::encode_mouse(encoding, button + mods, release, c + 1, r + 1);
-        frames.push(WireFrame::Input { pane, bytes });
+        frames.extend(bytes.map(|bytes| WireFrame::Input { pane, bytes }));
         Some(frames)
     }
 
@@ -4755,19 +4755,39 @@ impl App {
         vec![control(&Request::PaneScroll { pane, offset })]
     }
 
-    /// The bytes a wheel tick sends straight to `pane`'s child, or `None` for
-    /// a primary-screen pane whose scrollback tutti browses itself.
+    /// The bytes a wheel tick sends straight to `pane`'s child — a wheel
+    /// button to a program reporting the mouse, else on the alternate screen
+    /// arrow keys, as the program asked for its keys — or `None` for a
+    /// primary-screen pane whose scrollback tutti browses itself.
     fn forwarded_wheel(&self, pane: PaneId, col: u16, row: u16, up: bool) -> Option<Vec<u8>> {
-        let modes = self.panes.get(&pane)?.term.modes();
+        let term = &self.panes.get(&pane)?.term;
+        let modes = term.modes();
         if modes.mouse != rtty_vt::MouseMode::None {
-            // The 1-based cell within the pane interior, below its title and
-            // frame rows.
+            // The cell within the pane interior, below its title and frame rows.
             let (r, c) = self.clamp_to_pane(pane, col, row)?;
-            return Some(input::encode_wheel(modes.mouse_encoding, up, c + 1, r + 1));
+            let button = if up {
+                Button::WheelUp
+            } else {
+                Button::WheelDown
+            };
+            let wheel = Mouse {
+                button,
+                action: input::Action::Press,
+                mods: 0,
+                cell: (r, c),
+                pixel: (c.into(), r.into()),
+            };
+            return input::encode_mouse(&wheel, modes);
         }
-        modes
-            .alt_screen
-            .then(|| input::encode_wheel_arrows(modes.cursor_keys, up, MOUSE_SCROLL_STEP))
+        if !modes.alt_screen {
+            return None;
+        }
+        let arrow = Key {
+            code: if up { Code::Up } else { Code::Down },
+            ..Key::default()
+        };
+        let arrow = input::encode_key(&arrow, modes, term.kitty_keyboard());
+        arrow.map(|arrow| arrow.repeat(MOUSE_SCROLL_STEP))
     }
 
     // ---- layout / sizing ------------------------------------------------
@@ -5246,19 +5266,18 @@ fn center(r: Rect) -> (u16, u16) {
     (r.x + r.width / 2, r.y + r.height / 2)
 }
 
+fn mouse_button(button: MouseButton) -> Button {
+    match button {
+        MouseButton::Left => Button::Left,
+        MouseButton::Middle => Button::Middle,
+        MouseButton::Right => Button::Right,
+    }
+}
+
 /// Inner (borderless) size of a pane rect as `(rows, cols)`, clamped to at
 /// least 1 so a pty is never asked for a zero dimension. A pane rect reserves
 /// its top row for the title line drawn above the frame, so height loses that
 /// row plus the two border rows.
-/// xterm's number for a mouse button.
-fn button_code(button: MouseButton) -> u16 {
-    match button {
-        MouseButton::Left => 0,
-        MouseButton::Middle => 1,
-        MouseButton::Right => 2,
-    }
-}
-
 fn inner_size(rect: Rect) -> (u16, u16) {
     (
         rect.height.saturating_sub(3).max(1),

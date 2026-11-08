@@ -932,6 +932,10 @@ In order; each lands its TUI path in the same wave as its verbs.
    - ✅ Step 3, rtty itself: rtty runs on rtty-vt and its own pty since rtty
      commit nkmtylwp. `alacritty_terminal` stays only as rtty-vt's
      dev-dependency, the oracle of its differential tests.
+   - ✅ One key and mouse encoder (wave 13): `rtty_vt::input` encodes keys
+     (kitty's protocol, modifyOtherKeys, legacy xterm) and mouse reports for
+     rtty and the TUI alike; `attach/keys.rs` only turns crossterm's
+     `KeyEvent` and kitty's `Report` into rtty-vt's `Key`.
 11. ✅ **Wave 9** — six stacks, wire rev 12:
    - robust: a request whose task panics is answered with an error, and the
      CLI times out an unanswered one; the daemon log is trimmed while it

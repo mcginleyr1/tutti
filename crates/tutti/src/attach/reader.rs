@@ -841,7 +841,7 @@ fn luma(c: Rgb) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::attach::input::{Keyboard, encode_key};
+    use crate::attach::keys::encode_key;
 
     const NONE: KeyModifiers = KeyModifiers::NONE;
     const SHIFT: KeyModifiers = KeyModifiers::SHIFT;
@@ -1142,19 +1142,17 @@ mod tests {
             KeyEvent::new(KeyCode::F(12), NONE),
             KeyEvent::new(KeyCode::BackTab, SHIFT),
         ];
-        let kitty = Keyboard {
-            kitty: 1 | 4,
-            ..Keyboard::default()
-        };
+        let mut kitty = rtty_vt::Terminal::new(2, 10, 0);
+        kitty.advance(b"\x1b[>5u");
         let disambiguated = [
             KeyEvent::new(KeyCode::Char('i'), CTRL),
             KeyEvent::new(KeyCode::Char('h'), CTRL),
             KeyEvent::new(KeyCode::Esc, NONE),
             KeyEvent::new(KeyCode::Char('x'), ALT),
         ];
-        let cases = plain.into_iter().map(|key| (key, Keyboard::default()));
-        for (key, keyboard) in cases.chain(disambiguated.into_iter().map(|key| (key, kitty))) {
-            let bytes = encode_key(key, None, keyboard).unwrap();
+        let cases = plain.into_iter().map(|key| (key, None));
+        for (key, term) in cases.chain(disambiguated.into_iter().map(|key| (key, Some(&kitty)))) {
+            let bytes = encode_key(key, None, term).unwrap();
             assert_eq!(
                 decode(&[&bytes]),
                 vec![Input::Key(key, None)],
