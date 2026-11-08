@@ -878,7 +878,7 @@ mod tests {
             ["goose", "run", "--interactive", "--instructions"]
         );
         assert_eq!(read(&goose[4]), long);
-        for kind in ["pi", "auggie"] {
+        for kind in ["pi", "omp", "auggie"] {
             let argv = deploy(kind, &long, Some(&dir)).unwrap();
             assert_eq!((argv.len(), argv[2].as_str()), (3, ATTACHED_TASK), "{kind}");
             assert!(argv[1].starts_with('@'), "{argv:?}");

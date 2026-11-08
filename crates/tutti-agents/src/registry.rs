@@ -40,17 +40,21 @@ impl ProcessTree {
 pub const FIRST_TURN_REPORTERS: &[&str] = &["codex", "opencode"];
 
 /// The name detection knows a process by: its executable's `name`, or — for
-/// a node program, which runs as `node [flags] <script>` — its script's,
-/// from `args` (the argv after the executable). Gemini CLI runs so, then
-/// relaunches itself as `node --max-old-space-size=… <script>`: its
-/// executable is only ever `node`. A flag's value given as the argument
+/// a node or bun program, which runs as `node [flags] <script>` or `bun
+/// [flags] <script>` — its script's, from `args` (the argv after the
+/// executable). Gemini CLI runs so, then relaunches itself as `node
+/// --max-old-space-size=… <script>`: its executable is only ever `node`. Oh
+/// My Pi installed by `bun install -g` is a `#!/usr/bin/env bun` script, so
+/// it runs as `bun ~/.bun/bin/omp`. A flag's value given as the argument
 /// after it (`node --require x <script>`) is never taken for the script.
 pub fn program_name<'a>(name: &'a str, mut args: impl Iterator<Item = &'a str>) -> &'a str {
-    if name != "node" {
-        return name;
-    }
+    let value_flags = match name {
+        "node" => NODE_VALUE_FLAGS,
+        "bun" => BUN_VALUE_FLAGS,
+        _ => return name,
+    };
     while let Some(arg) = args.next() {
-        if NODE_VALUE_FLAGS.contains(&arg) {
+        if value_flags.contains(&arg) {
             args.next();
         } else if !arg.starts_with('-') {
             return arg;
@@ -88,6 +92,50 @@ const NODE_VALUE_FLAGS: &[&str] = &[
     "--icu-data-dir",
     "--openssl-config",
     "--localstorage-file",
+];
+
+/// Bun's options that take a value, which may come as the next argument:
+/// those `bun --help` (1.4.4) lists as `--flag=<val>`, but for the profiler,
+/// inspector, cron and package-script ones no agent's launcher passes. Not
+/// node's: bun's `-c` is `--config`, node's `--check`.
+const BUN_VALUE_FLAGS: &[&str] = &[
+    "-r",
+    "--preload",
+    "--require",
+    "--import",
+    "-e",
+    "--eval",
+    "-p",
+    "--print",
+    "--install",
+    "--port",
+    "--conditions",
+    "--fetch-preconnect",
+    "--max-http-header-size",
+    "--dns-result-order",
+    "--redirect-warnings",
+    "--disable-warning",
+    "--title",
+    "--unhandled-rejections",
+    "--console-depth",
+    "--user-agent",
+    "--main-fields",
+    "--extension-order",
+    "--tsconfig-override",
+    "-d",
+    "--define",
+    "--drop",
+    "--feature",
+    "-l",
+    "--loader",
+    "--jsx-factory",
+    "--jsx-fragment",
+    "--jsx-import-source",
+    "--jsx-runtime",
+    "--env-file",
+    "--cwd",
+    "-c",
+    "--config",
 ];
 
 /// How an agent's interactive mode takes its first message from a file.
@@ -350,8 +398,8 @@ impl Default for Registry {
         // How each agent's interactive mode takes a first message, as the
         // note on its row says: from its own `--help` where it is installed
         // here (checked 2026-11-04, versions named), else from its own docs,
-        // quoted. Only Ori (`--prompt-file`), Pi and Augment (`@file`) and
-        // Goose (`--instructions <file>`) take it from a file while staying
+        // quoted. Only Ori (`--prompt-file`), Pi, Oh My Pi and Augment
+        // (`@file`) and Goose (`--instructions <file>`) take it from a file while staying
         // interactive (`prompt_file`, which a long message rides), and only
         // Amp from stdin; any other agent is told to read a message too long
         // for an argument from a file (tutti's `issues::deploy_argv`).
@@ -474,6 +522,24 @@ impl Default for Registry {
                 guess("pi", "Pi", "https://github.com/badlogic/pi-mono", &["pi"])
                     .prompted(&[])
                     .filed(PromptFile::Attached),
+                // Oh My Pi is a fork of Pi with its own binary, `omp`.
+                // Observed (2026-11-08, both in a pty): Homebrew's 18.16.0 is a
+                // compiled executable that runs as `omp`, and `bun install -g`'s
+                // 18.13.1 is a `#!/usr/bin/env bun` script that runs as `bun
+                // ~/.bun/bin/omp` (`program_name`). Its idle composer has no
+                // fixed glyph, and no turn ran here (no model was logged in),
+                // so it gets the guess patterns. `--help` (18.16.0): `omp "List
+                // all .ts files in src/"` is "Interactive mode with initial
+                // prompt", and `omp @prompt.md @image.png "What color is the
+                // sky?"` will "Include files in initial message".
+                guess(
+                    "omp",
+                    "Oh My Pi",
+                    "https://github.com/can1357/oh-my-pi",
+                    &["omp"],
+                )
+                .prompted(&[])
+                .filed(PromptFile::Attached),
                 // Prime Agent began as a fork of Pi but runs as its own
                 // binary — its installer's `prime-agent` launcher execs
                 // `share/prime-agent/prime-agent` — so it never reads as Pi.
@@ -895,6 +961,34 @@ mod tests {
         );
     }
 
+    /// Oh My Pi's processes as observed: Homebrew's compiled `omp`, and `bun
+    /// install -g`'s script, which its `#!/usr/bin/env bun` runs as `bun
+    /// ~/.bun/bin/omp`. A bun flag's value is never the script, and bun's
+    /// `-c` takes one where node's does not.
+    #[test]
+    fn a_bun_program_is_known_by_its_script() {
+        let args = |line: &'static str| line.split(' ');
+        let script = "/Users/u/.bun/bin/omp";
+        assert_eq!(program_name("bun", args(script)), script);
+        let flagged = "--smol -r ./trace.ts --cwd /tmp -c bunfig.toml /Users/u/.bun/bin/omp";
+        assert_eq!(program_name("bun", args(flagged)), script, "values skipped");
+        assert_eq!(program_name("bun", std::iter::empty()), "bun", "a REPL");
+        assert_eq!(program_name("node", args("-c app.js")), "app.js");
+
+        let reg = Registry::default();
+        for program in [program_name("bun", args(script)), "/opt/homebrew/bin/omp"] {
+            let mut tree = ProcessTree::default();
+            tree.insert(100, None, "zsh");
+            tree.insert(101, Some(100), program);
+            assert_eq!(
+                reg.detect(&tree, 100),
+                Some(AgentKind::from("omp")),
+                "{program}"
+            );
+        }
+        assert_eq!(reg.match_process("bun").map(|s| &s.kind), None);
+    }
+
     #[test]
     fn detect_returns_none_without_a_match() {
         let reg = Registry::default();
@@ -1026,6 +1120,7 @@ mod tests {
             ("vibe", &["vibe", "fix it"]),
             ("muse", &["muse", "fix it"]),
             ("pi", &["pi", "fix it"]),
+            ("omp", &["omp", "fix it"]),
             (
                 "goose",
                 &["goose", "run", "--interactive", "--text", "fix it"],
@@ -1049,7 +1144,7 @@ mod tests {
         );
     }
 
-    /// The four agents whose interactive mode reads a first message from a
+    /// The five agents whose interactive mode reads a first message from a
     /// file take it their own documented way; every other agent has none.
     #[test]
     fn agents_with_a_file_input_take_a_first_message_from_a_file() {
@@ -1082,6 +1177,7 @@ mod tests {
                 ],
             ),
             ("pi", &["pi", at, ATTACHED_TASK]),
+            ("omp", &["omp", at, ATTACHED_TASK]),
             ("auggie", &["auggie", at, ATTACHED_TASK]),
         ] {
             assert_eq!(argv(kind).expect(kind), expected);
@@ -1092,7 +1188,7 @@ mod tests {
             .filter(|s| s.prompt_file.is_some())
             .map(|s| s.kind.0.as_str())
             .collect();
-        assert_eq!(filed, ["goose", "pi", "auggie", "ori"]);
+        assert_eq!(filed, ["goose", "pi", "omp", "auggie", "ori"]);
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -1238,6 +1334,7 @@ mod tests {
             ("crush", "crush"),
             ("opencode", "opencode"),
             ("pi", "pi"),
+            ("omp", "omp"),
             ("prime-agent", "prime-agent"),
             ("gemini", "gemini"),
             ("aider", "aider"),

@@ -287,7 +287,16 @@ Goal: the differentiator. Tutti knows which panes are agents and what state they
    never reads as Pi, and detection catching up keeps its `herdr:pi` /
    `prime-agent` claim. Open: Prime Agent reports `agent_session_path`, not
    an id, so its pane holds no conversation to revive (`prime-agent
-   --resume` takes a path or id); its screen patterns are guesses.
+   --resume` takes a path or id); its screen patterns are guesses. ✅ Oh My
+   Pi has its own registry row, `omp`, first message and `@file` as Pi's:
+   Homebrew's build runs as `omp`, and `bun install -g`'s as `bun
+   ~/.bun/bin/omp`, so detection reads a bun program by its script as it
+   does a node one. Open: its screen patterns are guesses (no turn was run).
+   It reports its lifecycle in-band as Warp's `warp://cli-agent` OSC 777
+   payloads once `WARP_CLI_AGENT_PROTOCOL_VERSION` ≥ 1, which tutti neither
+   sets nor reads. And the `HERDR_*` every pane carries makes it believe
+   it's in herdr: its notifier execs a `herdr` CLI that tutti's panes
+   don't have.
 3. **Surfacing**: colored state badge per pane border + tab, workspace overview in
    navigate mode grouped by state (Blocked first), optional terminal bell / OSC 9
    desktop notification on `Working → Blocked/Done`. ✅ The go-to overlay

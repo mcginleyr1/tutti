@@ -12225,7 +12225,7 @@ mod tests {
         assert_eq!(
             names(&app),
             [
-                "claude", "codex", "gemini", "opencode", "goose", "pi", "qwen", "cursor",
+                "claude", "codex", "gemini", "opencode", "goose", "pi", "omp", "qwen", "cursor",
                 "copilot", "droid", "muse", "vibe", "auggie", "amazon-q", "ori"
             ]
         );
