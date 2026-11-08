@@ -4194,7 +4194,7 @@ impl App {
         {
             return frames;
         }
-        self.on_mouse(mouse.kind, mouse.column, mouse.row)
+        self.on_mouse_held(mouse.kind, mouse.column, mouse.row, mouse.modifiers)
     }
 
     /// The frames handing `mouse` to the program it falls to, or `None` when
@@ -4222,13 +4222,11 @@ impl App {
             MouseEventKind::Up(b) => (mouse_button(b), input::Action::Release),
             _ => (Button::None, input::Action::Motion),
         };
-        let held = |m, bit| bit * u8::from(mouse.modifiers.contains(m));
-        let mods = held(KeyModifiers::ALT, input::ALT) | held(KeyModifiers::CONTROL, input::CTRL);
         let (r, c) = self.clamp_to_pane(pane, col, row)?;
         let report = Mouse {
             button,
             action,
-            mods,
+            mods: mouse_mods(mouse.modifiers),
             cell: (r, c),
             pixel: (c.into(), r.into()),
         };
@@ -4253,9 +4251,23 @@ impl App {
         Some(frames)
     }
 
+    /// `on_mouse_held` with no modifier held.
+    #[cfg(test)]
+    pub fn on_mouse(&mut self, kind: MouseEventKind, col: u16, row: u16) -> Vec<WireFrame> {
+        self.on_mouse_held(kind, col, row, KeyModifiers::NONE)
+    }
+
     /// Handle a mouse event as tutti's own — focus, select and copy, border
     /// drags, the chrome, the wheel — returning frames to send to the server.
-    pub fn on_mouse(&mut self, kind: MouseEventKind, col: u16, row: u16) -> Vec<WireFrame> {
+    /// A wheel tick passes Alt and Ctrl (`held`) on to a program reporting
+    /// the mouse.
+    fn on_mouse_held(
+        &mut self,
+        kind: MouseEventKind,
+        col: u16,
+        row: u16,
+        held: KeyModifiers,
+    ) -> Vec<WireFrame> {
         // The go-to overlay is modal over the whole screen: a click on an
         // entry jumps there and the wheel walks the highlight; nothing reaches
         // the panes, panels, or tab bar beneath.
@@ -4367,8 +4379,8 @@ impl App {
                 self.finish_selection();
                 Vec::new()
             }
-            MouseEventKind::ScrollUp => self.mouse_scroll(col, row, true),
-            MouseEventKind::ScrollDown => self.mouse_scroll(col, row, false),
+            MouseEventKind::ScrollUp => self.mouse_scroll(col, row, true, held),
+            MouseEventKind::ScrollDown => self.mouse_scroll(col, row, false, held),
             _ => Vec::new(),
         }
     }
@@ -4726,13 +4738,13 @@ impl App {
     /// scrollback to browse, so the wheel becomes arrow keys it can act on
     /// (the xterm "alternate scroll" convention); only a primary-screen pane
     /// enters tutti's frozen scrollback browse.
-    fn mouse_scroll(&mut self, col: u16, row: u16, up: bool) -> Vec<WireFrame> {
+    fn mouse_scroll(&mut self, col: u16, row: u16, up: bool, held: KeyModifiers) -> Vec<WireFrame> {
         let Some(pane) = self.pane_at(col, row) else {
             return Vec::new();
         };
         let mut frames = self.mouse_focus(pane);
         if self.panes.get(&pane).is_some_and(|s| s.scroll.is_none())
-            && let Some(bytes) = self.forwarded_wheel(pane, col, row, up)
+            && let Some(bytes) = self.forwarded_wheel(pane, col, row, up, held)
         {
             frames.push(WireFrame::Input { pane, bytes });
             return frames;
@@ -4756,10 +4768,18 @@ impl App {
     }
 
     /// The bytes a wheel tick sends straight to `pane`'s child — a wheel
-    /// button to a program reporting the mouse, else on the alternate screen
-    /// arrow keys, as the program asked for its keys — or `None` for a
-    /// primary-screen pane whose scrollback tutti browses itself.
-    fn forwarded_wheel(&self, pane: PaneId, col: u16, row: u16, up: bool) -> Option<Vec<u8>> {
+    /// button with Alt and Ctrl as `held` to a program reporting the mouse,
+    /// else on the alternate screen arrow keys, as the program asked for its
+    /// keys — or `None` for a primary-screen pane whose scrollback tutti
+    /// browses itself.
+    fn forwarded_wheel(
+        &self,
+        pane: PaneId,
+        col: u16,
+        row: u16,
+        up: bool,
+        held: KeyModifiers,
+    ) -> Option<Vec<u8>> {
         let term = &self.panes.get(&pane)?.term;
         let modes = term.modes();
         if modes.mouse != rtty_vt::MouseMode::None {
@@ -4773,7 +4793,7 @@ impl App {
             let wheel = Mouse {
                 button,
                 action: input::Action::Press,
-                mods: 0,
+                mods: mouse_mods(held),
                 cell: (r, c),
                 pixel: (c.into(), r.into()),
             };
@@ -5272,6 +5292,13 @@ fn mouse_button(button: MouseButton) -> Button {
         MouseButton::Middle => Button::Middle,
         MouseButton::Right => Button::Right,
     }
+}
+
+/// The modifiers a mouse report carries: Alt and Ctrl. Shift keeps the mouse
+/// tutti's.
+fn mouse_mods(held: KeyModifiers) -> u8 {
+    input::ALT * u8::from(held.contains(KeyModifiers::ALT))
+        + input::CTRL * u8::from(held.contains(KeyModifiers::CONTROL))
 }
 
 /// Inner (borderless) size of a pane rect as `(rows, cols)`, clamped to at
@@ -10117,6 +10144,27 @@ mod tests {
              at the cell under the pointer: below the title and frame rows"
         );
         assert_eq!(app.mode, Mode::Terminal);
+    }
+
+    /// A forwarded wheel tick carries Alt and Ctrl, as a click does; Shift,
+    /// which keeps the mouse tutti's, adds nothing.
+    #[test]
+    fn a_forwarded_wheel_carries_alt_and_ctrl() {
+        let mut app = App::new();
+        let rect = wheel_fixture(&mut app, b"\x1b[?1000h\x1b[?1006h");
+        let mut wheel = |kind, modifiers| {
+            let out = app.on_mouse_event(mouse(kind, rect.x + 5, rect.y + 3, modifiers));
+            let [WireFrame::Input { bytes, .. }] = out.as_slice() else {
+                panic!("{out:?}")
+            };
+            String::from_utf8(bytes.clone()).unwrap()
+        };
+        let (up, down) = (MouseEventKind::ScrollUp, MouseEventKind::ScrollDown);
+        assert_eq!(wheel(up, KeyModifiers::CONTROL), "\x1b[<80;5;2M");
+        assert_eq!(wheel(down, KeyModifiers::ALT), "\x1b[<73;5;2M");
+        let both = KeyModifiers::ALT | KeyModifiers::CONTROL;
+        assert_eq!(wheel(up, both), "\x1b[<88;5;2M");
+        assert_eq!(wheel(up, KeyModifiers::SHIFT), "\x1b[<64;5;2M");
     }
 
     #[test]
