@@ -247,8 +247,8 @@ impl App {
             return;
         };
         let prompt = issues::prompt(&template, &issue);
-        self.launcher.issue = Some((issue, prompt));
         self.open_launcher(false, Some(name), Some(&dir));
+        self.arm_launcher(issue, prompt);
     }
 
     /// Close the launcher and deploy `issue` with `agent`, its row's `argv`
@@ -869,5 +869,35 @@ mod tests {
         assert_eq!(listed(&app).len(), 3, "its issues still listed");
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.mode, Mode::Terminal);
+    }
+
+    /// An armed launcher left without being closed — a scripted focus takes
+    /// the keys from it here — takes its issue with it: the next launcher
+    /// runs where it was asked, it does not deploy.
+    #[test]
+    fn a_launcher_left_armed_does_not_arm_the_next_one() {
+        let dir = jj_project("left");
+        let mut app = issues_panel(&dir);
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.launcher_title(),
+            " deploy #123 · Fix the login redirect "
+        );
+        event(&mut app, Event::PaneFocused { pane: PaneId(1) });
+        assert_eq!(app.mode, Mode::Terminal);
+
+        app.on_key(ctrl('b'));
+        app.on_key(plain('r'));
+        assert_eq!(app.mode, Mode::Launcher);
+        assert_eq!(app.launcher_title(), " run in api ");
+        assert!(app.launcher.issue.is_none());
+        assert!(
+            app.launcher
+                .rows
+                .iter()
+                .any(|r| r.kind == LaunchKind::Shell),
+            "the shell row is back: an armed launcher lists agents alone"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

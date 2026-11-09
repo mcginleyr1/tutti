@@ -321,6 +321,8 @@ impl App {
     /// names the workspace the choice will land in, shown in the panel title;
     /// `dir` is its directory — when known, conversations harvested from the
     /// agent tools' own session stores append as resume rows at the foot.
+    /// It opens armed with nothing, whatever an earlier launcher left: one
+    /// left by a click or a frame was never closed.
     pub(super) fn open_launcher(
         &mut self,
         after_add: bool,
@@ -330,6 +332,7 @@ impl App {
         self.status = None;
         self.launcher.dir = dir.map(Path::to_path_buf);
         self.launcher.sandbox = None;
+        self.launcher.issue = None;
         self.rebuild_launcher();
         self.launcher.after_add = after_add;
         self.launcher.command.clear();
@@ -337,6 +340,15 @@ impl App {
         self.launcher.replace = None;
         self.launcher.target = target;
         self.mode = Mode::Launcher;
+    }
+
+    /// Arm the open launcher to deploy `issue`: only its agent rows stay, each
+    /// to run on the issue's `prompt`, and the pick deploys rather than runs.
+    pub(super) fn arm_launcher(&mut self, issue: Issue, prompt: String) {
+        self.launcher.issue = Some((issue, prompt));
+        let rows = std::mem::take(&mut self.launcher.rows);
+        self.launcher.rows = armed_rows(rows, &Registry::default());
+        self.launcher.selected = first_selectable(&self.launcher.rows);
     }
 
     /// Build the rows for where the launcher runs its pick. On the daemon's
