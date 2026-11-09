@@ -204,3 +204,9 @@ crates/tutti-server   daemon: PTYs and their terminals (rtty-vt), socket API, de
 crates/tutti          client: CLI verbs + ratatui TUI
 crates/tutti-agents   agent registry & screen-state classifier (data-driven)
 ```
+
+## License
+
+tutti is licensed `MIT OR Apache-2.0`: under either the MIT license
+([LICENSE-MIT](LICENSE-MIT)) or the Apache License, Version 2.0
+([LICENSE-APACHE](LICENSE-APACHE)), at your option.
