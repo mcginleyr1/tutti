@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use tutti_core::{
-    AgentState, Direction, Event, Frame as WireFrame, Layout, PaneId, PaneInfo, Request, Response,
-    SubagentInfo, TabId, TabView, Tagged, WorkspaceId, WorkspaceView,
+    AgentState, Direction, Event, FileStat, Frame as WireFrame, Layout, PaneId, PaneInfo, Request,
+    Response, SubagentInfo, TabId, TabView, Tagged, WorkspaceId, WorkspaceView,
 };
 
 use super::app::App;
@@ -287,4 +287,29 @@ pub(crate) fn temp_tree(subdirs: &[&str]) -> PathBuf {
         std::fs::create_dir_all(root.join(d)).unwrap();
     }
     root
+}
+
+/// One workspace whose delta against trunk carries two files, as the
+/// server's change probe would report it.
+pub(crate) fn view_with_changes() -> Vec<WorkspaceView> {
+    let mut ws = workspace(
+        1,
+        "api",
+        Some("main"),
+        vec![tab(1, "1", true, leaf(1), vec![shell(1)])],
+    );
+    ws.changes = Some("2 files +13 −4".into());
+    ws.changed_files = vec![
+        FileStat {
+            path: "src/main.rs".into(),
+            insertions: 12,
+            deletions: 4,
+        },
+        FileStat {
+            path: "crates/deep/dir/mod.rs".into(),
+            insertions: 1,
+            deletions: 0,
+        },
+    ];
+    vec![ws]
 }

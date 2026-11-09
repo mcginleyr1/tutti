@@ -5,6 +5,7 @@
 
 mod app;
 mod approval;
+mod changes;
 mod connection;
 mod follow;
 mod host;
