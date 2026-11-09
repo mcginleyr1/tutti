@@ -4,6 +4,7 @@
 //! TUI-less view: one pane, streamed raw to the terminal's own emulator.
 
 mod app;
+mod approval;
 mod connection;
 mod host;
 mod keys;
