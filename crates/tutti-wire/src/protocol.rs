@@ -7,12 +7,6 @@ use crate::domain::{AgentKind, Direction, Layout, Toward};
 use crate::ids::{PaneId, TabId, WorkspaceId};
 use crate::state::{AgentState, StateSource};
 
-/// The wire-protocol revision. BUMP THIS on ANY change to the Request /
-/// Response / Event shapes (including additive fields): the daemon reports it
-/// on attach and mismatched clients tell the user to restart the daemon —
-/// binaries upgrade on install, running daemons do not.
-pub const WIRE_REV: u32 = 19;
-
 /// The most notes the daemon's notification history keeps, the oldest going
 /// first. A client caps its copy the same, so the two agree.
 pub const NOTES_CAP: usize = 200;
@@ -1061,8 +1055,10 @@ pub enum Response {
     },
     /// The attach handshake reply: the session name and its full view. The
     /// pane snapshots that seed the client's parsers follow as pane frames.
-    /// `wire_rev` is the server's `WIRE_REV`; a client warns on mismatch (an
-    /// old daemon defaults to 0, which correctly reads as outdated).
+    /// `wire_rev` and `wire_floor` are the daemon's `WIRE_REV` and
+    /// `WIRE_FLOOR`, which a client weighs against its own (`Wire::accepts`).
+    /// A daemon from before either names neither: a revision of 0, which
+    /// reads as outdated, and no floor, which reads as its revision.
     /// `restorable` summarises the layout a previous daemon left to offer back
     /// (`Request::SessionRestore`); `None` when there is none, and from older
     /// servers. `notes` is the notification history, oldest first, so a
@@ -1073,6 +1069,8 @@ pub enum Response {
         workspaces: Vec<WorkspaceView>,
         #[serde(default)]
         wire_rev: u32,
+        #[serde(default)]
+        wire_floor: Option<u32>,
         #[serde(default)]
         restorable: Option<RestoreSummary>,
         #[serde(default)]
@@ -1254,6 +1252,7 @@ pub struct Tagged<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{WIRE_FLOOR, WIRE_REV};
 
     fn roundtrip<T>(value: &T)
     where
@@ -2122,6 +2121,7 @@ mod tests {
         });
         roundtrip(&Response::Attached {
             wire_rev: WIRE_REV,
+            wire_floor: Some(WIRE_FLOOR),
             session: "tutti".into(),
             workspaces: sample_view(),
             restorable: None,
@@ -2129,6 +2129,7 @@ mod tests {
         });
         roundtrip(&Response::Attached {
             wire_rev: WIRE_REV,
+            wire_floor: None,
             session: "tutti".into(),
             workspaces: Vec::new(),
             restorable: Some(RestoreSummary {
@@ -2355,6 +2356,44 @@ mod tests {
         });
         let ok: Response = serde_json::from_str(r#"{"req":1,"type":"ok"}"#).unwrap();
         assert_eq!(ok, Response::Ok);
+    }
+
+    /// What raising the revision alone rests on (`WIRE_FLOOR`): an older
+    /// peer reads past a field it does not know, at any depth; and a `type`
+    /// it does not know reads as no event and no response, which a client
+    /// skips, and as no request, which the daemon refuses.
+    #[test]
+    fn an_older_peer_reads_past_a_new_field_and_takes_a_new_type_for_none_of_its_own() {
+        let exited: Event =
+            serde_json::from_str(r#"{"type":"pane_exited","pane":3,"code":0,"signal":9}"#).unwrap();
+        assert_eq!(
+            exited,
+            Event::PaneExited {
+                pane: PaneId(3),
+                code: 0
+            }
+        );
+        let created: Tagged<Response> =
+            serde_json::from_str(r#"{"req":4,"type":"pane_created","id":9,"tab":2}"#).unwrap();
+        assert_eq!(created.body, Response::PaneCreated { id: PaneId(9) });
+        let kill: Request =
+            serde_json::from_str(r#"{"type":"pane_kill","pane":3,"force":true}"#).unwrap();
+        assert_eq!(kill, Request::PaneKill { pane: PaneId(3) });
+        let nested: Event = serde_json::from_str(
+            r#"{"type":"noted","note":{"id":1,"time":1,"pane":3,"pane_title":"sh","workspace":"w",
+                "kind":"bell","title":null,"body":null,"read":false,"sound":"ping"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(nested, Event::Noted { note } if note.pane == PaneId(3)));
+
+        let unknown = r#"{"type":"pane_moved","pane":3}"#;
+        assert!(serde_json::from_str::<Event>(unknown).is_err());
+        assert!(serde_json::from_str::<Tagged<Response>>(unknown).is_err());
+        assert!(serde_json::from_str::<Request>(unknown).is_err());
+        // What an older peer cannot read past: a value it does not know in
+        // a set it knows, which takes the whole message with it.
+        let state = r#"{"type":"state_changed","pane":3,"from":"working","to":"paused"}"#;
+        assert!(serde_json::from_str::<Event>(state).is_err());
     }
 
     #[test]
@@ -2688,8 +2727,8 @@ mod tests {
         // A bare `session_restore` restores rather than discards.
         let restore: Request = serde_json::from_str(r#"{"type":"session_restore"}"#).unwrap();
         assert_eq!(restore, Request::SessionRestore { discard: false });
-        // An `attached` from before `restorable` and `notes` existed offers
-        // nothing and has no history.
+        // An `attached` from before `wire_floor`, `restorable` and `notes`
+        // existed names no floor, offers nothing and has no history.
         let attached: Response = serde_json::from_str(
             r#"{"type":"attached","session":"tutti","workspaces":[],"wire_rev":6}"#,
         )
@@ -2700,6 +2739,7 @@ mod tests {
                 session: "tutti".into(),
                 workspaces: Vec::new(),
                 wire_rev: 6,
+                wire_floor: None,
                 restorable: None,
                 notes: Vec::new(),
             }

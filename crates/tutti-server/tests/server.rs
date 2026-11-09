@@ -17,8 +17,8 @@ use tokio::time::{sleep, timeout};
 use tutti_core::{
     AgentHookEvent, AgentState, ApprovalDecision, Checkpoint, Direction, Event, Frame, HostColors,
     IssueRef, Layout, Note, NoteKind, PaneData, PaneDims, PaneId, PaneInfo, PendingApproval,
-    Printed, Request, Response, Rgb, StateSource, SubagentInfo, Tagged, Toward, WatchPane,
-    WorkspaceId, row_hash,
+    Printed, Request, Response, Rgb, StateSource, SubagentInfo, Tagged, Toward, WIRE_FLOOR,
+    WIRE_REV, WatchPane, Wire, WorkspaceId, attached_wire, row_hash,
 };
 use tutti_server::{PaneSize, serve};
 
@@ -8286,6 +8286,90 @@ async fn a_self_reported_turn_checkpoints_its_diff() {
     assert_eq!((turn.files, turn.insertions), (1, 1), "just out.txt");
 
     let _ = std::fs::remove_dir_all(&dir);
+    server.stop().await;
+}
+
+/// The answer to an attach names the daemon's revision and its floor, the
+/// floor in a field a client from before floors reads past. By the two, a
+/// client as old as the floor attaches and goes on, and one below it
+/// refuses, naming both ends and the one to update.
+#[tokio::test]
+async fn a_client_at_the_daemons_floor_attaches_and_one_below_it_refuses() {
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum BeforeFloors {
+        Attached { session: String, wire_rev: u32 },
+    }
+
+    let server = TestServer::start();
+    let mut client = server.connect().await;
+    client
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: false,
+            view: false,
+            quiet: false,
+        })
+        .await;
+    let Frame::Control(json) = client.read_frame().await else {
+        panic!("expected the answer to the attach");
+    };
+    let BeforeFloors::Attached { session, wire_rev } = serde_json::from_slice(&json).unwrap();
+    assert_eq!((session.as_str(), wire_rev), ("s", WIRE_REV));
+    let (rev, floor) = attached_wire(&json).expect("the answer's wire");
+    assert_eq!((rev, floor), (WIRE_REV, Some(WIRE_FLOOR)));
+
+    let client_at = |client| {
+        Wire {
+            rev: client,
+            floor: client,
+        }
+        .accepts("the client", rev, floor)
+    };
+    assert_eq!(client_at(WIRE_FLOOR), Ok(()));
+    assert_eq!(
+        client.request(Request::PaneList).await,
+        Response::Panes { panes: Vec::new() },
+        "attached, it goes on"
+    );
+    let below = WIRE_FLOOR - 1;
+    assert_eq!(
+        client_at(below).unwrap_err(),
+        format!(
+            "tutti's daemon speaks wire revision {WIRE_REV} (floor {WIRE_FLOOR}), \
+             the client {below} (floor {below}): update the client"
+        )
+    );
+    server.stop().await;
+}
+
+/// What a newer client counts on from an older daemon: a request the daemon
+/// does not know, or one it knows carrying a value it does not, is refused
+/// under the request's `req`; a field it does not know is read past; and the
+/// connection goes on.
+#[tokio::test]
+async fn a_request_the_daemon_does_not_know_is_refused_and_a_field_read_past() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    let control = |json: &str| Frame::Control(json.as_bytes().to_vec());
+    for unknown in [
+        r#"{"req":7,"type":"pane_teleport","pane":1}"#,
+        r#"{"req":7,"type":"pane_wait","pane":1,"until":["asleep"]}"#,
+    ] {
+        conn.write_frame(&control(unknown)).await;
+        let Frame::Control(json) = conn.read_frame().await else {
+            panic!("expected a refusal");
+        };
+        let refusal: Tagged<Response> = serde_json::from_slice(&json).unwrap();
+        assert_eq!(refusal.req, Some(7));
+        assert!(
+            matches!(&refusal.body, Response::Error { message } if message.starts_with("bad request")),
+            "{refusal:?}"
+        );
+    }
+    conn.write_frame(&control(r#"{"type":"pane_list","sorted":true}"#))
+        .await;
+    assert_eq!(conn.response().await, Response::Panes { panes: Vec::new() });
     server.stop().await;
 }
 

@@ -561,8 +561,19 @@ impl App {
         let mut frames = Vec::new();
         if let Ok(event) = serde_json::from_slice::<Event>(json) {
             frames = self.handle_event(event);
-        } else if let Ok(Tagged { req, body }) = serde_json::from_slice::<Tagged<Response>>(json) {
-            frames = self.handle_response(req, body);
+        } else {
+            if let Ok(Tagged { req, body }) = serde_json::from_slice::<Tagged<Response>>(json) {
+                frames = self.handle_response(req, body);
+            }
+            // The daemon's wire, read from its answer to the attach on its
+            // own: an answer this build is too old to read whole still says
+            // which end to update. The daemon may hold live work, so the
+            // attach goes on and warns.
+            if let Some((rev, floor)) = tutti_core::attached_wire(json)
+                && let Err(refusal) = tutti_core::WIRE.accepts("tutti", rev, floor)
+            {
+                self.note(refusal);
+            }
         }
         // A peek only ever answers a blocked agent: once the agent moves on —
         // answered from here or from anywhere else — or vanishes, the overlay
@@ -716,9 +727,9 @@ impl App {
             Response::Attached {
                 session,
                 workspaces,
-                wire_rev,
                 restorable,
                 notes,
+                ..
             } => {
                 self.old_daemon = req.is_none();
                 self.session = session;
@@ -727,12 +738,6 @@ impl App {
                 // marks of the panes whose notifications nobody has read.
                 self.notified = notified_panes(&notes);
                 self.notes = notes;
-                if wire_rev != tutti_core::WIRE_REV {
-                    self.note(format!(
-                        "daemon is running an older build (wire rev {wire_rev}, client {}) — `tutti server stop`, reinstall, and reattach",
-                        tutti_core::WIRE_REV
-                    ));
-                }
                 // The offer comes first, over a first-run prompt too — but
                 // not to a view, which could take it up in no way.
                 if let Some(offer) = restorable.filter(|_| !self.view) {
@@ -2581,6 +2586,7 @@ mod tests {
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
                 wire_rev: 7,
+                wire_floor: None,
                 session: "t".into(),
                 workspaces: view_one_pane(),
                 restorable: None,
@@ -2691,6 +2697,7 @@ mod tests {
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
                 wire_rev: tutti_core::WIRE_REV,
+                wire_floor: None,
                 session: "t".into(),
                 workspaces: view_two_panes(),
                 restorable: None,
@@ -3169,28 +3176,56 @@ mod tests {
         );
     }
 
+    /// What an answer to the attach, as the daemon wrote it, leaves in the
+    /// status line.
+    fn warned_of(answer: &[u8]) -> String {
+        let mut app = App::new();
+        app.handle_frame(WireFrame::Control(answer.to_vec()));
+        app.transient().unwrap_or_default().to_string()
+    }
+
     #[test]
     fn attached_with_old_wire_rev_warns_to_restart_the_daemon() {
-        let mut app = App::new();
-        app.handle_response(
-            None,
-            Response::Attached {
+        let attached = |wire_rev| {
+            serde_json::to_vec(&Response::Attached {
                 session: "t".into(),
                 workspaces: Vec::new(),
-                wire_rev: 0,
+                wire_rev,
+                wire_floor: None,
                 restorable: None,
                 notes: Vec::new(),
-            },
-        );
-        let warning = app.transient().unwrap_or_default().to_string();
+            })
+            .unwrap()
+        };
+        let warning = warned_of(&attached(0));
         assert!(
-            warning.contains("older build"),
+            warning.contains("wire revision 0"),
             "expected skew warning, got {warning:?}"
         );
         assert!(
             warning.contains("server stop"),
             "warning must say how to fix: {warning:?}"
         );
+        // A daemon older than this build but at its floor is taken in silence.
+        assert_eq!(warned_of(&attached(tutti_core::WIRE_FLOOR)), "");
+    }
+
+    /// A daemon too new for this build says so in an answer whose rest no
+    /// longer reads here: its revision and floor are read on their own, so
+    /// the warning still names the end to update.
+    #[test]
+    fn an_answer_too_new_to_read_whole_still_warns_which_end_to_update() {
+        let newer = tutti_core::WIRE_REV + 1;
+        let answer = format!(
+            r#"{{"req":0,"type":"attached","wire_rev":{newer},"wire_floor":{newer},"workspaces":7}}"#
+        );
+        assert!(serde_json::from_str::<Tagged<Response>>(&answer).is_err());
+        let warning = warned_of(answer.as_bytes());
+        assert!(
+            warning.contains(&format!("wire revision {newer} (floor {newer})")),
+            "{warning:?}"
+        );
+        assert!(warning.ends_with("update tutti"), "{warning:?}");
     }
 
     fn restore(discard: bool) -> Vec<WireFrame> {

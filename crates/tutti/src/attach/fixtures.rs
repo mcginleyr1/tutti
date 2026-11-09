@@ -147,6 +147,7 @@ pub(crate) fn attached(app: &mut App) {
         0,
         Response::Attached {
             wire_rev: tutti_core::WIRE_REV,
+            wire_floor: None,
             session: "tutti".into(),
             workspaces: view_one_pane(),
             restorable: None,
@@ -181,6 +182,7 @@ pub(crate) fn attach_with(app: &mut App, workspaces: Vec<WorkspaceView>) {
         0,
         Response::Attached {
             wire_rev: tutti_core::WIRE_REV,
+            wire_floor: None,
             session: "t".into(),
             workspaces,
             restorable: None,
@@ -326,6 +328,7 @@ pub(crate) fn attach_offering(app: &mut App, workspaces: Vec<WorkspaceView>) {
     app.handle_frame(WireFrame::Control(
         serde_json::to_vec(&Response::Attached {
             wire_rev: tutti_core::WIRE_REV,
+            wire_floor: None,
             session: "t".into(),
             workspaces,
             restorable: Some(RestoreSummary {

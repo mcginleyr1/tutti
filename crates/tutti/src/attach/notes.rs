@@ -395,6 +395,7 @@ mod tests {
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
                 wire_rev: tutti_core::WIRE_REV,
+                wire_floor: None,
                 session: "t".into(),
                 workspaces: view_two_workspaces(),
                 restorable: None,

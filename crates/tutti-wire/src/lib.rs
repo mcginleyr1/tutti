@@ -10,6 +10,7 @@ mod frame;
 mod ids;
 mod paths;
 mod protocol;
+mod rev;
 mod state;
 
 pub use domain::{AgentKind, Direction, Layout, Toward};
@@ -19,7 +20,8 @@ pub use paths::{socket_dir, socket_path};
 pub use protocol::{
     AgentHookEvent, ApprovalDecision, Checkpoint, DIFF_RANGE, Event, FileStat, HostColors,
     IssueRef, NOTES_CAP, Note, NoteKind, PaneDims, PaneInfo, PendingApproval, Printed, Request,
-    Response, RestoreSummary, Rgb, SubagentInfo, TabInfo, TabView, Tagged, WIRE_REV, WaitFor,
-    WatchPane, WorkspaceInfo, WorkspaceView, row_hash,
+    Response, RestoreSummary, Rgb, SubagentInfo, TabInfo, TabView, Tagged, WaitFor, WatchPane,
+    WorkspaceInfo, WorkspaceView, row_hash,
 };
+pub use rev::{WIRE, WIRE_FLOOR, WIRE_REV, Wire, attached_wire};
 pub use state::{AgentState, Observation, StateEvent, StateSource};

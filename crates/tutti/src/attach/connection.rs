@@ -370,6 +370,7 @@ mod tests {
                     session: "s".into(),
                     workspaces: Vec::new(),
                     wire_rev: rev,
+                    wire_floor: None,
                     restorable: None,
                     notes: Vec::new(),
                 },

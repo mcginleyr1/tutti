@@ -833,6 +833,7 @@ fn handle_frame(
                     session: hub.name.clone(),
                     workspaces,
                     wire_rev: tutti_core::WIRE_REV,
+                    wire_floor: Some(tutti_core::WIRE_FLOOR),
                     restorable: hub
                         .state
                         .as_deref()

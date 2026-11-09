@@ -2521,6 +2521,7 @@ mod tests {
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
                 wire_rev: tutti_core::WIRE_REV,
+                wire_floor: None,
                 session: "demo".into(),
                 workspaces: vec![workspace(
                     1,
@@ -2620,6 +2621,7 @@ mod tests {
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
                 wire_rev: tutti_core::WIRE_REV,
+                wire_floor: None,
                 session: "demo".into(),
                 workspaces: vec![
                     workspace(
@@ -2707,6 +2709,7 @@ mod tests {
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
                 wire_rev: tutti_core::WIRE_REV,
+                wire_floor: None,
                 session: "demo".into(),
                 workspaces: view,
                 restorable: None,
@@ -2779,6 +2782,7 @@ mod tests {
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
                 wire_rev: tutti_core::WIRE_REV,
+                wire_floor: None,
                 session: "demo".into(),
                 workspaces: view,
                 restorable: None,
@@ -2818,6 +2822,7 @@ mod tests {
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
                 wire_rev: tutti_core::WIRE_REV,
+                wire_floor: None,
                 session: "demo".into(),
                 workspaces: view,
                 restorable: None,
@@ -2850,6 +2855,7 @@ mod tests {
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
                 wire_rev: tutti_core::WIRE_REV,
+                wire_floor: None,
                 session: "demo".into(),
                 workspaces: vec![workspace(
                     1,
@@ -2890,6 +2896,7 @@ mod tests {
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
                 wire_rev: tutti_core::WIRE_REV,
+                wire_floor: None,
                 session: "demo".into(),
                 workspaces: vec![workspace(
                     1,
@@ -3356,6 +3363,7 @@ mod tests {
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
                 wire_rev: tutti_core::WIRE_REV,
+                wire_floor: None,
                 restorable: None,
                 notes: Vec::new(),
                 session: "demo".into(),
@@ -3577,6 +3585,7 @@ mod tests {
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
                 wire_rev: tutti_core::WIRE_REV,
+                wire_floor: None,
                 session: "demo".into(),
                 workspaces: Vec::new(),
                 restorable: Some(tutti_core::RestoreSummary {
@@ -3667,6 +3676,7 @@ mod tests {
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
                 wire_rev: tutti_core::WIRE_REV,
+                wire_floor: None,
                 session: "demo".into(),
                 workspaces: view,
                 restorable: None,
@@ -3904,6 +3914,7 @@ mod tests {
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
                 wire_rev: tutti_core::WIRE_REV,
+                wire_floor: None,
                 session: "demo".into(),
                 workspaces: vec![workspace(
                     1,
@@ -4006,6 +4017,7 @@ mod tests {
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
                 wire_rev: tutti_core::WIRE_REV,
+                wire_floor: None,
                 session: "demo".into(),
                 workspaces: vec![workspace(
                     1,
@@ -4658,6 +4670,7 @@ mod tests {
         app.handle_frame(WireFrame::Control(
             serde_json::to_vec(&Response::Attached {
                 wire_rev: tutti_core::WIRE_REV,
+                wire_floor: None,
                 session: "demo".into(),
                 workspaces: view,
                 restorable: None,

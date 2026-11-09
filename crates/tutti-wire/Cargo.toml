@@ -7,6 +7,4 @@ description = "What a client speaks to tutti's daemon: where it listens, the fra
 
 [dependencies]
 serde.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true
