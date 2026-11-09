@@ -256,7 +256,10 @@ delta (a `PaneDelta`, so a client browsing the scrollback keeps its view). A
 resize sends every client a `PaneSnapshot` at the new size.
 
 Input payload (`kind = 0x04`, client → server): `[u32 pane_id][raw key bytes...]`,
-forwarded verbatim to the PTY (kept binary for the lowest-latency keystroke path).
+forwarded verbatim to the PTY (kept binary for the lowest-latency keystroke path). What
+is typed past a frame's length (a paste of 16 MiB or more) goes in several frames, in
+order, each but the last full (`Frame::inputs`): the daemon queues each for the pty behind
+the last, so where one ends is nothing the program sees.
 
 > `seq` is belt-and-suspenders: the socket is `SOCK_STREAM` (reliable, ordered), so
 > deltas cannot be dropped or reordered; `seq` exists to mark resync points (resize,
@@ -287,6 +290,96 @@ forwarded verbatim to the PTY (kept binary for the lowest-latency keystroke path
    (`scrolled_snapshot(offset)`: the rows from `offset` back, no cursor, no modes).
 8. **Detach:** client → `Frame{Control,{"t":"detach"}}`; server drops the client and
    keeps every PTY and parser alive.
+
+## Revisions and floors (wire rev 20)
+
+The wire as code is `crates/tutti-wire`: where the daemon listens, the frame codec, the
+requests, responses and events with the types they name, and what this section sets out.
+A client outside this workspace (rtty) depends on that crate, and `tutti-core` re-exports
+it for tutti's own.
+
+Binaries upgrade on install and running daemons do not, and rtty is installed apart from
+tutti. So each end has two numbers:
+
+- **`WIRE_REV`**, its revision: raised on any change to a request, a response or an event.
+- **`WIRE_FLOOR`**, its floor: the oldest peer revision it still works with faithfully.
+
+The daemon's answer to an attach names both:
+
+```json
+{"type":"attached","session":"tutti","workspaces":[],"wire_rev":20,"wire_floor":19,
+ "restorable":null,"notes":[]}
+```
+
+A daemon that names no `wire_floor` is from before floors (rev 19 and older), when a
+client took no revision but its own: its floor is its revision. One that names no
+`wire_rev` reads as revision 0.
+
+**The decision** is one function, `Wire::accepts`, which a client calls on its own
+revision and floor (`WIRE`) with the answer's. A client at `C` with floor `Cf` takes a
+daemon at `D` with floor `Df` exactly when `Df <= C` and `Cf <= D`: each end is at or above
+the other's floor. Otherwise it refuses, naming both ends and the one to update:
+
+```
+tutti's daemon speaks wire revision 18 (floor 18), rtty 20 (floor 19): update tutti and restart its daemon (`tutti server stop`)
+tutti's daemon speaks wire revision 23 (floor 21), rtty 20 (floor 19): update rtty
+```
+
+What a refusal does is the client's:
+
+- **rtty** opens no session on it, and the panes waiting for the session say why.
+- **The TUI** attaches all the same and shows it as a warning: the daemon may hold live
+  work, and when to stop it is the user's call.
+- **`tutti attach --view`** refuses a daemon from before views (rev 16) by a check of its
+  own, as before.
+- **A connection that never attaches** (the CLI's one-shot requests, `pane attach`,
+  `watch`) gets no `attached` answer and checks nothing. A daemon too old for what it asks
+  refuses the request, and the client says so (`the daemon cannot stream a pane (…);
+  restart it`).
+
+`attached_wire` reads the two numbers from the answer's frame on their own, so a client
+too old to read the rest of an answer still reads why. Both clients take them so: rtty
+asks it of every control frame of its opening, before it reads the frame, and the TUI of
+every control frame that is no event.
+
+**The rule for changing the wire:**
+
+| The change | Raises |
+|---|---|
+| One an older peer can ignore: a new optional field (`#[serde(default)]`, its absence meaning what the peer did before), a new request, a new value in a set only requests carry (`WaitFor`, an `AgentHookEvent`'s `kind`), a new event, a new answer to a new request | `WIRE_REV` |
+| One an older peer would misread: a field removed, renamed, retyped or made required; a new value in a set a client reads whole in what the daemon sends (`AgentState`, `StateSource`, `NoteKind`, `Layout`, `Direction`, `Toward`, `ApprovalDecision`); a new meaning for a message it already sends or reads; a new frame kind sent to a peer that did not ask for it | `WIRE_REV`, and `WIRE_FLOOR` to that new revision |
+
+Raising the floor is what splits installed builds apart, so the first row is the one to
+design for: something new is asked for by a new field or a new request (`quiet`, `keys`,
+`inline`), and its absence keeps what was.
+
+What the first row rests on (tutti-wire's tests pin how a field, a type and a frame kind
+read, the daemon's its refusal, rtty's its skip; the TUI's skip is by construction, in
+`handle_control`):
+
+- **A field a peer does not know is read past,** at any depth. No type on the wire denies
+  unknown fields.
+- **A request the daemon does not know is refused,** `{"type":"error","message":"bad
+  request: …"}` under the request's `req`, and the connection goes on. So is one it
+  knows carrying a value it does not.
+- **An event or an answer whose `type` a client does not know is skipped.** Each client
+  reads a control frame as an event, then as an answer, and passes over what is neither:
+  the TUI, the CLI waiting for its answer, `watch`, `pane attach` and rtty all do. One of
+  a type the client knows that does not read is passed over the same way, without a word,
+  which is why a change of the second row must raise the floor.
+- **A frame of a kind a peer does not know ends the connection**
+  (`FrameError::UnknownKind`): frame kinds are not skipped. A new kind goes only to a peer
+  that asked for it, as `PaneRaw` goes only to a `pane_attach`.
+
+**Rev 20** added the floor. `wire_floor` is a field an older client reads past, so by the
+rule the revision alone went up. Its floor is 19: the last revision whose clients took a
+daemon by equality, and the only one a rev-20 peer was checked against, that one field
+being all that separates them. A rev-19 client still refuses a rev-20 daemon, by its own
+equality, and a rev-20 client takes a rev-19 daemon.
+
+Host frames (below) keep the one number, `HOST_REV`, taken by equality: the proxy passes
+over a call it cannot read, which its caller waits out, so a new query is not yet a
+change an older proxy can refuse.
 
 ## Edges handed on (wire rev 11)
 
@@ -624,7 +717,8 @@ proxy across ssh. Host frames (`kind = 0x06`) carry them, one JSON object each:
 
 - **Hello** is the proxy's first frame, sent once it holds a daemon connection: the
   client waits for it before it takes the terminal (so ssh can still ask for a password),
-  refuses a `rev` other than its own `HOST_REV`, and takes `startup` — the first-run
+  refuses a `rev` other than its own `HOST_REV` (equality: host frames have no floor),
+  and takes `startup` — the first-run
   prefill and a startup project's failure, worked out on that machine as a local attach
   works them out.
 - **Call** / **Reply**: the client numbers its calls; the proxy answers each on a thread
