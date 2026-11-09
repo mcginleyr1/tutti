@@ -687,7 +687,7 @@ fn run_on(destination: &str, cli: Cli) -> Result<i32> {
             let argv = std::iter::once(Some("tutti".to_string()))
                 .chain(args.iter().map(|arg| arg.to_str().map(str::to_owned)))
                 .collect::<Option<Vec<String>>>()
-                .context("an argument is not UTF-8, which ssh's command line cannot carry")?;
+                .context("an argument is not UTF-8, which --host cannot forward")?;
             let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
             let error =
                 std::os::unix::process::CommandExt::exec(&mut client::ssh(destination, &argv, tty));
