@@ -43,7 +43,7 @@ pub(super) struct Issues {
     /// a jj repo — so a deploy can give the issue its own workspace — probed
     /// once as the panel opens.
     project: Option<WorkspaceId>,
-    jj: bool,
+    pub(super) jj: bool,
     /// The panel's filter, and whether keys are typing into it.
     query: String,
     filtering: bool,
@@ -161,12 +161,6 @@ impl App {
     /// The panel's filter text, and whether keys are typing into it.
     pub fn issues_query(&self) -> (&str, bool) {
         (&self.issues.query, self.issues.filtering)
-    }
-
-    /// Whether the panel's project is a jj repo, so a deploy can give the
-    /// issue a workspace of its own.
-    pub fn issues_jj(&self) -> bool {
-        self.issues.jj
     }
 
     /// Whether a deploy from the panel lands in a fresh tab of its project
@@ -543,10 +537,11 @@ mod tests {
                       123: Fix the login redirect\n\nIt loops.\n\n\
                       https://github.com/acme/api/issues/123";
         let names = |app: &App| -> Vec<String> {
-            app.launcher_rows().iter().map(|r| r.name.clone()).collect()
+            app.launcher.rows.iter().map(|r| r.name.clone()).collect()
         };
         let claude = app
-            .launcher_rows()
+            .launcher
+            .rows
             .iter()
             .find(|r| r.name == "claude")
             .unwrap();
@@ -566,7 +561,7 @@ mod tests {
                 "copilot", "droid", "muse", "vibe", "auggie", "amazon-q", "ori"
             ]
         );
-        assert!(app.launcher_rows().iter().all(LauncherRow::selectable));
+        assert!(app.launcher.rows.iter().all(LauncherRow::selectable));
         let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let fork = Request::WorkspaceFork {
             id: WorkspaceId(1),
@@ -864,7 +859,7 @@ mod tests {
     fn a_project_outside_jj_deploys_here_and_esc_backs_out_to_the_panel() {
         // `/tmp/w`, the fixtures' directory, is no jj repo.
         let mut app = issues_panel(Path::new("/tmp/w"));
-        assert!(!app.issues_jj());
+        assert!(!app.issues.jj);
         assert!(app.issues_deploy_here(), "no workspace to give the issue");
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.mode, Mode::Launcher);

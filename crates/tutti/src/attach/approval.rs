@@ -191,7 +191,7 @@ mod tests {
         );
         layout_changed(&mut app, view_holding(&[7]));
         assert_eq!(
-            app.sidebar().ident_at(app.sidebar_selected()),
+            app.sidebar().ident_at(app.sidebar.selected),
             Some(sidebar::EntryIdent::Waiting(PaneId(3), Some(7))),
             "the cursor falls to the pane's next row in the queue"
         );

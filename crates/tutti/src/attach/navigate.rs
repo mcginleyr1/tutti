@@ -292,7 +292,7 @@ fn urgency(marker: Marker) -> usize {
 #[derive(Default)]
 pub(super) struct Navigate {
     /// The go-to overlay's filter text.
-    query: String,
+    pub(super) query: String,
     /// The highlighted go-to row's identity, captured whenever the highlight
     /// moves, so an agent changing state (which regroups the overview) or a
     /// closing pane never slides it onto another row. `None` — on opening and
@@ -421,11 +421,6 @@ impl App {
             .unwrap_or(0)
             .saturating_sub((list.height as usize).saturating_sub(1));
         (list, first)
-    }
-
-    /// The go-to overlay's filter text, for the renderer.
-    pub fn navigate_query(&self) -> &str {
-        &self.navigate.query
     }
 }
 
@@ -775,12 +770,12 @@ mod tests {
         let mut app = navigate_fixture(Config::default());
         app.on_key(plain('j'));
         app.on_key(plain('k'));
-        assert_eq!(app.navigate_query(), "jk", "j and k type; they do not move");
+        assert_eq!(app.navigate.query, "jk", "j and k type; they do not move");
         assert!(app.navigate_rows().0.is_empty(), "nothing matches j-k");
         let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
         app.on_key(backspace);
         app.on_key(backspace);
-        assert_eq!(app.navigate_query(), "");
+        assert_eq!(app.navigate.query, "");
         app.on_key(plain('w'));
         app.on_key(plain('e'));
         let (rows, _) = app.navigate_rows();

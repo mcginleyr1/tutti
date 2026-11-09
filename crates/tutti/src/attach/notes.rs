@@ -34,11 +34,6 @@ impl App {
         self.notified.contains(&pane)
     }
 
-    /// The client's copy of the notification history, oldest first.
-    pub fn notes(&self) -> &[Note] {
-        &self.notes
-    }
-
     /// How many notes nobody has read — the app bar's notes chip.
     pub fn unread_notes(&self) -> usize {
         self.notes.iter().filter(|n| !n.read).count()
@@ -497,7 +492,7 @@ mod tests {
         assert!(out.is_empty());
         assert_eq!(app.transient(), Some("that pane is gone"));
         assert_eq!(app.mode, Mode::Notes, "the panel stays open on it");
-        assert_eq!(app.notes().len(), 1);
+        assert_eq!(app.notes.len(), 1);
     }
 
     #[test]
@@ -574,7 +569,7 @@ mod tests {
                 },
             );
         }
-        let ids: Vec<u64> = app.notes().iter().map(|n| n.id).collect();
+        let ids: Vec<u64> = app.notes.iter().map(|n| n.id).collect();
         assert_eq!(ids, [1, 2, 3], "a late note slots in, a repeat is dropped");
         for id in 4..=NOTES_CAP as u64 + 2 {
             event(
@@ -584,8 +579,8 @@ mod tests {
                 },
             );
         }
-        assert_eq!(app.notes().len(), NOTES_CAP);
-        assert_eq!(app.notes()[0].id, 3, "the oldest left first");
+        assert_eq!(app.notes.len(), NOTES_CAP);
+        assert_eq!(app.notes[0].id, 3, "the oldest left first");
         assert_eq!(app.unread_notes(), NOTES_CAP);
     }
 
@@ -617,7 +612,7 @@ mod tests {
             !app.is_notified(PaneId(3)),
             "a clear leaves nothing pending"
         );
-        assert!(app.notes().is_empty());
+        assert!(app.notes.is_empty());
     }
 
     #[test]
@@ -641,7 +636,7 @@ mod tests {
                 built,
             ],
         );
-        assert_eq!(app.notes().len(), 4);
+        assert_eq!(app.notes.len(), 4);
         assert_eq!(app.unread_notes(), 3);
         assert!(app.is_notified(PaneId(3)), "an unread bell marks its pane");
         assert!(

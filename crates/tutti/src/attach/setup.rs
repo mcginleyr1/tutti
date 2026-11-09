@@ -31,7 +31,7 @@ pub(super) struct Setup {
     /// scope switch, and after every install, so a row shows the disk.
     plans: Vec<Result<Plan, String>>,
     /// The highlighted setup row.
-    selected: usize,
+    pub(super) selected: usize,
     /// Whether the setup panel is asking to install the highlighted row.
     confirm: bool,
 }
@@ -139,11 +139,6 @@ impl App {
     /// renderer.
     pub fn setup_rows(&self) -> impl Iterator<Item = (&'static str, &Result<Plan, String>)> {
         SETUP.iter().map(|(_, label)| *label).zip(&self.setup.plans)
-    }
-
-    /// The highlighted setup row index.
-    pub fn setup_selected(&self) -> usize {
-        self.setup.selected
     }
 
     /// Whether the setup panel is asking to install the highlighted row.

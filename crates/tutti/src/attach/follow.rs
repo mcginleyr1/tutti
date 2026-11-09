@@ -132,7 +132,7 @@ mod tests {
             .sidebar()
             .index_of(sidebar::EntryIdent::Waiting(PaneId(3), None))
             .unwrap();
-        for _ in app.sidebar_selected()..waiting {
+        for _ in app.sidebar.selected..waiting {
             app.on_key(plain('j'));
         }
         app.on_key(plain('p'));

@@ -425,7 +425,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
     let waiting_count = sidebar.entries.len() - tree_count;
     // A selection only pops while the sidebar holds focus and is not prompting.
     let pop = app.sidebar_focused() && !app.sidebar_prompt_active();
-    let selected = app.sidebar_selected();
+    let selected = app.sidebar.selected;
     let glyphs = glyphs(app.config().icons);
 
     let mut lines: Vec<Line> = Vec::new();
@@ -512,7 +512,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
             area.height.saturating_sub(2),
         );
         let (completions, selected) = if app.sidebar_prompt_shows_completions() {
-            (app.prompt_completions(), app.prompt_selected())
+            (&app.prompt.completions[..], app.prompt.selected)
         } else {
             (&[][..], 0)
         };
@@ -520,7 +520,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
         draw_sidebar_prompt(
             frame,
             label,
-            app.sidebar_prompt(),
+            &app.prompt.input,
             completions,
             selected,
             inner,
@@ -546,7 +546,7 @@ fn draw_diff_panel(frame: &mut Frame, app: &App, area: Rect) {
     let files = app.changed_files();
     let turns = app.shown_turns();
     let focused = app.diff_panel_focused();
-    let selected = app.diff_selected();
+    let selected = app.changes.selected;
     let in_turns = selected >= files.len();
     let first = app.diff_first_visible(area.height);
     let drawn = app.diff_files_drawn(area.height);
@@ -1551,7 +1551,7 @@ fn draw_restore_offer(frame: &mut Frame, app: &App, area: Rect) {
 /// shell and command rows. The selected row takes an accent `❯` marker and
 /// accent name; a row a digit key launches shows that digit.
 fn draw_launcher(frame: &mut Frame, app: &App, area: Rect) {
-    let selected = app.launcher_selected();
+    let selected = app.launcher.selected;
     let mut lines: Vec<Line> = app
         .launcher_rows()
         .iter()
@@ -1614,7 +1614,7 @@ fn draw_launcher_command(frame: &mut Frame, app: &App, area: Rect) {
     let line = Line::from(vec![
         Span::styled("▍", Style::default().fg(accent())),
         Span::styled("run: ", dim()),
-        Span::styled(app.launcher_command().to_string(), Style::default()),
+        Span::styled(app.launcher.command.clone(), Style::default()),
         Span::styled("█", Style::default().fg(accent())),
     ]);
     // A minimum width so a short command still reads as an input field.
@@ -1690,7 +1690,7 @@ fn draw_issues(frame: &mut Frame, app: &App, area: Rect) {
             "deploy in a new workspace"
         },
     )];
-    if app.issues_jj() {
+    if app.issues.jj {
         keys.push(("h", if here { "new workspace" } else { "here" }));
     }
     keys.extend([("/", "filter"), ("esc", "close")]);
@@ -1755,7 +1755,7 @@ fn draw_setup(frame: &mut Frame, app: &App, area: Rect) {
         None => " setup · user ".to_string(),
     };
     let rows: Vec<_> = app.setup_rows().collect();
-    let selected = app.setup_selected();
+    let selected = app.setup.selected;
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let target = |path: &std::path::Path| {
         let (dir, base) = clipped_path(&path.display().to_string(), SETUP_PATH_W);
@@ -1956,7 +1956,7 @@ fn draw_navigate(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
     let input = Line::from(vec![
         Span::styled("▍", Style::default().fg(accent())),
         Span::styled("go to ", dim()),
-        Span::raw(app.navigate_query().to_string()),
+        Span::raw(app.navigate.query.clone()),
         Span::styled("█", Style::default().fg(accent())),
     ]);
     let input_w = input.width() as u16;
@@ -2066,10 +2066,10 @@ fn draw_notes(frame: &mut Frame, app: &App, area: Rect) {
     let content_w = list.width.saturating_sub(2) as usize;
     let selected = app.notes_selected();
     let (now, glyphs) = (unix_now(), glyphs(app.config().icons));
-    let lines: Vec<Line> = if app.notes().is_empty() {
+    let lines: Vec<Line> = if app.notes.is_empty() {
         vec![Line::from(Span::styled(" no notifications", dim()))]
     } else {
-        app.notes()
+        app.notes
             .iter()
             .rev()
             .enumerate()

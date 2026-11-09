@@ -440,11 +440,6 @@ impl App {
             .min(self.changed_files().len().saturating_sub(1));
         cursor.saturating_sub(visible - 1)
     }
-
-    /// The highlighted changed-files row, for the renderer.
-    pub fn diff_selected(&self) -> usize {
-        self.changes.selected
-    }
 }
 
 /// A file the changes panel hands to an editor pane (`App::take_editor_job`):
@@ -661,30 +656,33 @@ mod tests {
         );
 
         app.on_key(plain('G'));
-        assert_eq!(app.diff_selected(), 199, "G jumps to the last file");
+        assert_eq!(app.changes.selected, 199, "G jumps to the last file");
         app.on_key(plain('g'));
-        assert_eq!(app.diff_selected(), 0, "g jumps to the first file");
+        assert_eq!(app.changes.selected, 0, "g jumps to the first file");
         assert!(
             app.on_key(ctrl('d')).is_empty(),
             "C-d pages; it must not open the full diff like plain d"
         );
-        assert_eq!(app.diff_selected(), half);
+        assert_eq!(app.changes.selected, half);
         app.on_key(ctrl('d'));
-        assert_eq!(app.diff_selected(), 2 * half);
+        assert_eq!(app.changes.selected, 2 * half);
         app.on_key(ctrl('u'));
-        assert_eq!(app.diff_selected(), half);
+        assert_eq!(app.changes.selected, half);
         app.on_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
-        assert_eq!(app.diff_selected(), half + page);
+        assert_eq!(app.changes.selected, half + page);
         app.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
-        assert_eq!(app.diff_selected(), 199);
+        assert_eq!(app.changes.selected, 199);
         app.on_key(ctrl('d'));
-        assert_eq!(app.diff_selected(), 199, "paging clamps at the last file");
+        assert_eq!(app.changes.selected, 199, "paging clamps at the last file");
         app.on_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
-        assert_eq!(app.diff_selected(), 199 - page);
+        assert_eq!(app.changes.selected, 199 - page);
         app.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
-        assert_eq!(app.diff_selected(), 0);
+        assert_eq!(app.changes.selected, 0);
         app.on_key(ctrl('u'));
-        assert_eq!(app.diff_selected(), 0, "paging saturates at the first file");
+        assert_eq!(
+            app.changes.selected, 0,
+            "paging saturates at the first file"
+        );
         assert_eq!(
             app.mode,
             Mode::DiffFiles,
@@ -695,7 +693,7 @@ mod tests {
         assert_eq!(app.mode, Mode::Terminal, "h steps back into the panes");
         app.on_key(ctrl('b'));
         app.on_key(plain('f'));
-        assert_eq!(app.diff_selected(), 0, "refocusing keeps the cursor");
+        assert_eq!(app.changes.selected, 0, "refocusing keeps the cursor");
         app.on_key(plain('l'));
         assert_eq!(
             app.mode,
@@ -822,7 +820,7 @@ mod tests {
         assert_eq!(shown, [3, 2, 1], "the newest turn lists first");
 
         app.on_key(plain('G'));
-        assert_eq!(app.diff_selected(), 4, "two files, then three turns");
+        assert_eq!(app.changes.selected, 4, "two files, then three turns");
         app.on_key(plain('k'));
         app.on_key(plain('k'));
         let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));

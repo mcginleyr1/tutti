@@ -24,12 +24,12 @@ pub(super) struct Prompt {
     /// host again on a thread — under `--host` that is an ssh round trip — and
     /// the list shown meanwhile answers an older input, which Tab and Enter
     /// never take.
-    completions: Vec<String>,
+    pub(super) completions: Vec<String>,
     completions_for: String,
     /// The input to ask about next, taken by the event loop.
     ask: Option<String>,
     /// The highlighted completion row; `Tab` fills it, the arrows move it.
-    selected: usize,
+    pub(super) selected: usize,
     /// The workspace name captured in step 1, carried while the `where:` step is
     /// edited so submit can send both name and destination.
     name: String,
@@ -74,20 +74,6 @@ impl App {
             self.mode,
             Mode::SidebarPrompt | Mode::SidebarWorkspaceDest(_)
         )
-    }
-
-    pub fn sidebar_prompt(&self) -> &str {
-        &self.prompt.input
-    }
-
-    /// The directory completions shown under the add-project prompt.
-    pub fn prompt_completions(&self) -> &[String] {
-        &self.prompt.completions
-    }
-
-    /// The highlighted completion row index.
-    pub fn prompt_selected(&self) -> usize {
-        self.prompt.selected
     }
 
     /// Open the add-project prompt on the sidebar `n` path, prefilled with the
@@ -487,7 +473,7 @@ mod tests {
             app.sidebar_prompt_active(),
             "the first-run prompt is active"
         );
-        assert_eq!(app.sidebar_prompt(), "/home/alice/proj");
+        assert_eq!(app.prompt.input, "/home/alice/proj");
         assert!(app.sidebar_focused());
     }
 
@@ -535,7 +521,7 @@ mod tests {
         let out = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(out.is_empty(), "esc creates nothing");
         assert_eq!(app.mode, Mode::Sidebar);
-        assert!(app.sidebar_prompt().is_empty());
+        assert!(app.prompt.input.is_empty());
     }
 
     #[test]
@@ -547,7 +533,7 @@ mod tests {
         assert_eq!(app.mode, Mode::SidebarPrompt);
         // Both fixture workspaces live at `/tmp/w`, so the prompt prefills their
         // common parent with a trailing slash — the user types just the name.
-        assert_eq!(app.sidebar_prompt(), "/tmp/w/");
+        assert_eq!(app.prompt.input, "/tmp/w/");
 
         // A name of this process's own, so suites running at once (one per
         // workspace) never race on the directory created below.
@@ -557,9 +543,9 @@ mod tests {
             app.on_key(plain(c));
         }
         app.on_key(plain('x'));
-        assert_eq!(app.sidebar_prompt(), format!("{path}x"));
+        assert_eq!(app.prompt.input, format!("{path}x"));
         app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-        assert_eq!(app.sidebar_prompt(), path);
+        assert_eq!(app.prompt.input, path);
 
         // Enter only mounts a directory that exists on disk, so make it real.
         std::fs::create_dir_all(&path).unwrap();
@@ -572,7 +558,7 @@ mod tests {
             "submit mounts the typed directory, then the launcher picks its first pane"
         );
         assert_eq!(app.mode, Mode::Launcher);
-        assert!(app.sidebar_prompt().is_empty());
+        assert!(app.prompt.input.is_empty());
         assert!(
             app.adopt_active_view,
             "the jump to the new workspace is armed"
@@ -635,12 +621,12 @@ mod tests {
         // An absolute prefix keeps the test independent of the real HOME/cwd.
         app.start_first_run_prompt(format!("{}/a", root.display()));
         complete(&mut app);
-        assert_eq!(app.prompt_completions(), &["alpha".to_string()]);
+        assert_eq!(app.prompt.completions, &["alpha".to_string()]);
 
         let out = app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert!(out.is_empty(), "Tab sends nothing to the server");
         assert_eq!(
-            app.sidebar_prompt(),
+            app.prompt.input,
             format!("{}/alpha/", root.display()),
             "Tab fills the highlight and opens the directory with a trailing slash"
         );
@@ -656,9 +642,9 @@ mod tests {
         complete(&mut app);
         // Two matches; move the highlight onto the second.
         app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        assert_eq!(app.prompt_selected(), 1);
+        assert_eq!(app.prompt.selected, 1);
 
-        let typed = app.sidebar_prompt().to_string();
+        let typed = app.prompt.input.to_string();
         let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         // The typed path exists, so Enter mounts it (the tempdir), not the
         // highlight — the highlight only wins when the typed path is missing.
@@ -681,7 +667,7 @@ mod tests {
         let mut app = App::new();
         app.start_first_run_prompt(format!("{}/the", root.display()));
         complete(&mut app);
-        assert_eq!(app.prompt_completions(), &["the-librarian".to_string()]);
+        assert_eq!(app.prompt.completions, &["the-librarian".to_string()]);
 
         let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let dir = std::fs::canonicalize(root.join("the-librarian")).unwrap();
@@ -701,7 +687,7 @@ mod tests {
         let mut app = App::new();
         app.start_first_run_prompt(format!("{}/zzz", root.display()));
         complete(&mut app);
-        assert!(app.prompt_completions().is_empty());
+        assert!(app.prompt.completions.is_empty());
 
         let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(out.is_empty(), "nothing is sent for a missing directory");
@@ -722,22 +708,22 @@ mod tests {
         let mut app = App::new();
         app.start_first_run_prompt(format!("{}/", root.display()));
         complete(&mut app);
-        assert_eq!(app.prompt_completions().len(), 3);
-        assert_eq!(app.prompt_selected(), 0);
+        assert_eq!(app.prompt.completions.len(), 3);
+        assert_eq!(app.prompt.selected, 0);
 
         app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        assert_eq!(app.prompt_selected(), 2);
+        assert_eq!(app.prompt.selected, 2);
         app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        assert_eq!(app.prompt_selected(), 2, "Down clamps at the last row");
+        assert_eq!(app.prompt.selected, 2, "Down clamps at the last row");
         app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.prompt_selected(), 1);
+        assert_eq!(app.prompt.selected, 1);
 
         // Typing filters and snaps the highlight back to the best match.
         app.on_key(plain('g'));
         complete(&mut app);
-        assert_eq!(app.prompt_selected(), 0);
-        assert_eq!(app.prompt_completions(), &["gamma".to_string()]);
+        assert_eq!(app.prompt.selected, 0);
+        assert_eq!(app.prompt.completions, &["gamma".to_string()]);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -753,21 +739,21 @@ mod tests {
         let found = app.host().complete_dirs(&asked);
         app.completed(asked, found);
         assert!(
-            app.prompt_completions().is_empty(),
+            app.prompt.completions.is_empty(),
             "an answer for an older input is dropped"
         );
 
         complete(&mut app);
-        assert_eq!(app.prompt_completions(), &["alpha".to_string()]);
+        assert_eq!(app.prompt.completions, &["alpha".to_string()]);
         app.on_key(plain('x'));
         assert_eq!(
-            app.prompt_completions(),
+            app.prompt.completions,
             &["alpha".to_string()],
             "the older list stays up until the new answer lands"
         );
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(
-            app.sidebar_prompt(),
+            app.prompt.input,
             format!("{}/ax", root.display()),
             "Tab never fills from a list for an older input"
         );
@@ -791,16 +777,16 @@ mod tests {
         for c in "feature".chars() {
             app.on_key(plain(c));
         }
-        assert_eq!(app.sidebar_prompt(), "feature");
+        assert_eq!(app.prompt.input, "feature");
 
         // Enter validates the name and advances to the prefilled `where:` step.
         let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(out.is_empty(), "advancing to the dest step sends nothing");
         assert!(matches!(app.mode, Mode::SidebarWorkspaceDest(_)));
         assert!(
-            app.sidebar_prompt().contains("w-feature"),
+            app.prompt.input.contains("w-feature"),
             "the dest step prefills the sibling default: {:?}",
-            app.sidebar_prompt()
+            app.prompt.input
         );
 
         // Submitting the dest step fires the fork request carrying name + dest.
@@ -810,7 +796,7 @@ mod tests {
             Mode::Sidebar,
             "back to the sidebar awaiting reply"
         );
-        assert!(app.sidebar_prompt().is_empty());
+        assert!(app.prompt.input.is_empty());
         match only_request(&out) {
             Request::WorkspaceFork {
                 id,
@@ -838,7 +824,7 @@ mod tests {
         app.on_key(plain('j')); // web workspace
         app.on_key(plain('j')); // first agent (blocked pane 3, in tab 2 → workspace 2)
         assert!(matches!(
-            app.sidebar().entries[app.sidebar_selected()],
+            app.sidebar().entries[app.sidebar.selected],
             SidebarEntry::Agent(_)
         ));
 
@@ -901,7 +887,7 @@ mod tests {
         let out = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(out.is_empty(), "esc creates nothing");
         assert_eq!(app.mode, Mode::Sidebar);
-        assert!(app.sidebar_prompt().is_empty());
+        assert!(app.prompt.input.is_empty());
     }
 
     #[test]
@@ -922,8 +908,7 @@ mod tests {
             "esc steps back a step"
         );
         assert_eq!(
-            app.sidebar_prompt(),
-            "feature",
+            app.prompt.input, "feature",
             "the name the user typed is restored"
         );
     }
@@ -994,7 +979,7 @@ mod tests {
         let out = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(out.is_empty());
         assert_eq!(app.mode, Mode::Sidebar);
-        assert!(app.sidebar_prompt().is_empty());
+        assert!(app.prompt.input.is_empty());
     }
 
     #[test]

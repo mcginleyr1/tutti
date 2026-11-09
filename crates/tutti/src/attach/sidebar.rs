@@ -558,10 +558,6 @@ impl App {
         ) || (matches!(self.mode, Mode::Approval(_)) && self.approvals.back == Mode::Sidebar)
     }
 
-    pub fn sidebar_selected(&self) -> usize {
-        self.sidebar.selected
-    }
-
     /// Whether the sidebar should be drawn for a content area of `total_width`.
     /// A focused sidebar always shows (so the sidebar key can reveal a hidden
     /// one); otherwise the config mode decides — `auto` showing it once the
@@ -1591,21 +1587,21 @@ mod tests {
         attach_with(&mut app, view_two_workspaces());
         focus_sidebar(&mut app);
         assert_eq!(app.mode, Mode::Sidebar);
-        assert_eq!(app.sidebar_selected(), 0);
+        assert_eq!(app.sidebar.selected, 0);
 
         app.on_key(plain('j')); // second workspace — the filter follows it
-        assert_eq!(app.sidebar_selected(), 1);
+        assert_eq!(app.sidebar.selected, 1);
         app.on_key(plain('j')); // crosses into the agents section
-        assert_eq!(app.sidebar_selected(), 2);
+        assert_eq!(app.sidebar.selected, 2);
         assert!(matches!(app.sidebar().entries[2], SidebarEntry::Agent(_)));
         app.on_key(plain('j')); // last agent
-        assert_eq!(app.sidebar_selected(), 3);
+        assert_eq!(app.sidebar.selected, 3);
         app.on_key(plain('j')); // crosses into the waiting section
-        assert_eq!(app.sidebar_selected(), 4);
+        assert_eq!(app.sidebar.selected, 4);
         app.on_key(plain('j')); // clamped at the end
-        assert_eq!(app.sidebar_selected(), 4);
+        assert_eq!(app.sidebar.selected, 4);
         app.on_key(plain('k')); // back up into the agents
-        assert_eq!(app.sidebar_selected(), 3);
+        assert_eq!(app.sidebar.selected, 3);
 
         // esc unfocuses; the pane keeps its own focus.
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -1654,7 +1650,7 @@ mod tests {
         for _ in 0..6 {
             app.on_key(plain('j'));
         }
-        let SidebarEntry::Agent(a) = &sidebar.entries[app.sidebar_selected()] else {
+        let SidebarEntry::Agent(a) = &sidebar.entries[app.sidebar.selected] else {
             panic!("expected the first waiting row");
         };
         assert_eq!(
@@ -2110,7 +2106,7 @@ mod tests {
             serde_json::to_vec(&Event::LayoutChanged { workspaces: view }).unwrap(),
         ));
         let sidebar = app.sidebar();
-        let SidebarEntry::Workspace(w) = &sidebar.entries[app.sidebar_selected()] else {
+        let SidebarEntry::Workspace(w) = &sidebar.entries[app.sidebar.selected] else {
             panic!("expected a workspace row");
         };
         assert_eq!(w.name, "web", "the cursor followed the row's identity");
@@ -2134,7 +2130,7 @@ mod tests {
             serde_json::to_vec(&Event::LayoutChanged { workspaces: view }).unwrap(),
         ));
         let sidebar = app.sidebar();
-        let SidebarEntry::Workspace(w) = &sidebar.entries[app.sidebar_selected()] else {
+        let SidebarEntry::Workspace(w) = &sidebar.entries[app.sidebar.selected] else {
             panic!("expected the project row, got an agent row");
         };
         assert_eq!(
@@ -2210,7 +2206,7 @@ mod tests {
         app.on_key(plain('j'));
         app.on_key(plain('j'));
         app.on_key(plain('j')); // the last entry (the working agent)
-        assert_eq!(app.sidebar_selected(), 3);
+        assert_eq!(app.sidebar.selected, 3);
 
         // A killed workspace shrinks the view to a single agentless row.
         app.handle_frame(WireFrame::Control(
@@ -2220,8 +2216,7 @@ mod tests {
             .unwrap(),
         ));
         assert_eq!(
-            app.sidebar_selected(),
-            0,
+            app.sidebar.selected, 0,
             "the selection clamps onto the surviving row"
         );
     }

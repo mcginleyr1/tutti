@@ -255,14 +255,14 @@ pub fn prev_selectable(rows: &[LauncherRow], from: usize) -> usize {
 pub(super) struct Launcher {
     /// The launcher rows, built when the launcher opens so render and dispatch
     /// read one list.
-    rows: Vec<LauncherRow>,
+    pub(super) rows: Vec<LauncherRow>,
     /// The highlighted launcher row.
-    selected: usize,
+    pub(super) selected: usize,
     /// Whether the launcher opened right after add-project — `esc` there spawns
     /// the shell into the new workspace (the old outcome) rather than closing.
     after_add: bool,
     /// The command line typed in the launcher's `command…` input.
-    command: String,
+    pub(super) command: String,
     /// When set, the next launch first creates a fresh tab in this workspace
     /// (`TabNew` then the run): the sidebar's new-agent flow, where an agent
     /// gets its own tab rather than splitting an existing one.
@@ -399,16 +399,6 @@ impl App {
     /// The launcher rows as they currently render, for the renderer.
     pub fn launcher_rows(&self) -> &[LauncherRow] {
         &self.launcher.rows
-    }
-
-    /// The highlighted launcher row index.
-    pub fn launcher_selected(&self) -> usize {
-        self.launcher.selected
-    }
-
-    /// The text typed in the launcher's `command…` input.
-    pub fn launcher_command(&self) -> &str {
-        &self.launcher.command
     }
 
     /// The launcher panel title, naming the workspace the choice will run in so
@@ -944,11 +934,7 @@ mod tests {
             assert!(out.is_empty(), "opening the launcher emits no frames");
             assert_eq!(app.mode, Mode::Launcher);
             // The rows are the registry agents plus the shell and command entries.
-            let names: Vec<&str> = app
-                .launcher_rows()
-                .iter()
-                .map(|r| r.name.as_str())
-                .collect();
+            let names: Vec<&str> = app.launcher.rows.iter().map(|r| r.name.as_str()).collect();
             assert!(names.contains(&"claude"), "registry agents seed the rows");
             assert!(names.contains(&"shell"), "the shell row is always present");
             assert!(names.contains(&"command…"), "the command row too");
@@ -1028,7 +1014,7 @@ mod tests {
         focus_sidebar(&mut app);
         app.on_key(plain('n')); // new agent in the selected (first) workspace
         assert_eq!(app.mode, Mode::Launcher);
-        let rows = app.launcher_rows();
+        let rows = app.launcher.rows;
         let idx = rows
             .iter()
             .position(|r| r.name == "resume")
@@ -1057,7 +1043,7 @@ mod tests {
         // The shell row follows the installed agents: none on an empty PATH.
         app.set_local(|local| local.path = None);
         app.open_launcher(false, None, None);
-        assert_eq!(app.launcher_rows()[0].kind, LaunchKind::Shell);
+        assert_eq!(app.launcher.rows[0].kind, LaunchKind::Shell);
         let out = app.on_key(plain('1'));
         assert_eq!(
             out,
@@ -1080,7 +1066,8 @@ mod tests {
         // Walk to the command row, whatever this machine has on PATH: past
         // nine installed agents it has no quick-select number.
         let command_row = app
-            .launcher_rows()
+            .launcher
+            .rows
             .iter()
             .position(|r| matches!(r.kind, LaunchKind::Command))
             .unwrap();
@@ -1094,7 +1081,7 @@ mod tests {
         for c in "npm test".chars() {
             app.on_key(plain(c));
         }
-        assert_eq!(app.launcher_command(), "npm test");
+        assert_eq!(app.launcher.command, "npm test");
         let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(
             out,
@@ -1129,7 +1116,7 @@ mod tests {
         app.on_key(tab);
         assert_eq!(app.launcher_title(), " run in api · sandbox orb ");
         assert!(
-            app.launcher_rows().iter().all(LauncherRow::selectable),
+            app.launcher.rows.iter().all(LauncherRow::selectable),
             "a sandbox offers the whole catalog"
         );
         assert_eq!(app.launcher_tab_hint().as_deref(), Some("sandbox gke"));
@@ -1161,7 +1148,8 @@ mod tests {
         app.open_launcher(false, None, None);
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         let shell = app
-            .launcher_rows()
+            .launcher
+            .rows
             .iter()
             .position(|r| matches!(r.kind, LaunchKind::Shell))
             .unwrap();
@@ -1196,7 +1184,8 @@ mod tests {
         attached(&mut app);
         app.open_launcher(false, None, None);
         let command_row = app
-            .launcher_rows()
+            .launcher
+            .rows
             .iter()
             .position(|r| matches!(r.kind, LaunchKind::Command))
             .unwrap();
@@ -1209,7 +1198,7 @@ mod tests {
         let out = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(out.is_empty());
         assert_eq!(app.mode, Mode::Launcher, "esc steps back to the picker");
-        assert!(app.launcher_command().is_empty());
+        assert!(app.launcher.command.is_empty());
     }
 
     #[test]
@@ -1254,8 +1243,8 @@ mod tests {
         app.launcher.selected = 0;
         app.mode = Mode::Launcher;
         app.on_key(plain('j'));
-        assert_eq!(app.launcher_selected(), 2, "j skips the unavailable row");
+        assert_eq!(app.launcher.selected, 2, "j skips the unavailable row");
         app.on_key(plain('k'));
-        assert_eq!(app.launcher_selected(), 0, "k skips it too");
+        assert_eq!(app.launcher.selected, 0, "k skips it too");
     }
 }

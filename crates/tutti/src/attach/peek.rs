@@ -263,7 +263,7 @@ mod tests {
     fn p_on_a_blocked_row_peeks_and_answer_keys_go_out_guarded() {
         let mut app = peek_fixture();
         app.focus_change(); // drain the attach-time focus report
-        let (focused, tab, selected) = (app.focused, app.active_tab, app.sidebar_selected());
+        let (focused, tab, selected) = (app.focused, app.active_tab, app.sidebar.selected);
         assert_eq!(app.on_key(plain('p')), Vec::new(), "opening sends nothing");
         assert_eq!(app.mode, Mode::Peek(PaneId(3)));
 
@@ -285,7 +285,7 @@ mod tests {
         assert_eq!(app.on_key(esc), Vec::new());
         assert_eq!(app.mode, Mode::Sidebar);
         assert_eq!(
-            (app.focused, app.active_tab, app.sidebar_selected()),
+            (app.focused, app.active_tab, app.sidebar.selected),
             (focused, tab, selected),
             "peeking never moves focus, the tab, or the cursor"
         );

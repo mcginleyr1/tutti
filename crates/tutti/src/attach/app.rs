@@ -3256,18 +3256,18 @@ mod tests {
             app.sidebar_prompt_active(),
             "esc falls through to the prompt"
         );
-        assert_eq!(app.sidebar_prompt(), "/tmp/proj");
+        assert_eq!(app.prompt.input, "/tmp/proj");
 
         let mut app = offered();
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(app.on_key(enter), restore(false));
         assert_eq!(app.mode, Mode::Terminal, "the restored panes take the keys");
-        assert!(app.sidebar_prompt().is_empty(), "the prompt is cancelled");
+        assert!(app.prompt.input.is_empty(), "the prompt is cancelled");
 
         let mut app = offered();
         assert_eq!(app.on_key(plain('d')), restore(true));
         assert_eq!(app.mode, Mode::Sidebar, "as the prompt's own esc would");
-        assert!(app.sidebar_prompt().is_empty(), "the prompt is cancelled");
+        assert!(app.prompt.input.is_empty(), "the prompt is cancelled");
     }
 
     #[test]
