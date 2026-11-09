@@ -2327,12 +2327,16 @@ async fn a_tab_switch_stops_a_client_voting_for_panes_it_left() {
             .await,
     );
 
-    let mut a = server.connect().await;
-    attach(&mut a).await;
-    view(&mut a, &[(first, 10, 40)]).await;
+    // Every snapshot waited for is one a vote made after the last read of its
+    // connection brings: `view` skips the pane frames ahead of its answer, an
+    // attach's first snapshots among them.
     let mut b = server.connect().await;
     attach(&mut b).await;
     view(&mut b, &[(first, 20, 60)]).await;
+    snapshot_at(&mut b, first, 20, 60).await;
+    let mut a = server.connect().await;
+    attach(&mut a).await;
+    view(&mut a, &[(first, 10, 40)]).await;
     snapshot_at(&mut b, first, 10, 40).await;
 
     view(&mut a, &[(second, 10, 40)]).await;
