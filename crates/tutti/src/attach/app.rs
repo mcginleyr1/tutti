@@ -186,7 +186,9 @@ struct BorderDrag {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Terminal,
-    Prefix,
+    /// Awaiting the key after the prefix, pressed at this instant: the
+    /// which-key popup appears once it has sat unanswered `WHICHKEY_DELAY`.
+    Prefix(Instant),
     ConfirmKill(PaneId),
     /// Confirming a workspace kill raised from the sidebar (`y` kill, `D`
     /// discard the workspace's checkout, anything else cancels).
@@ -312,9 +314,6 @@ pub struct App {
     /// Set when a non-focused pane finished or blocked; the event loop rings the
     /// terminal bell once and clears it.
     bell: bool,
-    /// When the prefix was pressed, while awaiting the follow-up key. Drives the
-    /// which-key popup's delayed appearance.
-    prefix_since: Option<Instant>,
     /// The highlighted sidebar entry while the sidebar is focused.
     sidebar_selected: usize,
     /// The selected row's identity and owning project, captured whenever the
@@ -567,7 +566,6 @@ impl App {
             rtty: None,
             rtty_jobs: Vec::new(),
             bell: false,
-            prefix_since: None,
             sidebar_selected: 0,
             sidebar_anchor: None,
             sidebar_prompt: String::new(),
@@ -698,10 +696,7 @@ impl App {
     /// Whether the which-key popup should be shown: the prefix has been held,
     /// unanswered, past the delay.
     pub fn whichkey_visible(&self) -> bool {
-        matches!(self.mode, Mode::Prefix)
-            && self
-                .prefix_since
-                .is_some_and(|since| since.elapsed() >= WHICHKEY_DELAY)
+        matches!(self.mode, Mode::Prefix(since) if since.elapsed() >= WHICHKEY_DELAY)
     }
 
     /// The current working-spinner frame index. The event loop watches this to
@@ -1414,7 +1409,7 @@ impl App {
     pub fn on_key(&mut self, key: KeyEvent) -> Vec<WireFrame> {
         match self.mode {
             Mode::Terminal => self.on_key_terminal(key, None),
-            Mode::Prefix => self.on_key_prefix(key),
+            Mode::Prefix(_) => self.on_key_prefix(key),
             Mode::ConfirmKill(pane) => self.on_key_confirm(key, pane),
             Mode::ConfirmKillWorkspace(id) => self.on_key_confirm_workspace(key, id),
             Mode::ConfirmKillAgent(pane) => self.on_key_confirm_agent(key, pane),
@@ -1564,8 +1559,7 @@ impl App {
         if !self.config.prefix.matches(key) {
             return false;
         }
-        self.mode = Mode::Prefix;
-        self.prefix_since = Some(Instant::now());
+        self.mode = Mode::Prefix(Instant::now());
         true
     }
 
@@ -1588,7 +1582,6 @@ impl App {
 
     fn on_key_prefix(&mut self, key: KeyEvent) -> Vec<WireFrame> {
         self.mode = Mode::Terminal;
-        self.prefix_since = None;
         self.status = None;
         // Esc (and any key while the which-key popup is up) leaves prefix mode.
         if key.code == KeyCode::Esc {
@@ -2101,7 +2094,6 @@ impl App {
             .and_then(|p| sidebar.index_of(sidebar::EntryIdent::Workspace(p)))
             .unwrap_or(0);
         self.select_entry(&sidebar, idx);
-        self.prefix_since = None;
         self.status = None;
     }
 
@@ -2550,7 +2542,6 @@ impl App {
         }
         self.diff_selected = self.diff_selected.min(self.diff_rows() - 1);
         self.mode = Mode::DiffFiles;
-        self.prefix_since = None;
         self.status = None;
     }
 
@@ -3371,7 +3362,6 @@ impl App {
         self.launcher_replace = None;
         self.launcher_target = target;
         self.mode = Mode::Launcher;
-        self.prefix_since = None;
     }
 
     /// Build the rows for where the launcher runs its pick. On the daemon's
@@ -4125,7 +4115,6 @@ impl App {
     fn open_notes(&mut self) {
         self.mode = Mode::Notes;
         self.notes_anchor = self.notes.last().map(|n| n.id);
-        self.prefix_since = None;
         self.status = None;
     }
 
@@ -5050,9 +5039,8 @@ impl App {
     fn mouse_focus(&mut self, pane: PaneId) -> Vec<WireFrame> {
         self.focused = Some(pane);
         match self.mode {
-            Mode::Prefix => {
+            Mode::Prefix(_) => {
                 self.mode = Mode::Terminal;
-                self.prefix_since = None;
                 Vec::new()
             }
             Mode::Sidebar | Mode::DiffFiles => {
@@ -5975,9 +5963,12 @@ mod tests {
         // The prefix, its release, a lone Shift, then `%`: a split, and the
         // pane hears none of it.
         assert!(typed_in(&mut app, b"\x1b[98;5u\x1b[98;5:3u").is_empty());
-        assert_eq!(app.mode, Mode::Prefix);
+        assert!(matches!(app.mode, Mode::Prefix(_)));
         assert!(typed_in(&mut app, b"\x1b[57441;2u").is_empty());
-        assert_eq!(app.mode, Mode::Prefix, "a lone modifier is no prefix key");
+        assert!(
+            matches!(app.mode, Mode::Prefix(_)),
+            "a lone modifier is no prefix key"
+        );
         let split = app.on_typed(KeyEvent::new(KeyCode::Char('%'), KeyModifiers::NONE), None);
         assert!(
             split.iter().all(|f| !matches!(f, WireFrame::Input { .. })) && !split.is_empty(),
@@ -6157,7 +6148,7 @@ mod tests {
             app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL))
                 .is_empty()
         );
-        assert_eq!(app.mode, Mode::Prefix);
+        assert!(matches!(app.mode, Mode::Prefix(_)));
         let out = app.on_key(KeyEvent::new(KeyCode::Char('%'), KeyModifiers::NONE));
         assert_eq!(
             out,
@@ -6949,7 +6940,10 @@ mod tests {
         assert_eq!(app.on_key(alt('x')), input(b"\x1bx"));
         assert_eq!((app.focused, app.mode), (Some(PaneId(1)), Mode::Terminal));
         app.on_key(ctrl('b'));
-        assert_eq!(app.mode, Mode::Prefix, "the prefix is still tutti's");
+        assert!(
+            matches!(app.mode, Mode::Prefix(_)),
+            "the prefix is still tutti's"
+        );
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
         layout_changed(&mut app, with_keys("pane", Some(0)));
@@ -6973,11 +6967,11 @@ mod tests {
         let mut app = App::new();
         attached(&mut app);
         app.on_key(ctrl('b'));
-        assert_eq!(app.mode, Mode::Prefix);
+        assert!(matches!(app.mode, Mode::Prefix(_)));
         assert!(!app.whichkey_visible(), "hidden immediately after prefix");
 
         // Simulate the delay elapsing.
-        app.prefix_since = Some(Instant::now() - WHICHKEY_DELAY - Duration::from_millis(10));
+        app.mode = Mode::Prefix(Instant::now() - WHICHKEY_DELAY - Duration::from_millis(10));
         assert!(app.whichkey_visible(), "shown once the delay passes");
 
         // A follow-up key dispatches and dismisses the popup.
@@ -6994,7 +6988,7 @@ mod tests {
         let out = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(out.is_empty());
         assert_eq!(app.mode, Mode::Terminal);
-        assert!(app.prefix_since.is_none());
+        assert!(!matches!(app.mode, Mode::Prefix(_)));
     }
 
     #[test]
@@ -7838,7 +7832,7 @@ mod tests {
         // The prefix reaches across, closing the overlay into prefix mode.
         let mut app = navigate_fixture(Config::default());
         app.on_key(ctrl('b'));
-        assert_eq!(app.mode, Mode::Prefix);
+        assert!(matches!(app.mode, Mode::Prefix(_)));
         app.on_key(plain('w'));
         assert_eq!(app.mode, Mode::Sidebar);
     }

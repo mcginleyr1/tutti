@@ -1370,7 +1370,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 fn mode_label(mode: Mode) -> Option<&'static str> {
     match mode {
         Mode::Terminal => None,
-        Mode::Prefix => Some("PREFIX"),
+        Mode::Prefix(_) => Some("PREFIX"),
         Mode::ConfirmKill(_)
         | Mode::ConfirmKillWorkspace(_)
         | Mode::ConfirmKillAgent(_)
