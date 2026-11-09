@@ -12,7 +12,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use rtty_vt::{Attrs, Color as VtColor, Row, Terminal};
 use tutti_core::{AgentState, Checkpoint, Note, NoteKind, PaneId, PaneInfo, SubagentInfo};
 
-use super::app::{App, IssueRow, Mode};
+use super::app::{App, Mode};
+use super::deploy::IssueRow;
 use super::host;
 use super::launcher::LauncherRow;
 use super::navigate::{self, Marker};

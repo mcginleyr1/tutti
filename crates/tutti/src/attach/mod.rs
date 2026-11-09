@@ -7,6 +7,7 @@ mod app;
 mod approval;
 mod changes;
 mod connection;
+mod deploy;
 mod follow;
 mod host;
 mod keys;
