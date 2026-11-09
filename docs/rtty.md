@@ -93,8 +93,10 @@ when one is blocked or done. tutti's agent chrome (the sidebar, approvals,
 notes, the changes panel) stays in the TUI and is not planned in rtty.
 
 rtty does not yet reach sessions on other machines (`tutti --host`). It never
-starts a daemon: tutti's daemon must be running, and must speak wire revision
-19.
+starts a daemon: tutti's daemon must be running, and its wire and rtty's must
+work together, each at or above the other's floor (an rtty that speaks wire
+revision 20 works with a daemon at 19 or newer; see "Revisions and floors" in
+[transport-decision.md](transport-decision.md)).
 
 The feature is rtty's and is documented there, in
 [docs/tutti.md](https://github.com/mcginleyr1/rtty/blob/main/docs/tutti.md#tutti-panes).

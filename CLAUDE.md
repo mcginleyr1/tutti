@@ -44,10 +44,13 @@ cargo fmt --all --check
   only after unlocking, on a thread of its own. Nor does a view or listing
   read a file under the lock: a workspace's root and branch live in
   `session::Meta`, which the VCS watch rereads off every lock.
-- **`WIRE_REV`** (tutti-core/src/protocol.rs): bump on ANY protocol shape
-  change, additive included. Daemons outlive binary upgrades; the attach
-  handshake warning is the only thing standing between users and silent
-  version skew.
+- **`WIRE_REV` and `WIRE_FLOOR`** (tutti-wire/src/rev.rs): raise `WIRE_REV`
+  on ANY protocol shape change, additive included. Raise `WIRE_FLOOR` to the
+  new revision only when an older peer would misread the change
+  (docs/transport-decision.md, "Revisions and floors"). Daemons outlive
+  binary upgrades, and rtty is installed apart from tutti; the attach
+  handshake is the only thing standing between users and silent version
+  skew.
 - Protocol changes are **additive-only** with `#[serde(default)]` on new
   fields, plus round-trip and old-payload-defaults tests.
 - TUI geometry has one source of truth (`App::regions`/`content_rect`); any

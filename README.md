@@ -199,7 +199,8 @@ When you change a feature, update the file that documents it.
 ## Repository layout
 
 ```
-crates/tutti-core     pure domain model, agent state machine, protocol + frame codec
+crates/tutti-wire     what a client speaks to the daemon: its socket's path, the frame codec, the requests, responses and events, and whether two revisions work together (serde only; rtty depends on it)
+crates/tutti-core     tutti-wire re-exported, with the daemon's paths, the prompt fingerprint and the sandbox names
 crates/tutti-server   daemon: PTYs and their terminals (rtty-vt), socket API, detection & classification
 crates/tutti          client: CLI verbs + ratatui TUI
 crates/tutti-agents   agent registry & screen-state classifier (data-driven)

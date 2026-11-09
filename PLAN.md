@@ -64,7 +64,8 @@ overview.
 tutti/
 ├── Cargo.toml                 # workspace root (resolver = "3", edition 2024)
 └── crates/
-    ├── tutti-core/            # domain model, protocol types, state machine — no I/O deps
+    ├── tutti-wire/            # what a client speaks to the daemon: frames, protocol types, domain model, state machine, revisions — serde only
+    ├── tutti-core/            # tutti-wire re-exported, with the daemon's paths, the prompt fingerprint, the sandbox names — no I/O deps
     ├── tutti-server/          # daemon: PTY management, vt parsing, socket server
     ├── tutti/                 # client binary: ratatui TUI + CLI subcommands
     └── tutti-agents/          # agent detection & per-agent integrations
@@ -201,7 +202,12 @@ is deliberately left undone.
   timeout. Not checked live (w12 review);
 - a restore to a checkpoint whose commit `jj util gc` pruned fails with
   jj's `Revision … doesn't exist`, leaving the working copy as it was, but
-  records a `before restore` checkpoint first (w12).
+  records a `before restore` checkpoint first (w12);
+- host frames (`tutti proxy`'s hello) still take `HOST_REV` by equality:
+  the floor of wire rev 20 covers the daemon's wire only (w18);
+- a frame from the daemon (a `PaneFocused`, say) can close the restore
+  offer unanswered, and the offer then stays set until the next attach
+  (w18, from reading the code; not reproduced).
 
 ### Open in the phase items
 
@@ -362,7 +368,7 @@ Phase 5 bullet:
 - **Prior art.** Consulting permissively-licensed (Apache/MIT/BSD) tools for
   design ideas is fine; never copy code verbatim, and never consult
   AGPL/copyleft sources.
-- `tutti-core` stays free of I/O and UI dependencies — pure types + state machine,
+- `tutti-wire` and `tutti-core` stay free of I/O and UI dependencies — pure types + state machine,
   heavily unit-tested (especially the agent state transitions and layout tree).
 - Every feature lands with: the socket API first, the CLI verb second, the TUI last.
   If it isn't scriptable, it isn't done. The converse holds for humans: the CLI is

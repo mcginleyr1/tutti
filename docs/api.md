@@ -166,7 +166,7 @@ workspace/tab/pane structure, or to the attached TUI's focus or terminal;
 bursts coalesce.
 
 ```json
-{"type":"snapshot","session":"tutti","wire_rev":19,"attached_terminal":"com.mitchellh.ghostty",
+{"type":"snapshot","session":"tutti","wire_rev":20,"wire_floor":19,"attached_terminal":"com.mitchellh.ghostty",
  "panes":[{"id":3,"workspace":"smartnotch","dir":"/Users/me/develop/smartnotch","tab":"main",
            "title":"claude","agent":"claude","state":"blocked","source":"hook","exited":null,"focused":true,
            "user_vars":{},"cwd":"/Users/me/develop/smartnotch/src",
@@ -197,8 +197,15 @@ bursts coalesce.
   [deployed on](issues.md) — `{source, id, title, url}`, `url` `null`
   when the tracker gave none — or `null` for every other pane.
 - `attached_terminal` is the terminal app the attached TUI runs in (macOS's
-  `__CFBundleIdentifier`), `null` with nobody attached or off macOS;
-  `wire_rev` is the daemon's protocol revision.
+  `__CFBundleIdentifier`), `null` with nobody attached or off macOS.
+- `wire_rev` is the daemon's wire revision and `wire_floor` its floor: the
+  oldest revision of a reader it still serves faithfully. A watcher written
+  against revision `W`, which reads nothing that came after revision `Wf` (`W`
+  itself, if unsure), can trust the snapshots exactly when `wire_floor <= W`
+  and `Wf <= wire_rev`; otherwise it should say which end to update. A
+  snapshot with no `wire_floor` is from a daemon before floors (revision 19
+  and older): take its `wire_rev` for its floor. See [Revisions and
+  floors](transport-decision.md#revisions-and-floors-wire-rev-20).
 
 A watcher is read-only and is not an attached client: it sits beside the TUI
 without touching its sizes or focus, and watching a **done** pane never marks

@@ -966,6 +966,38 @@ were. The checks:
   - Codex's start-up idle report beat detection, so the pane read idle
     rather than unknown. That fix is tested, not re-run live.
 
+✅ **Wave 18 (w18, 2026-11-09)**, wire rev 20. Open:
+[PLAN.md](../PLAN.md#headline-items) (host frames by equality, the restore
+offer). What it built:
+- The wire is a crate of its own, `tutti-wire`: the socket's path, the frame
+  codec, the requests, responses and events, the domain types they carry, and
+  the revisions. `tutti-core` re-exports it, and rtty depends on it in place
+  of a hand copy.
+- A floor beside the revision (`WIRE_FLOOR`, 19): a client and a daemon work
+  together while each is at or above the other's floor, so an additive change
+  no longer makes rtty refuse the daemon. `attached` and the watch snapshot
+  both name it. The TUI weighs the daemon's wire in one place, and reads the
+  revision from an answer it cannot parse whole.
+- A paste longer than a frame goes in several (`Frame::inputs`), where it
+  panicked the TUI.
+- `attach/app.rs` is split by concern. 58 of `App`'s 91 fields live with
+  their mode or panel: in `Mode`'s variants, or in one struct per concern
+  (approval, changes, deploy, follow, mouse, notes, peek, prompt, setup, and
+  more in launcher, navigate, rtty and sidebar). Each module holds its state,
+  the code that works on it and its tests.
+- Found and fixed on the way:
+  - a launcher left armed with an issue armed the next one;
+  - a Shift-held mouse release left a hold that sent the next drag to the
+    old pane;
+  - the daemon closed its own handle on a pane's slave before the reader
+    ran, so a program already gone lost its output and the spawn stalled
+    0.6 s under the session's lock (seen only with a delay injected);
+  - two server tests failed under load: one waited for a snapshot its helper
+    had skipped, the other ran the caller's shell and startup files.
+- The gate runs in CI (`just verify` on macOS and Linux runners; not yet run
+  by GitHub when this was written), tutti is licensed MIT OR Apache-2.0, and
+  the README is a front page with its reference in `docs/`.
+
 ## Phase 5 — Hardening & distribution
 
 Open in [PLAN.md](../PLAN.md#open-in-the-phase-items): the config-file bullet
