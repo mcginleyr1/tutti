@@ -781,8 +781,8 @@ enum Verdict {
     Ask,
     /// Kept from the taps alone: mode 2031 set or reset — the daemon tells a
     /// pane of light/dark changes itself (`PtyPane::set_colors`); the
-    /// keyboard protocols, xterm's modifyOtherKeys (`CSI > 4 ; n m`) and
-    /// kitty's push, pop and set (`CSI > u`, `CSI < u`, `CSI = u`), which the
+    /// keyboard protocols, xterm's modifyOtherKeys (`CSI > 4 ; n m`) and its
+    /// format (`CSI > 4 ; n f`), and kitty's push, pop and set (`CSI > u`, `CSI < u`, `CSI = u`), which the
     /// TUI encodes a pane's keys by, but a `pane attach` terminal that took
     /// either would encode the prefix where the detach cannot see it, and
     /// keep it on past the detach (nvim and vim ask for modifyOtherKeys level
@@ -808,9 +808,12 @@ fn verdict(seq: &[u8]) -> Verdict {
                 .fold(0u32, |n, b| n.saturating_mul(10) + u32::from(b - b'0'));
             match (private, end) {
                 (Some(b'?'), b'u') => Verdict::Ask,
-                (Some(_), b'u') | (Some(b'>'), b'm') if *end == b'u' || first == 4 => Verdict::Own,
+                (Some(_), b'u') | (Some(b'>'), b'm' | b'f') if *end == b'u' || first == 4 => {
+                    Verdict::Own
+                }
                 _ if params().eq(*b"?2031") && matches!(end, b'h' | b'l') => Verdict::Own,
-                (Some(_), b'm') | (_, b'c' | b'n' | b'p' | b'q' | b't') => Verdict::Ask,
+                (Some(_), b'm') | (Some(b'?'), b'g') => Verdict::Ask,
+                (_, b'c' | b'n' | b'p' | b'q' | b't') => Verdict::Ask,
                 _ => Verdict::Pass,
             }
         }
@@ -2704,7 +2707,7 @@ mod tests {
             \x1b[?996n\x1b[?2031$p\x1b[?2031h\x1b[?2031$p\x1b[?2031l\
             \x1b[>4;2m\x1b[>4;1m\x1b[>4;0m\x1b[>4m\
             \x1b]10;?\x07\x1b]11;?\x1b\\\x1b]12;?\x07\
-            \x1b[?6n\x1b[1c\x1b[00c\x1b[=c\x1b[6;1n\x1b[?2031;1h\x1b[\x076n\x1b[>4;2;1m\x1b[?4m\
+            \x1b[?6n\x1b[1c\x1b[00c\x1b[=c\x1b[6;1n\x1b[?2031;1h\x1b[\x076n\x1b[>4;2;1m\x1b[?4m\x1b[>4;1f\x1b[?4g\
             \x1b]11;?x\x07\x1b]110\x07\x1b]11;rgb:0/0/0\x07\x1b]0;t\x1b\\\
             \x1b]11;?\x1b[c\x1b]1\x1b[5nend\x1b\x1b[6n";
         let raw: &[u8] = b"abX\r\nL1\r\nL2\r\nL3\x1b[1c\x1b[=c\x1b[?2031;1h\
@@ -2723,7 +2726,7 @@ mod tests {
             "\x1b]10;rgb:6565/7b7b/8383\x07\x1b]11;rgb:fdfd/f6f6/e3e3\x1b\\",
             "\x1b]12;rgb:5858/6e6e/7575\x07\x1b[?3;3;1R",
             da1,
-            "\x1b[3;3R\x1b[3;3R\x1b[>4;2m\x1b]11;rgb:0000/0000/0000\x1b\\",
+            "\x1b[3;3R\x1b[3;3R\x1b[>4;2m\x1b[>4;1f\x1b]11;rgb:0000/0000/0000\x1b\\",
             da1,
             "\x1b[0n\x1b[3;6R",
         ]

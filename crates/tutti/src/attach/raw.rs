@@ -471,7 +471,7 @@ fn strip(drawing: Vec<u8>) -> Vec<u8> {
             .map_or(rest.len(), |i| at + i + 3);
         let seq = &rest[at..end];
         let own = (seq.starts_with("\x1b[=") || seq.starts_with("\x1b[>")) && seq.ends_with('u')
-            || seq.starts_with("\x1b[>4;") && seq.ends_with('m')
+            || seq.starts_with("\x1b[>4;") && (seq.ends_with('m') || seq.ends_with('f'))
             || seq.starts_with("\x1b[?2031");
         if !own {
             out.push_str(seq);
@@ -961,7 +961,7 @@ mod tests {
     #[test]
     fn a_redraw_keeps_this_terminals_own_modes() {
         let mut mirror = Terminal::new(4, 20, 0);
-        mirror.advance(b"\x1b[>5u\x1b[>4;2m\x1b[?2031h\x1b[?1049h\x1b[>1uvim");
+        mirror.advance(b"\x1b[>5u\x1b[>4;2m\x1b[>4;1f\x1b[?2031h\x1b[?1049h\x1b[>1uvim");
         let (rows, cols) = mirror.size();
         let bytes = redraw(&mirror);
         let mut terminal = Terminal::new(rows, cols, 0);
@@ -969,6 +969,7 @@ mod tests {
         terminal.advance(&bytes);
         assert_eq!(terminal.kitty_keyboard(), 0);
         assert_eq!(terminal.modes().modify_other_keys, 0);
+        assert_eq!(terminal.modes().format_other_keys, 0);
         assert!(terminal.modes().color_scheme_reports);
         assert!(terminal.contents().starts_with("vim"));
         let text = String::from_utf8(bytes).unwrap();
