@@ -3,15 +3,19 @@
 //! `done` and `working` — over every project as a tree in sidebar order: the
 //! project, its tabs and their panes, then each workspace nested under it with
 //! its own. Typing filters every tree row by a fuzzy subsequence match over the
-//! path it sits on and collapses the grouping into one flat ranked list. No
-//! rendering and no app state, so the grouping, matching, and ranking are
-//! unit-tested in isolation.
+//! path it sits on and collapses the grouping into one flat ranked list. The
+//! model is pure — no rendering, no app state — so the grouping, matching, and
+//! ranking are unit-tested in isolation; the overlay's own state (`Navigate`)
+//! and `App`'s keys and clicks over it follow.
 
 use std::cmp::Reverse;
 use std::collections::HashSet;
 
-use tutti_core::{AgentState, PaneId, TabId, WorkspaceId, WorkspaceView};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::Rect;
+use tutti_core::{AgentState, Frame as WireFrame, PaneId, TabId, WorkspaceId, WorkspaceView};
 
+use super::app::{App, Mode, contains};
 use super::sidebar::kind_label;
 
 /// The overview's state groups, in attention order — also the filter's
@@ -284,11 +288,155 @@ fn urgency(marker: Marker) -> usize {
         .unwrap_or(GROUPS.len())
 }
 
+/// The go-to overlay's state, which means something only in `Mode::Navigate`.
+#[derive(Default)]
+pub(super) struct Navigate {
+    /// The go-to overlay's filter text.
+    query: String,
+    /// The highlighted go-to row's identity, captured whenever the highlight
+    /// moves, so an agent changing state (which regroups the overview) or a
+    /// closing pane never slides it onto another row. `None` — on opening and
+    /// after every filter edit — highlights the first entry: the most urgent
+    /// agent, or the best match.
+    anchor: Option<Ident>,
+    /// The go-to overlay (the content area) from the last size sync, for mouse
+    /// hit-testing. `None` while not navigating.
+    pub(super) rect: Option<Rect>,
+}
+
+impl App {
+    /// Open the go-to overlay: no filter, the first entry highlighted.
+    pub(super) fn open_navigate(&mut self) {
+        self.mode = Mode::Navigate;
+        self.navigate.query.clear();
+        self.navigate.anchor = None;
+    }
+
+    /// Keys in the go-to overlay. Printable characters edit the filter and
+    /// backspace deletes, each edit re-highlighting the first entry (the best
+    /// match); `↑`/`↓` and `C-p`/`C-n` walk the highlight past the headers;
+    /// enter jumps to it and `esc` closes (esc is the back key throughout).
+    /// The prefix chord still reaches across, closing the overlay into prefix
+    /// mode.
+    pub(super) fn on_key_navigate(&mut self, key: KeyEvent) -> Vec<WireFrame> {
+        if self.enter_prefix(key) {
+            return Vec::new();
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Terminal;
+                self.status = None;
+            }
+            KeyCode::Enter => {
+                let (rows, selected) = self.navigate_rows();
+                if let Some(Row::Entry(e)) = selected.map(|i| &rows[i]) {
+                    return self.jump_to(e.tab, e.pane());
+                }
+            }
+            KeyCode::Down => self.navigate_step(true),
+            KeyCode::Up => self.navigate_step(false),
+            KeyCode::Char('n') if ctrl => self.navigate_step(true),
+            KeyCode::Char('p') if ctrl => self.navigate_step(false),
+            KeyCode::Backspace => {
+                self.navigate.query.pop();
+                self.navigate.anchor = None;
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.navigate.query.push(c);
+                self.navigate.anchor = None;
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    /// The go-to rows for the current view and filter, with the index of the
+    /// highlighted entry: the anchored row while it is still listed (a grouped
+    /// agent that left every group falls to its tree row), else the first
+    /// entry. `None` when nothing is listed.
+    pub fn navigate_rows(&self) -> (Vec<Row>, Option<usize>) {
+        let rows = build(&self.workspaces, self.active_tab, &self.navigate.query);
+        let at = |ident: Ident| {
+            rows.iter()
+                .position(|r| matches!(r, Row::Entry(e) if e.ident == ident))
+        };
+        let anchored = self.navigate.anchor.and_then(|anchor| match anchor {
+            Ident::Grouped(pane) => at(anchor).or_else(|| at(Ident::Pane(pane))),
+            _ => at(anchor),
+        });
+        let selected = anchored.or_else(|| rows.iter().position(|r| matches!(r, Row::Entry(_))));
+        (rows, selected)
+    }
+
+    /// Walk the go-to highlight to the next entry down (or up), past headers
+    /// and spacers; it stays put at either end.
+    pub(super) fn navigate_step(&mut self, down: bool) {
+        let (rows, selected) = self.navigate_rows();
+        let Some(at) = selected else {
+            return;
+        };
+        let is_entry = |r: &Row| matches!(r, Row::Entry(_));
+        let next = if down {
+            rows[at + 1..].iter().position(is_entry).map(|i| at + 1 + i)
+        } else {
+            rows[..at].iter().rposition(is_entry)
+        };
+        if let Some(Row::Entry(e)) = next.map(|i| &rows[i]) {
+            self.navigate.anchor = Some(e.ident);
+        }
+    }
+
+    /// A left-click in the go-to overlay jumps to the entry under the
+    /// pointer; the input row, a header or spacer, empty space, and anything
+    /// outside the list do nothing.
+    pub(super) fn navigate_click(&mut self, col: u16, row: u16) -> Vec<WireFrame> {
+        let Some(area) = self.navigate.rect else {
+            return Vec::new();
+        };
+        let (rows, selected) = self.navigate_rows();
+        let (list, first) = App::navigate_list(area, selected);
+        if !contains(list, col, row) {
+            return Vec::new();
+        }
+        match rows.get(first + (row - list.y) as usize) {
+            Some(Row::Entry(e)) => self.jump_to(e.tab, e.pane()),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The go-to overlay's list within the overlay `area` (the content
+    /// region): the rect its rows draw in, below the filter input and a spacer
+    /// row, and the first row shown — 0 until the highlight would leave the
+    /// window, then following it. The one geometry the renderer and the click
+    /// hit-test share, so a click lands on what is drawn.
+    pub fn navigate_list(area: Rect, selected: Option<usize>) -> (Rect, usize) {
+        let top = 2.min(area.height);
+        let list = Rect::new(area.x, area.y + top, area.width, area.height - top);
+        let first = selected
+            .unwrap_or(0)
+            .saturating_sub((list.height as usize).saturating_sub(1));
+        (list, first)
+    }
+
+    /// The go-to overlay's filter text, for the renderer.
+    pub fn navigate_query(&self) -> &str {
+        &self.navigate.query
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::attach::fixtures::{agent, leaf, pane, split, tab, workspace};
-    use tutti_core::Direction;
+    use crate::attach::app::control;
+    use crate::attach::fixtures::*;
+    use crate::config::Config;
+    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+    use tutti_core::{Direction, Request};
 
     /// `api` (tab 1, the active tab: a working claude and a plain zsh), its
     /// nested workspace `api-feat` (tab 3: a blocked claude) — listed first in
@@ -571,5 +719,208 @@ mod tests {
             Some(7),
             "the later clean run, not the first scattered match"
         );
+    }
+
+    /// `view_two_workspaces` with the go-to overlay open over a 100x24
+    /// terminal. Its rows: the needs-you header over pane 3, a spacer, the
+    /// working header over pane 2, a spacer, then the projects header over
+    /// api, tab 1, pane 1, web, tab 2, pane 2, pane 3.
+    fn navigate_fixture(config: Config) -> App {
+        let mut app = App::with_config(config);
+        attach_with(&mut app, view_two_workspaces());
+        app.on_key(ctrl('b'));
+        app.on_key(plain('g'));
+        app.sync_sizes(Rect::new(0, 0, 100, 24));
+        app
+    }
+
+    /// The identity of the highlighted go-to entry.
+    fn navigate_selected(app: &App) -> Option<Ident> {
+        let (rows, selected) = app.navigate_rows();
+        match selected.map(|i| &rows[i]) {
+            Some(Row::Entry(e)) => Some(e.ident),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn prefix_g_opens_the_go_to_in_both_presets_and_esc_or_the_prefix_leaves_it() {
+        for config in [Config::default(), vim_config()] {
+            let mut app = navigate_fixture(config);
+            assert_eq!(app.mode, Mode::Navigate);
+            assert_eq!(
+                navigate_selected(&app),
+                Some(Ident::Grouped(PaneId(3))),
+                "the blocked agent leads"
+            );
+            let out = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert_eq!(out, Vec::new());
+            assert_eq!(app.mode, Mode::Terminal);
+            assert_eq!(
+                (app.active_tab, app.focused),
+                (Some(TabId(1)), Some(PaneId(1))),
+                "closing moves nothing"
+            );
+        }
+        // The prefix reaches across, closing the overlay into prefix mode.
+        let mut app = navigate_fixture(Config::default());
+        app.on_key(ctrl('b'));
+        assert!(matches!(app.mode, Mode::Prefix(_)));
+        app.on_key(plain('w'));
+        assert_eq!(app.mode, Mode::Sidebar);
+    }
+
+    #[test]
+    fn typing_filters_the_go_to_and_backspace_edits_the_filter() {
+        let mut app = navigate_fixture(Config::default());
+        app.on_key(plain('j'));
+        app.on_key(plain('k'));
+        assert_eq!(app.navigate_query(), "jk", "j and k type; they do not move");
+        assert!(app.navigate_rows().0.is_empty(), "nothing matches j-k");
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        app.on_key(backspace);
+        app.on_key(backspace);
+        assert_eq!(app.navigate_query(), "");
+        app.on_key(plain('w'));
+        app.on_key(plain('e'));
+        let (rows, _) = app.navigate_rows();
+        assert!(
+            rows.iter().all(|r| matches!(r, Row::Entry(_))),
+            "filtering collapses the groups into one flat list"
+        );
+        assert_eq!(
+            navigate_selected(&app),
+            Some(Ident::Pane(PaneId(3))),
+            "the best match is highlighted — web's rows tie, its blocked agent first"
+        );
+    }
+
+    #[test]
+    fn arrows_and_ctrl_n_p_walk_the_go_to_highlight_past_the_headers() {
+        let mut app = navigate_fixture(Config::default());
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        app.on_key(down);
+        assert_eq!(
+            navigate_selected(&app),
+            Some(Ident::Grouped(PaneId(2))),
+            "past the spacer and the working header"
+        );
+        app.on_key(ctrl('n'));
+        assert_eq!(
+            navigate_selected(&app),
+            Some(Ident::Workspace(WorkspaceId(1))),
+            "on into the projects tree"
+        );
+        app.on_key(up);
+        assert_eq!(navigate_selected(&app), Some(Ident::Grouped(PaneId(2))));
+        app.on_key(ctrl('p'));
+        assert_eq!(navigate_selected(&app), Some(Ident::Grouped(PaneId(3))));
+        app.on_key(up);
+        assert_eq!(
+            navigate_selected(&app),
+            Some(Ident::Grouped(PaneId(3))),
+            "the first entry stays put"
+        );
+        for _ in 0..20 {
+            app.on_key(down);
+        }
+        assert_eq!(
+            navigate_selected(&app),
+            Some(Ident::Pane(PaneId(3))),
+            "and so does the last"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_go_to_pane_row_selects_its_tab_and_focuses_it() {
+        let mut app = navigate_fixture(Config::default());
+        app.focus_change(); // drain the attach-time focus report
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(out, vec![control(&Request::TabSelect { id: TabId(2) })]);
+        assert_eq!(app.mode, Mode::Terminal);
+        assert_eq!(
+            (app.active_tab, app.focused),
+            (Some(TabId(2)), Some(PaneId(3)))
+        );
+        assert_eq!(
+            app.focus_change(),
+            Some(control(&Request::PaneFocus {
+                pane: PaneId(3),
+                seen: false
+            })),
+            "the same focus report a sidebar jump sends"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_go_to_project_or_tab_row_selects_its_tab() {
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        // Five steps down is web's project row, six its tab: either selects
+        // tab 2, focusing the tab's own active pane.
+        for (steps, row) in [
+            (5, Ident::Workspace(WorkspaceId(2))),
+            (6, Ident::Tab(TabId(2))),
+        ] {
+            let mut app = navigate_fixture(Config::default());
+            for _ in 0..steps {
+                app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            }
+            assert_eq!(navigate_selected(&app), Some(row));
+            assert_eq!(
+                app.on_key(enter),
+                vec![control(&Request::TabSelect { id: TabId(2) })]
+            );
+            assert_eq!(
+                (app.mode, app.active_tab, app.focused),
+                (Mode::Terminal, Some(TabId(2)), Some(PaneId(2)))
+            );
+        }
+    }
+
+    #[test]
+    fn the_go_to_highlight_follows_its_agent_across_a_regroup() {
+        let mut app = navigate_fixture(Config::default());
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); // pane 2
+        state_changed(&mut app, PaneId(2), AgentState::Working, AgentState::Done);
+        assert_eq!(
+            navigate_selected(&app),
+            Some(Ident::Grouped(PaneId(2))),
+            "regrouped under done, still highlighted"
+        );
+        state_changed(&mut app, PaneId(2), AgentState::Done, AgentState::Idle);
+        assert_eq!(
+            navigate_selected(&app),
+            Some(Ident::Pane(PaneId(2))),
+            "out of every group, it falls to its own tree row"
+        );
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(out, vec![control(&Request::TabSelect { id: TabId(2) })]);
+        assert_eq!(app.focused, Some(PaneId(2)));
+    }
+
+    #[test]
+    fn clicking_a_go_to_row_jumps_and_the_wheel_walks_the_highlight() {
+        let mut app = navigate_fixture(Config::default());
+        app.on_mouse(MouseEventKind::ScrollDown, 50, 10);
+        assert_eq!(navigate_selected(&app), Some(Ident::Grouped(PaneId(2))));
+        app.on_mouse(MouseEventKind::ScrollUp, 50, 10);
+        assert_eq!(navigate_selected(&app), Some(Ident::Grouped(PaneId(3))));
+        // The overlay is the content area (rows 2-22); its list starts on row
+        // 4 below the input and a spacer: the needs-you header, pane 3, a
+        // spacer, the working header, pane 2, … pane 3's tree row on 17.
+        let click = MouseEventKind::Down(MouseButton::Left);
+        for (col, row) in [(50, 4), (50, 2), (50, 0), (5, 23), (50, 20)] {
+            // A header, the input, the app bar, the footer, past the last row.
+            assert_eq!(app.on_mouse(click, col, row), Vec::new());
+            assert_eq!(
+                app.mode,
+                Mode::Navigate,
+                "a click at {col},{row} does nothing"
+            );
+        }
+        let out = app.on_mouse(click, 50, 8);
+        assert_eq!(out, vec![control(&Request::TabSelect { id: TabId(2) })]);
+        assert_eq!((app.mode, app.focused), (Mode::Terminal, Some(PaneId(2))));
     }
 }
