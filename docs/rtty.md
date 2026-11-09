@@ -1,10 +1,21 @@
 # tutti and rtty
 
-How tutti's TUI behaves when it runs inside a pane of
-[rtty](https://github.com/mcginleyr1/rtty), a terminal with panes of its own:
-which keys it claims from rtty, and where a move or a resize past tutti's edge
-goes. The last section notes the other direction, rtty showing a tutti
-session's panes itself.
+How tutti works with [rtty](https://github.com/mcginleyr1/rtty), a terminal
+with panes of its own: which of the two is the front end for a tutti session,
+how tutti's TUI behaves when it runs inside an rtty pane (the keys it claims
+from rtty, and where a move or a resize past tutti's edge goes), and rtty
+showing a tutti session's panes itself.
+
+## The two front ends
+
+tutti's TUI is the primary front end for a tutti session. It is the complete
+one: the agent sidebar, the approvals popup, the notes and the diffs are
+there, and new agent features land there first.
+
+rtty's native tutti panes (the [last section](#rtty-showing-tutti-panes-itself))
+are a plain view of a session: rtty draws the panes, shows on the tab's pill
+when an agent is working or blocked, and notifies when an agent is blocked or
+done. No further agent UI is planned in rtty.
 
 ## tutti in rtty
 
@@ -64,8 +75,8 @@ split in the same way.
 
 ## rtty showing tutti panes itself
 
-The other direction exists too. rtty can show the panes of a tutti session as
-panes of its own, without tutti's TUI:
+rtty can show the panes of a tutti session as panes of its own, without
+tutti's TUI:
 
 - a window that is a whole session: `rtty --tutti <session>`, or `rtty cli
   tutti open` from a pane;
@@ -76,11 +87,16 @@ tutti's daemon keeps the programs, the session and the agents' states, and
 rtty draws, so rtty's own scrollback, search and selection work on the pane.
 tutti's TUI can stay attached beside it.
 
-rtty does not show tutti's chrome (the sidebar, approvals, notes, the changes
-panel) and does not reach sessions on other machines (`tutti --host`). It
-never starts a daemon: tutti's daemon must be running, and must speak wire
-revision 19.
+This is the plain view of [the two front ends](#the-two-front-ends): the
+tab's pill shows when an agent is working or blocked, and a notification says
+when one is blocked or done. tutti's agent chrome (the sidebar, approvals,
+notes, the changes panel) stays in the TUI and is not planned in rtty.
 
-This is rtty's feature and is documented with
-[rtty](https://github.com/mcginleyr1/rtty), under "tutti panes". The frames it
-uses on tutti's socket are in [transport-decision.md](transport-decision.md).
+rtty does not yet reach sessions on other machines (`tutti --host`). It never
+starts a daemon: tutti's daemon must be running, and must speak wire revision
+19.
+
+The feature is rtty's and is documented there, in
+[docs/tutti.md](https://github.com/mcginleyr1/rtty/blob/main/docs/tutti.md#tutti-panes).
+The frames it uses on tutti's socket are in
+[transport-decision.md](transport-decision.md).

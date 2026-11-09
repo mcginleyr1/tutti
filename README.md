@@ -156,6 +156,17 @@ tutti server stop                        # stop the daemon and every pane it own
 [docs/cli.md](docs/cli.md); orchestration, replies and `tutti watch` are in
 [docs/api.md](docs/api.md).
 
+## tutti and rtty
+
+[rtty](https://github.com/mcginleyr1/rtty) is a terminal with panes of its
+own. tutti's TUI is the primary front end for a tutti session. It is the
+complete one: the agent sidebar, the approvals popup, the notes and the diffs
+are there, and new agent features land there first. rtty's native tutti panes
+are a plain view of a session: rtty draws the panes, shows on the tab's pill
+when an agent is working or blocked, and notifies when an agent is blocked or
+done. No further agent UI is planned in rtty. The TUI also runs inside an
+rtty pane; both are in [docs/rtty.md](docs/rtty.md).
+
 ## Where things are documented
 
 When you change a feature, update the file that documents it.
@@ -178,7 +189,7 @@ When you change a feature, update the file that documents it.
 | [docs/terminal.md](docs/terminal.md) | what a pane shows, `pane attach`, terminal queries, key protocols, colours |
 | [docs/shell-integration.md](docs/shell-integration.md) | `tutti shell-init`: working directories and command marks |
 | [docs/editors.md](docs/editors.md) | Neovim and Emacs in panes, `tutti edit`; the plugins are in [editors/](editors/README.md) |
-| [docs/rtty.md](docs/rtty.md) | the TUI inside the rtty terminal; rtty showing tutti panes itself |
+| [docs/rtty.md](docs/rtty.md) | the two front ends; the TUI inside the rtty terminal; rtty showing tutti panes itself |
 | [docs/limitations.md](docs/limitations.md) | known limitations |
 | [docs/transport-decision.md](docs/transport-decision.md) | the wire protocol on the daemon's socket |
 | [PLAN.md](PLAN.md) | architecture, what is open, ground rules for implementation |
