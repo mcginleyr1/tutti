@@ -13,6 +13,7 @@ mod host;
 mod keys;
 mod launcher;
 mod layout;
+mod mouse;
 mod navigate;
 mod notes;
 mod peek;

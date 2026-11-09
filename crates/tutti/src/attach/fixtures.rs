@@ -9,7 +9,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use tutti_core::{
     AgentState, Direction, Event, FileStat, Frame as WireFrame, Layout, PaneId, PaneInfo, Request,
-    Response, SubagentInfo, TabId, TabView, Tagged, WorkspaceId, WorkspaceView,
+    Response, RestoreSummary, SubagentInfo, TabId, TabView, Tagged, WorkspaceId, WorkspaceView,
 };
 
 use super::app::App;
@@ -319,4 +319,23 @@ pub(crate) fn view_one_exited_agent() -> Vec<WorkspaceView> {
     view[0].tabs[0].panes[0].agent = Some("claude".into());
     view[0].tabs[0].panes[0].exited = Some(0);
     view
+}
+
+/// Attach to a daemon that has a saved layout to offer back.
+pub(crate) fn attach_offering(app: &mut App, workspaces: Vec<WorkspaceView>) {
+    app.handle_frame(WireFrame::Control(
+        serde_json::to_vec(&Response::Attached {
+            wire_rev: tutti_core::WIRE_REV,
+            session: "t".into(),
+            workspaces,
+            restorable: Some(RestoreSummary {
+                workspaces: 3,
+                panes: 7,
+                agents: 2,
+                saved_at: 0,
+            }),
+            notes: Vec::new(),
+        })
+        .unwrap(),
+    ));
 }
