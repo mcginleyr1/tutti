@@ -1363,8 +1363,22 @@ async fn pane_read_last_output_answers_the_marked_command() {
 /// the workspace's own directory.
 #[tokio::test]
 async fn a_split_starts_where_its_source_panes_shell_is() {
-    let server = TestServer::start();
-    let mut conn = server.connect().await;
+    // A split runs the daemon's `$SHELL`, so this daemon is one of its own
+    // with `/bin/sh` and an empty home: no startup file of whoever runs the
+    // test stands between the split and its answer.
+    let base = runtime_dir("split");
+    let mut daemon = std::process::Command::new(env!("CARGO_BIN_EXE_tutti-server"))
+        .args(["--session", "split", "--foreground"])
+        .env("XDG_RUNTIME_DIR", &base)
+        .env("XDG_STATE_HOME", base.join("state"))
+        .env("SHELL", "/bin/sh")
+        .env("HOME", &base)
+        .env_remove("ENV")
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let stop = StopOnDrop(base.join("tutti").join("split.sock"));
+    let mut conn = connect_when_up(&stop.0).await;
     let root = fresh_dir("split-cwd");
     let inside = root.join("sub");
     std::fs::create_dir_all(&inside).unwrap();
@@ -1400,7 +1414,7 @@ async fn a_split_starts_where_its_source_panes_shell_is() {
             })
             .await,
         );
-        // Ask the split's own shell, whatever `$SHELL` is, where it started.
+        // Ask the split's own shell where it started.
         let out = root.join(format!("pwd-{split}"));
         let sent = conn
             .request(Request::PaneSend {
@@ -1431,7 +1445,9 @@ async fn a_split_starts_where_its_source_panes_shell_is() {
         );
     }
 
-    server.stop().await;
+    drop(stop);
+    let _ = daemon.wait();
+    let _ = std::fs::remove_dir_all(&base);
     let _ = std::fs::remove_dir_all(&root);
 }
 
