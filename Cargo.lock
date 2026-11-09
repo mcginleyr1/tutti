@@ -1951,8 +1951,7 @@ dependencies = [
 name = "tutti-core"
 version = "0.1.0"
 dependencies = [
- "serde",
- "serde_json",
+ "tutti-wire",
 ]
 
 [[package]]
@@ -1970,6 +1969,14 @@ dependencies = [
  "tokio",
  "tutti-agents",
  "tutti-core",
+]
+
+[[package]]
+name = "tutti-wire"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

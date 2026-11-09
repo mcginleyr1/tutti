@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/tutti",
     "crates/tutti-core",
+    "crates/tutti-wire",
     "crates/tutti-server",
     "crates/tutti-agents",
 ]
@@ -29,6 +30,7 @@ base64 = "0.22"
 signal-hook = "0.3"
 libc = "0.2"
 tutti-core = { path = "crates/tutti-core" }
+tutti-wire = { path = "crates/tutti-wire" }
 tutti-server = { path = "crates/tutti-server" }
 tutti-agents = { path = "crates/tutti-agents" }
 

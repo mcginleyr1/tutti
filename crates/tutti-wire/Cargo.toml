@@ -1,0 +1,12 @@
+[package]
+name = "tutti-wire"
+version.workspace = true
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+description = "What a client speaks to tutti's daemon: where it listens, the frames, the requests, responses and events, and their revision"
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
