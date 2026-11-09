@@ -17,6 +17,7 @@ mod navigate;
 mod notes;
 mod peek;
 mod printed;
+mod prompt;
 pub mod raw;
 mod reader;
 mod render;

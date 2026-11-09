@@ -1384,7 +1384,7 @@ fn mode_label(mode: Mode) -> Option<&'static str> {
         Mode::Sidebar => Some("SIDEBAR"),
         Mode::DiffFiles => Some("CHANGES"),
         Mode::SidebarPrompt => Some("ADD PROJECT"),
-        Mode::SidebarWorkspaceName | Mode::SidebarWorkspaceDest => Some("WORKSPACE"),
+        Mode::SidebarWorkspaceName(_) | Mode::SidebarWorkspaceDest(_) => Some("WORKSPACE"),
         Mode::Launcher | Mode::LauncherCommand => Some("RUN"),
         Mode::Integrations => Some("SETUP"),
         Mode::Peek(_) => Some("ANSWER"),
