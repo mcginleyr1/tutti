@@ -324,9 +324,14 @@ pub struct App {
     sidebar_anchor: Option<(sidebar::EntryIdent, WorkspaceId)>,
     /// The directory being typed while in `SidebarPrompt` mode (add project).
     sidebar_prompt: String,
-    /// Directory completions for the current `sidebar_prompt`, recomputed on
-    /// every edit so the render path only reads them (never touches the fs).
+    /// Directory completions and the input they answer. Every edit asks the
+    /// host again on a thread — under `--host` that is an ssh round trip — and
+    /// the list shown meanwhile answers an older input, which Tab and Enter
+    /// never take.
     prompt_completions: Vec<String>,
+    completions_for: String,
+    /// The input to ask about next, taken by the event loop.
+    completion_ask: Option<String>,
     /// The highlighted completion row; `Tab` fills it, the arrows move it.
     prompt_selected: usize,
     /// The launcher rows, built when the launcher opens so render and dispatch
@@ -567,6 +572,8 @@ impl App {
             sidebar_anchor: None,
             sidebar_prompt: String::new(),
             prompt_completions: Vec::new(),
+            completions_for: String::new(),
+            completion_ask: None,
             prompt_selected: 0,
             launcher: Vec::new(),
             launcher_selected: 0,
@@ -3080,7 +3087,7 @@ impl App {
     /// Tab-complete the prompt to the highlighted directory, appending `/` so the
     /// next component's listing opens immediately. A no-op with no completions.
     fn complete_selection(&mut self) {
-        let Some(name) = self.prompt_completions.get(self.prompt_selected).cloned() else {
+        let Some(name) = self.highlighted().cloned() else {
             return;
         };
         let dir_part = match self.sidebar_prompt.rfind('/') {
@@ -3092,19 +3099,41 @@ impl App {
         self.refresh_completions();
     }
 
-    /// Recompute the directory completions for the current input on the
-    /// daemon's machine. Kept off the render path: every edit calls this, and
-    /// the renderer only reads the cached result.
+    /// Ask for the directory completions of the current input on the daemon's
+    /// machine, off the event loop: every edit calls this.
     fn refresh_completions(&mut self) {
-        self.prompt_completions = self.host.complete_dirs(&self.sidebar_prompt);
+        self.completion_ask = Some(self.sidebar_prompt.clone());
+    }
+
+    pub fn take_completion_ask(&mut self) -> Option<String> {
+        self.completion_ask.take()
+    }
+
+    /// Land the completions found for `input`, unless the prompt has moved
+    /// on: only the latest input's answer is ever shown.
+    pub fn completed(&mut self, input: String, found: Vec<String>) {
+        if input != self.sidebar_prompt {
+            return;
+        }
+        self.prompt_completions = found;
+        self.completions_for = input;
         if self.prompt_selected >= self.prompt_completions.len() {
             self.prompt_selected = 0;
         }
     }
 
+    /// The highlighted completion, if the list answers what is typed now.
+    fn highlighted(&self) -> Option<&String> {
+        (self.completions_for == self.sidebar_prompt)
+            .then(|| self.prompt_completions.get(self.prompt_selected))
+            .flatten()
+    }
+
     fn clear_prompt(&mut self) {
         self.sidebar_prompt.clear();
         self.prompt_completions.clear();
+        self.completions_for.clear();
+        self.completion_ask = None;
         self.prompt_selected = 0;
     }
 
@@ -3126,7 +3155,7 @@ impl App {
             if exists {
                 return Ok(Some(dir));
             }
-            if self.prompt_completions.get(self.prompt_selected).is_none() {
+            if self.highlighted().is_none() {
                 return Ok(None);
             }
             self.complete_selection();
@@ -11160,6 +11189,14 @@ mod tests {
         root
     }
 
+    /// Answer the prompt's completion asks, as the event loop's thread would.
+    fn complete(app: &mut App) {
+        while let Some(input) = app.take_completion_ask() {
+            let found = app.host().complete_dirs(&input);
+            app.completed(input, found);
+        }
+    }
+
     #[test]
     fn prompt_prefill_uses_the_common_parent_of_the_workspaces() {
         let home = Path::new("/Users/me");
@@ -11192,6 +11229,7 @@ mod tests {
         let mut app = App::new();
         // An absolute prefix keeps the test independent of the real HOME/cwd.
         app.start_first_run_prompt(format!("{}/a", root.display()));
+        complete(&mut app);
         assert_eq!(app.prompt_completions(), &["alpha".to_string()]);
 
         let out = app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -11210,6 +11248,7 @@ mod tests {
         let root = temp_tree(&["alpha", "beta"]);
         let mut app = App::new();
         app.start_first_run_prompt(format!("{}/", root.display()));
+        complete(&mut app);
         // Two matches; move the highlight onto the second.
         app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.prompt_selected(), 1);
@@ -11236,6 +11275,7 @@ mod tests {
         let root = temp_tree(&["the-librarian"]);
         let mut app = App::new();
         app.start_first_run_prompt(format!("{}/the", root.display()));
+        complete(&mut app);
         assert_eq!(app.prompt_completions(), &["the-librarian".to_string()]);
 
         let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -11255,6 +11295,7 @@ mod tests {
         let root = temp_tree(&["alpha"]);
         let mut app = App::new();
         app.start_first_run_prompt(format!("{}/zzz", root.display()));
+        complete(&mut app);
         assert!(app.prompt_completions().is_empty());
 
         let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -11275,6 +11316,7 @@ mod tests {
         let root = temp_tree(&["alpha", "beta", "gamma"]);
         let mut app = App::new();
         app.start_first_run_prompt(format!("{}/", root.display()));
+        complete(&mut app);
         assert_eq!(app.prompt_completions().len(), 3);
         assert_eq!(app.prompt_selected(), 0);
 
@@ -11288,8 +11330,45 @@ mod tests {
 
         // Typing filters and snaps the highlight back to the best match.
         app.on_key(plain('g'));
+        complete(&mut app);
         assert_eq!(app.prompt_selected(), 0);
         assert_eq!(app.prompt_completions(), &["gamma".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn completions_for_an_older_input_are_shown_but_never_taken() {
+        let root = temp_tree(&["alpha", "beta"]);
+        let mut app = App::new();
+        app.start_first_run_prompt(format!("{}/", root.display()));
+        let asked = app.take_completion_ask().unwrap();
+        // Typing outpaces the answer, which then lands for nothing.
+        app.on_key(plain('a'));
+        let found = app.host().complete_dirs(&asked);
+        app.completed(asked, found);
+        assert!(
+            app.prompt_completions().is_empty(),
+            "an answer for an older input is dropped"
+        );
+
+        complete(&mut app);
+        assert_eq!(app.prompt_completions(), &["alpha".to_string()]);
+        app.on_key(plain('x'));
+        assert_eq!(
+            app.prompt_completions(),
+            &["alpha".to_string()],
+            "the older list stays up until the new answer lands"
+        );
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            app.sidebar_prompt(),
+            format!("{}/ax", root.display()),
+            "Tab never fills from a list for an older input"
+        );
+        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(out.is_empty(), "nor does Enter mount its highlight");
+        assert_eq!(app.mode, Mode::SidebarPrompt);
 
         let _ = std::fs::remove_dir_all(&root);
     }

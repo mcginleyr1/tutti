@@ -1007,13 +1007,13 @@ In order; each lands its TUI path in the same wave as its verbs.
    deploy's prompt file and its write-back, and `--view` reached the proxy.
 
 **Open** — the headline items; each phase item above keeps its own list:
-- under `--host`, the TUI's short host questions run on its event loop:
-  directory completion on every keystroke, and expanding a directory, the
-  jj check, the launcher, setup plans and a deploy's argv. Each is one ssh
-  round trip, so a slow link stutters typing and a stalled one freezes the
-  TUI for up to the 10 s answer timeout (the issue fetch, write-back and
-  editor already run on threads). Completion should ask off the loop and
-  keep only the answer for the latest input;
+- under `--host`, the TUI's one-shot host questions still run on its event
+  loop: expanding a submitted directory, the jj check, the launcher, setup
+  plans and a deploy's argv. Each is one ssh round trip after a key that
+  waits on its answer anyway, but a stalled link freezes the TUI for up to
+  the 10 s answer timeout. Directory completion, asked on every keystroke,
+  runs on a thread (2026-11-09), as the issue fetch, write-back and editor
+  do;
 - tracker write-back stops at the deploy: tutti never closes an issue
   (GitHub's own `Fixes #N` can), and command sources stay read-only;
 - under a terminal without kitty's keyboard protocol, a pane that asked for

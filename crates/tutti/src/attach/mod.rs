@@ -289,6 +289,8 @@ fn event_loop(
     // write-back to its tracker.
     let (rtty_tx, rtty_rx) = std::sync::mpsc::channel();
     let (written_tx, written_rx) = std::sync::mpsc::channel::<(String, Result<(), String>)>();
+    // And a prompt's directory completions, asked on every edit.
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
 
     loop {
         if tty.stop.swap(false, Ordering::SeqCst) {
@@ -335,6 +337,10 @@ fn event_loop(
         }
         while let Ok((id, written)) = written_rx.try_recv() {
             app.written_back(&id, written);
+            dirty = true;
+        }
+        while let Ok((input, found)) = completed_rx.try_recv() {
+            app.completed(input, found);
             dirty = true;
         }
 
@@ -490,6 +496,15 @@ fn event_loop(
             std::thread::spawn(move || {
                 let written = job.run(&host);
                 let _ = tx.send((job.id, written));
+            });
+        }
+        // And a prompt's completions: under `--host` each is an ssh round
+        // trip, which must never stall typing.
+        if let Some(input) = app.take_completion_ask() {
+            let (tx, host) = (completed_tx.clone(), app.host().clone());
+            std::thread::spawn(move || {
+                let found = host.complete_dirs(&input);
+                let _ = tx.send((input, found));
             });
         }
 

@@ -3698,6 +3698,9 @@ mod tests {
         let mut app = App::new();
         // An absolute prefix keeps the listing independent of HOME/cwd.
         app.start_first_run_prompt(format!("{}/a", root.display()));
+        let input = app.take_completion_ask().unwrap();
+        let found = app.host().complete_dirs(&input);
+        app.completed(input, found);
 
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
