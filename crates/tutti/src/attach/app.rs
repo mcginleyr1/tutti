@@ -22,7 +22,7 @@ use tutti_core::{
 };
 
 use super::approval::Approvals;
-use super::changes::{Changes, DIFF_PANEL_WIDTH, diff_pager_cmd};
+use super::changes::{Changes, DIFF_PANEL_WIDTH};
 use super::deploy::Issues;
 use super::follow::{FollowUp, FollowUps};
 use super::keys;
@@ -35,17 +35,10 @@ use super::prompt::Prompt;
 use super::reader::{Decoder, Input, Report};
 use super::rtty::{Handoff, Rtty};
 use super::setup::Setup;
-use super::sidebar::{self, Sidebar, SidebarEntry};
-use crate::config::{
-    self, Action, Config, PrefixAction, RESIZE_DELTA, SidebarAction, SidebarVisibility,
-};
+use super::sidebar::{self, SIDEBAR_WIDTH, SidebarState};
+use crate::config::{self, Action, Config, PrefixAction, RESIZE_DELTA};
 use crate::host::{Host, Info, Local};
 use crate::issues;
-
-/// The sidebar's fixed column width, and the minimum total width below which it
-/// is suppressed entirely so panes keep usable room.
-const SIDEBAR_WIDTH: u16 = 30;
-const SIDEBAR_MIN_TOTAL: u16 = 80;
 
 /// Rows the top chrome header claims: the full-width app bar plus the dim rule
 /// beneath it. The content region begins below them.
@@ -248,13 +241,7 @@ pub struct App {
     /// Set when a non-focused pane finished or blocked; the event loop rings the
     /// terminal bell once and clears it.
     bell: bool,
-    /// The highlighted sidebar entry while the sidebar is focused.
-    pub(super) sidebar_selected: usize,
-    /// The selected row's identity and owning project, captured whenever the
-    /// selection moves. `set_view` re-anchors the cursor through this after
-    /// every layout change — same row, else its project's row, else a clamped
-    /// index — so a kill or state change never silently retargets the cursor.
-    sidebar_anchor: Option<(sidebar::EntryIdent, WorkspaceId)>,
+    pub(super) sidebar: SidebarState,
     pub(super) prompt: Prompt,
     pub(super) launcher: Launcher,
     /// The daemon's machine: every directory, agent, conversation and install
@@ -265,8 +252,6 @@ pub struct App {
     /// Its login shell, which the launcher's shell and command rows run.
     pub(super) shell: String,
     pub(super) setup: Setup,
-    /// The sidebar column from the last size sync, for mouse hit-testing.
-    pub(super) sidebar_rect: Option<Rect>,
     pub(super) changes: Changes,
     /// The top tab-bar row from the last size sync, for mouse hit-testing.
     tab_bar_rect: Option<Rect>,
@@ -304,10 +289,6 @@ pub struct App {
     /// The app bar's unread-notes chip from the last size sync, for mouse
     /// hit-testing.
     notes_chip_rect: Option<Rect>,
-    /// Whether the projects / agents / waiting sidebar sections are collapsed to
-    /// their header. Toggled by clicking a section header.
-    collapsed_projects: bool,
-    collapsed_waiting: bool,
     /// Escape sequences queued for the real terminal (bell + OSC 9 re-emit), so
     /// the user's own terminal raises a desktop notification. Drained by the
     /// event loop.
@@ -371,15 +352,13 @@ impl App {
             focus_reported: None,
             rtty: None,
             bell: false,
-            sidebar_selected: 0,
-            sidebar_anchor: None,
+            sidebar: SidebarState::default(),
             prompt: Prompt::default(),
             launcher: Launcher::default(),
             host,
             home: info.home,
             shell: info.shell,
             setup: Setup::default(),
-            sidebar_rect: None,
             changes: Changes::default(),
             tab_bar_rect: None,
             peek: Peek::default(),
@@ -397,8 +376,6 @@ impl App {
             notes_panel: NotesPanel::default(),
             notes_chip_rect: None,
             terminal_out: Vec::new(),
-            collapsed_projects: false,
-            collapsed_waiting: false,
             mouse_capture: config.mouse,
             selection: None,
             config,
@@ -985,18 +962,7 @@ impl App {
         if !self.active_tab.is_some_and(|t| self.tab_exists(t)) {
             self.active_tab = self.flagged_active_tab().or_else(|| self.first_tab());
         }
-        // Re-anchor the cursor by identity, never by position: the same row if
-        // it survived, else its project's row (a killed agent falls to its
-        // project), else the old index clamped into range.
-        let sidebar = self.sidebar();
-        let resolved = self.sidebar_anchor.and_then(|(ident, project)| {
-            sidebar
-                .index_of(ident)
-                .or_else(|| sidebar.index_of(sidebar::EntryIdent::Workspace(project)))
-        });
-        self.sidebar_selected =
-            resolved.unwrap_or(self.sidebar_selected.min(sidebar.len().saturating_sub(1)));
-        self.sidebar_anchor = anchor_at(&sidebar, self.sidebar_selected);
+        self.reanchor_sidebar();
         self.refocus();
         // Keep the changes-panel cursor in range (after refocus: the turns
         // follow the focused pane); a panel emptied by a refresh (everything
@@ -1354,50 +1320,6 @@ impl App {
         }
     }
 
-    /// Resolve the sidebar workspace-kill confirm: `y` kills, `D` kills and
-    /// discards the fork's checkout, any other key cancels. Either way the
-    /// sidebar keeps focus; the view refresh drops a killed row.
-    fn on_key_confirm_workspace(&mut self, key: KeyEvent, id: WorkspaceId) -> Vec<WireFrame> {
-        let discard = match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => false,
-            KeyCode::Char('D') => true,
-            _ => {
-                self.mode = Mode::Sidebar;
-                self.status = None;
-                return Vec::new();
-            }
-        };
-        self.mode = Mode::Sidebar;
-        self.status = None;
-        // The target may have died between the confirm opening and the answer;
-        // re-resolve it rather than sending a kill for a stale id.
-        if !self.workspaces.iter().any(|w| w.id == id) {
-            self.set_status("that workspace is already gone".into());
-            return Vec::new();
-        }
-        vec![control(&Request::WorkspaceKill { id, discard })]
-    }
-
-    /// Resolve the sidebar agent-kill confirm: `y` kills the agent's pane, any
-    /// other key cancels. Either way the sidebar keeps focus; the view refresh
-    /// drops the killed row.
-    fn on_key_confirm_agent(&mut self, key: KeyEvent, pane: PaneId) -> Vec<WireFrame> {
-        self.mode = Mode::Sidebar;
-        self.status = None;
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                // Re-resolve the pane before killing: it may have exited or
-                // been killed by another client since the confirm opened.
-                if self.tab_of_pane(pane).is_none() {
-                    self.set_status("that agent is already gone".into());
-                    return Vec::new();
-                }
-                vec![control(&Request::PaneKill { pane })]
-            }
-            _ => Vec::new(),
-        }
-    }
-
     fn on_key_scroll(&mut self, key: KeyEvent, pane: PaneId) -> Vec<WireFrame> {
         let page = self.inner_rows(pane).max(1) as usize;
         let current = self.panes.get(&pane).and_then(|s| s.scroll).unwrap_or(0);
@@ -1412,18 +1334,6 @@ impl App {
         self.set_scroll(pane, Some(offset));
         self.set_status(format!("scroll -{offset} (q to exit)"));
         vec![control(&Request::PaneScroll { pane, offset })]
-    }
-
-    // ---- sidebar --------------------------------------------------------
-
-    /// The sidebar as it currently renders — the project tree then the waiting
-    /// queue — for the renderer, hit-testing, and navigation. Carries the
-    /// client's collapse state so the frame headers and row math agree.
-    pub fn sidebar(&self) -> Sidebar {
-        let mut sidebar = sidebar::build(&self.workspaces, self.active_tab, self.home.as_deref());
-        sidebar.projects_collapsed = self.collapsed_projects;
-        sidebar.waiting_collapsed = self.collapsed_waiting;
-        sidebar
     }
 
     /// The agent-state census across every project — the app bar's chips.
@@ -1452,55 +1362,6 @@ impl App {
                 .filter(|p| self.workspaces.iter().any(|o| o.id == *p))
                 .unwrap_or(ws.id),
         )
-    }
-
-    /// Whether the sidebar currently holds keyboard focus. The sidebar-raised
-    /// confirms and overlays count: while one is open the agents filter and
-    /// the selection highlight must not shift under the question being asked.
-    pub fn sidebar_focused(&self) -> bool {
-        matches!(
-            self.mode,
-            Mode::Sidebar
-                | Mode::SidebarPrompt
-                | Mode::SidebarWorkspaceName(_)
-                | Mode::SidebarWorkspaceDest(_)
-                | Mode::ConfirmKillWorkspace(_)
-                | Mode::ConfirmKillAgent(_)
-                | Mode::ConfirmMerge(_)
-                | Mode::ConfirmCleanup(_)
-                | Mode::Peek(_)
-                | Mode::Reply(_)
-        ) || (matches!(self.mode, Mode::Approval(_)) && self.approvals.back == Mode::Sidebar)
-    }
-
-    pub fn sidebar_selected(&self) -> usize {
-        self.sidebar_selected
-    }
-
-    /// Whether the sidebar should be drawn for a content area of `total_width`.
-    /// A focused sidebar always shows (so the sidebar key can reveal a hidden
-    /// one); otherwise the config mode decides — `auto` showing it once the
-    /// session is worth surfacing. Always suppressed below the width floor.
-    fn sidebar_shown(&self, total_width: u16) -> bool {
-        if total_width < SIDEBAR_MIN_TOTAL {
-            return false;
-        }
-        if self.sidebar_focused() {
-            return true;
-        }
-        match self.config.sidebar {
-            SidebarVisibility::On => true,
-            SidebarVisibility::Off => false,
-            SidebarVisibility::Auto => self.workspaces.len() > 1 || self.has_agent_pane(),
-        }
-    }
-
-    fn has_agent_pane(&self) -> bool {
-        self.workspaces
-            .iter()
-            .flat_map(|w| &w.tabs)
-            .flat_map(|t| &t.panes)
-            .any(|p| p.agent.is_some())
     }
 
     /// Split a content area into the sidebar column (when shown), the pane
@@ -1622,118 +1483,6 @@ impl App {
         (text, Rect::new(x, app_bar.y, width, 1))
     }
 
-    /// Focus the sidebar, revealing it if hidden. Refuses when the terminal is
-    /// too narrow to render it, so focus is never trapped on an invisible panel.
-    fn focus_sidebar(&mut self) {
-        if self.last_content_width < SIDEBAR_MIN_TOTAL {
-            self.set_status("terminal too narrow for the sidebar".into());
-            return;
-        }
-        self.mode = Mode::Sidebar;
-        // Land on the active project's row — where the user actually is — not
-        // unconditionally on row 0.
-        let sidebar = self.sidebar();
-        let idx = self
-            .active_project()
-            .and_then(|p| sidebar.index_of(sidebar::EntryIdent::Workspace(p)))
-            .unwrap_or(0);
-        self.select_entry(&sidebar, idx);
-        self.status = None;
-    }
-
-    /// Move the sidebar cursor to `idx`, capturing its identity anchor so the
-    /// next layout change re-finds the same row rather than the same position.
-    fn select_entry(&mut self, sidebar: &Sidebar, idx: usize) {
-        self.sidebar_selected = idx;
-        self.sidebar_anchor = anchor_at(sidebar, idx);
-    }
-
-    /// Keys while the sidebar is focused, dispatched through
-    /// `config::SIDEBAR_TABLE` — the table the help overlay and the bottom-bar
-    /// hint render, so what they say is what the keys do.
-    fn on_key_sidebar(&mut self, key: KeyEvent) -> Vec<WireFrame> {
-        if self.enter_prefix(key) {
-            return Vec::new();
-        }
-        // The directional direct bindings cross the sidebar↔pane edge:
-        // focus_right returns to the pane area (keeping its focus), focus_left
-        // goes past tutti's left edge as the pane's left edge would with no
-        // sidebar — on to rtty, else the previous tab — and in rtty, up and
-        // down go on to rtty's pane that way.
-        match self.config.keys.action_for(key) {
-            Some(Action::FocusRight) => {
-                self.mode = Mode::Terminal;
-                self.status = None;
-                return Vec::new();
-            }
-            Some(Action::FocusLeft) => {
-                self.mode = Mode::Terminal;
-                self.status = None;
-                return self.past_edge(FocusDir::Left);
-            }
-            Some(Action::FocusUp) if self.rtty.is_some() => return self.past_edge(FocusDir::Up),
-            Some(Action::FocusDown) if self.rtty.is_some() => {
-                return self.past_edge(FocusDir::Down);
-            }
-            _ => {}
-        }
-        let Some(action) = config::panel_action(config::SIDEBAR_TABLE, key) else {
-            return Vec::new();
-        };
-        let sidebar = self.sidebar();
-        match action {
-            SidebarAction::Down => {
-                self.select_entry(&sidebar, next_visible(&sidebar, self.sidebar_selected));
-                Vec::new()
-            }
-            SidebarAction::Up => {
-                self.select_entry(&sidebar, prev_visible(&sidebar, self.sidebar_selected));
-                Vec::new()
-            }
-            SidebarAction::Jump => self.jump_to_selected(&sidebar),
-            SidebarAction::Peek => self.open_peek(&sidebar),
-            SidebarAction::NewAgent => self.new_agent_in_selected(&sidebar),
-            SidebarAction::AddProject => {
-                self.open_project_prompt();
-                Vec::new()
-            }
-            SidebarAction::Diff => self.open_diff_pane(&sidebar),
-            SidebarAction::NewWorkspace => {
-                self.open_workspace_prompt(&sidebar);
-                Vec::new()
-            }
-            SidebarAction::Merge => {
-                self.confirm_merge(&sidebar);
-                Vec::new()
-            }
-            SidebarAction::Update => self.update_selected(&sidebar),
-            SidebarAction::Kill => {
-                self.confirm_kill_selected(&sidebar);
-                Vec::new()
-            }
-            SidebarAction::Back => {
-                self.mode = Mode::Terminal;
-                self.status = None;
-                Vec::new()
-            }
-        }
-    }
-
-    /// Jump to the selected entry and hand focus back to the pane: a workspace
-    /// selects its tab; an agent selects its tab and focuses its pane (the
-    /// `PaneFocus` follows from `focus_change`).
-    fn jump_to_selected(&mut self, sidebar: &Sidebar) -> Vec<WireFrame> {
-        match sidebar.entries.get(self.sidebar_selected) {
-            Some(SidebarEntry::Workspace(w)) => self.jump_to(w.jump_tab, None),
-            Some(SidebarEntry::Agent(a)) => self.jump_to(a.tab, Some(a.pane)),
-            None => {
-                self.mode = Mode::Terminal;
-                self.status = None;
-                Vec::new()
-            }
-        }
-    }
-
     /// Select `tab` and hand the keys back to the panes, focusing `pane` —
     /// else a focus already in that tab, else the tab's own active pane. The
     /// one jump the sidebar's rows and the go-to overlay share, so both send
@@ -1747,29 +1496,6 @@ impl App {
             Some(pane) => self.focused = Some(pane),
             None => self.refocus(),
         }
-        vec![control(&Request::TabSelect { id: tab })]
-    }
-
-    /// Jump to the selected entry's workspace — its active-or-first tab, the
-    /// same routing a workspace-row Enter uses — and open the launcher armed to
-    /// start the choice in a fresh tab there: an agent is a tab-sized thing, so
-    /// it never splits whatever that tab already holds. Splits stay behind the
-    /// explicit prefix verbs. An agent row targets the workspace that owns it.
-    fn new_agent_in_selected(&mut self, sidebar: &Sidebar) -> Vec<WireFrame> {
-        let Some((workspace, tab, name, dir)) = self.selected_workspace(sidebar).and_then(|w| {
-            w.tabs
-                .iter()
-                .find(|t| t.active)
-                .or_else(|| w.tabs.first())
-                .map(|t| (w.id, t.id, w.name.clone(), w.dir.clone()))
-        }) else {
-            return Vec::new();
-        };
-        self.active_tab = Some(tab);
-        self.zoom = false;
-        self.refocus();
-        self.open_launcher(false, Some(name), Some(&dir));
-        self.launcher.new_tab = Some(workspace);
         vec![control(&Request::TabSelect { id: tab })]
     }
 
@@ -1790,43 +1516,6 @@ impl App {
         self.zoom = false;
         self.refocus();
         true
-    }
-
-    /// Open the selected workspace's jj diff in an ephemeral pane — a real
-    /// terminal running `jj diff | less -R`, removed the moment `less` quits. A
-    /// workspace entry targets its own tab; an agent entry targets the tab it
-    /// lives in. A non-jj workspace shows a transient error instead of spawning,
-    /// since jj is the required VCS for workspace diffs.
-    fn open_diff_pane(&mut self, sidebar: &Sidebar) -> Vec<WireFrame> {
-        let tab = match sidebar.entries.get(self.sidebar_selected) {
-            Some(SidebarEntry::Workspace(w)) => w.jump_tab,
-            Some(SidebarEntry::Agent(a)) => a.tab,
-            None => return Vec::new(),
-        };
-        let Some(dir) = self.workspace_dir_of_tab(tab) else {
-            return Vec::new();
-        };
-        match self.host.is_jj(&dir) {
-            Ok(true) => {}
-            Ok(false) => {
-                self.set_status(format!("not a jj workspace: {}", dir.display()));
-                return Vec::new();
-            }
-            Err(e) => {
-                self.set_status(format!("error: {e:#}"));
-                return Vec::new();
-            }
-        }
-        self.mode = Mode::Terminal;
-        self.status = None;
-        self.active_tab = Some(tab);
-        self.zoom = false;
-        vec![control(&Request::PaneRun {
-            tab: Some(tab),
-            cmd: diff_pager_cmd(None),
-            ephemeral: true,
-            sandbox: None,
-        })]
     }
 
     /// Answer the restore offer: `enter` brings the saved layout back, `d`
@@ -1859,27 +1548,6 @@ impl App {
         vec![control(&Request::SessionRestore { discard })]
     }
 
-    /// The directory of the workspace owning `tab`, from the current view.
-    fn workspace_dir_of_tab(&self, tab: TabId) -> Option<PathBuf> {
-        self.workspaces
-            .iter()
-            .find(|w| w.tabs.iter().any(|t| t.id == tab))
-            .map(|w| w.dir.clone())
-    }
-
-    /// The `WorkspaceView` behind the selected entry — a workspace row's own, or
-    /// the workspace owning a selected agent row's tab. `None` when nothing is
-    /// selected or its workspace has left the view.
-    pub(super) fn selected_workspace(&self, sidebar: &Sidebar) -> Option<&WorkspaceView> {
-        match sidebar.entries.get(self.sidebar_selected)? {
-            SidebarEntry::Workspace(w) => self.workspaces.iter().find(|ws| ws.id == w.id),
-            SidebarEntry::Agent(a) => self
-                .workspaces
-                .iter()
-                .find(|w| w.tabs.iter().any(|t| t.id == a.tab)),
-        }
-    }
-
     /// The tab whose layout holds `pane`, if the current view carries it.
     pub(super) fn tab_of_pane(&self, pane: PaneId) -> Option<TabId> {
         self.workspaces
@@ -1887,110 +1555,6 @@ impl App {
             .flat_map(|w| &w.tabs)
             .find(|t| t.layout.as_ref().is_some_and(|l| l.panes().contains(&pane)))
             .map(|t| t.id)
-    }
-
-    /// Confirm merging the selected child workspace back into its project's trunk.
-    /// Only a nested (jj-workspace) row can merge; a top-level project flashes a
-    /// note. The bookmark is resolved server-side on `y`, so the confirm names a
-    /// generic `trunk`. A no-op with nothing selected.
-    fn confirm_merge(&mut self, sidebar: &Sidebar) {
-        let Some((id, name, is_child)) = self.selected_workspace(sidebar).map(|w| {
-            let is_child = w
-                .parent
-                .is_some_and(|p| self.workspaces.iter().any(|o| o.id == p));
-            (w.id, w.name.clone(), is_child)
-        }) else {
-            return;
-        };
-        if !is_child {
-            self.set_status("only workspaces merge".into());
-            return;
-        }
-        self.mode = Mode::ConfirmMerge(id);
-        self.set_status(format!("merge {name} into trunk? y/N"));
-    }
-
-    /// Update the selected entry's workspace when its working copy is stale:
-    /// dispatch `WorkspaceUpdate` and flash `updating <name>…`. A non-stale row
-    /// just flashes `not stale`; the server broadcasts the cleared tag.
-    fn update_selected(&mut self, sidebar: &Sidebar) -> Vec<WireFrame> {
-        let Some((id, name, stale)) = self
-            .selected_workspace(sidebar)
-            .map(|w| (w.id, w.name.clone(), w.stale))
-        else {
-            return Vec::new();
-        };
-        if !stale {
-            self.set_status("not stale".into());
-            return Vec::new();
-        }
-        self.set_status(format!("updating {name}…"));
-        vec![control(&Request::WorkspaceUpdate { id })]
-    }
-
-    /// Open the kill confirm for the selected row. An agent row targets only its
-    /// own pane — never the workspace around it, so a stray `x` on an agent can't
-    /// take a whole project down; a workspace row targets the workspace (with the
-    /// discard option). A no-op with nothing selected.
-    fn confirm_kill_selected(&mut self, sidebar: &Sidebar) {
-        match sidebar.entries.get(self.sidebar_selected) {
-            Some(SidebarEntry::Agent(a)) => {
-                self.mode = Mode::ConfirmKillAgent(a.pane);
-                self.set_status(format!("kill {} · {}? y/N", a.kind, a.project_name));
-            }
-            Some(SidebarEntry::Workspace(_)) => self.confirm_kill_workspace(sidebar),
-            None => self.set_status("nothing selected".into()),
-        }
-    }
-
-    /// Open the kill confirm for the selected workspace row in the transient
-    /// line. `y` kills it, `D` also discards a fork's checkout (the server
-    /// refuses discard for a workspace it did not fork, surfacing that error),
-    /// any other key cancels. A no-op with nothing selected.
-    fn confirm_kill_workspace(&mut self, sidebar: &Sidebar) {
-        let Some((id, name)) = self
-            .selected_workspace(sidebar)
-            .map(|w| (w.id, w.name.clone()))
-        else {
-            self.set_status("nothing selected".into());
-            return;
-        };
-        self.mode = Mode::ConfirmKillWorkspace(id);
-        self.set_status(format!("kill {name}? y · D discard checkout · N cancel"));
-    }
-
-    /// Resolve the merge confirm: `y` dispatches the `WorkspaceMerge` (letting the
-    /// server pick the trunk bookmark and push if a remote exists) and arms the
-    /// cleanup confirm the `Merged` reply will raise; any other key cancels.
-    fn on_key_confirm_merge(&mut self, key: KeyEvent, id: WorkspaceId) -> Vec<WireFrame> {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                self.mode = Mode::Sidebar;
-                let name = self.workspace_name(id).unwrap_or_default();
-                self.set_status(format!("merging {name}…"));
-                let merge = Request::WorkspaceMerge { id, push: true };
-                vec![self.follow(&merge, FollowUp::Merge(id))]
-            }
-            _ => {
-                self.mode = Mode::Sidebar;
-                self.status = None;
-                Vec::new()
-            }
-        }
-    }
-
-    /// Resolve the post-merge cleanup confirm: `y` discards the merged workspace
-    /// (`WorkspaceKill --discard`), any other key keeps it on disk. Either way the
-    /// sidebar keeps focus.
-    fn on_key_confirm_cleanup(&mut self, key: KeyEvent, id: WorkspaceId) -> Vec<WireFrame> {
-        self.mode = Mode::Sidebar;
-        self.status = None;
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                vec![control(&Request::WorkspaceKill { id, discard: true })]
-            }
-            _ => Vec::new(),
-        }
     }
 
     // ---- mouse ----------------------------------------------------------
@@ -2349,10 +1913,6 @@ impl App {
         (rows.min(grid_rows).max(1), cols.min(grid_cols).max(1))
     }
 
-    fn in_sidebar(&self, col: u16, row: u16) -> bool {
-        self.sidebar_rect.is_some_and(|r| contains(r, col, row))
-    }
-
     /// The app-bar tab segments, left to right: one ` <n> <name> ` per tab
     /// (carrying its id, and a badge for the most urgent state among its
     /// agents — blocked, then done, then working; none for a tab of shells)
@@ -2410,61 +1970,6 @@ impl App {
             x += w + 1; // step past the segment and its separator column
         }
         Vec::new()
-    }
-
-    /// A left-click inside the sidebar: focus it, then act on what the row is — a
-    /// section header toggles that section's collapse, an entry selects and jumps
-    /// to it, and a border/blank just focuses.
-    fn sidebar_click(&mut self, row: u16) -> Vec<WireFrame> {
-        if self.sidebar_prompt_active() {
-            return Vec::new();
-        }
-        if !self.sidebar_focused() {
-            self.mode = Mode::Sidebar;
-            self.sidebar_selected = 0;
-            self.sidebar_anchor = None;
-        }
-        let Some(rect) = self.sidebar_rect else {
-            return Vec::new();
-        };
-        let sidebar = self.sidebar();
-        let rel = row.saturating_sub(rect.y) as usize;
-        if let Some(section) = sidebar.header_at_row(rel) {
-            self.toggle_section(section);
-            return Vec::new();
-        }
-        match sidebar.entry_at_row(rel) {
-            Some(idx) => {
-                self.select_entry(&sidebar, idx);
-                self.jump_to_selected(&sidebar)
-            }
-            None => Vec::new(),
-        }
-    }
-
-    /// A right-click inside the sidebar: focus it, select the row under the
-    /// pointer, and peek at it — the mouse twin of `p`.
-    fn sidebar_peek_click(&mut self, row: u16) {
-        let Some(rect) = self.sidebar_rect else {
-            return;
-        };
-        if self.sidebar_prompt_active() {
-            return;
-        }
-        let sidebar = self.sidebar();
-        if let Some(idx) = sidebar.entry_at_row(row.saturating_sub(rect.y) as usize) {
-            self.mode = Mode::Sidebar;
-            self.select_entry(&sidebar, idx);
-            self.open_peek(&sidebar);
-        }
-    }
-
-    /// Collapse or expand a sidebar section (projects, agents, or waiting).
-    fn toggle_section(&mut self, section: sidebar::Section) {
-        match section {
-            sidebar::Section::Projects => self.collapsed_projects = !self.collapsed_projects,
-            sidebar::Section::Waiting => self.collapsed_waiting = !self.collapsed_waiting,
-        }
     }
 
     /// A wheel tick over a pane, routed by what the pane's program declared: a
@@ -2558,7 +2063,7 @@ impl App {
         let (app_bar, _rule) = App::header_rects(area);
         self.last_content_width = content.width;
         let (sidebar_rect, panes, diff_panel_rect) = self.regions(content);
-        self.sidebar_rect = sidebar_rect;
+        self.sidebar.rect = sidebar_rect;
         self.changes.rect = diff_panel_rect;
         self.tab_bar_rect = Some(self.tab_bar_rect(app_bar));
         self.notes_chip_rect = Some(self.notes_chip(app_bar).1);
@@ -2777,7 +2282,7 @@ impl App {
             return Vec::new();
         }
         match dir {
-            FocusDir::Left if self.sidebar_rect.is_some() => {
+            FocusDir::Left if self.sidebar.rect.is_some() => {
                 self.focus_sidebar();
                 Vec::new()
             }
@@ -2895,7 +2400,7 @@ impl App {
         self.all_tabs().first().map(|t| t.id)
     }
 
-    fn pane_at(&self, col: u16, row: u16) -> Option<PaneId> {
+    pub(super) fn pane_at(&self, col: u16, row: u16) -> Option<PaneId> {
         self.rects
             .iter()
             .find(|(_, r)| contains(*r, col, row))
@@ -3085,49 +2590,6 @@ fn base64(input: &[u8]) -> String {
     out
 }
 
-/// The next selectable entry at or after `from`, skipping entries whose section
-/// is collapsed; stays on `from` when nothing visible lies ahead. With no
-/// section collapsed this is a plain `from + 1` clamped to the last entry.
-/// The identity anchor for entry `idx`: its ident plus the project it belongs
-/// to (a workspace row's own project, an agent row's owner) — the fallback
-/// target when the row itself vanishes.
-fn anchor_at(sidebar: &Sidebar, idx: usize) -> Option<(sidebar::EntryIdent, WorkspaceId)> {
-    let ident = sidebar.ident_at(idx)?;
-    let project = match sidebar.entries.get(idx)? {
-        SidebarEntry::Workspace(w) => w.project,
-        SidebarEntry::Agent(a) => a.project,
-    };
-    Some((ident, project))
-}
-
-fn next_visible(sidebar: &Sidebar, from: usize) -> usize {
-    if sidebar.is_empty() {
-        return 0;
-    }
-    let last = sidebar.len() - 1;
-    let mut i = from;
-    while i < last {
-        i += 1;
-        if sidebar.is_visible(i) {
-            return i;
-        }
-    }
-    from
-}
-
-/// The previous visible entry before `from`, skipping collapsed sections; stays
-/// on `from` when nothing visible lies behind.
-fn prev_visible(sidebar: &Sidebar, from: usize) -> usize {
-    let mut i = from;
-    while i > 0 {
-        i -= 1;
-        if sidebar.is_visible(i) {
-            return i;
-        }
-    }
-    from
-}
-
 fn tab_infos(w: &WorkspaceView) -> impl Iterator<Item = &PaneInfo> {
     w.tabs.iter().flat_map(|t| &t.panes)
 }
@@ -3167,8 +2629,9 @@ fn placeholder_info(pane: PaneId) -> PaneInfo {
 mod tests {
     use super::*;
     use crate::attach::fixtures::*;
+    use crate::attach::sidebar::SidebarEntry;
     use ratatui::crossterm::event::KeyModifiers;
-    use tutti_core::{DIFF_RANGE, PaneData};
+    use tutti_core::PaneData;
 
     #[test]
     fn attach_sets_focus_and_session() {
@@ -4042,36 +3505,6 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_ctrl_l_returns_to_the_pane_area_keeping_focus() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces());
-        focus_sidebar(&mut app);
-        let focused = app.focused;
-        let out = app.on_key(ctrl('l'));
-        assert!(out.is_empty(), "returning to the pane emits nothing");
-        assert_eq!(app.mode, Mode::Terminal);
-        assert_eq!(
-            app.focused, focused,
-            "the previously-focused pane is restored"
-        );
-    }
-
-    #[test]
-    fn sidebar_ctrl_h_wraps_to_the_previous_tab() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_tabs());
-        focus_sidebar(&mut app);
-        let out = app.on_key(ctrl('h'));
-        assert_eq!(
-            out,
-            vec![control(&Request::TabSelect { id: TabId(2) })],
-            "ctrl+h in the sidebar keeps the old previous-tab behaviour"
-        );
-        assert_eq!(app.mode, Mode::Terminal);
-        assert_eq!(app.active_tab, Some(TabId(2)));
-    }
-
-    #[test]
     fn ctrl_j_at_a_vertical_edge_is_a_noop() {
         let mut app = App::new();
         attach_with(&mut app, view_two_tabs());
@@ -4268,8 +3701,6 @@ mod tests {
         assert!(app.should_quit);
     }
 
-    // ---- sidebar --------------------------------------------------------
-
     #[test]
     fn a_scripted_focus_jumps_across_workspaces() {
         let mut app = App::new();
@@ -4295,689 +3726,6 @@ mod tests {
             app.focused,
             Some(PaneId(3)),
             "an unknown pane moves nothing"
-        );
-    }
-
-    #[test]
-    fn sidebar_visibility_follows_config_and_width() {
-        fn auto() -> App {
-            App::with_config(Config::parse("sidebar = \"auto\"\n").unwrap())
-        }
-
-        // auto: hidden for a single plain workspace.
-        let mut app = auto();
-        attached(&mut app);
-        let (sb, panes, _) = app.split_content(Rect::new(0, 0, 100, 24));
-        assert!(sb.is_none(), "auto hides an agentless single workspace");
-        assert_eq!(panes.width, 100);
-
-        // auto: shown with multiple workspaces, panes shrink by the column width.
-        let mut app = auto();
-        attach_with(&mut app, view_two_workspaces());
-        let (sb, panes, _) = app.split_content(Rect::new(0, 0, 100, 24));
-        assert_eq!(sb.unwrap().width, 30);
-        assert_eq!(panes.width, 70);
-        assert_eq!(panes.x, 30);
-
-        // width floor suppresses it regardless of contents.
-        let (sb, panes, _) = app.split_content(Rect::new(0, 0, 79, 24));
-        assert!(sb.is_none(), "below the width floor the sidebar is hidden");
-        assert_eq!(panes.width, 79);
-
-        // on (the default): shown even for a plain single workspace.
-        let mut app = App::new();
-        attached(&mut app);
-        assert!(
-            app.split_content(Rect::new(0, 0, 100, 24)).0.is_some(),
-            "on is the default and shows for a single workspace"
-        );
-
-        // off: hidden even with multiple workspaces.
-        let mut app = App::with_config(Config::parse("sidebar = \"off\"\n").unwrap());
-        attach_with(&mut app, view_two_workspaces());
-        assert!(app.split_content(Rect::new(0, 0, 100, 24)).0.is_none());
-    }
-
-    #[test]
-    fn sidebar_key_focuses_and_selection_crosses_the_section_boundary() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces());
-        focus_sidebar(&mut app);
-        assert_eq!(app.mode, Mode::Sidebar);
-        assert_eq!(app.sidebar_selected(), 0);
-
-        app.on_key(plain('j')); // second workspace — the filter follows it
-        assert_eq!(app.sidebar_selected(), 1);
-        app.on_key(plain('j')); // crosses into the agents section
-        assert_eq!(app.sidebar_selected(), 2);
-        assert!(matches!(app.sidebar().entries[2], SidebarEntry::Agent(_)));
-        app.on_key(plain('j')); // last agent
-        assert_eq!(app.sidebar_selected(), 3);
-        app.on_key(plain('j')); // crosses into the waiting section
-        assert_eq!(app.sidebar_selected(), 4);
-        app.on_key(plain('j')); // clamped at the end
-        assert_eq!(app.sidebar_selected(), 4);
-        app.on_key(plain('k')); // back up into the agents
-        assert_eq!(app.sidebar_selected(), 3);
-
-        // esc unfocuses; the pane keeps its own focus.
-        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::Terminal);
-    }
-
-    #[test]
-    fn every_projects_agents_stay_visible_regardless_of_the_cursor() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces());
-        focus_sidebar(&mut app);
-        // web's agents hang under web in the tree even while the cursor sits on
-        // api — there is no cursor-driven filter to reshuffle the rows.
-        let before = app.sidebar();
-        assert_eq!(before.tree_count, 4, "api, web, and web's two agents");
-        app.on_key(plain('j')); // highlight web
-        assert_eq!(
-            app.sidebar().entries,
-            before.entries,
-            "moving the cursor never changes the tree's shape"
-        );
-    }
-
-    #[test]
-    fn a_waiting_row_cursor_stays_in_the_queue_across_moves() {
-        let mut view = view_two_workspaces();
-        view.push(workspace(
-            3,
-            "zed",
-            None,
-            vec![tab(
-                3,
-                "3",
-                false,
-                leaf(4),
-                vec![agent(4, "claude", AgentState::Blocked)],
-            )],
-        ));
-        let mut app = App::new();
-        attach_with(&mut app, view);
-        focus_sidebar(&mut app);
-        // Tree: api, web, web's agents 2+3, zed, zed's agent 4; waiting:
-        // blocked panes 3 then 4.
-        let sidebar = app.sidebar();
-        assert_eq!(sidebar.tree_count, 6);
-        for _ in 0..6 {
-            app.on_key(plain('j'));
-        }
-        let SidebarEntry::Agent(a) = &sidebar.entries[app.sidebar_selected()] else {
-            panic!("expected the first waiting row");
-        };
-        assert_eq!(
-            a.pane,
-            PaneId(3),
-            "blocked panes lead the queue in pane order"
-        );
-    }
-
-    #[test]
-    fn enter_on_a_workspace_selects_its_tab() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces());
-        focus_sidebar(&mut app);
-        app.on_key(plain('j')); // second workspace, jumps to tab 2
-        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(out, vec![control(&Request::TabSelect { id: TabId(2) })]);
-        assert_eq!(app.mode, Mode::Terminal);
-        assert_eq!(app.active_tab, Some(TabId(2)));
-    }
-
-    #[test]
-    fn enter_on_an_agent_selects_its_tab_and_focuses_its_pane() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces());
-        focus_sidebar(&mut app);
-        app.on_key(plain('j'));
-        app.on_key(plain('j')); // web's first agent in pane order: pane 2, tab 2
-        let out = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(out, vec![control(&Request::TabSelect { id: TabId(2) })]);
-        assert_eq!(app.active_tab, Some(TabId(2)));
-        assert_eq!(app.focused, Some(PaneId(2)));
-        // The PaneFocus follows from the focus-change the event loop drains.
-        assert_eq!(
-            app.focus_change(),
-            Some(control(&Request::PaneFocus {
-                pane: PaneId(2),
-                seen: false
-            })),
-        );
-    }
-
-    #[test]
-    fn n_on_a_workspace_row_jumps_to_it_and_opens_the_launcher_for_it() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces());
-        focus_sidebar(&mut app);
-        app.on_key(plain('j')); // select the second workspace (web, tab 2)
-        let out = app.on_key(plain('n'));
-        assert_eq!(
-            out,
-            vec![control(&Request::TabSelect { id: TabId(2) })],
-            "n jumps to the selected workspace's tab, the same routing as Enter"
-        );
-        assert_eq!(app.active_tab, Some(TabId(2)));
-        assert_eq!(
-            app.mode,
-            Mode::Launcher,
-            "and lands in the launcher so the next choice runs there"
-        );
-        assert_eq!(
-            app.launcher_title(),
-            " run in web ",
-            "the launcher title names the workspace it will run in"
-        );
-    }
-
-    #[test]
-    fn n_on_an_agent_row_targets_the_workspace_that_owns_it() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces());
-        focus_sidebar(&mut app);
-        app.on_key(plain('j'));
-        app.on_key(plain('j')); // first agent row, living in web's tab 2
-        assert!(matches!(app.sidebar().entries[2], SidebarEntry::Agent(_)));
-        let out = app.on_key(plain('n'));
-        assert_eq!(
-            out,
-            vec![control(&Request::TabSelect { id: TabId(2) })],
-            "an agent row targets the tab of the workspace that owns it"
-        );
-        assert_eq!(app.active_tab, Some(TabId(2)));
-        assert_eq!(app.mode, Mode::Launcher);
-        assert_eq!(
-            app.launcher_title(),
-            " run in web ",
-            "and names that owning workspace in the launcher title"
-        );
-    }
-
-    #[test]
-    fn d_on_a_jj_workspace_opens_an_ephemeral_diff_pane() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        // A workspace dir that is a jj repo (holds a `.jj`).
-        let dir = std::env::temp_dir().join(format!("tutti-app-jj-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(dir.join(".jj")).unwrap();
-
-        let mut app = App::new();
-        let mut ws = workspace(
-            1,
-            "api",
-            Some("main"),
-            vec![tab(1, "1", true, leaf(1), vec![shell(1)])],
-        );
-        ws.dir = dir.clone();
-        attach_with(&mut app, vec![ws]);
-        focus_sidebar(&mut app);
-
-        let out = app.on_key(plain('d'));
-        assert_eq!(
-            out,
-            vec![control(&Request::PaneRun {
-                tab: Some(TabId(1)),
-                cmd: diff_pager_cmd(None),
-                ephemeral: true,
-                sandbox: None,
-            })],
-            "d spawns the ephemeral jj-diff pane in the workspace's tab"
-        );
-        assert!(
-            diff_pager_cmd(None)[2].contains(DIFF_RANGE),
-            "the pager diffs against trunk, not the bare working copy"
-        );
-        assert_eq!(app.mode, Mode::Terminal);
-        assert_eq!(app.active_tab, Some(TabId(1)));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn d_on_a_non_jj_workspace_shows_a_transient_error() {
-        let mut app = App::new();
-        // view_two_workspaces roots workspaces at `/tmp/w`, which is not a jj repo.
-        attach_with(&mut app, view_two_workspaces());
-        focus_sidebar(&mut app);
-        let out = app.on_key(plain('d'));
-        assert!(out.is_empty(), "no pane is spawned for a non-jj workspace");
-        assert!(
-            app.transient()
-                .is_some_and(|t| t.contains("not a jj workspace")),
-            "a transient error names the missing jj repo"
-        );
-        assert_eq!(app.mode, Mode::Sidebar, "focus stays on the sidebar");
-    }
-
-    // ---- guided workspace create / merge / update stale -----------------
-
-    #[test]
-    fn f_is_gone_from_the_sidebar_dispatch() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces());
-        focus_sidebar(&mut app);
-        let out = app.on_key(plain('f'));
-        assert!(out.is_empty(), "f sends nothing");
-        assert_eq!(app.mode, Mode::Sidebar, "f no longer opens any prompt");
-    }
-
-    #[test]
-    fn m_on_a_child_workspace_confirms_merges_then_offers_cleanup() {
-        let mut app = App::new();
-        let mut view = view_two_workspaces();
-        view[1].parent = Some(WorkspaceId(1)); // web (id 2) nested under api
-        attach_with(&mut app, view);
-        focus_sidebar(&mut app);
-        app.on_key(plain('j')); // select the nested child (web, id 2)
-
-        // `m` raises the confirm, sending nothing yet.
-        let out = app.on_key(plain('m'));
-        assert!(out.is_empty(), "m opens the confirm, sending nothing");
-        assert_eq!(app.mode, Mode::ConfirmMerge(WorkspaceId(2)));
-        assert!(
-            app.transient().is_some_and(|t| t.contains("merge web")),
-            "the confirm names the workspace"
-        );
-
-        // `y` dispatches the merge (push requested; the server owns the bookmark),
-        // tagged so its reply alone completes the follow-up.
-        let out = app.on_key(plain('y'));
-        assert_eq!(
-            out,
-            vec![tagged(
-                &Request::WorkspaceMerge {
-                    id: WorkspaceId(2),
-                    push: true,
-                },
-                1
-            )],
-            "y sends the merge request"
-        );
-
-        // The Merged reply flashes the outcome and raises the cleanup confirm.
-        app.handle_response(
-            Some(1),
-            Response::Merged {
-                pushed: false,
-                bookmark: "main".into(),
-            },
-        );
-        assert_eq!(app.mode, Mode::ConfirmCleanup(WorkspaceId(2)));
-        assert!(
-            app.transient()
-                .is_some_and(|t| t.contains("merged into main") && t.contains("clean up")),
-            "the transient reports the merge and offers cleanup"
-        );
-
-        // `y` discards the now-merged workspace.
-        let out = app.on_key(plain('y'));
-        assert_eq!(
-            out,
-            vec![control(&Request::WorkspaceKill {
-                id: WorkspaceId(2),
-                discard: true,
-            })],
-            "cleanup discards the merged workspace"
-        );
-        assert_eq!(app.mode, Mode::Sidebar);
-    }
-
-    #[test]
-    fn merged_reply_notes_a_push_when_it_happened() {
-        let mut app = App::new();
-        let mut view = view_two_workspaces();
-        view[1].parent = Some(WorkspaceId(1));
-        attach_with(&mut app, view);
-        focus_sidebar(&mut app);
-        app.on_key(plain('j'));
-        app.on_key(plain('m'));
-        app.on_key(plain('y'));
-        app.handle_response(
-            Some(1),
-            Response::Merged {
-                pushed: true,
-                bookmark: "main".into(),
-            },
-        );
-        assert!(
-            app.transient().is_some_and(|t| t.contains("and pushed")),
-            "a pushed merge says so"
-        );
-    }
-
-    #[test]
-    fn merge_cleanup_declined_keeps_the_workspace() {
-        let mut app = App::new();
-        let mut view = view_two_workspaces();
-        view[1].parent = Some(WorkspaceId(1));
-        attach_with(&mut app, view);
-        focus_sidebar(&mut app);
-        app.on_key(plain('j'));
-        app.on_key(plain('m'));
-        app.on_key(plain('y'));
-        app.handle_response(
-            Some(1),
-            Response::Merged {
-                pushed: false,
-                bookmark: "main".into(),
-            },
-        );
-        // `n` at the cleanup confirm keeps the workspace on disk.
-        let out = app.on_key(plain('n'));
-        assert!(out.is_empty(), "declining cleanup sends nothing");
-        assert_eq!(app.mode, Mode::Sidebar);
-    }
-
-    #[test]
-    fn m_on_a_project_row_flashes_only_workspaces_merge() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces()); // both top-level projects
-        focus_sidebar(&mut app); // selection rests on api (a project, no parent)
-        let out = app.on_key(plain('m'));
-        assert!(out.is_empty(), "a project row merges nothing");
-        assert_eq!(app.mode, Mode::Sidebar, "no confirm is raised");
-        assert!(
-            app.transient()
-                .is_some_and(|t| t.contains("only workspaces merge")),
-            "a project row flashes the guidance"
-        );
-    }
-
-    #[test]
-    fn merge_confirm_cancels_on_any_other_key() {
-        let mut app = App::new();
-        let mut view = view_two_workspaces();
-        view[1].parent = Some(WorkspaceId(1));
-        attach_with(&mut app, view);
-        focus_sidebar(&mut app);
-        app.on_key(plain('j'));
-        app.on_key(plain('m'));
-        let out = app.on_key(plain('n'));
-        assert!(out.is_empty(), "n merges nothing");
-        assert_eq!(app.mode, Mode::Sidebar);
-    }
-
-    #[test]
-    fn u_on_a_stale_workspace_row_emits_a_workspace_update() {
-        let mut app = App::new();
-        let mut view = view_two_workspaces();
-        view[0].stale = true; // the api workspace's working copy is stale
-        attach_with(&mut app, view);
-        focus_sidebar(&mut app);
-
-        let out = app.on_key(plain('u'));
-        assert_eq!(
-            out,
-            vec![control(&Request::WorkspaceUpdate { id: WorkspaceId(1) })],
-            "u updates the selected stale workspace"
-        );
-        assert!(
-            app.transient().is_some_and(|t| t.contains("updating")),
-            "the transient names the workspace being updated"
-        );
-    }
-
-    #[test]
-    fn u_on_a_non_stale_row_flashes_and_emits_nothing() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces()); // none stale
-        focus_sidebar(&mut app);
-        let out = app.on_key(plain('u'));
-        assert!(out.is_empty(), "a healthy workspace sends no update");
-        assert!(
-            app.transient().is_some_and(|t| t.contains("not stale")),
-            "a non-stale row flashes `not stale`"
-        );
-    }
-
-    #[test]
-    fn x_on_a_workspace_row_opens_the_kill_confirm() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces());
-        focus_sidebar(&mut app); // selection rests on the api workspace (id 1)
-        let out = app.on_key(plain('x'));
-        assert!(out.is_empty(), "x opens the confirm, sending nothing yet");
-        assert_eq!(app.mode, Mode::ConfirmKillWorkspace(WorkspaceId(1)));
-        assert!(
-            app.transient().is_some_and(|t| t.contains("kill api?")),
-            "the confirm names the workspace and its options"
-        );
-    }
-
-    #[test]
-    fn kill_confirm_y_emits_a_plain_workspace_kill() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces());
-        focus_sidebar(&mut app);
-        app.on_key(plain('x'));
-        let out = app.on_key(plain('y'));
-        assert_eq!(
-            out,
-            vec![control(&Request::WorkspaceKill {
-                id: WorkspaceId(1),
-                discard: false,
-            })],
-            "y kills the workspace without discarding its checkout"
-        );
-        assert_eq!(app.mode, Mode::Sidebar, "focus returns to the sidebar");
-    }
-
-    #[test]
-    fn kill_confirm_shift_d_discards_the_forks_checkout() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces());
-        focus_sidebar(&mut app);
-        app.on_key(plain('x'));
-        let out = app.on_key(plain('D'));
-        assert_eq!(
-            out,
-            vec![control(&Request::WorkspaceKill {
-                id: WorkspaceId(1),
-                discard: true,
-            })],
-            "D kills and discards; the server refuses discard for a non-fork"
-        );
-    }
-
-    #[test]
-    fn kill_confirm_cancels_on_esc_or_any_other_key() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces());
-        focus_sidebar(&mut app);
-
-        app.on_key(plain('x'));
-        let out = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(out.is_empty(), "esc kills nothing");
-        assert_eq!(app.mode, Mode::Sidebar);
-
-        app.on_key(plain('x'));
-        let out = app.on_key(plain('n'));
-        assert!(out.is_empty(), "any non-y/D key cancels");
-        assert_eq!(app.mode, Mode::Sidebar);
-    }
-
-    #[test]
-    fn x_on_an_agent_row_kills_only_that_pane() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces());
-        focus_sidebar(&mut app);
-        app.on_key(plain('j')); // web workspace
-        app.on_key(plain('j')); // web's first agent (pane 2, tab 2 → workspace 2)
-        app.on_key(plain('x'));
-        assert_eq!(
-            app.mode,
-            Mode::ConfirmKillAgent(PaneId(2)),
-            "x on an agent row confirms killing the pane, never the workspace"
-        );
-        assert!(
-            app.transient()
-                .is_some_and(|t| t.contains("kill claude · web?")),
-            "the confirm names the agent and its project"
-        );
-        let out = app.on_key(plain('y'));
-        assert_eq!(
-            out,
-            vec![control(&Request::PaneKill { pane: PaneId(2) })],
-            "y kills the agent's pane only"
-        );
-        assert_eq!(app.mode, Mode::Sidebar, "focus returns to the sidebar");
-    }
-
-    #[test]
-    fn agent_kill_confirm_cancels_on_any_other_key() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces());
-        focus_sidebar(&mut app);
-        app.on_key(plain('j'));
-        app.on_key(plain('j'));
-        app.on_key(plain('x'));
-        let out = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(out.is_empty(), "esc kills nothing");
-        assert_eq!(app.mode, Mode::Sidebar);
-    }
-
-    #[test]
-    fn selection_follows_the_row_identity_across_a_view_change() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces());
-        focus_sidebar(&mut app);
-        app.on_key(plain('j')); // the web workspace row
-
-        // A new workspace lands ahead of web in the view; the cursor must stay
-        // on web, not on whatever now occupies its old index.
-        let mut view = view_two_workspaces();
-        view.insert(
-            1,
-            workspace(
-                3,
-                "mid",
-                None,
-                vec![tab(3, "3", false, leaf(9), vec![shell(9)])],
-            ),
-        );
-        app.handle_frame(WireFrame::Control(
-            serde_json::to_vec(&Event::LayoutChanged { workspaces: view }).unwrap(),
-        ));
-        let sidebar = app.sidebar();
-        let SidebarEntry::Workspace(w) = &sidebar.entries[app.sidebar_selected()] else {
-            panic!("expected a workspace row");
-        };
-        assert_eq!(w.name, "web", "the cursor followed the row's identity");
-    }
-
-    #[test]
-    fn a_killed_agents_cursor_falls_to_its_project_row() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces());
-        focus_sidebar(&mut app);
-        app.on_key(plain('j')); // web row
-        app.on_key(plain('j')); // web's first agent (pane 2)
-
-        // The agent dies: its row vanishes and the sidebar reshuffles. The
-        // cursor falls to the agent's project row — never to the unrelated row
-        // that now sits at the old index.
-        let mut view = view_two_workspaces();
-        view[1].tabs[0].layout = Some(leaf(3));
-        view[1].tabs[0].panes = vec![agent(3, "claude", AgentState::Blocked)];
-        app.handle_frame(WireFrame::Control(
-            serde_json::to_vec(&Event::LayoutChanged { workspaces: view }).unwrap(),
-        ));
-        let sidebar = app.sidebar();
-        let SidebarEntry::Workspace(w) = &sidebar.entries[app.sidebar_selected()] else {
-            panic!("expected the project row, got an agent row");
-        };
-        assert_eq!(
-            w.name, "web",
-            "the killed agent's cursor lands on its project"
-        );
-    }
-
-    #[test]
-    fn confirm_y_after_the_workspace_vanished_sends_nothing() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces());
-        focus_sidebar(&mut app);
-        app.on_key(plain('x')); // confirm kill of api (id 1)
-
-        // api dies under the confirm (another client, a crash) — y must not
-        // fire a kill at the stale id.
-        let mut view = view_two_workspaces();
-        view.remove(0);
-        app.handle_frame(WireFrame::Control(
-            serde_json::to_vec(&Event::LayoutChanged { workspaces: view }).unwrap(),
-        ));
-        let out = app.on_key(plain('y'));
-        assert!(out.is_empty(), "no kill is sent for a vanished workspace");
-        assert!(
-            app.transient().is_some_and(|t| t.contains("gone")),
-            "the miss is reported, not swallowed"
-        );
-    }
-
-    #[test]
-    fn the_sidebar_holds_steady_during_a_kill_confirm() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces());
-        focus_sidebar(&mut app);
-        app.on_key(plain('j')); // web row
-        let before = app.sidebar();
-        app.on_key(plain('x'));
-        assert!(matches!(app.mode, Mode::ConfirmKillWorkspace(_)));
-        assert_eq!(
-            app.sidebar().entries,
-            before.entries,
-            "opening the confirm must not reshuffle the rows under the question"
-        );
-        assert!(
-            app.sidebar_focused(),
-            "the confirm keeps sidebar focus so the highlight stays visible"
-        );
-    }
-
-    #[test]
-    fn capital_y_confirms_a_kill() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces());
-        focus_sidebar(&mut app);
-        app.on_key(plain('x'));
-        let out = app.on_key(plain('Y'));
-        assert_eq!(
-            out,
-            vec![control(&Request::WorkspaceKill {
-                id: WorkspaceId(1),
-                discard: false,
-            })],
-            "a shifted Y is a confirm, not a silent cancel"
-        );
-    }
-
-    #[test]
-    fn a_shorter_view_clamps_the_sidebar_selection() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces());
-        focus_sidebar(&mut app);
-        app.on_key(plain('j'));
-        app.on_key(plain('j'));
-        app.on_key(plain('j')); // the last entry (the working agent)
-        assert_eq!(app.sidebar_selected(), 3);
-
-        // A killed workspace shrinks the view to a single agentless row.
-        app.handle_frame(WireFrame::Control(
-            serde_json::to_vec(&Event::LayoutChanged {
-                workspaces: view_one_pane(),
-            })
-            .unwrap(),
-        ));
-        assert_eq!(
-            app.sidebar_selected(),
-            0,
-            "the selection clamps onto the surviving row"
         );
     }
 
@@ -5174,70 +3922,6 @@ mod tests {
         );
         assert_eq!(app.transient(), Some("discarded the saved layout"));
         assert_eq!(app.active_tab, Some(TabId(2)), "a discard moves nothing");
-    }
-
-    #[test]
-    fn panes_offset_by_the_sidebar_and_mouse_hit_tests_past_it() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces());
-        app.active_tab = Some(TabId(2)); // the two-pane workspace
-        app.sync_sizes(Rect::new(0, 0, 100, 24));
-
-        let left = app.rects.iter().find(|(p, _)| *p == PaneId(2)).unwrap().1;
-        assert_eq!(left.x, 30, "the leftmost pane sits right of the sidebar");
-
-        assert!(
-            app.pane_at(32, 5).is_some(),
-            "clicks past the sidebar and below the tab bar hit a pane"
-        );
-        assert!(
-            app.pane_at(5, 5).is_none(),
-            "clicks inside the sidebar miss the panes"
-        );
-    }
-
-    #[test]
-    fn clicking_a_sidebar_entry_focuses_and_jumps() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces());
-        app.sync_sizes(Rect::new(0, 0, 100, 24));
-        // The sidebar frame starts at content row 2 (below the app-bar header).
-        // Within it: projects header (border) rel 0, workspace 0 rel 1-2,
-        // workspace 1 rel 3-4 — so screen row 2 + 3 = 5 hits the second workspace.
-        let out = app.on_mouse(MouseEventKind::Down(MouseButton::Left), 2, 5);
-        assert_eq!(out, vec![control(&Request::TabSelect { id: TabId(2) })]);
-        assert_eq!(app.active_tab, Some(TabId(2)));
-    }
-
-    #[test]
-    fn clicking_the_sidebar_background_focuses_it_without_jumping() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces());
-        app.sync_sizes(Rect::new(0, 0, 100, 24));
-        // A blank filler row deep in the frame (past the entries, above the
-        // bottom border) is background — not a header or an entry.
-        let out = app.on_mouse(MouseEventKind::Down(MouseButton::Left), 2, 20);
-        assert!(out.is_empty(), "a background click jumps nowhere");
-        assert!(app.sidebar_focused(), "but it does focus the sidebar");
-    }
-
-    #[test]
-    fn clicking_a_section_header_toggles_its_collapse() {
-        let mut app = App::new();
-        attach_with(&mut app, view_two_workspaces());
-        app.sync_sizes(Rect::new(0, 0, 100, 24));
-        // The projects header is the sidebar's top border, at screen row 2.
-        assert!(!app.sidebar().projects_collapsed);
-        let out = app.on_mouse(MouseEventKind::Down(MouseButton::Left), 2, 2);
-        assert!(out.is_empty(), "toggling a section jumps nowhere");
-        assert!(
-            app.sidebar().projects_collapsed,
-            "clicking the projects header collapses it"
-        );
-        assert!(app.sidebar_focused(), "and focuses the sidebar");
-        // Clicking it again expands.
-        app.on_mouse(MouseEventKind::Down(MouseButton::Left), 2, 2);
-        assert!(!app.sidebar().projects_collapsed);
     }
 
     #[test]

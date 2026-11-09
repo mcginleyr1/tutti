@@ -40,7 +40,7 @@ impl App {
     /// Claude's dialog is held back, so there is no prompt on screen to peek.
     /// A done row asks for its last reply, which opens the reply overlay.
     pub(super) fn open_peek(&mut self, sidebar: &Sidebar) -> Vec<WireFrame> {
-        match sidebar.entries.get(self.sidebar_selected) {
+        match sidebar.entries.get(self.sidebar.selected) {
             Some(SidebarEntry::Agent(sidebar::AgentRow {
                 pane,
                 approval: Some(approval),
@@ -317,7 +317,7 @@ mod tests {
         let row = app
             .sidebar()
             .index_of(sidebar::EntryIdent::Agent(PaneId(2)));
-        app.sidebar_selected = row.expect("pane 2's row");
+        app.sidebar.selected = row.expect("pane 2's row");
         let read = Request::PaneRead {
             pane: PaneId(2),
             lines: None,
@@ -417,7 +417,7 @@ mod tests {
         app.mode = Mode::Terminal;
         let area = Rect::new(0, 0, 100, 24);
         app.sync_sizes(area);
-        let sidebar = app.sidebar_rect.unwrap();
+        let sidebar = app.sidebar.rect.unwrap();
         let row = (sidebar.y..sidebar.y + sidebar.height)
             .find(|r| {
                 app.sidebar().entry_at_row((r - sidebar.y) as usize)
