@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        # The checksums of the two archives each leg downloads: just's from its release's
+        # SHA256SUMS file, jj's from the digests on its release page.
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            just_sha256: "6574cea774ed4cae12e24b6aa11857de33e80dab4667cf628fd5840df96a2a9d"
+            jj_sha256: "50129b527f7cd6aef82aebd4bb2b670bb56766adc509ef3279c4327aa3592255"
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            just_sha256: "409044617b6f06517c1035e55ca38c8c856ff8b650e41bc2aa1ef82d5903a23e"
+            jj_sha256: "d4b657f622ee50929c8916466dfa3d6a6c17a0a32b50e7b2c793707ec9ebcad7"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Rust stable with clippy and rustfmt
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add clippy rustfmt
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # jj because the tests that drive a real repository pass without running when it is not on
+      # PATH. Nothing else is installed: gh, curl and ssh are stubbed, and the one test of a real
+      # nvim passes without running.
+      - name: just and jj, each archive checked against its sha256 before it is unpacked
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o just.tar.gz https://github.com/casey/just/releases/download/1.59.0/just-1.59.0-${{ matrix.target }}.tar.gz
+          curl -fsSL -o jj.tar.gz https://github.com/jj-vcs/jj/releases/download/v0.47.1/jj-v0.47.1-${{ matrix.target }}.tar.gz
+          echo "${{ matrix.just_sha256 }}  just.tar.gz" | shasum -a 256 -c
+          echo "${{ matrix.jj_sha256 }}  jj.tar.gz" | shasum -a 256 -c
+          mkdir -p "$HOME/bin"
+          tar -xzf just.tar.gz -C "$HOME/bin" just
+          tar -xzf jj.tar.gz -C "$HOME/bin" ./jj
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+      - run: just verify
