@@ -253,7 +253,7 @@ impl App {
             return;
         };
         let prompt = issues::prompt(&template, &issue);
-        self.launcher_issue = Some((issue, prompt));
+        self.launcher.issue = Some((issue, prompt));
         self.open_launcher(false, Some(name), Some(&dir));
     }
 
@@ -768,7 +768,7 @@ mod tests {
 
         app.mode = Mode::Issues;
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let (issue, prompt) = app.launcher_issue.take().unwrap();
+        let (issue, prompt) = app.launcher.issue.take().unwrap();
         let mut run = |agent: &str, argv: &[&str]| {
             let argv = argv.iter().map(|s| s.to_string()).collect();
             let out = app.deploy_frames(&issue, agent, &prompt, argv);
@@ -819,7 +819,7 @@ mod tests {
             long.body = "a".repeat(issues::FILE_PROMPT);
             app.issues_loaded(app.issues.generation, 0, Ok(vec![long]));
             app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-            let (issue, prompt) = app.launcher_issue.take().unwrap();
+            let (issue, prompt) = app.launcher.issue.take().unwrap();
             let deploy = |app: &mut App| {
                 let argv = vec!["ori".into(), "code".into()];
                 assert_eq!(app.deploy_frames(&issue, "ori", &prompt, argv).len(), 1);

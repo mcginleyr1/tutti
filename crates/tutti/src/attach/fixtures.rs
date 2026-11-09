@@ -313,3 +313,10 @@ pub(crate) fn view_with_changes() -> Vec<WorkspaceView> {
     ];
     vec![ws]
 }
+
+pub(crate) fn view_one_exited_agent() -> Vec<WorkspaceView> {
+    let mut view = view_one_pane();
+    view[0].tabs[0].panes[0].agent = Some("claude".into());
+    view[0].tabs[0].panes[0].exited = Some(0);
+    view
+}
