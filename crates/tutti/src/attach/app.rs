@@ -8,7 +8,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
@@ -362,11 +362,6 @@ impl App {
     /// threads.
     pub fn host(&self) -> &Host {
         &self.host
-    }
-
-    /// The daemon machine's home directory, which shown paths shorten to `~`.
-    pub fn home(&self) -> Option<&Path> {
-        self.home.as_deref()
     }
 
     /// Point this machine's host at fixture directories.
