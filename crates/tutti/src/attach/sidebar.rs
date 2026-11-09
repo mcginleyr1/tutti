@@ -997,9 +997,6 @@ impl App {
     }
 }
 
-/// The next selectable entry at or after `from`, skipping entries whose section
-/// is collapsed; stays on `from` when nothing visible lies ahead. With no
-/// section collapsed this is a plain `from + 1` clamped to the last entry.
 /// The identity anchor for entry `idx`: its ident plus the project it belongs
 /// to (a workspace row's own project, an agent row's owner) — the fallback
 /// target when the row itself vanishes.
@@ -1012,6 +1009,9 @@ fn anchor_at(sidebar: &Sidebar, idx: usize) -> Option<(EntryIdent, WorkspaceId)>
     Some((ident, project))
 }
 
+/// The next selectable entry at or after `from`, skipping entries whose section
+/// is collapsed; stays on `from` when nothing visible lies ahead. With no
+/// section collapsed this is a plain `from + 1` clamped to the last entry.
 fn next_visible(sidebar: &Sidebar, from: usize) -> usize {
     if sidebar.is_empty() {
         return 0;

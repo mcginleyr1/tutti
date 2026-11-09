@@ -1,6 +1,9 @@
 //! The attach client's state machine: everything the TUI knows and every
 //! decision it makes, driven purely by inbound wire frames and user input. It
 //! owns no socket and no terminal, so it can be exercised headlessly in tests.
+//! `App` and `Mode` are here, with the frames in, the key dispatch and the
+//! layout. What one mode or panel keeps is a plain struct in the sibling
+//! module of its name, beside the `impl App` that works on it and its tests.
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
