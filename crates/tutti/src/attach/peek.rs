@@ -12,7 +12,8 @@ use tutti_core::{
     AgentState, Frame as WireFrame, PaneId, Request, prompt_fingerprint, prompt_rows,
 };
 
-use super::app::{App, FollowUp, Mode, control};
+use super::app::{App, Mode, control};
+use super::follow::FollowUp;
 use super::keys;
 use super::sidebar::{self, Sidebar, SidebarEntry};
 
@@ -326,14 +327,14 @@ mod tests {
             last_reply: true,
         };
         let asked = app.on_key(plain('p'));
-        assert_eq!(asked, vec![tagged(&read, app.last_req)]);
+        assert_eq!(asked, vec![tagged(&read, app.follow_ups.last_req)]);
         assert_eq!(app.mode, Mode::Sidebar, "nothing opens before the answer");
 
         let said = Response::LastReply {
             text: format!("pong\n\n{}", "x".repeat(150)),
             truncated: false,
         };
-        app.handle_frame(reply(app.last_req, said.clone()));
+        app.handle_frame(reply(app.follow_ups.last_req, said.clone()));
         assert_eq!(app.mode, Mode::Reply(PaneId(2)));
         let (pane, _, rows) = app.text_popup(Rect::new(0, 0, 100, 24)).unwrap();
         assert_eq!(pane, PaneId(2));
@@ -349,7 +350,7 @@ mod tests {
         let refused = Response::Error {
             message: "pane 2's last turn ended without a reply".into(),
         };
-        app.handle_frame(reply(app.last_req, refused));
+        app.handle_frame(reply(app.follow_ups.last_req, refused));
         assert_eq!(app.mode, Mode::Sidebar);
         assert!(
             app.transient()
@@ -358,7 +359,7 @@ mod tests {
 
         app.on_key(plain('p'));
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        app.handle_frame(reply(app.last_req, said));
+        app.handle_frame(reply(app.follow_ups.last_req, said));
         assert_ne!(app.mode, Mode::Reply(PaneId(2)), "the sidebar was left");
     }
 

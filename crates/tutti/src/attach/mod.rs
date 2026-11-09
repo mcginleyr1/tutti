@@ -6,6 +6,7 @@
 mod app;
 mod approval;
 mod connection;
+mod follow;
 mod host;
 mod keys;
 mod launcher;

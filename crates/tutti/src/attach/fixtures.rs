@@ -274,3 +274,17 @@ pub(crate) fn event(app: &mut App, event: Event) {
 pub(crate) fn shift(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT)
 }
+
+/// A throwaway directory tree seeded with `subdirs`, uniquely named so
+/// parallel test runs never collide.
+pub(crate) fn temp_tree(subdirs: &[&str]) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("tutti-complete-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    for d in subdirs {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    root
+}
