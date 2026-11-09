@@ -15,6 +15,7 @@ pub mod raw;
 mod reader;
 mod render;
 mod rtty;
+mod setup;
 mod sidebar;
 mod theme;
 
