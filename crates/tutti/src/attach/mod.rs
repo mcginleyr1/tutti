@@ -12,6 +12,7 @@ mod launcher;
 mod layout;
 mod navigate;
 mod notes;
+mod peek;
 mod printed;
 pub mod raw;
 mod reader;
