@@ -511,8 +511,10 @@ pub enum Request {
         keys: bool,
     },
     /// End this connection's stream of `pane` (`PaneAttach`): nothing of it
-    /// follows the answer — nor its `Event::PaneExited` — its vote in the
-    /// pane's size goes, and the pane may be streamed again. The
+    /// follows the answer — nor its `Event::PaneExited` — the stream's vote
+    /// in the pane's size goes, and the pane may be streamed again. An
+    /// attached connection's own visible set (`ViewSizes`) is its own to
+    /// change: one that named the pane there sends its set without it. The
     /// connection's other streams go on; it closes after its last, as at a
     /// stream's end, unless it attached or watches. Answered `Ok`, or an
     /// Error when the connection streams no such pane.

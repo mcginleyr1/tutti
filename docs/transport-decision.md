@@ -333,9 +333,11 @@ stream. Four fields let it do all of that over one connection — one ssh channe
   connection already streams pane N`) — the stream's vote stays until the connection
   ends or detaches it, which is what keeps its exit told once (below).
   `{"type":"pane_detach","pane":N}` ends one stream: nothing of it follows the `ok`
-  (its exit neither), its vote goes and the pane's size is re-arbitrated, and the pane
-  may be streamed again; a pane the connection does not stream is refused (`this
-  connection streams no pane N`). A `view_sizes` moves
+  (its exit neither), the stream's vote goes and the pane's size is re-arbitrated, and
+  the pane may be streamed again; a pane the connection does not stream is refused
+  (`this connection streams no pane N`). An attached connection's own `view_sizes` set
+  stays as it sent it — it is the client's to replace, so one that named the pane
+  there sends its set without it. A `view_sizes` moves
   the vote of each pane it names that the connection streams, beside an attached
   client's own set. A pane's exit ends its stream alone; the daemon closes the
   connection after its last stream ends, unless the connection also attached or
