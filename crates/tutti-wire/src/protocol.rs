@@ -1224,10 +1224,15 @@ pub enum Event {
     /// the previous snapshot: every pane flat, in sidebar order.
     /// `attached_terminal` is the newest attached client's `terminal` — the
     /// newest view's only with no other client, `None` with nobody attached —
-    /// and `focused` marks that client's pane.
+    /// and `focused` marks that client's pane. `wire_rev` and `wire_floor`
+    /// are the daemon's, as `Response::Attached` names them, for a watcher
+    /// to weigh as a client does (`Wire::accepts`); a snapshot that names no
+    /// floor is from a daemon before floors, whose floor is its revision.
     Snapshot {
         session: String,
         wire_rev: u32,
+        #[serde(default)]
+        wire_floor: Option<u32>,
         attached_terminal: Option<String>,
         panes: Vec<WatchPane>,
     },
@@ -2211,18 +2216,22 @@ mod tests {
             toward: Toward::Down,
         });
         roundtrip(&sample_snapshot());
-        roundtrip(&Event::Snapshot {
-            session: "tutti".into(),
-            wire_rev: WIRE_REV,
-            attached_terminal: None,
-            panes: Vec::new(),
-        });
+        for wire_floor in [Some(WIRE_FLOOR), None] {
+            roundtrip(&Event::Snapshot {
+                session: "tutti".into(),
+                wire_rev: WIRE_REV,
+                wire_floor,
+                attached_terminal: None,
+                panes: Vec::new(),
+            });
+        }
     }
 
     fn sample_snapshot() -> Event {
         Event::Snapshot {
             session: "tutti".into(),
-            wire_rev: 6,
+            wire_rev: 20,
+            wire_floor: Some(19),
             attached_terminal: Some("com.mitchellh.ghostty".into()),
             panes: vec![WatchPane {
                 id: PaneId(3),
@@ -2253,13 +2262,16 @@ mod tests {
     }
 
     /// `tutti watch` prints snapshots verbatim, and a notch app is written
-    /// against this exact line.
+    /// against this exact line. It names the daemon's revision and, since
+    /// rev 20, its floor, so a watcher that links no tutti-wire can weigh
+    /// the two against its own.
     #[test]
     fn a_snapshot_is_the_watch_contract_line() {
         assert_eq!(
             serde_json::to_string(&sample_snapshot()).unwrap(),
             concat!(
-                r#"{"type":"snapshot","session":"tutti","wire_rev":6,"attached_terminal":"com.mitchellh.ghostty","#,
+                r#"{"type":"snapshot","session":"tutti","wire_rev":20,"wire_floor":19,"#,
+                r#""attached_terminal":"com.mitchellh.ghostty","#,
                 r#""panes":[{"id":3,"workspace":"smartnotch","dir":"/Users/me/develop/smartnotch","tab":"main","#,
                 r#""title":"claude","agent":"claude","state":"working","source":"hook","exited":null,"focused":true,"#,
                 r#""user_vars":{"TUTTI_KEYS":"pane"},"cwd":"/Users/me/develop/smartnotch/src","#,
@@ -2742,6 +2754,22 @@ mod tests {
                 wire_floor: None,
                 restorable: None,
                 notes: Vec::new(),
+            }
+        );
+        // A watch snapshot from before `wire_floor` names none either, which
+        // a watcher takes for a floor at the daemon's revision.
+        let snapshot: Event = serde_json::from_str(
+            r#"{"type":"snapshot","session":"tutti","wire_rev":19,"attached_terminal":null,"panes":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot,
+            Event::Snapshot {
+                session: "tutti".into(),
+                wire_rev: 19,
+                wire_floor: None,
+                attached_terminal: None,
+                panes: Vec::new(),
             }
         );
         // A bare `notes_list` lists every note; a bare `notes_read` marks

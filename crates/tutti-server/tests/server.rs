@@ -6345,10 +6345,16 @@ async fn snapshot_until(
                 Event::Snapshot {
                     session,
                     wire_rev,
+                    wire_floor,
                     attached_terminal,
                     panes,
                 } => {
-                    assert_eq!((session.as_str(), wire_rev), ("s", tutti_core::WIRE_REV));
+                    assert_eq!((session.as_str(), wire_rev), ("s", WIRE_REV));
+                    assert_eq!(
+                        wire_floor,
+                        Some(WIRE_FLOOR),
+                        "a watcher is told the floor too"
+                    );
                     if want(&attached_terminal, &panes) {
                         return (attached_terminal, panes);
                     }

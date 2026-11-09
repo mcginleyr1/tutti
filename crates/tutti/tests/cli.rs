@@ -1847,6 +1847,7 @@ fn watch_prints_snapshot_lines_until_the_daemon_goes() {
     let snapshot = |state| Event::Snapshot {
         session: "tutti".into(),
         wire_rev: tutti_core::WIRE_REV,
+        wire_floor: Some(tutti_core::WIRE_FLOOR),
         attached_terminal: None,
         panes: vec![WatchPane {
             id: PaneId(1),

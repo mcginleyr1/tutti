@@ -332,15 +332,31 @@ What a refusal does is the client's:
   work, and when to stop it is the user's call.
 - **`tutti attach --view`** refuses a daemon from before views (rev 16) by a check of its
   own, as before.
-- **A connection that never attaches** (the CLI's one-shot requests, `pane attach`,
-  `watch`) gets no `attached` answer and checks nothing. A daemon too old for what it asks
-  refuses the request, and the client says so (`the daemon cannot stream a pane (…);
-  restart it`).
+- **A connection that never attaches** (the CLI's one-shot requests, `pane attach`) gets
+  no `attached` answer and checks nothing. A daemon too old for what it asks refuses the
+  request, and the client says so (`the daemon cannot stream a pane (…); restart it`).
+- **A watcher** weighs the two itself, from the snapshot (below). `tutti watch` prints
+  each snapshot as it came and checks nothing.
 
 `attached_wire` reads the two numbers from the answer's frame on their own, so a client
 too old to read the rest of an answer still reads why. Both clients take them so: rtty
 asks it of every control frame of its opening, before it reads the frame, and the TUI of
 every control frame that is no event.
+
+**The watch snapshot names both too,** in every line `tutti watch` prints, for a watcher
+that links no tutti-wire (a menu-bar or notch app):
+
+```json
+{"type":"snapshot","session":"tutti","wire_rev":20,"wire_floor":19,"attached_terminal":null,"panes":[]}
+```
+
+A watcher has the same two numbers of its own: `W`, the revision its author read the
+snapshot's shape at, and `Wf`, the oldest revision that already had everything it reads
+(`W` itself, for one that does not know better). It applies the client's rule: the
+snapshots are what it expects exactly when `wire_floor <= W` and `Wf <= wire_rev`. A
+snapshot with no `wire_floor`, or a null one, is from a daemon before floors: its floor is
+its `wire_rev`, which leaves `Wf <= wire_rev <= W`. Outside that the watcher should say
+which end to update rather than show what it may be misreading.
 
 **The rule for changing the wire:**
 
@@ -371,8 +387,9 @@ read, the daemon's its refusal, rtty's its skip; the TUI's skip is by constructi
   (`FrameError::UnknownKind`): frame kinds are not skipped. A new kind goes only to a peer
   that asked for it, as `PaneRaw` goes only to a `pane_attach`.
 
-**Rev 20** added the floor. `wire_floor` is a field an older client reads past, so by the
-rule the revision alone went up. Its floor is 19: the last revision whose clients took a
+**Rev 20** added the floor, to the answer to an attach and to the watch snapshot.
+`wire_floor` is a field an older client or watcher reads past, so by the rule the
+revision alone went up. Its floor is 19: the last revision whose clients took a
 daemon by equality, and the only one a rev-20 peer was checked against, that one field
 being all that separates them. A rev-19 client still refuses a rev-20 daemon, by its own
 equality, and a rev-20 client takes a rev-19 daemon.

@@ -3457,6 +3457,7 @@ fn snapshot_watchers(hub: &Hub) {
     let snapshot = encode_json(&Event::Snapshot {
         session: hub.name.clone(),
         wire_rev: tutti_core::WIRE_REV,
+        wire_floor: Some(tutti_core::WIRE_FLOOR),
         attached_terminal,
         panes,
     });
