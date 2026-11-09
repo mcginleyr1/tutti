@@ -1022,9 +1022,10 @@ impl App {
 
     /// Text the terminal pasted (bracketed paste). In a pane, as a terminal
     /// hands a paste to its program: whole, inside the paste marks when the
-    /// program set bracketed paste, so a shell runs none of its lines, and
-    /// never to an exited pane, whose keys act on it. Elsewhere — a prompt,
-    /// a panel — typed, as the keys its bytes are.
+    /// program set bracketed paste, so a shell runs none of its lines, in as
+    /// many frames as its length takes, and never to an exited pane, whose
+    /// keys act on it. Elsewhere — a prompt, a panel — typed, as the keys
+    /// its bytes are.
     pub fn on_paste(&mut self, text: &[u8]) -> Vec<WireFrame> {
         if self.mode == Mode::Terminal {
             return match self.focused.map(|pane| (pane, self.panes.get(&pane))) {
@@ -1034,7 +1035,7 @@ impl App {
                     } else {
                         text.to_vec()
                     };
-                    vec![WireFrame::Input { pane, bytes }]
+                    WireFrame::inputs(pane, bytes)
                 }
                 _ => Vec::new(),
             };
@@ -2372,6 +2373,40 @@ mod tests {
         app.prompt.input.clear();
         assert!(app.on_paste(b"/nonexistent/src").is_empty());
         assert_eq!(app.prompt.input, "/nonexistent/src");
+    }
+
+    /// A paste longer than a frame holds goes out in several, whole and in
+    /// order between its marks. Each encodes, as the connection sends it:
+    /// the one frame it used to be panicked there, and the TUI with it.
+    #[test]
+    fn a_paste_longer_than_a_frame_goes_out_in_several_whole_and_in_order() {
+        let mut app = App::new();
+        attached(&mut app);
+        app.handle_frame(WireFrame::PaneSnapshot(PaneData {
+            pane: PaneId(1),
+            rows: 24,
+            cols: 80,
+            seq: 0,
+            bytes: b"\x1b[?2004h".to_vec(),
+        }));
+        let text: Vec<u8> = (0..tutti_core::MAX_FRAME_LEN)
+            .map(|at| b'a' + (at % 23) as u8)
+            .collect();
+        let frames = app.on_paste(&text);
+        assert!(frames.len() > 1, "{} frame", frames.len());
+        let mut sent = Vec::new();
+        for frame in &frames {
+            let encoded = frame.encode();
+            match WireFrame::decode(&encoded) {
+                Ok(Some((WireFrame::Input { pane, bytes }, used))) => {
+                    assert_eq!((pane, used), (PaneId(1), encoded.len()));
+                    sent.extend(bytes);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let pasted = [b"\x1b[200~".as_slice(), &text, b"\x1b[201~"].concat();
+        assert!(sent == pasted, "the paste, whole and in order");
     }
 
     #[test]

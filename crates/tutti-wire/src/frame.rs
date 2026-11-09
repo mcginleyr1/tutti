@@ -64,7 +64,31 @@ const KIND_HOST: u8 = 0x06;
 
 const PANE_HEADER: usize = 8 + 2 + 2 + 4;
 
+/// The most bytes one `Input` frame carries: the longest frame, less its
+/// kind byte and the pane's id.
+const MAX_INPUT: usize = MAX_FRAME_LEN - 1 - 8;
+
 impl Frame {
+    /// What is typed into `pane` as the `Input` frames that carry it, in
+    /// order: one, unless `bytes` is more than a frame holds (a paste of
+    /// megabytes, which `encode` panics on), then as many as it takes, each
+    /// but the last full. A frame ends wherever its length does, inside a
+    /// character or a bracketed paste as anywhere: the daemon takes a
+    /// connection's frames in order and queues each for the pane's pty
+    /// behind the last, so the program reads the bytes one write would have
+    /// brought it. Full frames, since each is one entry in the pane's
+    /// bounded queue of writes.
+    pub fn inputs(pane: PaneId, bytes: Vec<u8>) -> Vec<Frame> {
+        if bytes.len() <= MAX_INPUT {
+            return vec![Frame::Input { pane, bytes }];
+        }
+        let piece = |bytes: &[u8]| Frame::Input {
+            pane,
+            bytes: bytes.to_vec(),
+        };
+        bytes.chunks(MAX_INPUT).map(piece).collect()
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let (kind, payload_len) = match self {
             Frame::Control(json) => (KIND_CONTROL, json.len()),
@@ -193,6 +217,42 @@ mod tests {
             pane: PaneId(u64::MAX),
             bytes: vec![],
         });
+    }
+
+    /// What is typed goes in one frame while it fits, an empty write too,
+    /// and past that in as many as it takes: each encodes, which a longer
+    /// frame would panic on, and decodes, and their bytes in order are what
+    /// was typed.
+    #[test]
+    fn input_longer_than_a_frame_holds_goes_in_several_whole_and_in_order() {
+        let pane = PaneId(3);
+        let one = |bytes: &[u8]| {
+            let bytes = bytes.to_vec();
+            vec![Frame::Input { pane, bytes }]
+        };
+        assert_eq!(Frame::inputs(pane, b"ls\r".to_vec()), one(b"ls\r"));
+        assert_eq!(Frame::inputs(pane, Vec::new()), one(b""));
+        for (len, lengths) in [
+            (MAX_INPUT, vec![MAX_INPUT]),
+            (MAX_INPUT + 1, vec![MAX_INPUT, 1]),
+            (MAX_FRAME_LEN + 3, vec![MAX_INPUT, 12]),
+        ] {
+            let typed: Vec<u8> = (0..len).map(|at| (at % 251) as u8).collect();
+            let mut carried = Vec::new();
+            for frame in Frame::inputs(pane, typed.clone()) {
+                roundtrip(frame.clone());
+                match frame {
+                    Frame::Input {
+                        pane: PaneId(3),
+                        bytes,
+                    } => carried.push(bytes),
+                    frame => panic!("{frame:?}"),
+                }
+            }
+            let carries: Vec<usize> = carried.iter().map(Vec::len).collect();
+            assert_eq!(carries, lengths);
+            assert!(carried.concat() == typed, "{len} bytes, whole and in order");
+        }
     }
 
     #[test]
