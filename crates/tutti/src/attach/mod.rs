@@ -76,10 +76,11 @@ pub fn run_remote(
 ) -> Result<()> {
     let (mut conn, startup) = Connection::open_remote(destination, session, view)?;
     let host = Host::Remote(conn.remote());
+    // On a detach ssh still runs until the connection drops: nothing to wait for.
     let closed = attach(&mut conn, host, config, startup)?;
-    match conn.ended() {
-        Some(why) if closed => Err(why),
-        _ => Ok(()),
+    match closed.then(|| conn.ended()).flatten() {
+        Some(why) => Err(why),
+        None => Ok(()),
     }
 }
 
