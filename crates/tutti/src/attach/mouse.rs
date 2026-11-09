@@ -59,8 +59,12 @@ impl App {
     /// when the program asked for all of it — go to that program, a press
     /// focusing the pane too, as tmux and WezTerm do; Shift held keeps the
     /// mouse tutti's (select and copy). The wheel, border drags and the chrome
-    /// are tutti's: `on_mouse`.
+    /// are tutti's: `on_mouse`. A press ends the hold an earlier one left on
+    /// the mouse: its release came with Shift held, or never came.
     pub fn on_mouse_event(&mut self, mouse: MouseEvent) -> Vec<WireFrame> {
+        if matches!(mouse.kind, MouseEventKind::Down(_)) {
+            self.pointer.grab = None;
+        }
         if !mouse.modifiers.contains(KeyModifiers::SHIFT)
             && let Some(frames) = self.forward_mouse(mouse)
         {
@@ -1141,6 +1145,28 @@ mod tests {
             vec![split_ratio(0.69)],
             "pane 2's frame column is still the border's"
         );
+    }
+
+    /// A press ends the hold an earlier press left on the mouse — its release
+    /// came with Shift held, which keeps the mouse tutti's, or never came:
+    /// the drag that follows is this press's own, not the old pane's.
+    #[test]
+    fn a_press_ends_the_hold_an_unreleased_press_left() {
+        use MouseEventKind::{Down, Drag, Up};
+        let (none, shift) = (KeyModifiers::NONE, KeyModifiers::SHIFT);
+        for released in [true, false] {
+            let mut app = reporting_fixture(b"\x1b[?1002h\x1b[?1006h");
+            let out = app.on_mouse_event(mouse(Down(MouseButton::Left), 55, 6, none));
+            assert_eq!(out, to_two(b"\x1b[<0;5;3M"), "pane 2's program takes it");
+            if released {
+                app.on_mouse_event(mouse(Up(MouseButton::Left), 55, 6, shift));
+            }
+            // Pane 1's program reports nothing: a drag there selects.
+            app.on_mouse_event(mouse(Down(MouseButton::Left), 5, 6, none));
+            let out = app.on_mouse_event(mouse(Drag(MouseButton::Left), 15, 6, none));
+            assert_eq!(out, Vec::new(), "pane 2 hears nothing of it");
+            assert!(app.selection_span(PaneId(1)).is_some());
+        }
     }
 
     #[test]
