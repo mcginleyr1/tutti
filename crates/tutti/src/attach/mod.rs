@@ -10,6 +10,7 @@ mod keys;
 mod launcher;
 mod layout;
 mod navigate;
+mod notes;
 mod printed;
 pub mod raw;
 mod reader;
