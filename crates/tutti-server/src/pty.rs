@@ -944,9 +944,6 @@ impl PtyPane {
             .slave
             .spawn_command(cmd)
             .with_context(|| format!("failed to spawn {}", spec.program))?;
-        // Drop our copy of the slave so the master reader sees EOF once the
-        // child's own descriptors close.
-        drop(pair.slave);
 
         let killer = child.clone_killer();
         let pid = child.process_id();
@@ -1000,6 +997,12 @@ impl PtyPane {
                 )
             })
             .context("failed to spawn pty reader thread")?;
+        // Drop our copy of the slave so the master reader sees EOF once the
+        // child's own descriptors close — only now that the reader runs: on
+        // macOS the last close of a pty's slave, which this is when the
+        // program is already gone, waits some 0.6 s for the master to be read
+        // and then discards what the program printed.
+        drop(pair.slave);
 
         let wait_thread = std::thread::Builder::new()
             .name("tutti-pty-wait".into())
