@@ -319,6 +319,36 @@ missing `view` reads as `false`; a daemon from before it drops the flag
 unseen, so `attach --view` waits for the `attached` reply and refuses a
 `wire_rev` below 16 before it sends anything else.
 
+## A terminal window on one connection (wire rev 19)
+
+rtty mirrors a whole session in one window and draws each of its panes from a raw
+stream. Four fields let it do all of that over one connection — one ssh channel under
+`--host` — each defaulting to `false` when missing:
+
+- **`attach`'s `"quiet":true`:** the client is sent no `PaneSnapshot` or `PaneDelta`,
+  every event still. A quiet client never makes the render tick look at a pane for it,
+  and with only quiet clients attached the tick looks at none.
+- **Several `pane_attach`es on one connection,** each frame naming its pane. A pane is
+  streamed once a connection: again, even after its exit, it is refused (`this
+  connection already streams pane N`) — the stream's vote stays until the connection
+  ends or detaches it, which is what keeps its exit told once (below).
+  `{"type":"pane_detach","pane":N}` ends one stream: nothing of it follows the `ok`
+  (its exit neither), its vote goes and the pane's size is re-arbitrated, and the pane
+  may be streamed again; a pane the connection does not stream is refused (`this
+  connection streams no pane N`). A `view_sizes` moves
+  the vote of each pane it names that the connection streams, beside an attached
+  client's own set. A pane's exit ends its stream alone; the daemon closes the
+  connection after its last stream ends, unless the connection also attached or
+  watches. An attached connection hears of a pane it streams exiting once, from the
+  stream after the pane's last output, never from the broadcast too.
+- **`pane_attach`'s `"keys":true`:** the stream keeps the keyboard protocols (below), so
+  a terminal that encodes keys by them — rtty, through rtty-vt's `input`, as the TUI
+  does — gets Neovim's kitty keys. A snapshot carries them for every stream.
+- **`pane_focus`'s `"seen":true`, from a view:** someone is looking at the pane (rtty's
+  window is the active one), so it is seen as a client's focus sees it — a `Done` pane
+  turns `Idle`, its notes read — though the session's active pane stays and no
+  `pane_focused` is relayed. The TUI's `attach --view` never sends it.
+
 ## Raw pane streams for real terminals (wire rev 10)
 
 Option C rests on one premise: the client "is not a real terminal" — the TUI draws a
@@ -376,7 +406,8 @@ reply, and so no `wire_rev`, comes on a stream). A resize's snapshot hands on no
 whether the terminal's own reflow kept the ones the daemon's pushed off its screen is
 not the daemon's to know. The stream ends with `Event::PaneExited` once
 the child's last output is queued (up to 250 ms is spent letting the reader drain the pty
-first), and the daemon then closes the connection.
+first), and the daemon then closes the connection — after its last stream, for a
+connection that streams several (wire rev 19, below).
 A daemon that stops just closes it: its own shutdown killed the pane, which did not exit.
 A stream is not an attached client: it gets no events, answers no held approval, and is
 no watcher's attached terminal — but it votes in its pane's size like one (smallest
@@ -483,15 +514,16 @@ queries itself):
 | Colours | `OSC 10 ; ?`, `OSC 11 ; ?`, `OSC 12 ; ?`, `OSC 4 ; n ; ?` | `OSC 1x ; rgb:rrrr/gggg/bbbb`, closed as asked (BEL, or `ESC \`) — what the program set, else, once a client has reported its terminal's colours, those; OSC 12 only with a cursor colour, OSC 4 only for a slot the program set; else unanswered, and passed on |
 | Light/dark | `CSI ? 996 n` | `CSI ? 997 ; 1 n` (dark) or `; 2 n` (light) — only with colours reported |
 | Mode 2031 | `CSI ? 2031 h` / `l` | nothing: the daemon keeps the mode per pane, and never passes it on |
-| modifyOtherKeys | `CSI > 4 ; … m` | nothing: the engine keeps the level, and its snapshots and redraws hand it to the TUI, which encodes the pane's keys by it; never passed on. A `pane attach` terminal that took it (nvim and vim ask for level 2, Emacs for 1) would encode the prefix where the detach cannot see it, and keep it after the detach |
-| Kitty keyboard | `CSI ? u` · `CSI > … u`, `CSI < … u`, `CSI = … u` | `CSI ? flags u` · nothing: the engine keeps each screen's stack of flags as it does modifyOtherKeys, for the TUI, and for the same reason never passes them on (nvim pushes `CSI > 3 u` once answered) |
+| modifyOtherKeys | `CSI > 4 ; … m` | nothing: the engine keeps the level, and its snapshots and redraws hand it to the TUI, which encodes the pane's keys by it; passed on only to a stream that asked for the keys (`"keys":true`, rtty). A `pane attach` terminal that took it (nvim and vim ask for level 2, Emacs for 1) would encode the prefix where the detach cannot see it, and keep it after the detach |
+| Kitty keyboard | `CSI ? u` · `CSI > … u`, `CSI < … u`, `CSI = … u` | `CSI ? flags u` · nothing: the engine keeps each screen's stack of flags as it does modifyOtherKeys, for the TUI, and for the same reason passes them on only to a stream that asked for the keys (nvim pushes `CSI > 3 u` once answered) |
 
 The reader's own escape scanner (`Seq`, pty.rs) follows vte through every sequence,
 across read boundaries, and gives each one a verdict where vte ends it. A sequence the
 engine might answer ends a run of bytes fed to it, so a reply that comes back is that
 query's own — and a cursor report reads the cursor where the query found it — and the
 query is kept from the streams exactly when it was answered. Mode 2031 and the keyboard
-protocols reach the engine but are kept from the streams. Plain text and every other sequence go to the engine in runs
+protocols reach the engine but are kept from the streams — the keyboard protocols from
+all but a `"keys"` stream, which gets each back at its place in the read. Plain text and every other sequence go to the engine in runs
 as long as the read. The bytes of a sequence a read cut off are held from both until a
 later read ends it — up to 256 bytes, past which, too long to be a query, it goes on. The
 answers go to the pty from a per-pane thread, off the parser lock and through a bounded
@@ -563,7 +595,8 @@ reach the shell as typing, and the TUI would type into the shell in kitty's enco
 
 Only the first of a run of command ends counts: zsh's integration marks one from PROMPT_SP
 and another from its precmd. Streams are told of the mouse and focus modes after the mark
-(the rest never reach them). The prompt start (A) would be too late: fish sets 2031 and
+(the rest never reach them), and a `"keys"` stream of modifyOtherKeys, its format and
+kitty's flags too (`CSI > 4 ; 0 m`, `CSI > 4 ; 0 f`, `CSI < 65535 u`). The prompt start (A) would be too late: fish sets 2031 and
 modifyOtherKeys between its own A and the integration's.
 
 ## Host frames: the daemon's machine (`tutti --host`)

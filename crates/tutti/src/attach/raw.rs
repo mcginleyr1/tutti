@@ -142,6 +142,7 @@ pub fn run(
         history,
         inline,
         since,
+        keys: false,
     };
     stream.write_all(&control(&attach))?;
     let mut buf = Vec::new();

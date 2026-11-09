@@ -100,6 +100,7 @@ fn attach(conn: &mut Connection, host: Host, config: Config, startup: Startup) -
         terminal,
         handoff: rtty.is_some(),
         view,
+        quiet: false,
     };
     conn.send(&tagged(&attach, 0))
         .context("send attach request")?;

@@ -33,8 +33,13 @@ const HOLD_MAX: usize = 256;
 /// What a command's end turns off in a pane's terminal (rtty-vt's
 /// `set_command_end_reset`) that reaches a tap: the mouse's reports (every
 /// tracking mode and encoding) and focus (1004). The rest — 2031 and the key
-/// encodings — never reaches one (`Verdict::Own`).
+/// encodings — never reaches one (`Verdict::Own`), save the key encodings a
+/// tap that keeps them (`PtyPane::tap`) is told of in `KEYS_LEFT_ON`.
 const LEFT_ON_TAPS: &[u8] = b"\x1b[?9;1000;1002;1003;1004;1005;1006;1015;1016l";
+/// What a command's end turns off of the key encodings, for a tap that keeps
+/// them (`Verdict::Keys`): modifyOtherKeys, its format, and kitty's whole
+/// stack.
+const KEYS_LEFT_ON: &[u8] = b"\x1b[>4;0m\x1b[>4;0f\x1b[<65535u";
 
 /// What to run in a pane.
 #[derive(Debug, Clone)]
@@ -149,8 +154,9 @@ pub struct Look {
 /// stream order: a snapshot of the screen to start from, with the scrollback
 /// rows it asked for, then each read as the child wrote it, less the queries
 /// the daemon answered and the sequences it owns (`verdict`) — a tap's own
-/// terminal would answer or take them again; and after a resize, or once it
-/// fell behind, a fresh snapshot.
+/// terminal would answer or take them again, the key encodings kept for a
+/// tap that asked for them; and after a resize, or once it fell behind, a
+/// fresh snapshot.
 pub enum Feed<'a> {
     Snapshot(Start),
     /// One read, whole: a tap takes all of it or, behind, none. `cuts` part
@@ -254,9 +260,41 @@ struct Processed {
     /// whatever else that read held — a bell, a cursor shape — unless the
     /// switch comes alone.
     cuts: Vec<usize>,
+    /// The key encodings `raw` was cut from (`Verdict::Keys`), for a tap that
+    /// keeps them, in order: each goes back at its place.
+    keys: Vec<Key>,
     /// The answers to write back to the pane, in order.
     answers: Vec<u8>,
     signals: Vec<Signal>,
+}
+
+/// One key encoding cut from a read for the taps (`Processed::keys`): its
+/// bytes, and where they went — at `raw[at]`, after the first `cuts` cuts.
+struct Key {
+    at: usize,
+    cuts: usize,
+    bytes: Vec<u8>,
+}
+
+impl Processed {
+    /// The read for a tap that keeps the key encodings: `raw` with each put
+    /// back, and its cuts moved past them.
+    fn keyed(&self) -> (Vec<u8>, Vec<usize>) {
+        let mut raw = Vec::with_capacity(self.raw.len());
+        let mut cuts = Vec::with_capacity(self.cuts.len());
+        let (mut from, mut cut) = (0, 0);
+        for key in &self.keys {
+            let shift = raw.len() - from;
+            cuts.extend(self.cuts[cut..key.cuts].iter().map(|at| at + shift));
+            raw.extend_from_slice(&self.raw[from..key.at]);
+            raw.extend_from_slice(&key.bytes);
+            (from, cut) = (key.at, key.cuts);
+        }
+        let shift = raw.len() - from;
+        cuts.extend(self.cuts[cut..].iter().map(|at| at + shift));
+        raw.extend_from_slice(&self.raw[from..]);
+        (raw, cuts)
+    }
 }
 
 /// A pane's terminal behind the parser lock, with the raw-output taps it
@@ -274,9 +312,10 @@ struct Term {
     /// The last sequence was a string an `ESC` ended, and whether the taps
     /// were kept from it: an `ESC \` next is its terminator, and goes with it.
     string_kept: Option<bool>,
-    /// The raw-output subscribers, by id: fed under this lock, so each sees
-    /// its snapshot and then every read once, in order.
-    taps: Vec<(u64, Tap)>,
+    /// The raw-output subscribers, by id, and whether each keeps the key
+    /// encodings: fed under this lock, so each sees its snapshot and then
+    /// every read once, in order.
+    taps: Vec<(u64, bool, Tap)>,
     /// The engine panicked (`crash`): `vt` is a blank terminal telling of
     /// it, and nothing the pane writes reaches it.
     crashed: bool,
@@ -323,7 +362,7 @@ impl Term {
             (Seq::Ground, false, None, true);
         self.synced = None;
         self.held.clear();
-        for (_, tap) in &mut self.taps {
+        for (_, _, tap) in &mut self.taps {
             tap(Feed::Snapshot(start(&self.vt, None)));
         }
     }
@@ -464,16 +503,23 @@ impl Term {
                 fed = seq.end;
                 self.drain(out) && verdict == Verdict::Ask
             }
-            Verdict::Own | Verdict::Pass if then.is_empty() => {
+            Verdict::Own | Verdict::Keys | Verdict::Pass if then.is_empty() => {
                 feed(&mut self.vt, &[&held]);
-                verdict == Verdict::Own
+                verdict != Verdict::Pass
             }
-            Verdict::Own | Verdict::Pass => {
+            Verdict::Own | Verdict::Keys | Verdict::Pass => {
                 feed(&mut self.vt, &[&held, &bytes[fed..seq.end], then]);
                 fed = seq.end;
-                verdict == Verdict::Own
+                verdict != Verdict::Pass
             }
         };
+        if verdict == Verdict::Keys {
+            out.keys.push(Key {
+                at: out.raw.len(),
+                cuts: out.cuts.len(),
+                bytes: whole.to_vec(),
+            });
+        }
         if !kept {
             let alone = switches(&whole);
             if alone {
@@ -492,6 +538,11 @@ impl Term {
         // on with its `\` first.
         if then.is_empty() && std::mem::take(&mut self.taps_owed) {
             out.raw.extend_from_slice(LEFT_ON_TAPS);
+            out.keys.push(Key {
+                at: out.raw.len(),
+                cuts: out.cuts.len(),
+                bytes: KEYS_LEFT_ON.to_vec(),
+            });
         }
         if !then.is_empty() && matches!(whole.get(1), Some(b']' | b'P')) {
             self.string_kept = Some(kept);
@@ -780,15 +831,18 @@ enum Verdict {
     /// pane — and passed on if not, for theirs to answer.
     Ask,
     /// Kept from the taps alone: mode 2031 set or reset — the daemon tells a
-    /// pane of light/dark changes itself (`PtyPane::set_colors`); the
-    /// keyboard protocols, xterm's modifyOtherKeys (`CSI > 4 ; n m`) and its
-    /// format (`CSI > 4 ; n f`), and kitty's push, pop and set (`CSI > u`, `CSI < u`, `CSI = u`), which the
-    /// TUI encodes a pane's keys by, but a `pane attach` terminal that took
-    /// either would encode the prefix where the detach cannot see it, and
-    /// keep it on past the detach (nvim and vim ask for modifyOtherKeys level
-    /// 2, Emacs for 1; nvim pushes kitty flags once its query, an `Ask`, is
-    /// answered); and the ST of a string kept from them.
+    /// pane of light/dark changes itself (`PtyPane::set_colors`) — and the
+    /// ST of a string kept from them.
     Own,
+    /// Kept from the taps but one that keeps them (rtty, which encodes a
+    /// pane's keys by them as the TUI does): the keyboard protocols, xterm's
+    /// modifyOtherKeys (`CSI > 4 ; n m`) and its format (`CSI > 4 ; n f`),
+    /// and kitty's push, pop and set (`CSI > u`, `CSI < u`, `CSI = u`). A
+    /// `pane attach` terminal that took either would encode the prefix where
+    /// the detach cannot see it, and keep it on past the detach (nvim and
+    /// vim ask for modifyOtherKeys level 2, Emacs for 1; nvim pushes kitty
+    /// flags once its query, an `Ask`, is answered).
+    Keys,
     /// Anything else: on to both.
     Pass,
     /// One that went on to both before it ended, too long or plain to be a
@@ -809,7 +863,7 @@ fn verdict(seq: &[u8]) -> Verdict {
             match (private, end) {
                 (Some(b'?'), b'u') => Verdict::Ask,
                 (Some(_), b'u') | (Some(b'>'), b'm' | b'f') if *end == b'u' || first == 4 => {
-                    Verdict::Own
+                    Verdict::Keys
                 }
                 _ if params().eq(*b"?2031") && matches!(end, b'h' | b'l') => Verdict::Own,
                 (Some(_), b'm') | (Some(b'?'), b'g') => Verdict::Ask,
@@ -1047,7 +1101,7 @@ impl PtyPane {
         let size = PaneSize { rows, cols };
         self.with(|term| {
             term.vt.resize(rows, cols);
-            for (_, tap) in &mut term.taps {
+            for (_, _, tap) in &mut term.taps {
                 tap(Feed::Snapshot(start(&term.vt, None)));
             }
         });
@@ -1060,20 +1114,20 @@ impl PtyPane {
     /// handed a snapshot of the screen as it stands, after the scrollback
     /// `rows` it asks for, and joins the reader, which hands it each read in
     /// the same hold that parses it — so nothing is lost or repeated between
-    /// them.
-    pub fn tap(&self, id: u64, rows: Option<Rows>, tap: Tap) {
+    /// them. `keys`: its reads keep the key encodings (`Verdict::Keys`).
+    pub fn tap(&self, id: u64, rows: Option<Rows>, keys: bool, tap: Tap) {
         let mut tap = Some((tap, rows));
         self.with(|term| {
             if let Some((mut tap, rows)) = tap.take() {
                 tap(Feed::Snapshot(start(&term.vt, rows)));
-                term.taps.push((id, tap));
+                term.taps.push((id, keys, tap));
             }
         });
     }
 
     /// Unsubscribe tap `id`, if it still is.
     pub fn untap(&self, id: u64) {
-        lock(&self.term).taps.retain(|(tap, _)| *tap != id);
+        lock(&self.term).taps.retain(|(tap, _, _)| *tap != id);
     }
 
     /// The size the pane was spawned at or last resized to.
@@ -1339,29 +1393,28 @@ fn read_loop(
                 // hold, so it never poisons the lock, and ends this pane.
                 let mut term = lock(&term);
                 let handled = catch_unwind(AssertUnwindSafe(|| {
-                    let Processed {
-                        raw,
-                        cuts,
-                        answers,
-                        signals,
-                    } = term.process(&buf[..n]);
-                    // A tap behind is handed the screen as this read left it
-                    // instead of the read.
-                    if !raw.is_empty() {
-                        let Term { vt, taps, .. } = &mut *term;
-                        let top = vt.screen_top();
-                        for (_, tap) in taps {
-                            let read = Feed::Read {
-                                raw: &raw,
-                                cuts: &cuts,
-                                top,
-                            };
-                            if let Kept::Behind(rows) = tap(read) {
-                                tap(Feed::Snapshot(start(vt, rows)));
-                            }
+                    let out = term.process(&buf[..n]);
+                    let Term { vt, taps, .. } = &mut *term;
+                    // Spliced once, for every tap that keeps the key
+                    // encodings.
+                    let keyed = (!out.keys.is_empty() && taps.iter().any(|(_, keys, _)| *keys))
+                        .then(|| out.keyed());
+                    let top = vt.screen_top();
+                    for (_, keys, tap) in taps {
+                        let (raw, cuts) = match &keyed {
+                            Some((raw, cuts)) if *keys => (raw, cuts),
+                            _ => (&out.raw, &out.cuts),
+                        };
+                        if raw.is_empty() {
+                            continue;
+                        }
+                        // A tap behind is handed the screen as this read
+                        // left it instead of the read.
+                        if let Kept::Behind(rows) = tap(Feed::Read { raw, cuts, top }) {
+                            tap(Feed::Snapshot(start(vt, rows)));
                         }
                     }
-                    (answers, signals)
+                    (out.answers, out.signals)
                 }));
                 let (answer, signals) = match handled {
                     Ok(handled) => handled,
@@ -2742,17 +2795,23 @@ mod tests {
 
     /// Kitty's keyboard protocol and xterm's modifyOtherKeys reach the
     /// terminal — which answers their queries, and whose snapshots and
-    /// redraws hand the TUI the flags to encode keys by — but never the
-    /// taps, however a read cuts them: a `pane attach` terminal keeps plain
-    /// keys.
+    /// redraws hand the TUI the flags to encode keys by — but only the taps
+    /// that keep them, however a read cuts them: a `pane attach` terminal
+    /// keeps plain keys, rtty's encodes them as the program asked.
     #[test]
-    fn the_keyboard_protocols_reach_the_terminal_but_not_the_taps() {
+    fn the_keyboard_protocols_reach_the_terminal_and_only_the_taps_that_keep_them() {
         let stream: &[u8] =
             b"\x1b[?u\x1b[>3u\x1b[=1;1u\x1b[>5u\x1b[<u\x1b[?u\x1b[>4;2m\x1b[?4m\x1b[c";
         let answers = b"\x1b[?0u\x1b[?1u\x1b[>4;2m\x1b[?62;22c".to_vec();
+        let keyed: &[u8] = b"\x1b[>3u\x1b[=1;1u\x1b[>5u\x1b[<u\x1b[>4;2m";
         for cut in 0..=stream.len() {
             let mut term = Term::new(PaneSize::new(3, 20), None);
             let (first, second) = (term.process(&stream[..cut]), term.process(&stream[cut..]));
+            assert_eq!(
+                [first.keyed().0, second.keyed().0].concat(),
+                keyed,
+                "cut at {cut}"
+            );
             assert_eq!([first.raw, second.raw].concat(), b"", "cut at {cut}");
             assert_eq!([first.answers, second.answers].concat(), answers);
             assert_eq!(term.vt.kitty_keyboard(), 1);
@@ -2771,7 +2830,8 @@ mod tests {
     /// stream, so the shell neither hears a light/dark flip (a 997 report
     /// zsh's line editor takes for typing) nor gets its keys in kitty's
     /// encoding. Bracketed paste and the alternate screen stay. The taps
-    /// are told of the mouse and focus modes, after the mark.
+    /// are told of the mouse and focus modes, after the mark — and a tap
+    /// that keeps the key encodings of those too.
     #[test]
     fn a_commands_end_turns_off_what_it_left_on() {
         let left: &[u8] = b"\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2031h\x1b[?2004h\
@@ -2789,9 +2849,22 @@ mod tests {
             b"\x1b]133;A\x07$ ",
         ]
         .concat();
+        let keyed = [
+            b"\x1b]133;C\x07\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2004h\
+                \x1b[>4;2m\x1b[>1u\x1b]133;D;137\x1b\\",
+            LEFT_ON_TAPS,
+            KEYS_LEFT_ON,
+            b"\x1b]133;A\x07$ ",
+        ]
+        .concat();
         for cut in 0..=stream.len() {
             let mut term = Term::new(PaneSize::new(3, 20), None);
             let (first, second) = (term.process(&stream[..cut]), term.process(&stream[cut..]));
+            assert_eq!(
+                [first.keyed().0, second.keyed().0].concat(),
+                keyed,
+                "cut at {cut}"
+            );
             assert_eq!([first.raw, second.raw].concat(), raw, "cut at {cut}");
             let modes = term.vt.modes();
             assert_eq!(
@@ -2897,6 +2970,69 @@ mod tests {
         }
     }
 
+    /// A key encoding goes back where it was for a tap that keeps it, on its
+    /// own side of a switch of screens beside it — the switch still alone —
+    /// and kept from the others.
+    #[test]
+    fn a_key_encoding_keeps_its_side_of_a_switch() {
+        let mut term = Term::new(PaneSize::new(5, 20), None);
+        let out =
+            term.process(b"a\x1b[>1u\x1b[?1049h\x1b[>4;2mc\x1b[<u\x1b[?1049ld\x1b[?2031h\x1b[c");
+        let pieces = |raw: &[u8], cuts: &[usize]| -> Vec<Vec<u8>> {
+            let ends = cuts.iter().copied().chain([raw.len()]);
+            [0].into_iter()
+                .chain(cuts.iter().copied())
+                .zip(ends)
+                .map(|(from, to)| raw[from..to].to_vec())
+                .collect()
+        };
+        let (raw, cuts) = out.keyed();
+        let keyed: [&[u8]; 5] = [
+            b"a\x1b[>1u",
+            b"\x1b[?1049h",
+            b"\x1b[>4;2mc\x1b[<u",
+            b"\x1b[?1049l",
+            b"d",
+        ];
+        assert_eq!(pieces(&raw, &cuts), keyed);
+        let plain: [&[u8]; 5] = [b"a", b"\x1b[?1049h", b"c", b"\x1b[?1049l", b"d"];
+        assert_eq!(pieces(&out.raw, &out.cuts), plain);
+    }
+
+    /// Of two taps on one pane, the one that keeps the key encodings gets
+    /// them in its reads, the other the same reads without.
+    #[test]
+    fn only_a_tap_that_keeps_the_key_encodings_reads_them() {
+        let spec = PtySpec {
+            args: vec![
+                "-c".into(),
+                "read go; printf 'one\\033[>1utwo\\033[<u'; read stay".into(),
+            ],
+            ..PtySpec::new("/bin/sh")
+        };
+        let pane = PtyPane::spawn(spec, PaneSize::new(5, 20)).unwrap();
+        let (plain_tx, plain) = std::sync::mpsc::channel();
+        let (keys_tx, keys) = std::sync::mpsc::channel();
+        pane.tap(7, None, false, recorder(plain_tx, |_| false, |_| None));
+        pane.tap(8, None, true, recorder(keys_tx, |_| false, |_| None));
+        pane.write_input(b"go\r").unwrap();
+        wait_for(|| pane.contents().contains("onetwo"), "no output");
+        let reads = |rx: std::sync::mpsc::Receiver<(Option<PaneSize>, Vec<u8>)>| {
+            let mut reads = Vec::new();
+            while let Ok((size, bytes)) = rx.recv_timeout(Duration::from_millis(200)) {
+                if size.is_none() {
+                    reads.extend(bytes);
+                }
+            }
+            String::from_utf8(reads).unwrap()
+        };
+        let (plain, keys) = (reads(plain), reads(keys));
+        assert!(plain.contains("onetwo"), "{plain:?}");
+        assert!(keys.contains("one\x1b[>1utwo\x1b[<u"), "{keys:?}");
+        assert_eq!(keys.replace("\x1b[>1u", "").replace("\x1b[<u", ""), plain);
+        pane.kill().unwrap();
+    }
+
     /// With no colours reported the daemon invents none: the colour queries
     /// and the light/dark one go on to the taps unanswered. Without a cursor
     /// colour, so does OSC 12 alone.
@@ -2997,7 +3133,7 @@ mod tests {
         let pane = PtyPane::spawn(spec, PaneSize::new(24, 80)).unwrap();
         wait_for(|| lock(&pane.term).vt.screen_top() > 1000, "no output");
         let (tx, rx) = std::sync::mpsc::channel();
-        pane.tap(7, None, recorder(tx, |_| false, |_| None));
+        pane.tap(7, None, false, recorder(tx, |_| false, |_| None));
         wait_for(
             || pane.output_receiver().has_changed().is_err(),
             "the output never ended",
@@ -3087,7 +3223,7 @@ mod tests {
                 held: Vec::new(),
                 at_most: history,
             };
-            pane.tap(id, Some(rows), recorder(tx, |_| false, |_| None));
+            pane.tap(id, Some(rows), false, recorder(tx, |_| false, |_| None));
             assert_eq!(rx.recv().unwrap(), (None, want), "{history} rows");
             let (size, snapshot) = rx.recv().unwrap();
             assert_eq!(size, Some(PaneSize::new(5, 20)));
@@ -3111,7 +3247,7 @@ mod tests {
         let pane = PtyPane::spawn(spec, PaneSize::new(5, 20)).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let behind = |read: &[u8]| read.starts_with(b"before");
-        pane.tap(7, None, recorder(tx, behind, |_| None));
+        pane.tap(7, None, false, recorder(tx, behind, |_| None));
         pane.write_input(b"go\r").unwrap();
         wait_for(|| pane.contents().contains("after"), "no output");
         let mut terminal = Terminal::new(5, 20, 0);
@@ -3151,6 +3287,7 @@ mod tests {
         pane.tap(
             7,
             None,
+            false,
             recorder(tx, |read| read.ends_with(b"12\r\n"), rows),
         );
         pane.write_input(b"go\r").unwrap();

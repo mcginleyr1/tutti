@@ -1670,7 +1670,13 @@ fn edit_opens_the_file_in_a_real_nvim_then_focuses_its_pane() {
         let (mut stream, _) = listener.accept().unwrap();
         for (want, reply) in [
             (Request::View, Response::View { workspaces: view }),
-            (Request::PaneFocus { pane: PaneId(5) }, Response::Ok),
+            (
+                Request::PaneFocus {
+                    pane: PaneId(5),
+                    seen: false,
+                },
+                Response::Ok,
+            ),
         ] {
             assert_eq!(read_request(&mut stream), want);
             let frame = Frame::Control(serde_json::to_vec(&reply).unwrap());

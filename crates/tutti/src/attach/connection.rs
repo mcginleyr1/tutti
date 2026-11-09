@@ -300,7 +300,7 @@ fn navigates(frame: &Frame) -> bool {
             tagged.body,
             Request::Attach { .. }
                 | Request::Detach
-                | Request::PaneFocus { .. }
+                | Request::PaneFocus { seen: false, .. }
                 | Request::TabSelect { .. }
                 | Request::PaneScroll { .. }
                 | Request::PaneRead { .. }
@@ -410,9 +410,10 @@ mod tests {
                 terminal: None,
                 handoff: false,
                 view: false,
+                quiet: false,
             },
             Request::Detach,
-            Request::PaneFocus { pane },
+            Request::PaneFocus { pane, seen: false },
             Request::TabSelect { id: TabId(2) },
             Request::PaneScroll { pane, offset: 3 },
         ] {
@@ -453,6 +454,8 @@ mod tests {
                 id: WorkspaceId(1),
                 discard: false,
             },
+            // A view's focus says nobody is looking.
+            Request::PaneFocus { pane, seen: true },
             Request::NotesRead {
                 up_to: None,
                 pane: None,

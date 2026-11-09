@@ -165,8 +165,10 @@ cargo fmt --all --check
   the daemon answered or owns** (`Term::taps`, `verdict`; it owns mode 2031
   and the keyboard protocols — modifyOtherKeys and kitty's push, pop and set
   reach the terminal, whose snapshots and redraws hand them to the TUI's key
-  encoder, but never a stream, and `pane attach`'s mirror redraws leave them
-  out too, so its terminal keeps plain keys): a stream's snapshot
+  encoder, but never a stream that did not ask for them — `PaneAttach.keys`
+  hands rtty each back at its place (`Verdict::Keys`, `Processed::keyed`) —
+  and `pane attach`'s mirror redraws leave them out too, so its terminal keeps
+  plain keys): a stream's snapshot
   and its first raw read come from one hold, so nothing is lost or repeated,
   and a resize hands taps a fresh snapshot in the hold that resizes. An
   answered query that reached a raw stream would be answered again by the

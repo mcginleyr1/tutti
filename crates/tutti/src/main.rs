@@ -1231,7 +1231,10 @@ fn to_request(command: Command) -> Result<Request> {
             },
             PaneAction::Focus {
                 pane: Some(pane), ..
-            } => Request::PaneFocus { pane: PaneId(pane) },
+            } => Request::PaneFocus {
+                pane: PaneId(pane),
+                seen: false,
+            },
             PaneAction::Focus {
                 direction,
                 from,
@@ -1683,7 +1686,7 @@ fn run_edit(session: &str, target: &str, workspace: Option<u64>) -> Result<i32> 
         return Ok(1);
     };
     editor::open(editor, &path, line, col)?;
-    match client.request(&Request::PaneFocus { pane })? {
+    match client.request(&Request::PaneFocus { pane, seen: false })? {
         Response::Ok => Ok(0),
         other => Ok(emit(other, false)),
     }
@@ -3009,7 +3012,10 @@ mod tests {
     fn pane_focus_parses() {
         assert_eq!(
             request_of(&["tutti", "pane", "focus", "3"]),
-            Request::PaneFocus { pane: PaneId(3) }
+            Request::PaneFocus {
+                pane: PaneId(3),
+                seen: false
+            }
         );
     }
 

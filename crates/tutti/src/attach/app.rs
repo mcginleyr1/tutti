@@ -741,7 +741,7 @@ impl App {
             self.notified.remove(&pane);
         }
         self.focused
-            .map(|pane| control(&Request::PaneFocus { pane }))
+            .map(|pane| control(&Request::PaneFocus { pane, seen: false }))
     }
 
     /// The TUI runs in rtty pane `pane`: moves past tutti's edge go on to
@@ -6395,7 +6395,10 @@ mod tests {
         attached(&mut app);
         assert_eq!(
             app.focus_change(),
-            Some(control(&Request::PaneFocus { pane: PaneId(1) })),
+            Some(control(&Request::PaneFocus {
+                pane: PaneId(1),
+                seen: false
+            })),
             "attach should notify focus of the initial pane"
         );
         assert_eq!(app.focus_change(), None, "unchanged focus emits nothing");
@@ -7080,7 +7083,10 @@ mod tests {
         assert_eq!(app.focused, Some(PaneId(3)));
         assert_eq!(
             app.focus_change(),
-            Some(control(&Request::PaneFocus { pane: PaneId(3) }))
+            Some(control(&Request::PaneFocus {
+                pane: PaneId(3),
+                seen: false
+            }))
         );
 
         app.handle_frame(focused(PaneId(9)));
@@ -7913,7 +7919,10 @@ mod tests {
         );
         assert_eq!(
             app.focus_change(),
-            Some(control(&Request::PaneFocus { pane: PaneId(3) })),
+            Some(control(&Request::PaneFocus {
+                pane: PaneId(3),
+                seen: false
+            })),
             "the same focus report a sidebar jump sends"
         );
     }
@@ -8018,7 +8027,10 @@ mod tests {
         // The PaneFocus follows from the focus-change the event loop drains.
         assert_eq!(
             app.focus_change(),
-            Some(control(&Request::PaneFocus { pane: PaneId(2) })),
+            Some(control(&Request::PaneFocus {
+                pane: PaneId(2),
+                seen: false
+            })),
         );
     }
 

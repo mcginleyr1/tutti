@@ -2,6 +2,7 @@
 //! listener on a private temp path, serves it in-process, and talks the wire
 //! protocol over `tokio::net::UnixStream`.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -458,7 +459,7 @@ async fn an_ask_waits_for_the_next_reported_turn_end() {
         reply: Some(text.into()),
     };
     hook(&mut control, pane, said("first")).await;
-    let focus = Request::PaneFocus { pane };
+    let focus = Request::PaneFocus { pane, seen: false };
     assert_eq!(control.request(focus).await, Response::Ok);
 
     let after = sent(control.request(ask_send(pane, "x")).await);
@@ -733,7 +734,7 @@ async fn pane_wait_next_ignores_the_current_state_and_a_focus() {
 
     let mut waiter = server.connect().await;
     start_wait(&mut waiter, wait_for(pane, &[WaitFor::Done], true, None)).await;
-    let focus = Request::PaneFocus { pane };
+    let focus = Request::PaneFocus { pane, seen: false };
     assert_eq!(control.request(focus.clone()).await, Response::Ok);
     hook(
         &mut control,
@@ -817,7 +818,12 @@ async fn a_child_exit_ends_a_wait() {
     assert!(never.contains("exited with code 3"), "{never}");
     start_wait(&mut waiter, wait_for(busy, &[WaitFor::Idle], false, None)).await;
     assert_eq!(
-        control.request(Request::PaneFocus { pane: busy }).await,
+        control
+            .request(Request::PaneFocus {
+                pane: busy,
+                seen: false
+            })
+            .await,
         Response::Ok
     );
     assert_eq!(waited(waiter.response().await), (AgentState::Idle, false));
@@ -1530,6 +1536,7 @@ async fn attach_receives_snapshot_then_delta() {
             terminal: None,
             handoff: false,
             view: false,
+            quiet: false,
         })
         .await;
     match viewer.response().await {
@@ -1591,6 +1598,7 @@ async fn snapshot_carries_mouse_reporting_mode() {
             terminal: None,
             handoff: false,
             view: false,
+            quiet: false,
         })
         .await;
     let _ = viewer.response().await;
@@ -1634,6 +1642,7 @@ async fn attach_resize_reseeds_at_new_size() {
             terminal: None,
             handoff: false,
             view: false,
+            quiet: false,
         })
         .await;
     let _ = viewer.response().await;
@@ -1695,6 +1704,7 @@ async fn attach(
         terminal: None,
         handoff: false,
         view: false,
+        quiet: false,
     })
     .await;
     loop {
@@ -1984,6 +1994,7 @@ async fn resize_split_adjusts_ratio_and_broadcasts() {
             terminal: None,
             handoff: false,
             view: false,
+            quiet: false,
         })
         .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
@@ -2040,6 +2051,7 @@ async fn split_ratio_sets_the_separating_split_and_broadcasts() {
             terminal: None,
             handoff: false,
             view: false,
+            quiet: false,
         })
         .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
@@ -2133,6 +2145,7 @@ async fn wedged_client_is_dropped_but_others_keep_flowing() {
             terminal: None,
             handoff: false,
             view: false,
+            quiet: false,
         })
         .await;
 
@@ -2142,6 +2155,7 @@ async fn wedged_client_is_dropped_but_others_keep_flowing() {
         terminal: None,
         handoff: false,
         view: false,
+        quiet: false,
     })
     .await;
     assert!(matches!(good.response().await, Response::Attached { .. }));
@@ -2371,6 +2385,7 @@ fn pane_attach(pane: PaneId, rows: u16, cols: u16) -> Request {
         history: 0,
         inline: false,
         since: None,
+        keys: false,
     }
 }
 
@@ -2384,6 +2399,7 @@ fn inline_attach(pane: PaneId, history: u32, since: Option<Printed>) -> Request 
         history,
         inline: true,
         since,
+        keys: false,
     }
 }
 
@@ -2405,6 +2421,7 @@ async fn a_pane_stream_starts_with_the_history_it_asks_for() {
             history: 10,
             inline: false,
             since: None,
+            keys: false,
         })
         .await;
     let mut history = Vec::new();
@@ -2446,8 +2463,8 @@ async fn a_pane_stream_starts_with_the_history_it_asks_for() {
 
 /// A pane stream opens on a snapshot of the screen, then carries the pane's
 /// output raw and in order — a terminal fed both is level with the pane —
-/// and its `Input` frames type into the pane. One pane per connection, and
-/// only a pane that exists.
+/// and its `Input` frames type into the pane. A pane once per connection,
+/// and only a pane that exists.
 #[tokio::test]
 async fn a_pane_stream_sends_a_snapshot_then_raw_output_in_order() {
     let server = TestServer::start();
@@ -2567,6 +2584,271 @@ async fn a_pane_stream_ends_with_the_exit_after_the_last_output() {
     let mut rest = [0u8; 64];
     let read = timeout(DEADLINE, stream.stream.read(&mut rest)).await;
     assert_eq!(read.expect("the stream stayed open").unwrap(), 0);
+
+    server.stop().await;
+}
+
+/// Read `stream` until `pane`'s exit: its code, and the raw bytes each pane
+/// streamed on the way. Another pane's exit on the way fails the test.
+async fn stream_to_exit(stream: &mut Conn, pane: PaneId) -> (i32, HashMap<PaneId, Vec<u8>>) {
+    let mut raw: HashMap<PaneId, Vec<u8>> = HashMap::new();
+    let code = timeout(DEADLINE, async {
+        loop {
+            match stream.read_frame().await {
+                Frame::PaneRaw { pane, bytes } => raw.entry(pane).or_default().extend(bytes),
+                Frame::Control(json) => {
+                    if let Ok(Event::PaneExited { pane: exited, code }) =
+                        serde_json::from_slice(&json)
+                    {
+                        assert_eq!(exited, pane, "another pane's exit came first");
+                        return code;
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("pane {pane} never exited"));
+    (code, raw)
+}
+
+/// One connection streams several panes, each frame naming its pane: the
+/// same pane twice is refused, a size it sends votes for each pane it
+/// streams, a pane's exit ends that stream alone — the other streams on —
+/// and the daemon closes the connection after the last.
+#[tokio::test]
+async fn a_connection_streams_several_panes_until_the_last_ends() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let first = run_marker(&mut control, "read line; printf 'one-%s' \"$line\"; exit 3").await;
+    let second = run_marker(&mut control, "read line; printf 'two-%s' \"$line\"; exit 4").await;
+    let mut stream = server.connect().await;
+    stream.send(&pane_attach(first, 24, 80)).await;
+    snapshot_at(&mut stream, first, 24, 80).await;
+    stream.send(&pane_attach(second, 10, 40)).await;
+    snapshot_at(&mut stream, second, 10, 40).await;
+    stream.send(&pane_attach(first, 24, 80)).await;
+    let refusal = error_message(stream.response().await);
+    assert_eq!(
+        refusal,
+        format!("this connection already streams pane {first}")
+    );
+
+    // The snapshots at the new sizes go out before the answer.
+    let votes = [(first, 20, 70), (second, 12, 50)];
+    let panes = votes
+        .iter()
+        .map(|&(pane, rows, cols)| PaneDims { pane, rows, cols })
+        .collect();
+    stream.send(&Request::ViewSizes { panes }).await;
+    let want = HashSet::from(votes);
+    let mut resized = HashSet::new();
+    timeout(DEADLINE, async {
+        while resized != want {
+            if let Frame::PaneSnapshot(data) = stream.read_frame().await {
+                resized.insert((data.pane, data.rows, data.cols));
+                resized.retain(|seen| want.contains(seen));
+            }
+        }
+    })
+    .await
+    .expect("a pane streamed was never resized to its vote");
+
+    let input = |pane, bytes: &[u8]| Frame::Input {
+        pane,
+        bytes: bytes.to_vec(),
+    };
+    stream.write_frame(&input(second, b"now\r")).await;
+    let (code, raw) = stream_to_exit(&mut stream, second).await;
+    assert_eq!(code, 4);
+    assert!(raw[&second].ends_with(b"two-now"), "{raw:?}");
+    stream.write_frame(&input(first, b"later\r")).await;
+    let (code, raw) = stream_to_exit(&mut stream, first).await;
+    assert_eq!(code, 3);
+    assert!(raw[&first].ends_with(b"one-later"), "{raw:?}");
+    let mut rest = [0u8; 64];
+    let read = timeout(DEADLINE, stream.stream.read(&mut rest)).await;
+    assert_eq!(read.expect("the connection stayed open").unwrap(), 0);
+
+    server.stop().await;
+}
+
+/// A connection ends one of its streams with `PaneDetach`: its vote goes —
+/// the pane grows back to the other viewer's size — the connection's other
+/// stream goes on, and the pane may be streamed again, its exit then told
+/// once, by the new stream alone. A pane it does not stream is refused.
+#[tokio::test]
+async fn a_connection_detaches_one_stream_and_may_stream_it_again() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let first = run_marker(&mut control, "read line; printf 'one-%s' \"$line\"; exit 3").await;
+    let second = run_marker(&mut control, "read line; printf 'two-%s' \"$line\"; exit 4").await;
+    let mut wide = server.connect().await;
+    attach(&mut wide).await;
+    view(&mut wide, &[(first, 30, 100)]).await;
+    snapshot_at(&mut wide, first, 30, 100).await;
+    let mut stream = server.connect().await;
+    stream.send(&pane_attach(first, 20, 120)).await;
+    snapshot_at(&mut stream, first, 20, 100).await;
+    stream.send(&pane_attach(second, 10, 40)).await;
+    snapshot_at(&mut stream, second, 10, 40).await;
+    snapshot_at(&mut wide, first, 20, 100).await;
+
+    let detach = Request::PaneDetach { pane: first };
+    assert_eq!(stream.request(detach.clone()).await, Response::Ok);
+    snapshot_at(&mut wide, first, 30, 100).await;
+    let refusal = error_message(stream.request(detach).await);
+    assert_eq!(refusal, format!("this connection streams no pane {first}"));
+
+    stream.send(&pane_attach(first, 20, 120)).await;
+    snapshot_at(&mut stream, first, 20, 100).await;
+    let input = |pane, bytes: &[u8]| Frame::Input {
+        pane,
+        bytes: bytes.to_vec(),
+    };
+    stream.write_frame(&input(first, b"now\r")).await;
+    let (code, raw) = stream_to_exit(&mut stream, first).await;
+    assert_eq!(code, 3);
+    assert!(raw[&first].ends_with(b"one-now"), "{raw:?}");
+    stream.write_frame(&input(second, b"later\r")).await;
+    let (code, raw) = stream_to_exit(&mut stream, second).await;
+    assert_eq!(code, 4);
+    assert!(raw[&second].ends_with(b"two-later"), "{raw:?}");
+    let mut rest = [0u8; 64];
+    let read = timeout(DEADLINE, stream.stream.read(&mut rest)).await;
+    assert_eq!(read.expect("the connection stayed open").unwrap(), 0);
+
+    server.stop().await;
+}
+
+/// rtty's window on one connection: a quiet view that streams its pane with
+/// the key encodings. Its stream carries the kitty flags the pane's program
+/// pushes and pops, which a plain stream of the same pane never sees; the
+/// pane's exit ends the stream but not the connection, which is still told
+/// of the session.
+#[tokio::test]
+async fn an_attached_connection_keeps_the_keys_and_outlives_its_streams() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let script = "read go; printf 'one\\033[>1utwo\\033[<u'; read line; exit 0";
+    let pane = run_marker(&mut control, script).await;
+    let mut window = server.connect().await;
+    window
+        .send(&Request::Attach {
+            terminal: Some("local.rtty".into()),
+            handoff: true,
+            view: true,
+            quiet: true,
+        })
+        .await;
+    read_until_control(&mut window, |r: &Response| {
+        matches!(r, Response::Attached { .. })
+    })
+    .await;
+    window
+        .send(&Request::PaneAttach {
+            pane,
+            rows: 24,
+            cols: 80,
+            history: 0,
+            inline: false,
+            since: None,
+            keys: true,
+        })
+        .await;
+    snapshot_at(&mut window, pane, 24, 80).await;
+    let mut plain = server.connect().await;
+    plain.send(&pane_attach(pane, 24, 80)).await;
+    snapshot_at(&mut plain, pane, 24, 80).await;
+
+    let input = |bytes: &[u8]| Frame::Input {
+        pane,
+        bytes: bytes.to_vec(),
+    };
+    window.write_frame(&input(b"go\rbye\r")).await;
+    let (code, raw) = stream_to_exit(&mut window, pane).await;
+    assert_eq!(code, 0);
+    let keyed = String::from_utf8_lossy(&raw[&pane]).into_owned();
+    assert!(keyed.contains("one\x1b[>1utwo\x1b[<u"), "{keyed:?}");
+    let (_, raw) = stream_to_exit(&mut plain, pane).await;
+    let unkeyed = String::from_utf8_lossy(&raw[&pane]).into_owned();
+    assert!(unkeyed.contains("onetwo"), "{unkeyed:?}");
+
+    assert_eq!(
+        control.request(Request::PaneKill { pane }).await,
+        Response::Ok
+    );
+    let layout = read_until_control(&mut window, |e: &Event| {
+        assert!(
+            !matches!(e, Event::PaneExited { .. }),
+            "the exit was told twice"
+        );
+        matches!(e, Event::LayoutChanged { .. })
+    })
+    .await;
+    assert!(matches!(layout, Event::LayoutChanged { .. }));
+
+    server.stop().await;
+}
+
+/// A quiet client is sent no pane frame — no snapshot, no delta — across
+/// the output a plain client beside it is sent both for; events reach both.
+#[tokio::test]
+async fn a_quiet_client_is_sent_no_pane_frames() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    let pane = run_marker(&mut control, "exec cat").await;
+    let mut quiet = server.connect().await;
+    quiet
+        .send(&Request::Attach {
+            terminal: None,
+            handoff: false,
+            view: false,
+            quiet: true,
+        })
+        .await;
+    let mut plain = server.connect().await;
+    attach(&mut plain).await;
+    expect_pane_frame(&mut plain, pane, true).await;
+    control
+        .write_frame(&Frame::Input {
+            pane,
+            bytes: b"typed\r".to_vec(),
+        })
+        .await;
+    expect_pane_frame(&mut plain, pane, false).await;
+
+    // What the ticks so far sent the quiet client came before this split's
+    // layout.
+    let split = Request::PaneSplit {
+        pane,
+        direction: Direction::Vertical,
+    };
+    let new = pane_id(control.request(split).await);
+    let holds_new = |e: &Event| match e {
+        Event::LayoutChanged { workspaces } => workspaces
+            .iter()
+            .flat_map(|w| &w.tabs)
+            .flat_map(|t| &t.panes)
+            .any(|p| p.id == new),
+        _ => false,
+    };
+    timeout(DEADLINE, async {
+        loop {
+            match quiet.read_frame().await {
+                Frame::Control(json) => {
+                    if serde_json::from_slice(&json).is_ok_and(|e| holds_new(&e)) {
+                        return;
+                    }
+                }
+                other => panic!("a quiet client got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the quiet client never heard of the split");
+    read_until_control(&mut plain, holds_new).await;
 
     server.stop().await;
 }
@@ -3237,6 +3519,7 @@ async fn a_requests_req_rides_back_on_its_answer() {
                 terminal: None,
                 handoff: false,
                 view: false,
+                quiet: false,
             },
         ))
         .await;
@@ -3716,6 +3999,7 @@ async fn agent_event_blocks_and_broadcasts() {
             terminal: None,
             handoff: false,
             view: false,
+            quiet: false,
         })
         .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
@@ -3768,6 +4052,7 @@ async fn attached_viewer(server: &TestServer) -> Conn {
             terminal: None,
             handoff: false,
             view: false,
+            quiet: false,
         })
         .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
@@ -3826,6 +4111,7 @@ async fn an_approval_hold_with_no_client_attached_passes_at_once() {
             terminal: None,
             handoff: false,
             view: true,
+            quiet: false,
         })
         .await;
     read_until_control(&mut viewer, |r: &Response| {
@@ -4515,6 +4801,7 @@ async fn notifications_and_attention_transitions_land_in_the_history() {
         terminal: None,
         handoff: false,
         view: false,
+        quiet: false,
     })
     .await;
     let caught_up = timeout(DEADLINE, async {
@@ -4657,7 +4944,12 @@ async fn focusing_a_pane_marks_its_notes_read() {
     noted(&mut viewer).await;
 
     assert_eq!(
-        control.request(Request::PaneFocus { pane: first }).await,
+        control
+            .request(Request::PaneFocus {
+                pane: first,
+                seen: false
+            })
+            .await,
         Response::Ok
     );
     let read: Vec<(PaneId, bool)> = notes_changed(&mut viewer)
@@ -4747,7 +5039,7 @@ async fn bells_land_once_and_never_from_the_pane_in_view() {
 
     // The focus's reply follows its broadcasts and the server noting what
     // the viewer looks at.
-    viewer.send(&Request::PaneFocus { pane }).await;
+    viewer.send(&Request::PaneFocus { pane, seen: false }).await;
     timeout(DEADLINE, async {
         loop {
             if let Frame::Control(json) = viewer.read_frame().await
@@ -5045,6 +5337,7 @@ async fn a_shell_panes_own_status_reports_drive_its_state() {
             terminal: None,
             handoff: false,
             view: false,
+            quiet: false,
         })
         .await;
     let label = |p: &PaneInfo| p.agent.as_ref().map(ToString::to_string);
@@ -5271,6 +5564,7 @@ async fn agent_state_changes_working_then_blocked() {
             terminal: None,
             handoff: false,
             view: false,
+            quiet: false,
         })
         .await;
 
@@ -5486,6 +5780,7 @@ async fn a_mirror_fingerprints_like_the_live_grid() {
             terminal: None,
             handoff: false,
             view: false,
+            quiet: false,
         })
         .await;
     let mut mirror = None;
@@ -5729,6 +6024,7 @@ async fn ephemeral_pane_vanishes_on_child_exit() {
             terminal: None,
             handoff: false,
             view: false,
+            quiet: false,
         })
         .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
@@ -5816,7 +6112,7 @@ async fn focus_transitions_done_pane_to_idle() {
     );
 
     assert_eq!(
-        conn.request(Request::PaneFocus { pane }).await,
+        conn.request(Request::PaneFocus { pane, seen: false }).await,
         Response::Ok
     );
     assert!(
@@ -5829,7 +6125,7 @@ async fn focus_transitions_done_pane_to_idle() {
 
 /// Focus `pane` from `conn`, an attached client, waiting for the answer.
 async fn focus(conn: &mut Conn, pane: PaneId) {
-    conn.send(&Request::PaneFocus { pane }).await;
+    conn.send(&Request::PaneFocus { pane, seen: false }).await;
     read_until_control(conn, |r: &Response| *r == Response::Ok).await;
 }
 
@@ -5865,6 +6161,7 @@ async fn a_views_focus_marks_nothing_seen() {
         terminal: None,
         handoff: false,
         view,
+        quiet: false,
     };
     let mut tui = server.connect().await;
     tui.send(&attach(false)).await;
@@ -5942,6 +6239,92 @@ async fn a_views_focus_marks_nothing_seen() {
     focus(&mut tui, shell).await;
     assert!(wait_state(&mut control, done, AgentState::Idle).await);
     assert!(list_notes(&mut control, true).await.is_empty());
+
+    server.stop().await;
+}
+
+/// A view's focus that says someone looks at the pane (`seen`) sees it as a
+/// client's focus does — done turns idle, its notes read — yet moves no pane
+/// of the session's and relays no `PaneFocused` to the attached client
+/// beside it. Without `seen` it sees nothing.
+#[tokio::test]
+async fn a_views_seen_focus_sees_but_moves_nothing() {
+    let server = TestServer::start();
+    let mut control = server.connect().await;
+    new_workspace(&mut control).await;
+    let run = Request::PaneRun {
+        tab: None,
+        cmd: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf '\\033]9;look\\007'; exit 0".into(),
+        ],
+        ephemeral: false,
+        sandbox: None,
+    };
+    let done = pane_id(control.request(run).await);
+    assert!(wait_state(&mut control, done, AgentState::Done).await);
+    timeout(DEADLINE, async {
+        while list_notes(&mut control, true).await.is_empty() {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the note never landed");
+    let other = run_shell(&mut control).await;
+    let attach = |view| Request::Attach {
+        terminal: None,
+        handoff: false,
+        view,
+        quiet: false,
+    };
+    let mut tui = server.connect().await;
+    tui.send(&attach(false)).await;
+    focus(&mut tui, other).await;
+    let mut viewer = server.connect().await;
+    viewer.send(&attach(true)).await;
+
+    focus(&mut viewer, done).await;
+    assert!(wait_state(&mut control, done, AgentState::Done).await);
+    assert_eq!(list_notes(&mut control, true).await.len(), 1);
+
+    viewer
+        .send(&Request::PaneFocus {
+            pane: done,
+            seen: true,
+        })
+        .await;
+    read_until_control(&mut viewer, |r: &Response| *r == Response::Ok).await;
+    assert!(wait_state(&mut control, done, AgentState::Idle).await);
+    assert!(list_notes(&mut control, true).await.is_empty());
+    let Response::View { workspaces } = control.request(Request::View).await else {
+        panic!("no view");
+    };
+    let current: Vec<_> = workspaces
+        .iter()
+        .flat_map(|w| &w.tabs)
+        .filter(|t| t.active)
+        .map(|t| t.active_pane)
+        .collect();
+    assert_eq!(current, [Some(other)], "the session's focus moved");
+    // Anything the focus relayed to the TUI comes before this answer.
+    tui.send(&Request::View).await;
+    timeout(DEADLINE, async {
+        loop {
+            if let Frame::Control(json) = tui.read_frame().await {
+                let relayed = serde_json::from_slice::<Event>(&json);
+                assert!(
+                    !matches!(relayed, Ok(Event::PaneFocused { .. })),
+                    "a view's focus was relayed"
+                );
+                if let Ok(Response::View { .. }) = serde_json::from_slice(&json) {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .expect("the TUI's view was never answered");
 
     server.stop().await;
 }
@@ -6030,9 +6413,10 @@ async fn a_watcher_snapshots_the_session_beside_an_attached_client() {
             terminal: Some("com.mitchellh.ghostty".into()),
             handoff: false,
             view: false,
+            quiet: false,
         })
         .await;
-    viewer.send(&Request::PaneFocus { pane }).await;
+    viewer.send(&Request::PaneFocus { pane, seen: false }).await;
     snapshot_until(&mut watcher, |terminal, panes| {
         terminal.as_deref() == Some("com.mitchellh.ghostty") && panes[0].focused
     })
@@ -6149,9 +6533,15 @@ async fn a_scripted_focus_is_relayed_to_the_attached_client() {
             terminal: None,
             handoff: false,
             view: false,
+            quiet: false,
         })
         .await;
-    viewer.send(&Request::PaneFocus { pane: own }).await;
+    viewer
+        .send(&Request::PaneFocus {
+            pane: own,
+            seen: false,
+        })
+        .await;
     let relayed = |json: &[u8]| match serde_json::from_slice(json) {
         Ok(Event::PaneFocused { pane }) => Some(pane),
         _ => None,
@@ -6170,7 +6560,12 @@ async fn a_scripted_focus_is_relayed_to_the_attached_client() {
     .expect("the focus was never answered");
 
     assert_eq!(
-        control.request(Request::PaneFocus { pane: scripted }).await,
+        control
+            .request(Request::PaneFocus {
+                pane: scripted,
+                seen: false
+            })
+            .await,
         Response::Ok
     );
     timeout(DEADLINE, async {
@@ -6250,9 +6645,15 @@ async fn directional_focus_and_resize_start_from_the_named_or_attached_pane() {
             terminal: None,
             handoff: false,
             view: false,
+            quiet: false,
         })
         .await;
-    viewer.send(&Request::PaneFocus { pane: left }).await;
+    viewer
+        .send(&Request::PaneFocus {
+            pane: left,
+            seen: false,
+        })
+        .await;
     read_until_control(&mut viewer, |r: &Response| *r == Response::Ok).await;
 
     assert_eq!(
@@ -6299,7 +6700,12 @@ async fn directional_focus_and_resize_start_from_the_named_or_attached_pane() {
 
     // Once the viewer shows `right`, its right edge is the viewer's to take
     // on — sideways only, and never instead of a wrap.
-    viewer.send(&Request::PaneFocus { pane: right }).await;
+    viewer
+        .send(&Request::PaneFocus {
+            pane: right,
+            seen: false,
+        })
+        .await;
     read_until_control(&mut viewer, |r: &Response| *r == Response::Ok).await;
     assert_eq!(
         control
@@ -6369,9 +6775,15 @@ async fn a_handoff_client_takes_every_edge_and_unsplit_resizes() {
             terminal: None,
             handoff: true,
             view: false,
+            quiet: false,
         })
         .await;
-    viewer.send(&Request::PaneFocus { pane: right }).await;
+    viewer
+        .send(&Request::PaneFocus {
+            pane: right,
+            seen: false,
+        })
+        .await;
     read_until_control(&mut viewer, |r: &Response| *r == Response::Ok).await;
 
     let up = Request::PaneFocusToward {
@@ -6437,6 +6849,7 @@ async fn a_panes_user_vars_reach_its_listing_view_and_watchers() {
             terminal: None,
             handoff: false,
             view: false,
+            quiet: false,
         })
         .await;
     let mut watcher = server.connect().await;
@@ -6552,6 +6965,7 @@ async fn a_shell_side_jj_operation_refreshes_the_change_stat() {
             terminal: None,
             handoff: false,
             view: false,
+            quiet: false,
         })
         .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
@@ -6595,6 +7009,7 @@ async fn the_watch_ignores_the_probes_own_snapshot() {
             terminal: None,
             handoff: false,
             view: false,
+            quiet: false,
         })
         .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
@@ -6613,6 +7028,7 @@ async fn the_watch_ignores_the_probes_own_snapshot() {
             terminal: None,
             handoff: false,
             view: false,
+            quiet: false,
         })
         .await;
     assert!(matches!(second.response().await, Response::Attached { .. }));
@@ -6728,6 +7144,7 @@ async fn fork_creates_sibling_checkout_with_a_shell_pane() {
             terminal: None,
             handoff: false,
             view: false,
+            quiet: false,
         })
         .await;
     let workspaces = match viewer.response().await {
@@ -6941,6 +7358,7 @@ async fn fork_goes_stale_then_update_clears_it() {
             terminal: None,
             handoff: false,
             view: false,
+            quiet: false,
         })
         .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));
@@ -7720,6 +8138,7 @@ async fn a_turn_checkpoints_its_diff_and_restores_round_trip() {
             terminal: None,
             handoff: false,
             view: false,
+            quiet: false,
         })
         .await;
     assert!(matches!(viewer.response().await, Response::Attached { .. }));

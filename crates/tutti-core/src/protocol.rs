@@ -11,7 +11,7 @@ use crate::state::{AgentState, StateSource};
 /// Response / Event shapes (including additive fields): the daemon reports it
 /// on attach and mismatched clients tell the user to restart the daemon —
 /// binaries upgrade on install, running daemons do not.
-pub const WIRE_REV: u32 = 18;
+pub const WIRE_REV: u32 = 19;
 
 /// The most notes the daemon's notification history keeps, the oldest going
 /// first. A client caps its copy the same, so the two agree.
@@ -250,8 +250,14 @@ pub enum Request {
     },
     /// Mark `pane` the active pane. The server records it and applies a
     /// `Focused` state event, so a `Done` pane becomes `Idle` once looked at.
+    /// From a view (`Attach`'s `view`), it moves only the view's own focus;
+    /// `seen` says someone is looking at it, so the pane is seen as a
+    /// client's focus sees it — a `Done` pane turns `Idle`, its notes read —
+    /// still moving no pane of the session's and relaying no `PaneFocused`.
     PaneFocus {
         pane: PaneId,
+        #[serde(default)]
+        seen: bool,
     },
     /// Focus the pane `toward` of `from` in its tab (`Layout::neighbor`, with
     /// `wrap`) as `PaneFocus` would, answered with `Response::Neighbor` —
@@ -422,7 +428,10 @@ pub enum Request {
     /// (`Event::ResizeEdge`). `view`: the client only watches (`tutti
     /// attach --view`): its focus is its own — it moves no pane of the
     /// session's, marks no `Done` pane seen and no note read — and it is "the"
-    /// attached client only while no other is.
+    /// attached client only while no other is. `quiet`: the client shows no
+    /// pane from this connection's pane frames — rtty draws them from pane
+    /// streams (`PaneAttach`) — so it is sent no `PaneSnapshot` or
+    /// `PaneDelta`, every event still.
     Attach {
         #[serde(default)]
         terminal: Option<String>,
@@ -430,6 +439,8 @@ pub enum Request {
         handoff: bool,
         #[serde(default)]
         view: bool,
+        #[serde(default)]
+        quiet: bool,
     },
     Detach,
     /// Subscribe this connection to `Event::Snapshot`s: one at once, then one
@@ -451,8 +462,25 @@ pub enum Request {
     /// `Input` frames type into the pane. A connection that falls behind the
     /// stream has what is queued for it dropped for a fresh snapshot, and
     /// streams on from there. The child exiting ends the stream with
-    /// `Event::PaneExited`, and the daemon then closes it. Error for an
-    /// unknown pane, or on a connection already streaming one.
+    /// `Event::PaneExited`. Error for an unknown pane, or one this
+    /// connection has streamed already and not detached (`PaneDetach`).
+    ///
+    /// One connection may stream several panes, each its own `PaneAttach`,
+    /// its frames named by pane. Its `ViewSizes` votes for each pane it names
+    /// that it streams. The daemon closes a connection whose last stream
+    /// ended, unless it also attached (`Attach`) or watches (`Watch`). An
+    /// attached connection hears of a streamed pane's exit once, from the
+    /// stream, never from the broadcast too.
+    ///
+    /// `keys`: the stream keeps the keyboard protocols the pane's program
+    /// sets — kitty's push, pop and set (`CSI > u`, `CSI < u`, `CSI = u`),
+    /// xterm's modifyOtherKeys (`CSI > 4 ; n m`) and its format
+    /// (`CSI > 4 ; n f`) — for a terminal that encodes the pane's keys by
+    /// them, as rtty does. Without it they are cut out of the reads, as
+    /// `pane attach` wants: its terminal would keep them past the detach.
+    /// A snapshot carries them either way. A command's end (OSC 133;D)
+    /// turns them off on a `keys` stream too, as it does in the daemon's
+    /// terminal.
     ///
     /// `history`: up to that many of the newest rows of the pane's primary
     /// scrollback come first, before the first snapshot only, as `PaneRaw`
@@ -479,6 +507,17 @@ pub enum Request {
         inline: bool,
         #[serde(default)]
         since: Option<Printed>,
+        #[serde(default)]
+        keys: bool,
+    },
+    /// End this connection's stream of `pane` (`PaneAttach`): nothing of it
+    /// follows the answer — nor its `Event::PaneExited` — its vote in the
+    /// pane's size goes, and the pane may be streamed again. The
+    /// connection's other streams go on; it closes after its last, as at a
+    /// stream's end, unless it attached or watches. Answered `Ok`, or an
+    /// Error when the connection streams no such pane.
+    PaneDetach {
+        pane: PaneId,
     },
     /// The colours of the terminal a client shows panes on, which the daemon
     /// answers its panes' colour queries with — OSC 10/11/12 and mode 2031's
@@ -1112,6 +1151,9 @@ pub enum Event {
         from: AgentState,
         to: AgentState,
     },
+    /// A pane's child exited: to every attached client — but one whose
+    /// connection streams the pane, told once, by the stream, after the
+    /// pane's last output (`Request::PaneAttach`) — and to each stream of it.
     PaneExited {
         pane: PaneId,
         code: i32,
@@ -1410,7 +1452,14 @@ mod tests {
             pane: PaneId(2),
             offset: 120,
         });
-        roundtrip(&Request::PaneFocus { pane: PaneId(2) });
+        roundtrip(&Request::PaneFocus {
+            pane: PaneId(2),
+            seen: false,
+        });
+        roundtrip(&Request::PaneFocus {
+            pane: PaneId(2),
+            seen: true,
+        });
         roundtrip(&Request::PaneFocusToward {
             from: Some(PaneId(2)),
             toward: Toward::Left,
@@ -1564,16 +1613,25 @@ mod tests {
             terminal: None,
             handoff: false,
             view: false,
+            quiet: false,
         });
         roundtrip(&Request::Attach {
             terminal: Some("com.mitchellh.ghostty".into()),
             handoff: true,
             view: false,
+            quiet: false,
         });
         roundtrip(&Request::Attach {
             terminal: None,
             handoff: false,
             view: true,
+            quiet: false,
+        });
+        roundtrip(&Request::Attach {
+            terminal: Some("local.rtty".into()),
+            handoff: true,
+            view: true,
+            quiet: true,
         });
         roundtrip(&Request::Watch);
         roundtrip(&Request::PaneAttach {
@@ -1583,6 +1641,7 @@ mod tests {
             history: 1000,
             inline: true,
             since: None,
+            keys: false,
         });
         roundtrip(&Request::PaneAttach {
             pane: PaneId(3),
@@ -1595,7 +1654,18 @@ mod tests {
                 row: 4_210,
                 held: vec![row_hash("$ make"), row_hash("")],
             }),
+            keys: false,
         });
+        roundtrip(&Request::PaneAttach {
+            pane: PaneId(3),
+            rows: 24,
+            cols: 80,
+            history: 0,
+            inline: false,
+            since: None,
+            keys: true,
+        });
+        roundtrip(&Request::PaneDetach { pane: PaneId(3) });
         roundtrip(&Request::HostColors(sample_colors()));
         roundtrip(&Request::HostColors(HostColors {
             cursor: None,
@@ -2220,9 +2290,14 @@ mod tests {
                 history: 0,
                 inline: false,
                 since: None,
+                keys: false,
             })
             .unwrap(),
-            r#"{"type":"pane_attach","pane":3,"rows":24,"cols":80,"history":0,"inline":false,"since":null}"#
+            r#"{"type":"pane_attach","pane":3,"rows":24,"cols":80,"history":0,"inline":false,"since":null,"keys":false}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::PaneDetach { pane: PaneId(3) }).unwrap(),
+            r#"{"type":"pane_detach","pane":3}"#
         );
         assert_eq!(
             serde_json::to_string(&Event::StateChanged {
@@ -2323,9 +2398,10 @@ mod tests {
                 sandbox: None,
             }
         );
-        // `pane_attach` without `history`, `inline` or `since` replays none,
-        // numbers no rows and knows of nothing printed before; a record
-        // without `held` holds no row past its own.
+        // `pane_attach` without `history`, `inline`, `since` or `keys`
+        // replays none, numbers no rows, knows of nothing printed before and
+        // keeps no keyboard protocol; a record without `held` holds no row
+        // past its own.
         let attach: Request =
             serde_json::from_str(r#"{"type":"pane_attach","pane":3,"rows":24,"cols":80}"#).unwrap();
         assert_eq!(
@@ -2337,6 +2413,16 @@ mod tests {
                 history: 0,
                 inline: false,
                 since: None,
+                keys: false,
+            }
+        );
+        // `pane_focus` from before `seen` sees nothing from a view.
+        let focus: Request = serde_json::from_str(r#"{"type":"pane_focus","pane":2}"#).unwrap();
+        assert_eq!(
+            focus,
+            Request::PaneFocus {
+                pane: PaneId(2),
+                seen: false,
             }
         );
         let printed: Printed = serde_json::from_str(r#"{"epoch":7,"row":40}"#).unwrap();
@@ -2518,8 +2604,9 @@ mod tests {
                 last_reply: false,
             }
         );
-        // `attach` from before `terminal`, `handoff` and `view` existed names
-        // no terminal, hands nothing on, and is no mere view.
+        // `attach` from before `terminal`, `handoff`, `view` and `quiet`
+        // existed names no terminal, hands nothing on, is no mere view, and
+        // is sent pane frames.
         let attach: Request = serde_json::from_str(r#"{"type":"attach"}"#).unwrap();
         assert_eq!(
             attach,
@@ -2527,6 +2614,7 @@ mod tests {
                 terminal: None,
                 handoff: false,
                 view: false,
+                quiet: false,
             }
         );
         // ...and an older daemon, whose `Attach` is a unit variant, still

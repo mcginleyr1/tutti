@@ -167,6 +167,7 @@ fn attach_seeds_app_and_input_updates_grid() {
         terminal: None,
         handoff: false,
         view: false,
+        quiet: false,
     });
 
     let mut app = App::new();
@@ -242,6 +243,7 @@ fn a_scripted_pane_focus_jumps_the_attached_client() {
         terminal: None,
         handoff: false,
         view: false,
+        quiet: false,
     });
     let mut app = App::new();
     let response = viewer.response();
@@ -252,7 +254,10 @@ fn a_scripted_pane_focus_jumps_the_attached_client() {
         viewer.write(&frame);
     }
 
-    control.send(&Request::PaneFocus { pane: first });
+    control.send(&Request::PaneFocus {
+        pane: first,
+        seen: false,
+    });
     assert_eq!(control.response(), Response::Ok);
 
     let deadline = Instant::now() + DEADLINE;
@@ -264,7 +269,11 @@ fn a_scripted_pane_focus_jumps_the_attached_client() {
     assert_eq!(
         app.focus_change(),
         Some(Frame::Control(
-            serde_json::to_vec(&Request::PaneFocus { pane: first }).unwrap()
+            serde_json::to_vec(&Request::PaneFocus {
+                pane: first,
+                seen: false
+            })
+            .unwrap()
         )),
         "the client reports the jumped-to pane as its focus"
     );
