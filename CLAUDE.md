@@ -1,8 +1,10 @@
 # CLAUDE.md — working conventions for the tutti repo
 
-Product docs live in README.md; roadmap and ground rules in PLAN.md; wire
-protocol in docs/transport-decision.md. This file is the non-obvious knowledge
-that isn't derivable from those.
+Product docs live in docs/, one topic a file; README.md is the front page and
+maps them ("Where things are documented": update the file that documents what
+you change). What is open and the ground rules are in PLAN.md, what was built
+in docs/history.md; wire protocol in docs/transport-decision.md. This file is
+the non-obvious knowledge that isn't derivable from those.
 
 ## Version control
 
@@ -304,7 +306,8 @@ cargo fmt --all --check
 
 - `just install` kills ALL running daemons then reinstalls both binaries —
   deliberate dev behavior so you're always testing the code you just built.
-  End users get the non-killing flow documented in README.
+  End users get the non-killing flow documented in docs/install.md
+  ("Upgrading").
 - Installs — `hooks … --install`, `skill --install`, the setup panel (prefix
   `i`) — all go through `tutti::integrations`: plan, confirm, then `apply`
   with a backup and a changed-since-inspected guard. Never write

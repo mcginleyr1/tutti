@@ -223,8 +223,8 @@ more for the chain Neovim or Emacs → tutti → rtty to work with one key:
    tab.
 
 The CLI exits 0 once the TUI has the move, so the plugin reads "moved" even
-when rtty's own edge then stops it. tutti's README has the whole edge table,
-under "tutti in rtty".
+when rtty's own edge then stops it. [docs/rtty.md](../docs/rtty.md#tutti-in-rtty)
+has the whole edge table, under "tutti in rtty".
 
 ## Tests
 
