@@ -79,27 +79,11 @@ impl App {
         !overdue.is_empty()
     }
 
-    /// The follow-up a reply completes: the one its `req` keys — or, from an
-    /// old daemon that echoes none, the oldest pending one that `fits`.
-    pub(super) fn take_follow_up(
-        &mut self,
-        req: Option<u64>,
-        fits: impl Fn(&FollowUp) -> bool,
-    ) -> Option<FollowUp> {
-        let req = match req {
-            Some(req) => req,
-            None if self.old_daemon => *self
-                .follow_ups
-                .pending
-                .iter()
-                .filter(|(_, (f, ..))| fits(f))
-                .map(|(req, _)| req)
-                .min()?,
-            None => return None,
-        };
+    /// The follow-up a reply completes: the one its `req` keys.
+    pub(super) fn take_follow_up(&mut self, req: Option<u64>) -> Option<FollowUp> {
         self.follow_ups
             .pending
-            .remove(&req)
+            .remove(&req?)
             .map(|(follow_up, ..)| follow_up)
     }
 }
@@ -232,46 +216,5 @@ mod tests {
             },
         ));
         assert!(!app.adopt_active_view, "its own");
-    }
-
-    /// An old daemon echoes no `req`: a reply completes the oldest follow-up
-    /// of its kind, and any refusal cancels them all — the rule before tags.
-    #[test]
-    fn an_old_daemons_refusal_cancels_every_follow_up() {
-        let mut app = App::new();
-        let mut view = view_two_workspaces();
-        view[1].parent = Some(WorkspaceId(1));
-        app.handle_frame(WireFrame::Control(
-            serde_json::to_vec(&Response::Attached {
-                wire_rev: 7,
-                wire_floor: None,
-                session: "t".into(),
-                workspaces: view,
-                restorable: None,
-                notes: Vec::new(),
-            })
-            .unwrap(),
-        ));
-        let untagged =
-            |response: &Response| WireFrame::Control(serde_json::to_vec(response).unwrap());
-        let merged = Response::Merged {
-            pushed: false,
-            bookmark: "main".into(),
-        };
-        focus_sidebar(&mut app);
-        app.on_key(plain('j'));
-        app.on_key(plain('m'));
-        app.on_key(plain('y'));
-        app.handle_frame(untagged(&merged));
-        assert_eq!(app.mode, Mode::ConfirmCleanup(WorkspaceId(2)));
-
-        app.on_key(plain('n'));
-        app.on_key(plain('m'));
-        app.on_key(plain('y'));
-        app.handle_frame(untagged(&Response::Error {
-            message: "the prompt changed since you looked".into(),
-        }));
-        app.handle_frame(untagged(&merged));
-        assert_eq!(app.mode, Mode::Sidebar, "the refusal cancelled the offer");
     }
 }

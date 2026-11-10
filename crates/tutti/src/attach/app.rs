@@ -243,12 +243,6 @@ pub struct App {
     /// to return to.
     restore_offer: Option<(RestoreSummary, Mode)>,
     pub(super) follow_ups: FollowUps,
-    /// Whether the daemon predates request tags (wire rev 8): it answered the
-    /// attach without its `req`. Such a daemon echoes none and knows only
-    /// per-pane `PaneResize`, so the client speaks the old way to it: a reply
-    /// completes the oldest follow-up of its kind, and any `Error` cancels
-    /// them all.
-    pub(super) old_daemon: bool,
     /// Panes that raised a notification while unfocused; their sidebar entry
     /// shows a bell mark until the pane is focused, or the history says its
     /// notifications were read.
@@ -336,7 +330,6 @@ impl App {
             adopt_active_view: false,
             restore_offer: None,
             follow_ups: FollowUps::default(),
-            old_daemon: false,
             notified: HashSet::new(),
             notes: Vec::new(),
             notes_panel: NotesPanel::default(),
@@ -720,7 +713,6 @@ impl App {
                 notes,
                 ..
             } => {
-                self.old_daemon = req.is_none();
                 self.session = session;
                 self.set_view(workspaces);
                 // A reattach catches up on the history — and on the bell
@@ -748,10 +740,7 @@ impl App {
                 // front); guided create waited for it: jump to the new workspace,
                 // open the launcher over it, and flash what it made and where. A
                 // deploy waited for its issue's workspace: run the agent there.
-                let creates = |f: &FollowUp| {
-                    matches!(f, FollowUp::Mount | FollowUp::Fork | FollowUp::Deploy(..))
-                };
-                match self.take_follow_up(req, creates) {
+                match self.take_follow_up(req) {
                     Some(FollowUp::Fork) => {
                         let created = self
                             .workspaces
@@ -783,8 +772,7 @@ impl App {
             Response::Merged { pushed, bookmark } => {
                 // The merge landed: report where, then offer to clean up (discard)
                 // the now-merged workspace.
-                let merges = |f: &FollowUp| matches!(f, FollowUp::Merge(_));
-                if let Some(FollowUp::Merge(id)) = self.take_follow_up(req, merges) {
+                if let Some(FollowUp::Merge(id)) = self.take_follow_up(req) {
                     let mut msg = format!("merged into {bookmark}");
                     if pushed {
                         msg.push_str(" and pushed");
@@ -801,8 +789,7 @@ impl App {
                 tab,
                 pane,
             } => {
-                let deploys = |f: &FollowUp| matches!(f, FollowUp::Deployed(_));
-                if let Some(FollowUp::Deployed(_)) = self.take_follow_up(req, deploys) {
+                if let Some(FollowUp::Deployed(_)) = self.take_follow_up(req) {
                     let frames = self.jump_to(tab, Some(pane));
                     let deployed = self.panes.get(&pane).and_then(|s| {
                         let issue = s.info.issue.as_ref()?;
@@ -824,8 +811,7 @@ impl App {
             // The asked-for reply came: show it, unless the sidebar it was
             // asked from has moved on to something else meanwhile.
             Response::LastReply { text, .. } => {
-                let replies = |f: &FollowUp| matches!(f, FollowUp::Reply(_));
-                if let Some(FollowUp::Reply(pane)) = self.take_follow_up(req, replies)
+                if let Some(FollowUp::Reply(pane)) = self.take_follow_up(req)
                     && self.mode == Mode::Sidebar
                 {
                     self.peek.reply = text;
@@ -856,35 +842,17 @@ impl App {
                 // A failed new-workspace, guided-create, merge, or deploy request
                 // must not later hijack the tab, the launcher, the cleanup
                 // confirm, or another workspace — and cancels only its own: a
-                // refused answer leaves a merge's cleanup offer standing. An old
-                // daemon names no request, so its refusal cancels them all.
-                let cancelled: Vec<FollowUp> = match req {
-                    Some(req) => self
-                        .follow_ups
-                        .pending
-                        .remove(&req)
-                        .map(|(f, ..)| f)
-                        .into_iter()
-                        .collect(),
-                    None if self.old_daemon => self
-                        .follow_ups
-                        .pending
-                        .drain()
-                        .map(|(_, (f, ..))| f)
-                        .collect(),
-                    None => Vec::new(),
-                };
-                if (req.is_none() && self.old_daemon) || cancelled.contains(&FollowUp::Mount) {
+                // refused answer leaves a merge's cleanup offer standing.
+                let cancelled = self.take_follow_up(req);
+                if cancelled == Some(FollowUp::Mount) {
                     self.adopt_active_view = false;
                 }
                 // A cancelled deploy's prompt file went to no pane, so nothing
                 // else would remove it before the daemon stops.
-                for follow_up in cancelled {
-                    if let FollowUp::Deploy(_, Some(file)) | FollowUp::Deployed(Some(file)) =
-                        follow_up
-                    {
-                        let _ = self.host.forget_prompt(&file);
-                    }
+                if let Some(FollowUp::Deploy(_, Some(file)) | FollowUp::Deployed(Some(file))) =
+                    cancelled
+                {
+                    let _ = self.host.forget_prompt(&file);
                 }
                 self.set_status(format!("error: {message}"));
             }
@@ -1575,8 +1543,7 @@ impl App {
 
     /// Recompute pane rectangles for the terminal `area` and, when the visible
     /// set moved, send it whole as `ViewSizes` — each shown pane at its
-    /// rendered size — so the server sizes every pane by its smallest viewer
-    /// (an old daemon gets a `PaneResize` per pane whose size moved instead).
+    /// rendered size — so the server sizes every pane by its smallest viewer.
     /// Records the sidebar and tab-bar rects and the split boundaries for
     /// mouse hit-testing.
     pub fn sync_sizes(&mut self, area: Rect) -> Vec<WireFrame> {
@@ -1615,20 +1582,8 @@ impl App {
         if view == self.view_sent {
             return Vec::new();
         }
-        let out = if self.old_daemon {
-            view.iter()
-                .filter(|dims| !self.view_sent.contains(dims))
-                .map(|&PaneDims { pane, rows, cols }| {
-                    control(&Request::PaneResize { pane, rows, cols })
-                })
-                .collect()
-        } else {
-            vec![control(&Request::ViewSizes {
-                panes: view.clone(),
-            })]
-        };
-        self.view_sent = view;
-        out
+        self.view_sent = view.clone();
+        vec![control(&Request::ViewSizes { panes: view })]
     }
 
     pub fn compute_rects(&self, content: Rect) -> Vec<(PaneId, Rect)> {
@@ -2599,42 +2554,6 @@ mod tests {
         assert_eq!(
             app.sync_sizes(area),
             vec![control(&Request::ViewSizes { panes: Vec::new() })]
-        );
-    }
-
-    /// A daemon that answered the attach untagged predates `ViewSizes`: the
-    /// client sends it a `PaneResize` per pane whose size moved, as before.
-    #[test]
-    fn an_old_daemon_gets_a_resize_per_moved_pane() {
-        let mut app = App::with_config(Config::parse("sidebar = \"off\"\n").unwrap());
-        app.handle_frame(WireFrame::Control(
-            serde_json::to_vec(&Response::Attached {
-                wire_rev: 7,
-                wire_floor: None,
-                session: "t".into(),
-                workspaces: view_one_pane(),
-                restorable: None,
-                notes: Vec::new(),
-            })
-            .unwrap(),
-        ));
-        let area = Rect::new(0, 0, 80, 24);
-        assert_eq!(
-            app.sync_sizes(area),
-            vec![control(&Request::PaneResize {
-                pane: PaneId(1),
-                rows: 18,
-                cols: 78,
-            })]
-        );
-        assert!(app.sync_sizes(area).is_empty());
-        assert_eq!(
-            app.sync_sizes(Rect::new(0, 0, 80, 30)),
-            vec![control(&Request::PaneResize {
-                pane: PaneId(1),
-                rows: 24,
-                cols: 78,
-            })]
         );
     }
 

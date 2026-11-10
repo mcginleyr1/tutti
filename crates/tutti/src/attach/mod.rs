@@ -101,8 +101,7 @@ fn attach(conn: &mut Connection, host: Host, config: Config, startup: Startup) -
     let view = conn.view;
     // macOS names the GUI app a process was launched under; watchers raise it.
     // In rtty, a move past tutti's edge goes on to rtty's panes — the daemon
-    // hands this client a program's moves at every edge for that. Tagged, so
-    // the reply shows whether the daemon echoes a request's `req`.
+    // hands this client a program's moves at every edge for that.
     let terminal = std::env::var("__CFBundleIdentifier").ok();
     let rtty = rtty::pane();
     let attach = Request::Attach {
