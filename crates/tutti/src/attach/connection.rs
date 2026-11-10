@@ -15,13 +15,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use tutti_core::{Frame, Request, Response, Tagged};
+use tutti_core::{Frame, Request, Tagged};
 
 use crate::client;
 use crate::host::{self, HOST_REV, Remote, Startup, Waiting};
-
-/// The wire rev from which a daemon knows a view (`Attach.view`).
-const VIEW_REV: u32 = 16;
 
 /// The most of ssh's stderr kept to explain a connection that ended.
 const STDERR_TAIL: usize = 4096;
@@ -155,25 +152,13 @@ impl Connection {
         Remote::new(Arc::clone(&self.writer), Arc::clone(&self.waiting))
     }
 
-    /// A view's attach just sent, refused by the daemon's `Attached` reply
-    /// when that is from before `VIEW_REV`: such a daemon takes a view for a
-    /// client like any other, its focus marking agents seen and notes read
-    /// for everybody — refused before the view moves it once.
-    pub fn refuse_an_old_daemon(&mut self) -> Result<()> {
-        let rev = self.wire_rev(Duration::from_secs(5))?;
-        if rev < VIEW_REV {
-            bail!(
-                "the daemon predates `attach --view` (wire rev {rev}, a view needs {VIEW_REV}): \
-                 it would take this view's focus for yours — restart it: `tutti server stop`"
-            );
-        }
-        Ok(())
-    }
-
-    /// The daemon's wire rev, from its `Attached` reply to the attach just
-    /// sent, waited for up to `wait`. Every frame read on the way, the reply
-    /// included, stays for `drain`.
-    fn wire_rev(&mut self, wait: Duration) -> Result<u32> {
+    /// The attach just sent, refused when the daemon's answer puts the two
+    /// ends past each other's floors (`Wire::accepts`) — before the TUI takes
+    /// the terminal or sends anything else: a daemon from before views would
+    /// take a view's focus for everybody's. The answer is waited for up to
+    /// `wait`; every frame read on the way, the answer included, stays for
+    /// `drain`.
+    pub fn refuse_a_daemon_past_the_floor(&mut self, wait: Duration) -> Result<()> {
         let until = Instant::now() + wait;
         loop {
             let left = until.saturating_duration_since(Instant::now());
@@ -186,19 +171,15 @@ impl Connection {
                     bail!("tutti-server closed the attach connection")
                 }
             };
-            let rev = match &frame {
-                Frame::Control(json) => match serde_json::from_slice(json) {
-                    Ok(Tagged {
-                        body: Response::Attached { wire_rev, .. },
-                        ..
-                    }) => Some(wire_rev),
-                    _ => None,
-                },
+            let wire = match &frame {
+                Frame::Control(json) => tutti_core::attached_wire(json),
                 _ => None,
             };
             self.early.push(frame);
-            if let Some(rev) = rev {
-                return Ok(rev);
+            if let Some((rev, floor)) = wire {
+                return tutti_core::WIRE
+                    .accepts("tutti", rev, floor)
+                    .map_err(|refusal| anyhow!(refusal));
             }
         }
     }
@@ -349,55 +330,75 @@ fn read_loop(
 #[cfg(test)]
 mod tests {
     use tutti_core::{
-        ApprovalDecision, Direction, Event, HostColors, PaneDims, PaneId, Rgb, TabId, WorkspaceId,
+        ApprovalDecision, Direction, Event, HostColors, PaneDims, PaneId, Response, Rgb, TabId,
+        WorkspaceId,
     };
 
     use super::*;
     use crate::attach::{control, tagged};
 
-    /// A connection to a daemon played over a socket pair that answers an
-    /// attach as wire rev `rev`, after an event in the gap: what
-    /// `refuse_an_old_daemon` says, and what `drain` hands on after it.
-    fn attached_at(rev: u32) -> (Result<()>, Vec<Frame>) {
+    /// A connection to a daemon played over a socket pair that answers the
+    /// attach with `answer`, after an event in the gap: what
+    /// `refuse_a_daemon_past_the_floor` says, and what `drain` hands on after it.
+    fn answered(answer: Vec<u8>) -> (Result<()>, Vec<Frame>) {
         let (ours, mut daemon) = UnixStream::pair().unwrap();
-        let mut conn = Connection::new(ours, true).unwrap();
-        let json = |value: serde_json::Value| Frame::Control(value.to_string().into_bytes());
-        let event = json(serde_json::to_value(Event::PaneOutput { pane: PaneId(1) }).unwrap());
-        let attached = json(
-            serde_json::to_value(Tagged {
-                req: Some(0),
-                body: Response::Attached {
-                    session: "s".into(),
-                    workspaces: Vec::new(),
-                    wire_rev: rev,
-                    wire_floor: None,
-                    restorable: None,
-                    notes: Vec::new(),
-                },
-            })
-            .unwrap(),
-        );
-        for frame in [&event, &attached] {
-            daemon.write_all(&frame.encode()).unwrap();
+        let mut conn = Connection::new(ours, false).unwrap();
+        let event = serde_json::to_vec(&Event::PaneOutput { pane: PaneId(1) }).unwrap();
+        for json in [event, answer] {
+            daemon.write_all(&Frame::Control(json).encode()).unwrap();
         }
-        let refused = conn.refuse_an_old_daemon();
+        let refused = conn.refuse_a_daemon_past_the_floor(Duration::from_secs(5));
         (refused, conn.drain().unwrap())
     }
 
-    /// A view on a daemon from before views is refused, naming the fix; on
-    /// one that knows views it goes on, and nothing read on the way to the
-    /// daemon's answer is lost to the TUI.
+    fn attached(wire_rev: u32) -> Vec<u8> {
+        serde_json::to_vec(&Tagged {
+            req: Some(0),
+            body: Response::Attached {
+                session: "s".into(),
+                workspaces: Vec::new(),
+                wire_rev,
+                wire_floor: None,
+                restorable: None,
+                notes: Vec::new(),
+            },
+        })
+        .unwrap()
+    }
+
+    /// A daemon below this build's floor is refused, naming the fix; one
+    /// at the floor is taken, and nothing read on the way to its answer is
+    /// lost to the TUI.
     #[test]
-    fn a_view_refuses_a_daemon_from_before_views() {
-        let (refused, _) = attached_at(VIEW_REV - 1);
+    fn the_attach_refuses_a_daemon_below_the_floor() {
+        let (refused, _) = answered(attached(tutti_core::WIRE_FLOOR - 1));
         let message = refused.unwrap_err().to_string();
         assert!(message.contains("tutti server stop"), "{message}");
-        let (refused, drained) = attached_at(VIEW_REV);
+        let (refused, drained) = answered(attached(tutti_core::WIRE_FLOOR));
         refused.unwrap();
         assert_eq!(drained.len(), 2, "the event and the reply, in order");
         assert!(
             matches!(&drained[0], Frame::Control(json) if json.windows(11).any(|w| w == b"pane_output"))
         );
+    }
+
+    /// A daemon too new for this build says so in an answer whose rest no
+    /// longer reads here: its revision and floor are read on their own, so
+    /// the refusal still names the end to update.
+    #[test]
+    fn an_answer_too_new_to_read_whole_still_names_the_end_to_update() {
+        let newer = tutti_core::WIRE_REV + 1;
+        let answer = format!(
+            r#"{{"req":0,"type":"attached","wire_rev":{newer},"wire_floor":{newer},"workspaces":7}}"#
+        );
+        assert!(serde_json::from_str::<Tagged<Response>>(&answer).is_err());
+        let (refused, _) = answered(answer.into_bytes());
+        let message = refused.unwrap_err().to_string();
+        assert!(
+            message.contains(&format!("wire revision {newer} (floor {newer})")),
+            "{message}"
+        );
+        assert!(message.ends_with("update tutti"), "{message}");
     }
 
     /// A view moves its own focus, tab and scrollback, reads, and detaches —

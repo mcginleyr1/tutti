@@ -77,8 +77,8 @@ someone pairing with you; its footer leads with `view`.
   nothing; the daemon refuses them from a view), and a held approval does not
   wait on a view, which cannot answer it.
 - **An older daemon.** A daemon from before views (wire rev
-  16) would take one for a client like any other, so the view refuses it:
-  restart the daemon.
+  16) would take one for a client like any other. It is below the wire
+  floor, which every attach refuses: restart the daemon.
 - **Sizes.** The panes keep the sizes the other clients vote. With no other client they keep the size they have, drawn from
   the top-left and cut where the view is smaller: a resize would reach the
   pane's program, so a view never makes one.

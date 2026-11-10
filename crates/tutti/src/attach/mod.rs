@@ -113,9 +113,7 @@ fn attach(conn: &mut Connection, host: Host, config: Config, startup: Startup) -
     };
     conn.send(&tagged(&attach, 0))
         .context("send attach request")?;
-    if view {
-        conn.refuse_an_old_daemon()?;
-    }
+    conn.refuse_a_daemon_past_the_floor(Duration::from_secs(5))?;
 
     // A truecolor theme's panes are painted over its own ground, which their
     // colour queries are answered with; on `terminal` the terminal's own

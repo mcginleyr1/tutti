@@ -328,10 +328,9 @@ tutti's daemon speaks wire revision 23 (floor 21), rtty 20 (floor 19): update rt
 What a refusal does is the client's:
 
 - **rtty** opens no session on it, and the panes waiting for the session say why.
-- **The TUI** attaches all the same and shows it as a warning: the daemon may hold live
-  work, and when to stop it is the user's call.
-- **`tutti attach --view`** refuses a daemon from before views (rev 16) by a check of its
-  own, as before.
+- **The TUI**, `--view` included, exits with it before it takes the terminal or sends
+  anything past the attach: a daemon from before views (rev 16) would take a view's focus
+  for everybody's.
 - **A connection that never attaches** (the CLI's one-shot requests, `pane attach`) gets
   no `attached` answer and checks nothing. A daemon too old for what it asks refuses the
   request, and the client says so (`the daemon cannot stream a pane (…); restart it`).
@@ -341,7 +340,7 @@ What a refusal does is the client's:
 `attached_wire` reads the two numbers from the answer's frame on their own, so a client
 too old to read the rest of an answer still reads why. Both clients take them so: rtty
 asks it of every control frame of its opening, before it reads the frame, and the TUI of
-every control frame that is no event.
+every control frame until the answer, which it waits for before anything else.
 
 **The watch snapshot names both too,** in every line `tutti watch` prints, for a watcher
 that links no tutti-wire (a menu-bar or notch app):

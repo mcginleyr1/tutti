@@ -66,8 +66,8 @@ Re-run the two `cargo install` commands. A daemon that is already running keeps
 executing the **old** binary until it is restarted — finish or detach your
 agents, `tutti server stop`, and the next `tutti` starts the new one and offers
 your layout back (see [Restoring after a restart](sessions.md#restoring-after-a-restart)).
-The attach handshake warns whenever client and daemon disagree on the wire
-protocol, so version skew is loud, never silent. The hooks run whichever
+The attach handshake refuses a daemon whose wire protocol the client cannot
+speak, naming the end to update, so version skew is loud, never silent. The hooks run whichever
 `tutti` is first on a pane's `PATH`, and a hook install from an older tutti
 lacks the newer events — re-run `tutti hooks claude --install` (or `Ctrl+B i`),
 which adds just the missing ones.
