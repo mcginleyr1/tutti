@@ -70,9 +70,7 @@ says so on its status line.
 
 `--json` on any verb emits the raw protocol response for scripting. A
 project's id works anywhere a workspace id does (`run --workspace`, `tab new
---workspace`, `workspace diff`). Scripts written against the old spellings
-`workspace new --dir <path>` and `workspace fork <id> --name <name>` keep
-working: both are hidden aliases of `project add` and `workspace add`.
+--workspace`, `workspace diff`).
 
 Every verb takes `-s <session>`. Inside a tutti pane it defaults to that pane's
 own session (`TUTTI_SESSION`, which every pane exports beside its `TUTTI_PANE`

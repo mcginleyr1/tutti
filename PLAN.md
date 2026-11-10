@@ -292,7 +292,7 @@ Phases 3 and 4 were marked met (docs/history.md). These two never were. They
 are judgments, not features, so they wait for someone to make them. The alpha
 milestone above names both (M1 and M2), and its own exit is unmarked too.
 
-- **Phase 1.** with no TUI at all — `tutti workspace new --dir .`, `tutti pane run -- top`,
+- **Phase 1.** with no TUI at all — `tutti project add .`, `tutti pane run -- top`,
   close the terminal, reopen, `tutti pane read` shows `top` still running.
   Integration tests drive the socket directly; CI runs them headless.
   (`pane_survives_client_disconnect` in `crates/tutti-server/tests/server.rs`

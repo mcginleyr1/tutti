@@ -232,9 +232,8 @@ cargo fmt --all --check
 - User-facing: **project** (top-level sidebar entry) and **workspace** (a jj
   checkout nested under it). The word "fork" is banned from UI text — git
   baggage. The CLI matches: `project add|list|kill`, `workspace
-  add|list|kill|merge|update|diff`. The pre-rename `workspace new --dir` /
-  `workspace fork` spellings are hidden aliases (tests pin them to the same
-  requests), and a test keeps "fork" out of every help screen. The wire keeps
+  add|list|kill|merge|update|diff`, and a test keeps "fork" out of every help
+  screen. The wire keeps
   `WorkspaceNew`/`WorkspaceFork`: never rename protocol variants.
 - **No human-facing capability may ship CLI-only** (PLAN ground rule). The CLI
   is the agent/script API; the TUI is the human surface. A wave adding a

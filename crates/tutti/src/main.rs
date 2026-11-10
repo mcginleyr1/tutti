@@ -343,7 +343,6 @@ enum ProjectAction {
 enum WorkspaceAction {
     /// Add a workspace under a project: `jj workspace add` a named checkout and
     /// open it with a shell pane.
-    #[command(alias = "fork")]
     Add {
         /// The project (or workspace) to check out from.
         project: u64,
@@ -388,12 +387,6 @@ enum WorkspaceAction {
         id: u64,
         #[arg(long)]
         stat: bool,
-    },
-    /// The old spelling of `project add`, kept so scripts keep working.
-    #[command(hide = true)]
-    New {
-        #[arg(long)]
-        dir: PathBuf,
     },
 }
 
@@ -1095,9 +1088,6 @@ fn to_request(command: Command) -> Result<Request> {
                 name,
                 revision,
                 dest: dest.as_deref().map(absolutize_dest),
-            },
-            WorkspaceAction::New { dir } => Request::WorkspaceNew {
-                dir: absolutize(&dir),
             },
             WorkspaceAction::List => Request::WorkspaceList,
             WorkspaceAction::Kill { id, discard } => Request::WorkspaceKill {
@@ -2486,63 +2476,8 @@ mod tests {
         );
     }
 
-    /// The pre-rename spellings still parse — hidden from `--help` — to
-    /// exactly the requests their new names send, so scripts keep working.
-    #[test]
-    fn the_legacy_workspace_spellings_send_the_same_requests() {
-        assert_eq!(
-            request_of(&["tutti", "workspace", "new", "--dir", "/srv/api"]),
-            request_of(&["tutti", "project", "add", "/srv/api"]),
-        );
-        assert_eq!(
-            request_of(&["tutti", "workspace", "new", "--dir", "/srv/api"]),
-            Request::WorkspaceNew {
-                dir: PathBuf::from("/srv/api")
-            }
-        );
-        for (legacy, new) in [
-            (
-                &["tutti", "workspace", "fork", "2", "--name", "feature"][..],
-                &["tutti", "workspace", "add", "2", "--name", "feature"][..],
-            ),
-            (
-                &[
-                    "tutti",
-                    "workspace",
-                    "fork",
-                    "2",
-                    "--name",
-                    "feature",
-                    "-r",
-                    "@-",
-                ][..],
-                &[
-                    "tutti",
-                    "workspace",
-                    "add",
-                    "2",
-                    "--name",
-                    "feature",
-                    "-r",
-                    "@-",
-                ][..],
-            ),
-        ] {
-            assert_eq!(request_of(legacy), request_of(new), "{legacy:?}");
-        }
-        assert_eq!(
-            request_of(&["tutti", "workspace", "fork", "2", "--name", "feature"]),
-            Request::WorkspaceFork {
-                id: WorkspaceId(2),
-                name: "feature".into(),
-                revision: None,
-                dest: None,
-            }
-        );
-    }
-
     /// "fork" is banned from user-facing text: no visible help screen says
-    /// it, and the legacy spellings that still run are listed nowhere.
+    /// it, and no workspace verb carries a visible alias.
     #[test]
     fn no_help_screen_says_fork() {
         fn walk(cmd: &mut clap::Command, path: &str) {
@@ -3556,18 +3491,13 @@ mod tests {
         // A relative `.` must reach the daemon as an absolute path so its
         // git-branch probe resolves against the client's directory, not the
         // daemon's.
-        for args in [
-            &["tutti", "project", "add", "."][..],
-            &["tutti", "workspace", "new", "--dir", "."][..],
-        ] {
-            let Request::WorkspaceNew { dir } = request_of(args) else {
-                panic!("expected a workspace-new request");
-            };
-            assert!(
-                dir.is_absolute(),
-                "the dir is absolutized client-side: {dir:?}"
-            );
-        }
+        let Request::WorkspaceNew { dir } = request_of(&["tutti", "project", "add", "."]) else {
+            panic!("expected a workspace-new request");
+        };
+        assert!(
+            dir.is_absolute(),
+            "the dir is absolutized client-side: {dir:?}"
+        );
     }
 
     #[test]
