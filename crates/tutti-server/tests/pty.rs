@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use tokio::time::timeout;
-use tutti_server::pty::{PaneSize, PtyPane, PtySpec, Snapshot};
+use tutti_server::{PaneSize, PtyPane, PtySpec, Snapshot};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
