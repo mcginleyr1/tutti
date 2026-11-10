@@ -593,10 +593,10 @@ async fn an_asks_wait_takes_a_report_claiming_a_block_the_screen_read() {
     server.stop().await;
 }
 
-/// A `cat` renamed `claude`: detected as the agent, it draws on its screen
+/// A `cat` named `claude`: detected as the agent, it draws on its screen
 /// whatever is sent to it (`shown`), for the classifier to read.
 async fn claude_cat(conn: &mut Conn) -> PaneId {
-    let bin = copy_bin("claude", "/bin/cat");
+    let bin = cat_named("claude");
     new_workspace(conn).await;
     let pane = pane_id(
         conn.request(Request::PaneRun {
@@ -5178,9 +5178,9 @@ async fn a_herdr_notification_naming_no_pane_lands_on_its_senders() {
 async fn hook_driven_pane_ignores_screen_classification() {
     let server = TestServer::start();
     let mut conn = server.connect().await;
-    // A `cat` renamed `claude` is detected as an agent and echoes sent text onto
+    // A `cat` named `claude` is detected as an agent and echoes sent text onto
     // its screen, so a working-pattern can be fed to the classifier.
-    let bin = copy_bin("claude", "/bin/cat");
+    let bin = cat_named("claude");
     new_workspace(&mut conn).await;
     let pane = pane_id(
         conn.request(Request::PaneRun {
@@ -5248,7 +5248,7 @@ async fn hook_driven_pane_ignores_screen_classification() {
 async fn a_dialog_answered_in_the_pane_ends_the_hooks_block() {
     let server = TestServer::start();
     let mut conn = server.connect().await;
-    let bin = copy_bin("claude", "/bin/cat");
+    let bin = cat_named("claude");
     new_workspace(&mut conn).await;
     let pane = pane_id(
         conn.request(Request::PaneRun {
@@ -5444,25 +5444,29 @@ async fn a_shell_panes_own_status_reports_drive_its_state() {
     server.stop().await;
 }
 
-/// Copy `src` to a fresh temp directory under the name `name` and make it
-/// executable, so a benign binary can masquerade as an agent for detection.
-fn copy_bin(name: &str, src: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
+/// Build a `cat` called `name` in a fresh temp directory, so a benign binary
+/// can masquerade as an agent for detection. Built here, not copied from the
+/// system's: where `/bin/cat` is one multi-call binary for every coreutil
+/// (Ubuntu 26.04), a copy under another name refuses to run.
+fn cat_named(name: &str) -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("tutti-bin-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("cat.rs");
+    let cat = "fn main() { let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::stdout()); }";
+    std::fs::write(&source, cat).unwrap();
     let dst = dir.join(name);
-    std::fs::copy(src, &dst).unwrap();
-    let mut perms = std::fs::metadata(&dst).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&dst, perms).unwrap();
-    // Apple Silicon refuses to exec a copied system binary whose code signature
-    // no longer matches; an ad-hoc re-sign restores it. A no-op elsewhere (the
-    // command is absent on Linux, where unsigned copies run fine).
-    let _ = std::process::Command::new("codesign")
-        .args(["--sign", "-", "--force"])
+    let built = std::process::Command::new("rustc")
+        .arg("-o")
         .arg(&dst)
-        .output();
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
     dst
 }
 
@@ -5508,13 +5512,13 @@ async fn wait_agent(conn: &mut Conn, pane: PaneId, kind: &str) -> bool {
 async fn detects_agent_process_by_name() {
     let server = TestServer::start();
     let mut conn = server.connect().await;
-    let bin = copy_bin("claude", "/bin/sleep");
+    let bin = cat_named("claude");
 
     new_workspace(&mut conn).await;
     let pane = pane_id(
         conn.request(Request::PaneRun {
             tab: None,
-            cmd: vec![bin.display().to_string(), "30".into()],
+            cmd: vec![bin.display().to_string()],
             ephemeral: false,
             sandbox: None,
         })
@@ -5557,14 +5561,14 @@ async fn wait_state_event(
 
 /// A detected agent pane emits `StateChanged` events driven by its screen text:
 /// a working marker moves it to `Working`, and a later blocked marker to
-/// `Blocked`, in that order. The pane runs `cat` (renamed `claude`), so sent
+/// `Blocked`, in that order. The pane runs a `cat` named `claude`, so sent
 /// text echoes onto the screen; the blocked marker is sent only after `Working`
 /// is observed, fixing the order without depending on classifier timing.
 #[tokio::test]
 async fn agent_state_changes_working_then_blocked() {
     let server = TestServer::start();
     let mut control = server.connect().await;
-    let bin = copy_bin("claude", "/bin/cat");
+    let bin = cat_named("claude");
 
     new_workspace(&mut control).await;
     let pane = pane_id(
