@@ -3249,7 +3249,8 @@ mod tests {
         };
         let pane = PtyPane::spawn(spec, PaneSize::new(5, 20)).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        let behind = |read: &[u8]| read.starts_with(b"before");
+        // The read may open with the echo of `go`, when that reaches the reader with the output.
+        let behind = |read: &[u8]| read.windows(6).any(|bytes| bytes == b"before");
         pane.tap(7, None, false, recorder(tx, behind, |_| None));
         pane.write_input(b"go\r").unwrap();
         wait_for(|| pane.contents().contains("after"), "no output");
