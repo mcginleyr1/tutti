@@ -191,6 +191,7 @@ fn a_light_dark_flip_recolors_the_tui_and_reaches_a_2031_pane() {
         cmd: vec!["/bin/sh".into(), "-c".into(), script.into()],
         ephemeral: false,
         sandbox: None,
+        source: None,
     }) {
         Response::PaneCreated { id } => id,
         other => panic!("{other:?}"),

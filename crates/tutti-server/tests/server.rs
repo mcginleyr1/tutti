@@ -154,6 +154,7 @@ async fn run_marker(conn: &mut Conn, cmd: &str) -> PaneId {
             cmd: vec!["/bin/sh".into(), "-c".into(), cmd.into()],
             ephemeral: false,
             sandbox: None,
+            source: None,
         })
         .await,
     )
@@ -202,6 +203,38 @@ async fn pane_survives_client_disconnect() {
         "second connection could not read the persisted pane"
     );
 
+    server.stop().await;
+}
+
+/// A run with a `source` file starts its command behind a shell that sources
+/// it: the command sees what the file exported, and the pane is the
+/// command's own, in title and listed command. A file that is not there ends
+/// the pane on the shell's error.
+#[tokio::test]
+async fn a_sourced_run_sees_what_its_file_exports() {
+    let server = TestServer::start();
+    let mut conn = server.connect().await;
+    new_workspace(&mut conn).await;
+    let file = std::env::temp_dir().join(format!("tutti-source-{}.sh", std::process::id()));
+    std::fs::write(&file, "export TUTTI_SOURCED=from-the-file\n").unwrap();
+    let shown = r#"printf 'key=%s' "$TUTTI_SOURCED"; sleep 30"#;
+    let run = |source: PathBuf| Request::PaneRun {
+        tab: None,
+        cmd: vec!["/bin/sh".into(), "-c".into(), shown.into()],
+        ephemeral: false,
+        sandbox: None,
+        source: Some(source),
+    };
+    let pane = pane_id(conn.request(run(file.clone())).await);
+    assert!(read_until(&mut conn, pane, "key=from-the-file").await);
+    assert!(wait_pane(&mut conn, pane, |p| p.title == "sh").await);
+
+    let gone = pane_id(conn.request(run(file.with_extension("gone"))).await);
+    assert!(
+        wait_pane(&mut conn, gone, |p| p.exited.is_some_and(|code| code != 0)).await,
+        "a file that is not there ends the pane"
+    );
+    std::fs::remove_file(&file).ok();
     server.stop().await;
 }
 
@@ -604,6 +637,7 @@ async fn claude_cat(conn: &mut Conn) -> PaneId {
             cmd: vec![bin.display().to_string()],
             ephemeral: false,
             sandbox: None,
+            source: None,
         })
         .await,
     );
@@ -844,6 +878,7 @@ async fn a_killed_pane_ends_its_wait() {
         cmd: vec!["/bin/sleep".into(), "30".into()],
         ephemeral: false,
         sandbox: None,
+        source: None,
     };
 
     let workspace = new_workspace(&mut control).await;
@@ -920,6 +955,7 @@ fn run_sleep(workspace: Option<WorkspaceId>, dir: Option<PathBuf>, title: Option
         title: title.map(Into::into),
         from: None,
         issue: None,
+        source: None,
     }
 }
 
@@ -937,6 +973,7 @@ async fn run_opens_a_fresh_tab_per_call_and_keeps_the_current_one() {
             cmd: vec!["/bin/cat".into()],
             ephemeral: false,
             sandbox: None,
+            source: None,
         })
         .await,
     );
@@ -1027,6 +1064,7 @@ async fn run_links_its_pane_to_the_issue_it_deploys() {
             title: None,
             issue: Some(issue.clone()),
             from: None,
+            source: None,
         })
         .await);
     let (_, _, plain) = ran(conn.request(run_sleep(Some(workspace), None, None)).await);
@@ -1089,6 +1127,7 @@ async fn a_panes_prompt_files_go_once_its_program_exits() {
         title: None,
         issue: None,
         from: None,
+        source: None,
     };
     let message = format!("Your task is in the file {named}. Read that file.");
     let quick = vec![bare.clone(), format!("@{at}"), message, elsewhere.clone()];
@@ -1131,6 +1170,7 @@ async fn run_refuses_bad_targets_and_rolls_back_a_failed_spawn() {
         title: None,
         from: None,
         issue: None,
+        source: None,
     };
 
     for (request, needle) in [
@@ -1236,6 +1276,7 @@ async fn pane_send_echoes_into_grid() {
             cmd: vec!["/bin/cat".into()],
             ephemeral: false,
             sandbox: None,
+            source: None,
         })
         .await,
     );
@@ -1392,6 +1433,7 @@ async fn a_split_starts_where_its_source_panes_shell_is() {
             cmd: vec!["/bin/sh".into()],
             ephemeral: false,
             sandbox: None,
+            source: None,
         })
         .await,
     );
@@ -1486,6 +1528,7 @@ async fn kill_removes_panes() {
             cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
             ephemeral: false,
             sandbox: None,
+            source: None,
         })
         .await,
     );
@@ -1495,6 +1538,7 @@ async fn kill_removes_panes() {
             cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
             ephemeral: false,
             sandbox: None,
+            source: None,
         })
         .await,
     );
@@ -1542,6 +1586,7 @@ async fn attach_receives_snapshot_then_delta() {
                 cmd: vec!["/bin/cat".into()],
                 ephemeral: false,
                 sandbox: None,
+                source: None,
             })
             .await,
     );
@@ -1648,6 +1693,7 @@ async fn attach_resize_reseeds_at_new_size() {
                 cmd: vec!["/bin/cat".into()],
                 ephemeral: false,
                 sandbox: None,
+                source: None,
             })
             .await,
     );
@@ -1771,6 +1817,7 @@ fn sleeper_in(tab: Option<tutti_core::TabId>) -> Request {
         cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
         ephemeral: false,
         sandbox: None,
+        source: None,
     }
 }
 
@@ -1924,6 +1971,7 @@ async fn a_restarted_daemon_takes_the_notification_history_back() {
         cmd: vec!["/bin/sh".into()],
         ephemeral: false,
         sandbox: None,
+        source: None,
     };
     let kept = pane_id(conn.request(shell()).await);
     let gone = pane_id(conn.request(shell()).await);
@@ -1990,6 +2038,7 @@ async fn resize_split_adjusts_ratio_and_broadcasts() {
                 cmd: vec!["/bin/cat".into()],
                 ephemeral: false,
                 sandbox: None,
+                source: None,
             })
             .await,
     );
@@ -2049,6 +2098,7 @@ async fn split_ratio_sets_the_separating_split_and_broadcasts() {
         cmd: vec!["/bin/cat".into()],
         ephemeral: false,
         sandbox: None,
+        source: None,
     };
     let left = pane_id(control.request(cat(None)).await);
     let right = pane_id(
@@ -2193,6 +2243,7 @@ async fn wedged_client_is_dropped_but_others_keep_flowing() {
                 ],
                 ephemeral: false,
                 sandbox: None,
+                source: None,
             })
             .await,
     );
@@ -2339,6 +2390,7 @@ async fn a_tab_switch_stops_a_client_voting_for_panes_it_left() {
                 cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
                 ephemeral: false,
                 sandbox: None,
+                source: None,
             })
             .await,
     );
@@ -3390,6 +3442,7 @@ async fn a_pane_that_stops_reading_its_input_stalls_nobody() {
                 cmd: vec!["/bin/cat".into()],
                 ephemeral: false,
                 sandbox: None,
+                source: None,
             })
             .await,
     );
@@ -3964,6 +4017,7 @@ async fn run_lands_beside_its_calling_pane() {
         title: None,
         issue: None,
         from,
+        source: None,
     };
 
     let (beside, _, _) = ran(conn.request(run(None, Some(caller))).await);
@@ -4000,6 +4054,7 @@ async fn run_sleeper(conn: &mut Conn) -> PaneId {
             cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
             ephemeral: false,
             sandbox: None,
+            source: None,
         })
         .await,
     )
@@ -4559,6 +4614,7 @@ async fn an_exiting_pane_drops_its_held_approvals() {
                 cmd: vec!["/bin/sh".into(), "-c".into(), "read line".into()],
                 ephemeral: false,
                 sandbox: None,
+                source: None,
             })
             .await,
     );
@@ -4752,6 +4808,7 @@ async fn run_shell(conn: &mut Conn) -> PaneId {
             cmd: vec!["/bin/sh".into()],
             ephemeral: false,
             sandbox: None,
+            source: None,
         })
         .await,
     )
@@ -5188,6 +5245,7 @@ async fn hook_driven_pane_ignores_screen_classification() {
             cmd: vec![bin.display().to_string()],
             ephemeral: false,
             sandbox: None,
+            source: None,
         })
         .await,
     );
@@ -5256,6 +5314,7 @@ async fn a_dialog_answered_in_the_pane_ends_the_hooks_block() {
             cmd: vec![bin.display().to_string()],
             ephemeral: false,
             sandbox: None,
+            source: None,
         })
         .await,
     );
@@ -5348,6 +5407,7 @@ async fn a_shell_panes_own_status_reports_drive_its_state() {
                 cmd: vec!["/bin/sh".into()],
                 ephemeral: false,
                 sandbox: None,
+                source: None,
             })
             .await,
     );
@@ -5521,6 +5581,7 @@ async fn detects_agent_process_by_name() {
             cmd: vec![bin.display().to_string()],
             ephemeral: false,
             sandbox: None,
+            source: None,
         })
         .await,
     );
@@ -5578,6 +5639,7 @@ async fn agent_state_changes_working_then_blocked() {
                 cmd: vec![bin.display().to_string()],
                 ephemeral: false,
                 sandbox: None,
+                source: None,
             })
             .await,
     );
@@ -6060,6 +6122,7 @@ async fn ephemeral_pane_vanishes_on_child_exit() {
                 cmd: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
                 ephemeral: true,
                 sandbox: None,
+                source: None,
             })
             .await,
     );
@@ -6126,6 +6189,7 @@ async fn focus_transitions_done_pane_to_idle() {
             cmd: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
             ephemeral: false,
             sandbox: None,
+            source: None,
         })
         .await,
     );
@@ -6168,6 +6232,7 @@ async fn a_views_focus_marks_nothing_seen() {
         cmd: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
         ephemeral: false,
         sandbox: None,
+        source: None,
     };
     let done = pane_id(control.request(run).await);
     assert!(wait_state(&mut control, done, AgentState::Done).await);
@@ -6285,6 +6350,7 @@ async fn a_views_seen_focus_sees_but_moves_nothing() {
         ],
         ephemeral: false,
         sandbox: None,
+        source: None,
     };
     let done = pane_id(control.request(run).await);
     assert!(wait_state(&mut control, done, AgentState::Done).await);
@@ -6408,6 +6474,7 @@ async fn a_watcher_snapshots_the_session_beside_an_attached_client() {
                 cmd: vec!["/bin/cat".into()],
                 ephemeral: false,
                 sandbox: None,
+                source: None,
             })
             .await,
     );
@@ -6502,6 +6569,7 @@ async fn a_snapshot_carries_cwd_and_the_held_approval_and_the_list_the_workspace
         cmd: vec!["/bin/sh".into()],
         ephemeral: false,
         sandbox: None,
+        source: None,
     };
     let pane = pane_id(control.request(shell).await);
     assert!(
@@ -6552,6 +6620,7 @@ async fn a_scripted_focus_is_relayed_to_the_attached_client() {
             cmd: vec!["/bin/cat".into()],
             ephemeral: false,
             sandbox: None,
+            source: None,
         };
         panes.push(pane_id(control.request(run).await));
     }
@@ -6647,6 +6716,7 @@ async fn directional_focus_and_resize_start_from_the_named_or_attached_pane() {
         cmd: vec!["/bin/cat".into()],
         ephemeral: false,
         sandbox: None,
+        source: None,
     };
     let left = pane_id(control.request(run).await);
     let split = Request::PaneSplit {
@@ -6792,6 +6862,7 @@ async fn a_handoff_client_takes_every_edge_and_unsplit_resizes() {
         cmd: vec!["/bin/cat".into()],
         ephemeral: false,
         sandbox: None,
+        source: None,
     };
     let left = pane_id(control.request(run).await);
     let split = Request::PaneSplit {
@@ -6871,6 +6942,7 @@ async fn a_panes_user_vars_reach_its_listing_view_and_watchers() {
         cmd: vec!["/bin/sh".into()],
         ephemeral: false,
         sandbox: None,
+        source: None,
     };
     let pane = pane_id(control.request(run).await);
     let mut viewer = server.connect().await;
@@ -7664,6 +7736,7 @@ async fn sandbox_pull_checks_out_the_branch_the_sandbox_pushed() {
         cmd: vec![cmd.into()],
         ephemeral: false,
         sandbox: sandbox.map(Into::into),
+        source: None,
     };
 
     let shell = pane_id(conn.request(run("/bin/sh", None)).await);
@@ -7960,6 +8033,7 @@ async fn tab_name_follows_active_pane_title() {
             cmd: vec!["/bin/cat".into()],
             ephemeral: false,
             sandbox: None,
+            source: None,
         })
         .await,
     );
@@ -8085,6 +8159,7 @@ async fn a_turn_checkpoints_its_diff_and_restores_round_trip() {
             cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
             ephemeral: false,
             sandbox: None,
+            source: None,
         })
         .await,
     );
@@ -8243,6 +8318,7 @@ async fn the_next_prompt_closes_an_interrupted_turn_under_its_own() {
             cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
             ephemeral: false,
             sandbox: None,
+            source: None,
         })
         .await,
     );
@@ -8301,6 +8377,7 @@ async fn a_self_reported_turn_checkpoints_its_diff() {
             cmd: vec!["/bin/sh".into()],
             ephemeral: false,
             sandbox: None,
+            source: None,
         })
         .await,
     );
@@ -8417,6 +8494,7 @@ async fn checkpoints_stay_empty_outside_jj() {
             cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
             ephemeral: false,
             sandbox: None,
+            source: None,
         })
         .await,
     );

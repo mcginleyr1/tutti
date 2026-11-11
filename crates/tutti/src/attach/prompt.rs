@@ -508,6 +508,7 @@ mod tests {
                 cmd: vec![shell],
                 ephemeral: false,
                 sandbox: None,
+                source: None,
             })],
         );
         assert_eq!(app.mode, Mode::Terminal);
@@ -574,6 +575,7 @@ mod tests {
                 cmd: vec![shell],
                 ephemeral: false,
                 sandbox: None,
+                source: None,
             })],
             "esc after add-project spawns the shell into the new workspace"
         );

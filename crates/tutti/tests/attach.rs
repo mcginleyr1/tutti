@@ -155,6 +155,7 @@ fn attach_seeds_app_and_input_updates_grid() {
         cmd: vec!["/bin/cat".into()],
         ephemeral: false,
         sandbox: None,
+        source: None,
     });
     let pane = match control.response() {
         Response::PaneCreated { id } => id,
@@ -229,6 +230,7 @@ fn a_scripted_pane_focus_jumps_the_attached_client() {
             cmd: vec!["/bin/cat".into()],
             ephemeral: false,
             sandbox: None,
+            source: None,
         });
         match control.response() {
             Response::PaneCreated { id } => id,
@@ -312,6 +314,7 @@ fn tty_hook_commands_report_through_the_panes_pty() {
         ],
         ephemeral: false,
         sandbox: None,
+        source: None,
     });
     let pane = match control.response() {
         Response::PaneCreated { id } => id,

@@ -4,7 +4,7 @@ use serde::Deserialize;
 /// or `Event` shapes, additive fields included: the daemon's answer to an
 /// attach names it, and binaries upgrade on install while running daemons do
 /// not.
-pub const WIRE_REV: u32 = 20;
+pub const WIRE_REV: u32 = 21;
 
 /// The oldest peer revision this build still works with faithfully. A change
 /// an older peer can ignore — a new optional field, a new request, a new

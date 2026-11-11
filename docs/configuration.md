@@ -89,14 +89,42 @@ name = "jira"
 kind = "command"          # any tracker: prints [{id, title, body?, url?, labels?}]
 command = ["~/bin/jira-issues", "--json"]
 prompt = "Fix {id}: {title}\n\n{body}\n\n{url}"  # any kind; the agent's first message
+
+# A shell file an agent is started behind, by its catalog name (see below).
+[agents.omp]
+source = "~/secrets.sh"   # absolute, or under `~`
 ```
 
 ### Chords, and what is a default
 
 Chord syntax is `C-<char>` (Ctrl), `A-<char>` (Alt), or a bare printable
 character. The top-level keys and `[keys]` above are exactly the defaults, so a
-file that reproduces them changes nothing; `[[projects]]`, `[[sandboxes]]` and
-`[[issues]]` are examples.
+file that reproduces them changes nothing; `[[projects]]`, `[[sandboxes]]`,
+`[[issues]]` and `[agents.omp]` are examples.
+
+## A file an agent starts behind
+
+`[agents.<name>] source = "<file>"` gives one agent what it needs from your
+shell — an API key, say — without putting it in every pane's environment.
+`<name>` is the agent's name in the [catalog](agents.md#the-catalog)'s
+launcher (`claude`, `omp`, `antigravity`, …); an unknown one is an error.
+
+- **What it does.** The daemon starts the agent as `/bin/sh -c '. <file> &&
+  exec <agent> …'`: the file is sourced by `sh`, so keep it to POSIX
+  (`export KEY=…` lines), and then the agent takes the shell's place. The
+  pane is the agent's own: its title, its detection, the command saved with
+  the layout. A file that is missing or fails ends the pane on the shell's
+  error, in the pane.
+- **Where it applies.** The launcher's agent and resume rows, an issue
+  deploy, `tutti run` and `tutti pane run` when the command is that agent's
+  (named as detection names it, so Cursor run as `agent` is matched only from
+  its launcher row), and a [restore](sessions.md#restoring-after-a-restart)
+  reviving the agent's conversation.
+- **Where it does not.** A sandbox, which cannot read this machine's file;
+  the launcher's shell and `command…` rows; an agent you type into a shell
+  yourself.
+- **Whose config.** The daemon's machine's: under `tutti --host` the file is
+  read there, from that machine's config.
 
 ## The escape time
 

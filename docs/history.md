@@ -199,7 +199,12 @@ Goal: the differentiator. Tutti knows which panes are agents and what state they
    the conversation's transcript. Its hooks report no permission dialog, so
    a pane they hold working still has its screen read: a dialog there blocks
    it, and its idle prompt after a cancelled dialog ends the turn
-   (`SCREEN_PROMPTERS`).
+   (`SCREEN_PROMPTERS`). ✅ `[agents.<name>] source` in the config names a
+   shell file an agent starts behind — an API key for that agent's panes
+   alone: the run request carries it (`source`, wire rev 21), the daemon
+   runs the command as `/bin/sh -c '. file && exec …'` with the pane still
+   the command's own in title and saved argv, and a restore revives the
+   agent behind it again.
 3. **Surfacing**: colored state badge per pane border + tab, workspace overview in
    navigate mode grouped by state (Blocked first), optional terminal bell / OSC 9
    desktop notification on `Working → Blocked/Done`. ✅ The go-to overlay

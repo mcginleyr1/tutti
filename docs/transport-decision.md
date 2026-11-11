@@ -291,7 +291,7 @@ the last, so where one ends is nothing the program sees.
 8. **Detach:** client → `Frame{Control,{"t":"detach"}}`; server drops the client and
    keeps every PTY and parser alive.
 
-## Revisions and floors (wire rev 20)
+## Revisions and floors (wire rev 21)
 
 The wire as code is `crates/tutti-wire`: where the daemon listens, the frame codec, the
 requests, responses and events with the types they name, and what this section sets out.
@@ -307,7 +307,7 @@ tutti. So each end has two numbers:
 The daemon's answer to an attach names both:
 
 ```json
-{"type":"attached","session":"tutti","workspaces":[],"wire_rev":20,"wire_floor":19,
+{"type":"attached","session":"tutti","workspaces":[],"wire_rev":21,"wire_floor":19,
  "restorable":null,"notes":[]}
 ```
 
@@ -346,7 +346,7 @@ every control frame until the answer, which it waits for before anything else.
 that links no tutti-wire (a menu-bar or notch app):
 
 ```json
-{"type":"snapshot","session":"tutti","wire_rev":20,"wire_floor":19,"attached_terminal":null,"panes":[]}
+{"type":"snapshot","session":"tutti","wire_rev":21,"wire_floor":19,"attached_terminal":null,"panes":[]}
 ```
 
 A watcher has the same two numbers of its own: `W`, the revision its author read the
@@ -392,6 +392,10 @@ revision alone went up. Its floor is 19: the last revision whose clients took a
 daemon by equality, and the only one a rev-20 peer was checked against, that one field
 being all that separates them. A rev-19 client still refuses a rev-20 daemon, by its own
 equality, and a rev-20 client takes a rev-19 daemon.
+
+**Rev 21** added `source` to `run` and `pane_run`: a shell file the daemon sources before
+the command (`[agents.<name>] source` in the config). An older daemon reads past it and
+starts the command without the file, as it did before the field, so the floor stays 19.
 
 Host frames (below) keep the one number, `HOST_REV`, taken by equality: the proxy passes
 over a call it cannot read, which its caller waits out, so a new query is not yet a
@@ -726,7 +730,7 @@ that machine instead: in the TUI's own process when it runs beside its daemon, b
 proxy across ssh. Host frames (`kind = 0x06`) carry them, one JSON object each:
 
 ```json
-{"type":"hello","rev":3,"startup":{"first_run":"/home/me","notice":null}}
+{"type":"hello","rev":4,"startup":{"first_run":"/home/me","notice":null}}
 {"type":"call","id":3,"query":{"q":"complete_dirs","input":"~/src/a"}}
 {"type":"reply","id":3,"answer":{"Ok":{"dirs":["api","app"]}}}
 ```

@@ -753,6 +753,7 @@ impl App {
             cmd: diff_pager_cmd(None),
             ephemeral: true,
             sandbox: None,
+            source: None,
         })]
     }
 
@@ -1769,6 +1770,7 @@ mod tests {
                 cmd: diff_pager_cmd(None),
                 ephemeral: true,
                 sandbox: None,
+                source: None,
             })],
             "d spawns the ephemeral jj-diff pane in the workspace's tab"
         );

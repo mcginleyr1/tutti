@@ -193,6 +193,7 @@ impl App {
                     cmd: diff_pager_cmd(None),
                     ephemeral: true,
                     sandbox: None,
+                    source: None,
                 })];
             }
             ChangesAction::NextTab => {
@@ -229,6 +230,7 @@ impl App {
             cmd: diff_pager_cmd(Some(&path)),
             ephemeral: true,
             sandbox: None,
+            source: None,
         })]
     }
 
@@ -250,6 +252,7 @@ impl App {
             cmd: turn_pager_cmd(from, &turn.commit),
             ephemeral: true,
             sandbox: None,
+            source: None,
         })]
     }
 
@@ -532,6 +535,7 @@ mod tests {
                 cmd,
                 ephemeral,
                 sandbox: None,
+                source: None,
             } => {
                 assert_eq!(tab, Some(TabId(1)));
                 assert!(ephemeral, "the pager pane vanishes when less quits");
@@ -830,6 +834,7 @@ mod tests {
                 cmd,
                 ephemeral,
                 sandbox: None,
+                source: None,
             } => {
                 assert_eq!(tab, Some(TabId(1)));
                 assert!(ephemeral, "the pager pane vanishes when less quits");

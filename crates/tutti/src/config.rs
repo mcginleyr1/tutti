@@ -4,12 +4,14 @@
 //! defaults; a malformed file, an unknown key, or an unparseable chord is a
 //! hard error naming the offending entry — never silently ignored.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Deserialize;
+use tutti_agents::{Registry, program_name};
 
 use crate::issues::{self, Kind};
 use crate::sandbox::{Profile, Source};
@@ -497,6 +499,10 @@ pub struct Config {
     /// The issue trackers deploys draw from, in config order. Empty by
     /// default.
     pub issues: Vec<issues::Source>,
+    /// The shell file each agent is started behind (`[agents.<name>]
+    /// source`), by its catalog name, `~`-expanded: an API key, say, for that
+    /// agent's panes alone. Empty by default.
+    pub sources: BTreeMap<String, PathBuf>,
     prefix_bindings: Vec<PrefixBinding>,
 }
 
@@ -631,6 +637,30 @@ impl Config {
             bail!("issues: duplicate name {:?}", dup.1.name);
         }
 
+        let registry = Registry::default();
+        let sources = raw
+            .agents
+            .into_iter()
+            .map(|(agent, raw)| {
+                if registry.spec(&agent.as_str().into()).is_none() {
+                    let known: Vec<&str> =
+                        registry.specs().iter().map(|s| s.kind.0.as_str()).collect();
+                    bail!(
+                        "agents.{agent}: no such agent (one of {})",
+                        known.join(", ")
+                    );
+                }
+                let file = expand_home(&raw.source, home.as_deref());
+                if !file.is_absolute() {
+                    bail!(
+                        "agents.{agent}.source: {:?} is neither absolute nor under ~",
+                        raw.source
+                    );
+                }
+                Ok((agent, file))
+            })
+            .collect::<Result<BTreeMap<String, PathBuf>>>()?;
+
         let mut overrides = raw.keys.into_map();
         let mut bindings = Vec::new();
         for (action, name, default) in DEFAULTS {
@@ -662,8 +692,21 @@ impl Config {
             projects,
             sandboxes,
             issues,
+            sources,
             prefix_bindings,
         })
+    }
+
+    /// The file `cmd` starts behind: the one configured for the agent it
+    /// runs, named by its command as detection names a process — a node or
+    /// bun program by its script (`program_name`, `Registry::match_process`).
+    /// `None` for any other command.
+    pub fn source(&self, cmd: &[String]) -> Option<PathBuf> {
+        let (program, args) = cmd.split_first()?;
+        let name = Path::new(program).file_name()?.to_str()?;
+        let registry = Registry::default();
+        let agent = registry.match_process(program_name(name, args.iter().map(String::as_str)))?;
+        self.sources.get(&agent.kind.0).cloned()
     }
 
     /// The sandbox profile called `name`, or an error naming what is
@@ -751,6 +794,14 @@ struct RawConfig {
     sandboxes: Vec<RawSandbox>,
     #[serde(default)]
     issues: Vec<RawIssues>,
+    #[serde(default)]
+    agents: BTreeMap<String, RawAgent>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAgent {
+    source: String,
 }
 
 #[derive(Deserialize)]
@@ -1276,6 +1327,40 @@ kill_pane    = "A-x"
             cfg.projects,
             vec![PathBuf::from("/srv/api"), PathBuf::from("/srv/web")]
         );
+    }
+
+    /// `[agents.<name>] source` names the file an agent starts behind: by
+    /// its catalog name, absolute or under `~`, and found again from the
+    /// command that runs it.
+    #[test]
+    fn an_agents_source_file_is_validated_and_found_by_its_command() {
+        assert!(Config::default().sources.is_empty());
+        let cfg = Config::parse("[agents.omp]\nsource = \"/home/u/secrets.sh\"\n").unwrap();
+        let file = Some(PathBuf::from("/home/u/secrets.sh"));
+        let cmd = |argv: &[&str]| argv.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        assert_eq!(cfg.source(&cmd(&["omp"])), file);
+        assert_eq!(cfg.source(&cmd(&["/opt/homebrew/bin/omp", "fix it"])), file);
+        assert_eq!(
+            cfg.source(&cmd(&["/usr/local/bin/bun", "--smol", "/u/.bun/bin/omp"])),
+            file,
+            "a bun program is its script's"
+        );
+        assert_eq!(cfg.source(&cmd(&["bun", "run", "build"])), None);
+        assert_eq!(cfg.source(&cmd(&["claude"])), None, "another agent");
+        assert_eq!(cfg.source(&cmd(&["sh", "-lc", "omp"])), None, "a shell");
+        assert_eq!(cfg.source(&[]), None);
+        for (bad, why) in [
+            ("[agents.nope]\nsource = \"/x\"\n", "no such agent"),
+            (
+                "[agents.omp]\nsource = \"secrets.sh\"\n",
+                "neither absolute nor under ~",
+            ),
+            ("[agents.omp]\n", "missing field `source`"),
+            ("[agents.omp]\nsource = \"/x\"\nenv = 1\n", "unknown field"),
+        ] {
+            let err = format!("{:#}", Config::parse(bad).unwrap_err());
+            assert!(err.contains(why), "{bad}: {err}");
+        }
     }
 
     #[test]

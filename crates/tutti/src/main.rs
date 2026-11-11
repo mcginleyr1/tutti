@@ -859,6 +859,23 @@ fn run(cli: Cli) -> Result<i32> {
             {
                 *from = caller_pane(&session);
             }
+            // An agent the config names a file for starts behind it — here:
+            // a sandbox cannot read it.
+            if let Request::Run {
+                cmd,
+                sandbox: None,
+                source,
+                ..
+            }
+            | Request::PaneRun {
+                cmd,
+                sandbox: None,
+                source,
+                ..
+            } = &mut request
+            {
+                *source = Config::load()?.source(cmd);
+            }
             let mut client = Client::connect_or_start(&session)?;
             let response = client.request(&request)?;
             Ok(if project {
@@ -1025,6 +1042,7 @@ fn mount_projects(
             cmd: vec![shell.to_string()],
             ephemeral: false,
             sandbox: None,
+            source: None,
         })? {
             Response::PaneCreated { .. } | Response::Ok => {}
             Response::Error { message } => notices.push(format!("{}: {message}", dir.display())),
@@ -1153,6 +1171,7 @@ fn to_request(command: Command) -> Result<Request> {
                 title,
                 from: None,
                 issue: None,
+                source: None,
             })
         }
         Command::Pane { action } => Ok(match action {
@@ -1171,6 +1190,7 @@ fn to_request(command: Command) -> Result<Request> {
                     cmd,
                     ephemeral,
                     sandbox,
+                    source: None,
                 }
             }
             PaneAction::Split { pane, direction } => Request::PaneSplit {
@@ -1565,6 +1585,8 @@ fn run_issue(action: IssueAction, session: &str, json: bool) -> Result<i32> {
             let files = sandbox.is_none().then(|| tutti_core::prompts_dir(session));
             let argv = spec.argv(path.as_deref());
             let (cmd, written) = issues::deploy_argv(spec, argv, &prompt, files.as_deref())?;
+            let behind = config.sources.get(&agent).cloned();
+            let behind = behind.filter(|_| sandbox.is_none());
             let into = (!here && project.dir.ancestors().any(|d| d.join(".jj").exists()))
                 .then(|| issues::workspace_name(&issue.source, &issue.id));
             let response = (|| -> Result<Response> {
@@ -1589,6 +1611,7 @@ fn run_issue(action: IssueAction, session: &str, json: bool) -> Result<i32> {
                     title: None,
                     issue: Some(issue.link()),
                     from: None,
+                    source: behind,
                 })
             })();
             // No pane took the prompt file, so nothing else would remove it
@@ -2654,6 +2677,7 @@ mod tests {
                 cmd: vec!["claude".to_string(), "--flag".to_string()],
                 ephemeral: false,
                 sandbox: None,
+                source: None,
             }
         );
     }
@@ -2668,6 +2692,7 @@ mod tests {
                 cmd: vec!["ls".into()],
                 ephemeral: false,
                 sandbox: None,
+                source: None,
             }
         );
     }
@@ -2681,6 +2706,7 @@ mod tests {
                 cmd: vec!["less".into()],
                 ephemeral: true,
                 sandbox: None,
+                source: None,
             }
         );
     }
@@ -3128,6 +3154,7 @@ mod tests {
                 title: Some("fixer".into()),
                 from: None,
                 issue: None,
+                source: None,
             }
         );
         assert_eq!(
@@ -3140,6 +3167,7 @@ mod tests {
                 title: None,
                 from: None,
                 issue: None,
+                source: None,
             }
         );
         let Request::Run { dir: Some(dir), .. } =
@@ -3595,6 +3623,7 @@ mod tests {
                     cmd: vec!["/bin/zsh".into()],
                     ephemeral: false,
                     sandbox: None,
+                    source: None,
                 },
                 Request::WorkspaceNew {
                     dir: PathBuf::from("/b")
@@ -3604,6 +3633,7 @@ mod tests {
                     cmd: vec!["/bin/zsh".into()],
                     ephemeral: false,
                     sandbox: None,
+                    source: None,
                 },
             ],
         );
@@ -3640,6 +3670,7 @@ mod tests {
                     cmd: vec!["/bin/zsh".into()],
                     ephemeral: false,
                     sandbox: None,
+                    source: None,
                 },
             ],
             "only the not-yet-mounted /b is created",

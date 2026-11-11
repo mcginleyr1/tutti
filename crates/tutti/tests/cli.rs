@@ -928,6 +928,7 @@ fn pane_run_sandbox_sends_a_configured_profile_and_refuses_an_unknown_one() {
                     cmd: vec!["claude".into()],
                     ephemeral: false,
                     sandbox: Some("orb".into()),
+                    source: None,
                 }
             );
         },
@@ -1481,6 +1482,7 @@ fn run_prints_the_bare_pane_id() {
                     title: None,
                     from: None,
                     issue: None,
+                    source: None,
                 }
             );
         },

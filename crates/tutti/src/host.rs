@@ -30,7 +30,7 @@ use crate::sandbox::Profile;
 /// The revision of the host frames' shapes, checked in the proxy's hello. Bump
 /// it on any change to `HostFrame`, `Query` or `Answer`: the tutti on each end
 /// of an ssh connection is installed separately.
-pub const HOST_REV: u32 = 3;
+pub const HOST_REV: u32 = 4;
 
 /// Most answers are a directory read or a file plan away.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -167,6 +167,8 @@ pub struct Info {
     pub shell: String,
     pub sandboxes: Vec<Profile>,
     pub issues: Vec<Source>,
+    /// Its config's `[agents.<name>] source` files (`Config::sources`).
+    pub sources: BTreeMap<String, PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -384,6 +386,7 @@ impl Local {
                     .map_or_else(|| "/bin/sh".into(), |shell| shell.display().to_string()),
                 sandboxes: self.config.sandboxes.clone(),
                 issues: self.config.issues.clone(),
+                sources: self.config.sources.clone(),
             }),
             Query::CompleteDirs { input } => Answer::Dirs(complete_dirs(&input, home, &self.cwd)),
             Query::ExpandDir { input } => {
@@ -912,7 +915,7 @@ mod tests {
             serde_json::to_string(&reply).unwrap(),
             r#"{"type":"reply","id":3,"answer":{"Ok":{"dirs":["src"]}}}"#
         );
-        let hello = r#"{"type":"hello","rev":3,"startup":{"first_run":"/srv","notice":null}}"#;
+        let hello = r#"{"type":"hello","rev":4,"startup":{"first_run":"/srv","notice":null}}"#;
         match serde_json::from_str(hello).unwrap() {
             HostFrame::Hello { rev, startup } => {
                 assert_eq!(

@@ -264,6 +264,8 @@ impl App {
         argv: Vec<String>,
     ) -> Vec<WireFrame> {
         let sandbox = self.launcher_profile().map(String::from);
+        let source = self.config.sources.get(agent).cloned();
+        let source = source.filter(|_| sandbox.is_none());
         self.close_launcher();
         let Some(project) = self.issues.project else {
             return Vec::new();
@@ -284,6 +286,7 @@ impl App {
             title: None,
             issue: Some(issue.link()),
             from: None,
+            source,
         };
         if self.issues_deploy_here() {
             return vec![self.follow(&run, FollowUp::Deployed(written))];
@@ -600,6 +603,7 @@ mod tests {
             title: None,
             issue: Some(link.clone()),
             from: None,
+            source: None,
         };
         assert_eq!(
             out,
@@ -657,6 +661,7 @@ mod tests {
             title: None,
             issue: Some(typo.link()),
             from: None,
+            source: None,
         };
         assert_eq!(
             out,

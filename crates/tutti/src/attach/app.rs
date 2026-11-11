@@ -287,11 +287,13 @@ impl App {
     }
 
     /// An app asking `host` about the daemon's machine, which `info` describes:
-    /// its sandboxes and issue trackers replace `config`'s, which keeps the
-    /// rest — keys, theme, mouse — from the machine the TUI draws on.
+    /// its sandboxes, issue trackers and agents' source files replace
+    /// `config`'s, which keeps the rest — keys, theme, mouse — from the
+    /// machine the TUI draws on.
     pub fn with_host(mut config: Config, host: Host, info: Info) -> Self {
         config.sandboxes = info.sandboxes;
         config.issues = info.issues;
+        config.sources = info.sources;
         Self {
             session: String::new(),
             workspaces: Vec::new(),

@@ -170,7 +170,7 @@ workspace/tab/pane structure, or to the attached TUI's focus or terminal;
 bursts coalesce.
 
 ```json
-{"type":"snapshot","session":"tutti","wire_rev":20,"wire_floor":19,"attached_terminal":"com.mitchellh.ghostty",
+{"type":"snapshot","session":"tutti","wire_rev":21,"wire_floor":19,"attached_terminal":"com.mitchellh.ghostty",
  "panes":[{"id":3,"workspace":"smartnotch","dir":"/Users/me/develop/smartnotch","tab":"main",
            "title":"claude","agent":"claude","state":"blocked","source":"hook","exited":null,"focused":true,
            "user_vars":{},"cwd":"/Users/me/develop/smartnotch/src",

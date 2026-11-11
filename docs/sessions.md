@@ -34,7 +34,9 @@ restore [--discard]`.
   conversation under its old title, when tutti knows the tool's resume recipe
   (Claude Code, Codex, Gemini CLI, Antigravity CLI, opencode, Muse Code, Mistral Vibe). Every other pane comes
   back as a fresh shell in its workspace. A saved command is never re-run:
-  re-running `claude "fix the tests"` would re-issue the prompt.
+  re-running `claude "fix the tests"` would re-issue the prompt. An agent
+  started behind a [source file](configuration.md#a-file-an-agent-starts-behind)
+  is revived behind it again.
 - Each pane's [turns](workspaces.md#turns-review-and-undo-one-agent-turn) come back too,
   numbering continued, and a revived agent stays linked to the
   [issue](issues.md) it was deployed on.

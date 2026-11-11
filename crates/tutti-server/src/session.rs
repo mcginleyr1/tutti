@@ -126,6 +126,9 @@ struct PaneSlot {
     /// any sandbox wrapping), a split's login shell, a restore's recipe.
     /// Saved with the layout to say what ran here; a restore never re-runs it.
     argv: Vec<String>,
+    /// The shell file sourced before `argv` ran (`sourced_argv`), saved with
+    /// the layout so the agent a restore revives sources it again.
+    source: Option<PathBuf>,
     /// An ephemeral pane is removed outright when its child exits (the reaper
     /// drops it from the layout) instead of being kept as an exited corpse.
     ephemeral: bool,
@@ -539,13 +542,20 @@ impl Session {
     /// down entirely when its child exits. With a `sandbox` profile the pane
     /// runs `cmd` through `tutti sandbox run <profile> --name <name> --`,
     /// titled for `cmd`, its sandbox named for the pane (`sandbox_name`).
+    /// With a `source` file it runs `cmd` behind a shell that sources the
+    /// file first (`sourced_argv`), titled for `cmd` all the same; a sandbox
+    /// cannot read the file, so the two together are refused.
     pub fn pane_run(
         &mut self,
         tab: Option<TabId>,
         cmd: Vec<String>,
         ephemeral: bool,
         sandbox: Option<String>,
+        source: Option<PathBuf>,
     ) -> Result<PaneId> {
+        if sandbox.is_some() && source.is_some() {
+            bail!("a sandbox cannot source a file of this machine's");
+        }
         let tab = self.resolve_tab(tab)?;
         let title = pane_title(cmd.first().context("empty command")?);
         let nanos = SystemTime::now()
@@ -554,9 +564,10 @@ impl Session {
         // Named for the id `spawn_into_tab` allocates next.
         let sandbox =
             sandbox.map(|profile| (profile, sandbox_name(PaneId(self.ids.pane + 1), nanos)));
-        let argv = match &sandbox {
-            Some((profile, name)) => sandbox_argv(&client_exe()?, profile, name, cmd.clone()),
-            None => cmd.clone(),
+        let argv = match (&sandbox, &source) {
+            (Some((profile, name)), _) => sandbox_argv(&client_exe()?, profile, name, cmd.clone()),
+            (None, Some(file)) => sourced_argv(file, cmd.clone()),
+            (None, None) => cmd.clone(),
         };
         let (program, args) = argv.split_first().context("empty command")?;
         let dir = self.tab_workspace_dir(tab)?;
@@ -567,6 +578,7 @@ impl Session {
         let id = self.spawn_into_tab(tab, spec, cmd, title, None, ephemeral)?;
         if let Some(slot) = self.panes.get_mut(&id) {
             (slot.meta.sandbox, slot.meta.sandbox_name) = sandbox.unzip();
+            slot.source = source;
         }
         Ok(id)
     }
@@ -627,6 +639,7 @@ impl Session {
         }: RunTarget,
         cmd: Vec<String>,
         sandbox: Option<String>,
+        source: Option<PathBuf>,
         title: Option<String>,
         issue: Option<IssueRef>,
     ) -> Result<(WorkspaceId, TabId, PaneId, bool)> {
@@ -658,7 +671,7 @@ impl Session {
                 (id, self.tab_new(Some(id))?, false)
             }
         };
-        let spawned = self.pane_run(Some(tab), cmd, false, sandbox);
+        let spawned = self.pane_run(Some(tab), cmd, false, sandbox, source);
         match &spawned {
             Ok(pane) => {
                 self.current_tab = current.or(Some(tab));
@@ -1710,6 +1723,7 @@ impl Session {
                                         id,
                                         title: slot.meta.title.clone(),
                                         argv: slot.argv.clone(),
+                                        source: slot.source.clone(),
                                         agent: slot.meta.agent.clone(),
                                         conversation: slot.meta.conversation.clone(),
                                         issue: slot.meta.issue.clone(),
@@ -1748,7 +1762,8 @@ impl Session {
     /// under its old title, keeping its agent and conversation; every other one
     /// is a login shell in the workspace's directory. A saved command is never
     /// re-run — re-running `claude "fix the tests"` would re-issue the prompt.
-    /// Each pane's checkpoints carry over, numbering and head intact; a turn
+    /// A revived agent started behind a sourced file (`PaneRun.source`)
+    /// sources it again. Each pane's checkpoints carry over, numbering and head intact; a turn
     /// left in flight is closed under its prompt (`Turns::note_restart`), and
     /// a revived agent notes its start, as a detected one does. A pane that
     /// fails to spawn is dropped from its tree and named in `skipped`. The
@@ -1800,8 +1815,14 @@ impl Session {
                         Some(cmd) => (cmd.clone(), pane.title.clone()),
                         None => (vec![shell.clone()], pane_title(&shell)),
                     };
-                    let mut spec = PtySpec::new(&argv[0]);
-                    spec.args = argv[1..].to_vec();
+                    // A revived agent sources what it was started behind.
+                    let source = pane.source.filter(|_| revived.is_some());
+                    let spawned = match &source {
+                        Some(file) => sourced_argv(file, argv.clone()),
+                        None => argv.clone(),
+                    };
+                    let mut spec = PtySpec::new(&spawned[0]);
+                    spec.args = spawned[1..].to_vec();
                     spec.cwd = Some(dir.clone());
                     spec.env = vec![("TERM".into(), "xterm-256color".into())];
                     let id = match self.spawn_into_tab(tab, spec, argv, title, None, false) {
@@ -1815,6 +1836,7 @@ impl Session {
                     if let Some(slot) = self.panes.get_mut(&id) {
                         slot.turns = pane.turns;
                         slot.turns.note_restart();
+                        slot.source = source;
                         if revived.is_some() {
                             slot.meta.conversation = pane.conversation;
                             slot.meta.issue = pane.issue;
@@ -1975,6 +1997,7 @@ impl Session {
                 pty,
                 tab,
                 argv,
+                source: None,
                 ephemeral,
                 answered: None,
                 turns: Turns::default(),
@@ -2134,6 +2157,15 @@ fn pane_info(slot: &PaneSlot) -> PaneInfo {
     info
 }
 
+/// `argv` behind a `/bin/sh` that sources `file` first and then execs it: the
+/// pane's process becomes `argv`'s own, with whatever the file exported. A
+/// file that does not source ends the pane on the shell's own error.
+fn sourced_argv(file: &Path, argv: Vec<String>) -> Vec<String> {
+    let shell = ["/bin/sh", "-c", r#". "$0" && exec "$@""#].map(String::from);
+    let file = file.to_string_lossy().into_owned();
+    shell.into_iter().chain([file]).chain(argv).collect()
+}
+
 fn pane_title(program: &str) -> String {
     std::path::Path::new(program)
         .file_name()
@@ -2235,7 +2267,7 @@ fn parse_head(contents: &str) -> Option<String> {
 mod tests {
     use super::{
         FRESH_GRACE, ForkMeta, REPLY_CAP, STALL_AFTER, Session, git_branch, pane_title, parse_head,
-        rename_leaves, sandbox_argv, sandbox_name, stop_subagent,
+        rename_leaves, sandbox_argv, sandbox_name, sourced_argv, stop_subagent,
     };
     use crate::herdr;
     use crate::persist::{Saved, SavedPane};
@@ -2258,7 +2290,13 @@ mod tests {
         let mut session = Session::new(PaneSize::new(24, 80), "test");
         session.workspace_new(tmp.path().to_path_buf());
         let pane = session
-            .pane_run(None, vec!["/bin/sleep".into(), "30".into()], false, None)
+            .pane_run(
+                None,
+                vec!["/bin/sleep".into(), "30".into()],
+                false,
+                None,
+                None,
+            )
             .unwrap();
         (session, pane, tmp)
     }
@@ -2702,7 +2740,7 @@ mod tests {
         let tmp = TempDir::new();
         let mut s = Session::new(PaneSize::new(24, 80), "test");
         s.workspace_new(tmp.path().to_path_buf());
-        let agent = s.pane_run(None, sleep_cmd(), false, None).unwrap();
+        let agent = s.pane_run(None, sleep_cmd(), false, None, None).unwrap();
         s.set_agent(agent, Some("claude".into()));
         s.apply_agent_event(agent, AgentHookEvent::SessionStarted, Some("c1".into()));
         let mut r = Session::new(PaneSize::new(24, 80), "test");
@@ -3575,13 +3613,61 @@ mod tests {
         serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap()
     }
 
+    /// A pane started behind a source file is still its command's, in argv
+    /// and title; the file is saved with the layout, so the agent a restore
+    /// revives starts behind it again, and a pane that comes back a shell
+    /// does not. A sandbox cannot read the file.
+    #[test]
+    fn a_sourced_pane_stays_its_commands_and_revives_behind_its_file() {
+        let dir = TempDir::new();
+        let file = dir.path().join("secrets.sh");
+        std::fs::write(&file, "export TUTTI_SOURCED=1\n").unwrap();
+        assert_eq!(
+            sourced_argv(Path::new("/h/s.sh"), vec!["omp".into(), "fix it".into()]),
+            [
+                "/bin/sh",
+                "-c",
+                r#". "$0" && exec "$@""#,
+                "/h/s.sh",
+                "omp",
+                "fix it"
+            ]
+        );
+        let mut s = Session::new(PaneSize::new(24, 80), "test");
+        s.workspace_new(dir.path().to_path_buf());
+        let behind = Some(file.clone());
+        let agent = s
+            .pane_run(None, sleep_cmd(), false, None, behind.clone())
+            .unwrap();
+        assert_eq!(s.argv(agent), Some(sleep_cmd()));
+        assert_eq!(s.pane(agent).unwrap().title, "sleep");
+        let refused = s.pane_run(None, sleep_cmd(), false, Some("gke".into()), behind.clone());
+        assert!(
+            format!("{:#}", refused.unwrap_err()).contains("sandbox cannot source"),
+            "a sandbox cannot read this machine's file"
+        );
+        s.set_agent(agent, Some("claude".into()));
+        s.apply_agent_event(agent, AgentHookEvent::SessionStarted, Some("c1".into()));
+        let plain = s
+            .pane_run(None, sleep_cmd(), false, None, behind.clone())
+            .unwrap();
+
+        let mut r = Session::new(PaneSize::new(24, 80), "test");
+        let out = r.restore(reread(s.snapshot().unwrap()), revive_as_sleep);
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+        let (revived, shell) = (out.panes[&agent], out.panes[&plain]);
+        assert_eq!(r.panes[&revived].source, behind);
+        assert_eq!(r.argv(revived), Some(sleep_cmd()), "the recipe, unwrapped");
+        assert_eq!(r.panes[&shell].source, None, "a shell came back");
+    }
+
     #[test]
     fn a_snapshot_restores_its_layout_agents_and_turns() {
         let (one, two) = (TempDir::new(), TempDir::new());
         let mut s = Session::new(PaneSize::new(24, 80), "test");
         assert!(s.snapshot().is_none(), "an empty session saves nothing");
         let a = s.workspace_new(one.path().to_path_buf());
-        let agent = s.pane_run(None, sleep_cmd(), false, None).unwrap();
+        let agent = s.pane_run(None, sleep_cmd(), false, None, None).unwrap();
         let shell = s.pane_split(agent, Direction::Vertical).unwrap();
         s.pane_resize_split(agent, Direction::Vertical, 0.15)
             .unwrap();
@@ -3610,14 +3696,15 @@ mod tests {
         let busy = Some("add the tests".to_string());
         s.apply_agent_event(agent, prompt(busy.clone(), "p1"), None);
         let logs = s.tab_new(Some(a)).unwrap();
-        s.pane_run(Some(logs), sleep_cmd(), false, None).unwrap();
+        s.pane_run(Some(logs), sleep_cmd(), false, None, None)
+            .unwrap();
         s.tab_mut(logs).unwrap().name = "logs".into();
         let fork = ForkMeta {
             origin_root: one.path().to_path_buf(),
             jj_name: "feature".into(),
         };
         s.workspace_new_forked(two.path().to_path_buf(), fork.clone());
-        s.pane_run(None, sleep_cmd(), false, None).unwrap();
+        s.pane_run(None, sleep_cmd(), false, None, None).unwrap();
         s.set_active_pane(shell).unwrap();
 
         let mut r = Session::new(PaneSize::new(24, 80), "test");
@@ -3707,11 +3794,13 @@ mod tests {
         let (mut s, pane, _tmp) = session_with_pane();
         let exited = s.pane_split(pane, Direction::Horizontal).unwrap();
         s.mark_exited(exited, 0);
-        s.pane_run(None, sleep_cmd(), true, None).unwrap();
+        s.pane_run(None, sleep_cmd(), true, None, None).unwrap();
         let sandboxed = s.pane_split(pane, Direction::Vertical).unwrap();
         s.panes.get_mut(&sandboxed).unwrap().meta.sandbox = Some("gke".into());
         let lone = s.tab_new(None).unwrap();
-        let dead = s.pane_run(Some(lone), sleep_cmd(), false, None).unwrap();
+        let dead = s
+            .pane_run(Some(lone), sleep_cmd(), false, None, None)
+            .unwrap();
         s.mark_exited(dead, 1);
         let bare = TempDir::new();
         s.workspace_new(bare.path().to_path_buf());
@@ -3763,7 +3852,7 @@ mod tests {
 
         let mut r = Session::new(PaneSize::new(24, 80), "test");
         let open = r.workspace_new(tmp.path().join("."));
-        r.pane_run(None, sleep_cmd(), false, None).unwrap();
+        r.pane_run(None, sleep_cmd(), false, None, None).unwrap();
         let out = r.restore(saved, |_| None);
         assert_eq!(out.workspaces, [open]);
         assert_eq!(

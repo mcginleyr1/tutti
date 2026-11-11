@@ -485,7 +485,13 @@ impl App {
         match kind {
             LaunchKind::Agent(cmd) | LaunchKind::Resume(cmd) => match self.launcher.issue.take() {
                 Some((issue, prompt)) => self.deploy_frames(&issue, &name, &prompt, cmd),
-                None => self.launch_frames(cmd),
+                // An agent row is named for its agent; a resume row's
+                // command names it.
+                None => {
+                    let source = self.config.sources.get(&name).cloned();
+                    let source = source.or_else(|| self.config.source(&cmd));
+                    self.launch_frames(cmd, source)
+                }
             },
             LaunchKind::Shell => self.launch_shell_and_close(),
             LaunchKind::Command => {
@@ -497,7 +503,7 @@ impl App {
     }
 
     fn launch_shell_and_close(&mut self) -> Vec<WireFrame> {
-        self.launch_frames(vec![self.launcher_shell()])
+        self.launch_frames(vec![self.launcher_shell()], None)
     }
 
     /// The shell the launcher's shell and command rows run: the login shell
@@ -514,34 +520,38 @@ impl App {
     /// into an exited pane's tab followed by that corpse's kill when armed to
     /// replace it, else a plain run into the current tab. Requests share one
     /// ordered connection, so the run always lands after the tab exists and
-    /// before the corpse goes.
-    fn launch_frames(&mut self, cmd: Vec<String>) -> Vec<WireFrame> {
+    /// before the corpse goes. `cmd` starts behind `source`, the file its
+    /// agent's config names — locally: a sandbox cannot read it.
+    fn launch_frames(&mut self, cmd: Vec<String>, source: Option<PathBuf>) -> Vec<WireFrame> {
         let new_tab = self.launcher.new_tab.take();
         let replace = self.launcher.replace.take();
         let sandbox = self.launcher_profile().map(String::from);
+        let source = source.filter(|_| sandbox.is_none());
         self.close_launcher();
+        // A persistent pane in `tab`, else the session's current one: the
+        // just-created workspace after add-project, the active tab for
+        // prefix-`r`.
+        let run = |tab| {
+            control(&Request::PaneRun {
+                tab,
+                cmd,
+                ephemeral: false,
+                sandbox,
+                source,
+            })
+        };
         if let Some(workspace) = new_tab {
-            return vec![
-                control(&Request::TabNew {
-                    workspace: Some(workspace),
-                }),
-                run_pane(cmd, sandbox),
-            ];
+            let tab = Request::TabNew {
+                workspace: Some(workspace),
+            };
+            return vec![control(&tab), run(None)];
         }
         if let Some(corpse) = replace
             && let Some(tab) = self.tab_of_pane(corpse)
         {
-            return vec![
-                control(&Request::PaneRun {
-                    tab: Some(tab),
-                    cmd,
-                    ephemeral: false,
-                    sandbox,
-                }),
-                control(&Request::PaneKill { pane: corpse }),
-            ];
+            return vec![run(Some(tab)), control(&Request::PaneKill { pane: corpse })];
         }
-        vec![run_pane(cmd, sandbox)]
+        vec![run(None)]
     }
 
     /// Dismiss the launcher back to terminal mode, dropping its transient state.
@@ -576,23 +586,11 @@ impl App {
                 if input.is_empty() {
                     return Vec::new();
                 }
-                self.launch_frames(vec![self.launcher_shell(), "-lc".into(), input])
+                self.launch_frames(vec![self.launcher_shell(), "-lc".into(), input], None)
             }
             _ => Vec::new(),
         }
     }
-}
-
-/// A `PaneRun` into the session's current tab (the just-created workspace after
-/// add-project, or the active tab for prefix-`r`), spawning a persistent pane —
-/// in `sandbox` when the launcher was switched to one.
-fn run_pane(cmd: Vec<String>, sandbox: Option<String>) -> WireFrame {
-    control(&Request::PaneRun {
-        tab: None,
-        cmd,
-        ephemeral: false,
-        sandbox,
-    })
 }
 
 #[cfg(test)]
@@ -833,6 +831,7 @@ mod tests {
                     cmd: vec!["claude".into()],
                     ephemeral: false,
                     sandbox: None,
+                    source: None,
                 }),
             ],
             "the run follows a TabNew on the same ordered connection, so it \
@@ -868,6 +867,7 @@ mod tests {
                 cmd: vec!["claude".into()],
                 ephemeral: false,
                 sandbox: None,
+                source: None,
             })],
             "esc dropped the armed TabNew; C-b r still runs in place"
         );
@@ -897,6 +897,7 @@ mod tests {
                     cmd: vec!["claude".into(), "--resume".into(), "abc".into()],
                     ephemeral: false,
                     sandbox: None,
+                    source: None,
                 }),
                 control(&Request::PaneKill { pane: PaneId(1) }),
             ],
@@ -926,6 +927,7 @@ mod tests {
                     cmd: vec!["claude".into()],
                     ephemeral: false,
                     sandbox: Some("gke".into()),
+                    source: None,
                 }),
                 control(&Request::PaneKill { pane: PaneId(1) }),
             ]
@@ -974,6 +976,7 @@ mod tests {
                 cmd: vec!["claude".into()],
                 ephemeral: false,
                 sandbox: None,
+                source: None,
             })],
             "enter launches the selected agent in a new pane"
         );
@@ -1000,10 +1003,56 @@ mod tests {
                 cmd: vec!["claude".into(), "--resume".into(), "abc".into()],
                 ephemeral: false,
                 sandbox: None,
+                source: None,
             })],
             "enter resumes the conversation in a new pane"
         );
         assert_eq!(app.mode, Mode::Terminal);
+    }
+
+    /// An agent with a `source` file in the config starts behind it: its own
+    /// row by the row's name (Cursor's runs a path that names nobody), a
+    /// resume row by its command. A shell, a command line and a sandbox —
+    /// which cannot read the file — get none.
+    #[test]
+    fn an_agent_with_a_source_file_starts_behind_it_locally() {
+        let sourced = "[agents.claude]\nsource = \"/h/secrets.sh\"\n\n\
+                       [agents.cursor]\nsource = \"/h/cursor.sh\"\n\n\
+                       [[sandboxes]]\nname = \"orb\"\nimage = \"i\"\n";
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let launched = |row: LauncherRow, sandbox: Option<usize>| {
+            let mut app = App::with_config(Config::parse(sourced).unwrap());
+            attached(&mut app);
+            app.launcher.rows = vec![row];
+            app.launcher.sandbox = sandbox;
+            app.mode = Mode::Launcher;
+            match only_request(&app.on_key(enter)) {
+                Request::PaneRun { source, .. } => source,
+                other => panic!("{other:?}"),
+            }
+        };
+        let row = |name: &str, kind: LaunchKind| LauncherRow {
+            name: name.into(),
+            role: name.into(),
+            kind,
+            available: true,
+        };
+        let argv = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        let claude = || row("claude", LaunchKind::Agent(argv(&["claude"])));
+        let secrets = Some(PathBuf::from("/h/secrets.sh"));
+        assert_eq!(launched(claude(), None), secrets);
+        assert_eq!(
+            launched(
+                row("cursor", LaunchKind::Agent(argv(&["/u/bin/agent"]))),
+                None
+            ),
+            Some(PathBuf::from("/h/cursor.sh"))
+        );
+        let resume = LaunchKind::Resume(argv(&["claude", "--resume", "abc"]));
+        assert_eq!(launched(row("resume", resume), None), secrets);
+        assert_eq!(launched(agent_row("codex", true), None), None);
+        assert_eq!(launched(row("shell", LaunchKind::Shell), None), None);
+        assert_eq!(launched(claude(), Some(0)), None, "a sandbox cannot");
     }
 
     #[test]
@@ -1064,6 +1113,7 @@ mod tests {
                 cmd: vec![login_shell()],
                 ephemeral: false,
                 sandbox: None,
+                source: None,
             })],
             "the shell row's number launches it outright"
         );
@@ -1102,6 +1152,7 @@ mod tests {
                 cmd: vec![login_shell(), "-lc".into(), "npm test".into()],
                 ephemeral: false,
                 sandbox: None,
+                source: None,
             })],
             "the command runs through the login shell's -lc"
         );
@@ -1147,6 +1198,7 @@ mod tests {
                 cmd: vec!["claude".into()],
                 ephemeral: false,
                 sandbox: Some("orb".into()),
+                source: None,
             })],
             "the pick runs in the selected sandbox"
         );
@@ -1174,6 +1226,7 @@ mod tests {
                 cmd: vec!["sh".into()],
                 ephemeral: false,
                 sandbox: Some("orb".into()),
+                source: None,
             })],
             "an image has sh, not this machine's login shell"
         );

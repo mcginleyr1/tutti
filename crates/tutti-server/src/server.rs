@@ -1349,23 +1349,25 @@ fn dispatch(hub: &Arc<Hub>, request: Request) -> Response {
             title,
             issue,
             from,
+            source,
         } => {
             let target = RunTarget {
                 workspace,
                 dir,
                 from,
             };
-            run_in_fresh_tab(hub, target, cmd, sandbox, title, issue)
+            run_in_fresh_tab(hub, target, cmd, sandbox, source, title, issue)
         }
         Request::PaneRun {
             tab,
             cmd,
             ephemeral,
             sandbox,
+            source,
         } => {
             let declared = declared_agent(hub, sandbox.as_deref(), &cmd);
             spawn_pane(hub, |s| {
-                let pane = s.pane_run(tab, cmd, ephemeral, sandbox)?;
+                let pane = s.pane_run(tab, cmd, ephemeral, sandbox, source)?;
                 s.set_agent(pane, declared);
                 Ok(pane)
             })
@@ -2299,6 +2301,7 @@ fn run_in_fresh_tab(
     target: RunTarget,
     cmd: Vec<String>,
     sandbox: Option<String>,
+    source: Option<PathBuf>,
     title: Option<String>,
     issue: Option<IssueRef>,
 ) -> Response {
@@ -2306,7 +2309,7 @@ fn run_in_fresh_tab(
     let mut ran = None;
     let response = spawn_pane(hub, |s| {
         let (workspace, tab, pane, mounted) =
-            s.run_in_fresh_tab(target, cmd, sandbox, title, issue)?;
+            s.run_in_fresh_tab(target, cmd, sandbox, source, title, issue)?;
         s.set_agent(pane, declared);
         ran = Some((workspace, tab, mounted));
         Ok(pane)
@@ -2824,7 +2827,9 @@ fn workspace_fork(
             session.workspace_new_forked(dest, meta)
         };
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        spawn_pane(&hub, |s| s.pane_run(Some(tab_id), vec![shell], false, None));
+        spawn_pane(&hub, |s| {
+            s.pane_run(Some(tab_id), vec![shell], false, None, None)
+        });
         // Seed the fork's change stat / stale flag now that it exists.
         refresh_changes(&hub, ws_id);
         reply.send(Response::WorkspaceCreated { id: ws_id }).await;
@@ -3757,6 +3762,7 @@ mod tests {
             cmd: vec!["/bin/cat".into()],
             ephemeral: false,
             sandbox: None,
+            source: None,
         };
         let Response::PaneCreated { id: pane } = viewer.request(&run).await else {
             panic!("expected the cat pane");
@@ -3827,6 +3833,7 @@ mod tests {
             cmd: vec!["/bin/sh".into(), "-c".into(), script.into()],
             ephemeral: false,
             sandbox: None,
+            source: None,
         };
         let Response::PaneCreated { id: pane } = peer.request(&run).await else {
             panic!("expected a pane");
@@ -3930,6 +3937,7 @@ mod tests {
                 cmd: vec!["/bin/sh".into(), "-c".into(), script.into()],
                 ephemeral: false,
                 sandbox: None,
+                source: None,
             };
             let Response::PaneCreated { id } = viewer.request(&run).await else {
                 panic!("expected a pane");
@@ -4073,7 +4081,7 @@ mod tests {
         let pane = {
             let mut session = hub.session();
             session.workspace_new(std::env::temp_dir());
-            session.pane_run(None, vec!["/bin/cat".into()], false, None)
+            session.pane_run(None, vec!["/bin/cat".into()], false, None, None)
         }
         .unwrap();
         let id = hub
@@ -4123,7 +4131,7 @@ mod tests {
         let pane = {
             let mut session = hub.session();
             session.workspace_new(std::env::temp_dir());
-            session.pane_run(None, vec!["/bin/cat".into()], false, None)
+            session.pane_run(None, vec!["/bin/cat".into()], false, None, None)
         }
         .unwrap();
         for behind in [255, 256, 4096] {
@@ -4168,7 +4176,7 @@ mod tests {
         let pane = {
             let mut session = hub.session();
             session.workspace_new(std::env::temp_dir());
-            session.pane_run(None, vec!["/bin/cat".into()], false, None)
+            session.pane_run(None, vec!["/bin/cat".into()], false, None, None)
         }
         .unwrap();
         for _ in 0..100 {
@@ -4204,7 +4212,7 @@ mod tests {
         let spawn = || {
             let mut session = hub.session();
             let workspace = session.workspace_new(std::env::temp_dir());
-            let pane = session.pane_run(None, vec!["/bin/cat".into()], false, None);
+            let pane = session.pane_run(None, vec!["/bin/cat".into()], false, None, None);
             let pane = pane.unwrap();
             session.slow_teardown(pane, pause, done.clone());
             (workspace, pane)

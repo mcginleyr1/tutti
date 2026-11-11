@@ -79,6 +79,11 @@ pub struct SavedPane {
     /// What the pane was spawned with. Kept to say what ran there, never to
     /// run it again: re-running `claude "fix the tests"` re-issues the prompt.
     pub argv: Vec<String>,
+    /// The shell file the pane's command was started behind
+    /// (`PaneRun.source`): a revived agent sources it again. Absent from
+    /// files saved before it existed.
+    #[serde(default)]
+    pub source: Option<PathBuf>,
     pub agent: Option<AgentKind>,
     /// The agent's own id for the conversation it held.
     pub conversation: Option<String>,
@@ -248,6 +253,7 @@ mod tests {
             id: PaneId(id),
             title: "claude".into(),
             argv: vec!["claude".into(), "fix the tests".into()],
+            source: None,
             agent: agent.map(Into::into),
             conversation: conversation.map(Into::into),
             issue: None,

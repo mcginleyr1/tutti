@@ -91,9 +91,9 @@ pub enum Request {
     /// the current one; naming both `workspace` and `dir` is an error. A fresh
     /// tab because an orchestrated agent must never split a tab someone is
     /// using — and the session's current tab stays put, so an attached client
-    /// is not yanked over to it. `sandbox` works as in `PaneRun`; `title`
-    /// names the pane; `issue` links it to the tracker issue it was deployed
-    /// on (`PaneInfo::issue`).
+    /// is not yanked over to it. `sandbox` and `source` work as in `PaneRun`;
+    /// `title` names the pane; `issue` links it to the tracker issue it was
+    /// deployed on (`PaneInfo::issue`).
     Run {
         #[serde(default)]
         workspace: Option<WorkspaceId>,
@@ -111,6 +111,8 @@ pub enum Request {
         /// outside the session's panes and from older clients.
         #[serde(default)]
         from: Option<PaneId>,
+        #[serde(default)]
+        source: Option<PathBuf>,
     },
     PaneRun {
         tab: Option<TabId>,
@@ -127,6 +129,13 @@ pub enum Request {
         /// only ever shows `tutti` and `kubectl`.
         #[serde(default)]
         sandbox: Option<String>,
+        /// A shell file of the daemon's machine that `/bin/sh` sources before
+        /// it execs `cmd` — an API key, say, for this pane alone. The pane
+        /// stays `cmd`'s: its title, its saved command, and the agent a
+        /// restore revives, which sources the file again. Never with
+        /// `sandbox`, which cannot read it. `None` from older clients.
+        #[serde(default)]
+        source: Option<PathBuf>,
     },
     PaneSplit {
         pane: PaneId,
@@ -1281,18 +1290,28 @@ mod tests {
             cmd: vec!["claude".into(), "--dangerously".into()],
             ephemeral: false,
             sandbox: None,
+            source: None,
         });
         roundtrip(&Request::PaneRun {
             tab: None,
             cmd: vec!["sh".into()],
             ephemeral: true,
             sandbox: None,
+            source: None,
         });
         roundtrip(&Request::PaneRun {
             tab: None,
             cmd: vec!["claude".into()],
             ephemeral: false,
             sandbox: Some("gke".into()),
+            source: None,
+        });
+        roundtrip(&Request::PaneRun {
+            tab: None,
+            cmd: vec!["omp".into()],
+            ephemeral: false,
+            sandbox: None,
+            source: Some(PathBuf::from("/home/u/secrets.sh")),
         });
         roundtrip(&Request::WorkspaceDiff {
             id: WorkspaceId(2),
@@ -1332,6 +1351,7 @@ mod tests {
             title: Some("fixer".into()),
             from: None,
             issue: Some(sample_issue()),
+            source: None,
         });
         roundtrip(&Request::Run {
             workspace: None,
@@ -1341,6 +1361,7 @@ mod tests {
             title: None,
             issue: None,
             from: None,
+            source: None,
         });
         roundtrip(&Request::Run {
             workspace: None,
@@ -1350,6 +1371,7 @@ mod tests {
             title: None,
             issue: None,
             from: Some(PaneId(7)),
+            source: None,
         });
         roundtrip(&Request::PaneSplit {
             pane: PaneId(1),
@@ -2438,8 +2460,10 @@ mod tests {
 
     #[test]
     fn additive_fields_default_when_omitted() {
-        // `pane_run` from before `ephemeral`/`sandbox` existed still parses
-        // (non-ephemeral, local).
+        // `pane_run` from before `ephemeral`/`sandbox`/`source` existed still
+        // parses (non-ephemeral, local, behind no file), and so does a `run`.
+        let run: Request = serde_json::from_str(r#"{"type":"run","cmd":["sh"]}"#).unwrap();
+        assert!(matches!(run, Request::Run { source: None, .. }));
         let run: Request =
             serde_json::from_str(r#"{"type":"pane_run","tab":null,"cmd":["sh"]}"#).unwrap();
         assert_eq!(
@@ -2449,6 +2473,7 @@ mod tests {
                 cmd: vec!["sh".into()],
                 ephemeral: false,
                 sandbox: None,
+                source: None,
             }
         );
         // `pane_attach` without `history`, `inline`, `since` or `keys`
@@ -2730,6 +2755,7 @@ mod tests {
                 title: None,
                 from: None,
                 issue: None,
+                source: None,
             }
         );
         // An issue from a tracker without links carries no url.
