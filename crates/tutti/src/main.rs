@@ -158,16 +158,16 @@ enum Command {
         action: Option<NotesAction>,
     },
     /// Forward an agent's hook event to tutti (reads its JSON on stdin): a
-    /// Claude Code, Codex or Gemini CLI hook payload, or an opencode event
-    /// from tutti's plugin. Wired up by `tutti hooks <agent>`; a silent no-op
-    /// outside a tutti pane.
+    /// Claude Code, Codex, Gemini CLI or Antigravity CLI hook payload, or an
+    /// opencode event from tutti's plugin. Wired up by `tutti hooks <agent>`;
+    /// a silent no-op outside a tutti pane.
     AgentEvent {
         #[arg(value_enum)]
         agent: HookAgent,
     },
     /// Print or install the hooks wiring an agent to tutti: Claude Code's
     /// settings.json hooks, Codex's hooks.json, Gemini CLI's settings.json
-    /// hooks, or opencode's plugin.
+    /// hooks, Antigravity CLI's hooks.json, or opencode's plugin.
     Hooks {
         #[arg(value_enum)]
         agent: HookAgent,
@@ -183,8 +183,8 @@ enum Command {
         #[arg(long)]
         install: bool,
         /// Install into the project (./.claude/settings.json,
-        /// ./.codex/hooks.json, ./.gemini/settings.json, ./.opencode/plugins/)
-        /// instead of the user config.
+        /// ./.codex/hooks.json, ./.gemini/settings.json, ./.agents/hooks.json,
+        /// ./.opencode/plugins/) instead of the user config.
         #[arg(long, requires = "install")]
         project: bool,
         /// Skip the confirmation prompt.
@@ -225,6 +225,7 @@ enum HookAgent {
     Claude,
     Codex,
     Gemini,
+    Antigravity,
     Opencode,
 }
 
@@ -465,8 +466,9 @@ enum PaneAction {
         #[arg(long, conflicts_with_all = ["since", "fingerprint"])]
         last_output: bool,
         /// Print the final message of the agent's last finished turn, as its
-        /// hooks reported it (Claude Code, Codex, Gemini CLI, opencode), not
-        /// the screen. An error when no turn has ended with one.
+        /// hooks reported it (Claude Code, Codex, Gemini CLI, Antigravity CLI,
+        /// opencode), not the screen. An error when no turn has ended with
+        /// one.
         #[arg(long, conflicts_with_all = ["lines", "unwrapped", "since", "fingerprint", "last_output"])]
         last_reply: bool,
     },
@@ -790,7 +792,10 @@ fn run(cli: Cli) -> Result<i32> {
             project,
             yes,
         }) => match (agent, install) {
-            (HookAgent::Codex | HookAgent::Gemini | HookAgent::Opencode, _) if tty => {
+            (
+                HookAgent::Codex | HookAgent::Gemini | HookAgent::Antigravity | HookAgent::Opencode,
+                _,
+            ) if tty => {
                 bail!("--tty is for claude: a sandbox image bakes in Claude Code's hooks")
             }
             (HookAgent::Claude, true) => {
@@ -799,6 +804,9 @@ fn run(cli: Cli) -> Result<i32> {
             (HookAgent::Codex, true) => install_integration(Integration::CodexHooks, project, yes),
             (HookAgent::Gemini, true) => {
                 install_integration(Integration::GeminiHooks, project, yes)
+            }
+            (HookAgent::Antigravity, true) => {
+                install_integration(Integration::AntigravityHooks, project, yes)
             }
             (HookAgent::Opencode, true) => {
                 install_integration(Integration::OpencodePlugin, project, yes)
@@ -813,6 +821,10 @@ fn run(cli: Cli) -> Result<i32> {
             }
             (HookAgent::Gemini, false) => {
                 emit_gemini_hooks(raw);
+                Ok(0)
+            }
+            (HookAgent::Antigravity, false) => {
+                emit_antigravity_hooks(raw);
                 Ok(0)
             }
             (HookAgent::Opencode, false) => {
@@ -1335,8 +1347,9 @@ const ENTER_AFTER: Duration = Duration::from_millis(150);
 /// later, then wait for a block or for the next turn end the hooks report.
 /// The wait counts turn ends, so one before it starts still counts, and no
 /// exit or screen-read state passes for one. Print the reply that turn left.
-/// A Codex or opencode whose hooks are installed is taken before they have
-/// reported (`installed_hooks`): its first turn is the one the ask starts.
+/// A Codex, opencode or Antigravity CLI whose hooks are installed is taken
+/// before they have reported (`installed_hooks`): its first turn is the one
+/// the ask starts.
 fn run_ask(
     session: &str,
     json: bool,
@@ -1431,8 +1444,9 @@ fn run_ask(
 }
 
 /// The agent detected in `pane` when it is one whose hooks report only from
-/// its first turn on — Codex (SessionStart comes with the first prompt),
-/// opencode (its plugin hears nothing before a turn) — and tutti's are
+/// its first turn on — Codex and Antigravity CLI (SessionStart comes with the
+/// first prompt), opencode (its plugin hears nothing before a turn) — and
+/// tutti's are
 /// installed for it, in the user's config or the pane's project. An ask's
 /// send names it, so the daemon takes the pane before the hooks have spoken.
 /// Installed is all tutti can see: Codex runs a hook only once it is trusted
@@ -1449,6 +1463,7 @@ fn installed_hooks(client: &mut Client, pane: PaneId) -> Result<Option<AgentKind
     let integration = match info.agent.as_ref().map(|a| a.0.as_str()) {
         Some("codex") => Integration::CodexHooks,
         Some("opencode") => Integration::OpencodePlugin,
+        Some("antigravity") => Integration::AntigravityHooks,
         _ => return Ok(None),
     };
     let project = match client.request(&Request::WorkspaceList)? {
@@ -1743,13 +1758,14 @@ fn run_agent_event(session: &str, agent: HookAgent) -> Result<i32> {
         HookAgent::Claude => hooks::map_claude_event(&value),
         HookAgent::Codex => hooks::map_codex_event(&value),
         HookAgent::Gemini => hooks::map_gemini_event(&value),
+        HookAgent::Antigravity => hooks::map_antigravity_event(&value),
         HookAgent::Opencode => hooks::map_opencode_event(&value),
     };
     let Some((event, conversation)) = mapped else {
         return Ok(0);
     };
     let (request, call) = match agent {
-        HookAgent::Claude | HookAgent::Codex | HookAgent::Gemini => {
+        HookAgent::Claude | HookAgent::Codex | HookAgent::Gemini | HookAgent::Antigravity => {
             (hooks::permission_request(&value), hooks::call_key(&value))
         }
         HookAgent::Opencode => (
@@ -1770,7 +1786,7 @@ fn run_agent_event(session: &str, agent: HookAgent) -> Result<i32> {
         };
         let held = hold_approval(&session, &hold, timeout);
         let answer = held.map(|decision| match agent {
-            HookAgent::Claude | HookAgent::Codex | HookAgent::Gemini => {
+            HookAgent::Claude | HookAgent::Codex | HookAgent::Gemini | HookAgent::Antigravity => {
                 hooks::permission_decision(&decision)
             }
             HookAgent::Opencode => hooks::opencode_reply(&decision),
@@ -1953,6 +1969,20 @@ fn emit_gemini_hooks(raw: bool) {
     }
 }
 
+/// Print Antigravity CLI's hooks.json entry: the JSON to stdout, plus —
+/// unless `--raw` — where it goes on stderr, so the JSON pipes cleanly on its
+/// own.
+fn emit_antigravity_hooks(raw: bool) {
+    let snippet = serde_json::to_string_pretty(&hooks::antigravity_hooks_json());
+    println!("{}", snippet.expect("hooks snippet serializes"));
+    if !raw {
+        eprintln!("# Merge the object above into ~/.gemini/config/hooks.json at the TOP level");
+        eprintln!("# (.agents/hooks.json in a project): it is one hook, named tutti — or let");
+        eprintln!("# tutti do it: `tutti hooks antigravity --install`. Outside a tutti pane");
+        eprintln!("# the hook does nothing.");
+    }
+}
+
 /// Print the opencode plugin: the JavaScript to stdout, plus — unless `--raw` —
 /// where it goes on stderr, so the plugin pipes cleanly on its own.
 fn emit_opencode_plugin(raw: bool) {
@@ -1990,9 +2020,10 @@ fn install_integration(integration: Integration, project: bool, yes: bool) -> Re
     let path = plan.path.display();
     // Hooks merge into a file of the tool's; the plugin and skill are files of tutti's.
     let (noun, the, at) = match integration {
-        Integration::ClaudeHooks | Integration::CodexHooks | Integration::GeminiHooks => {
-            ("hooks", "", "in")
-        }
+        Integration::ClaudeHooks
+        | Integration::CodexHooks
+        | Integration::GeminiHooks
+        | Integration::AntigravityHooks => ("hooks", "", "in"),
         Integration::OpencodePlugin => ("plugin", "the ", "at"),
         Integration::Skill => ("skill", "the ", "at"),
         Integration::ShellInit => ("shell integration", "", "in"),

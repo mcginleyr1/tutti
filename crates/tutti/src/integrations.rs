@@ -1,5 +1,6 @@
-//! The integrations tutti installs: Claude Code's, Codex's and Gemini CLI's
-//! hooks, the opencode plugin, the tutti skill, and the shell integration's
+//! The integrations tutti installs: Claude Code's, Codex's, Gemini CLI's and
+//! Antigravity CLI's hooks, the opencode plugin, the tutti skill, and the
+//! shell integration's
 //! line in the user's rc file.
 //! `Integration::plan` inspects one's target file and works out what
 //! installing would change, with no side effects — cheap enough to run
@@ -28,6 +29,9 @@ pub enum Integration {
     CodexHooks,
     /// Gemini CLI hooks in settings.json, running `tutti agent-event gemini`.
     GeminiHooks,
+    /// Antigravity CLI's hook named `tutti` in hooks.json, running `tutti
+    /// agent-event antigravity`.
+    AntigravityHooks,
     /// The opencode plugin, piping to `tutti agent-event opencode`.
     OpencodePlugin,
     /// The tutti skill, for Claude Code.
@@ -213,6 +217,9 @@ impl Integration {
                 hooks::GEMINI_HOOK_COMMAND,
                 "",
             ),
+            Integration::AntigravityHooks => {
+                named_hook_status(&path, found.as_deref(), &hooks::antigravity_hooks_json())
+            }
             Integration::OpencodePlugin => whole_file_status(
                 found.as_deref(),
                 hooks::OPENCODE_PLUGIN,
@@ -247,6 +254,10 @@ impl Integration {
                 Some(gemini) => gemini.join(".gemini/settings.json"),
                 None => home()?.join(".gemini/settings.json"),
             },
+            // Its customization roots (its own docs, 1.5.6): `.agents/` in a
+            // project, `~/.gemini/config/` for the user.
+            (Integration::AntigravityHooks, Some(project)) => project.join(".agents/hooks.json"),
+            (Integration::AntigravityHooks, None) => home()?.join(".gemini/config/hooks.json"),
             (Integration::OpencodePlugin, Some(project)) => {
                 project.join(".opencode/plugins/tutti.js")
             }
@@ -352,6 +363,39 @@ fn hooks_status(
         Status::Missing(change)
     } else {
         Status::Outdated(change)
+    }
+}
+
+/// Antigravity CLI's hooks.json, which keys each hook by a name: `ours`, the
+/// one named `tutti`, set whole beside whatever others the file holds. With
+/// none there it is `Missing`; with another under that name — an older
+/// install — `Outdated`.
+fn named_hook_status(path: &Path, found: Option<&str>, ours: &Value) -> Status {
+    let mut hooks = match found.map(serde_json::from_str::<Value>).transpose() {
+        Ok(None) => serde_json::Map::new(),
+        Ok(Some(Value::Object(hooks))) => hooks,
+        Ok(Some(other)) => {
+            return Status::Unreadable(format!(
+                "{}'s root is not an object: {other}",
+                path.display()
+            ));
+        }
+        Err(e) => return Status::Unreadable(format!("{} is not valid JSON: {e}", path.display())),
+    };
+    let pretty = |v: &Value| serde_json::to_string_pretty(v).expect("hooks serialize");
+    let before = hooks.get("tutti").cloned();
+    if before.as_ref() == ours.get("tutti") {
+        return Status::Installed;
+    }
+    hooks.extend(ours.as_object().expect("snippet is an object").clone());
+    let change = |summary: &str| Change {
+        contents: pretty(&Value::Object(hooks)),
+        summary: summary.into(),
+        preview: format!("--- hook ---\n{}\n", pretty(ours)),
+    };
+    match before {
+        None => Status::Missing(change("adding the hook named tutti")),
+        Some(_) => Status::Outdated(change("replacing an older hook named tutti")),
     }
 }
 
@@ -592,6 +636,52 @@ mod tests {
         assert_eq!(
             Integration::GeminiHooks.plan(&project).unwrap().status,
             Status::Installed
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Antigravity's hooks.json keys each hook by a name: tutti's goes in
+    /// beside the others, and an older one under its name is replaced.
+    #[test]
+    fn antigravity_hooks_go_in_under_their_own_name_keeping_the_rest() {
+        let home = temp_home();
+        let plan = Integration::AntigravityHooks.plan(&user(&home)).unwrap();
+        assert_eq!(plan.path, home.join(".gemini/config/hooks.json"));
+        assert!(
+            matches!(&plan.status, Status::Missing(_)),
+            "{:?}",
+            plan.status
+        );
+
+        let project = Dirs {
+            project: Some(home.join("repo")),
+            ..Dirs::default()
+        };
+        let file = home.join("repo/.agents/hooks.json");
+        let lint =
+            r#"{ "lint": { "Stop": [{ "command": "./lint.sh" }] }, "tutti": { "Stop": [] } }"#;
+        write(&file, lint);
+        let plan = Integration::AntigravityHooks.plan(&project).unwrap();
+        assert_eq!(plan.path, file);
+        assert!(
+            matches!(&plan.status, Status::Outdated(_)),
+            "{:?}",
+            plan.status
+        );
+        apply(&plan).unwrap();
+        let now: Value = serde_json::from_str(&text(&file)).unwrap();
+        assert_eq!(now["lint"]["Stop"][0]["command"], "./lint.sh");
+        assert_eq!(now["tutti"], hooks::antigravity_hooks_json()["tutti"]);
+        assert_eq!(
+            Integration::AntigravityHooks.plan(&project).unwrap().status,
+            Status::Installed
+        );
+        write(&file, "[1]");
+        let plan = Integration::AntigravityHooks.plan(&project).unwrap();
+        assert!(
+            matches!(&plan.status, Status::Unreadable(why) if why.contains("root is not an object")),
+            "{:?}",
+            plan.status
         );
         let _ = std::fs::remove_dir_all(&home);
     }

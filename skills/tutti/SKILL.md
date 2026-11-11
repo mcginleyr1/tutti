@@ -151,9 +151,10 @@ turn: the pane is working or blocked (nothing was typed: wait for it, or
 answer it, first; an agent you just started can read as working for a
 moment), the agent exited, the pane is gone, or its turn ended without a
 reply (interrupted, or failed). `ask` and `--last-reply` work for Claude Code,
-Codex, Gemini CLI and opencode panes whose tutti hooks are installed; `ask`
-refuses any other pane. A Codex or opencode you just started is taken once
-tutti has detected it (a second or so): your ask is its first turn.
+Codex, Gemini CLI, Antigravity CLI and opencode panes whose tutti hooks are
+installed; `ask` refuses any other pane. A Codex, opencode or Antigravity CLI
+you just started is taken once tutti has detected it (a second or so): your
+ask is its first turn.
 
 ```sh
 tutti run -- codex --no-daemon

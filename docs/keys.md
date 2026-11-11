@@ -49,7 +49,7 @@ preset:
 | `N` | notifications: the history of bells, desktop notifications, and agents that blocked or finished |
 | `r` | run an agent / shell / command here (opens the launcher) |
 | `I` | issues: list your trackers' issues and deploy one to an agent |
-| `i` | setup: install the Claude Code, Codex and Gemini CLI hooks, the opencode plugin, the tutti skill, and the shell integration — for you, or (`s`) into the active project |
+| `i` | setup: install the Claude Code, Codex, Gemini CLI and Antigravity CLI hooks, the opencode plugin, the tutti skill, and the shell integration — for you, or (`s`) into the active project |
 | `o`, arrows | focus next pane / directional focus |
 | `z` | zoom focused pane |
 | `x` | kill pane (confirms) |

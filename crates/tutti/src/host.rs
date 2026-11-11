@@ -30,7 +30,7 @@ use crate::sandbox::Profile;
 /// The revision of the host frames' shapes, checked in the proxy's hello. Bump
 /// it on any change to `HostFrame`, `Query` or `Answer`: the tutti on each end
 /// of an ssh connection is installed separately.
-pub const HOST_REV: u32 = 2;
+pub const HOST_REV: u32 = 3;
 
 /// Most answers are a directory read or a file plan away.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -912,7 +912,7 @@ mod tests {
             serde_json::to_string(&reply).unwrap(),
             r#"{"type":"reply","id":3,"answer":{"Ok":{"dirs":["src"]}}}"#
         );
-        let hello = r#"{"type":"hello","rev":2,"startup":{"first_run":"/srv","notice":null}}"#;
+        let hello = r#"{"type":"hello","rev":3,"startup":{"first_run":"/srv","notice":null}}"#;
         match serde_json::from_str(hello).unwrap() {
             HostFrame::Hello { rev, startup } => {
                 assert_eq!(

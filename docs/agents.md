@@ -3,7 +3,7 @@
 Which agents tutti recognises, how it works out what state each one is in
 (blocked, working, done or idle), the ways any program can report its own
 state, and the integrations that give exact state for Claude Code, Codex,
-Gemini CLI and opencode.
+Gemini CLI, Antigravity CLI and opencode.
 
 ## The catalog
 
@@ -16,6 +16,7 @@ so the picker doubles as the install list.
 | [Claude Code](https://claude.com/claude-code) | `claude` | tuned fully |
 | [Codex CLI](https://github.com/openai/codex) | `codex` | tuned fully |
 | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | `gemini` | generic heuristics |
+| [Antigravity CLI](https://antigravity.google) | `agy` | tuned fully |
 | [OpenCode](https://opencode.ai) | `opencode` | generic heuristics |
 | [Crush](https://github.com/charmbracelet/crush) | `crush` | generic heuristics |
 | [Aider](https://aider.chat) | `aider` | generic heuristics |
@@ -35,7 +36,7 @@ so the picker doubles as the install list.
 | [Ori](https://openrouter.ai/labs/ori) | `ori` | tuned fully |
 
 Precise blocked/working/done detection is tuned per agent — Claude Code,
-Codex, and Ori fully, Muse Code (working/done) and Mistral Vibe
+Codex, Antigravity CLI and Ori fully, Muse Code (working/done) and Mistral Vibe
 (blocked/working) in part; the rest start from generic heuristics — see
 `crates/tutti-agents/src/registry.rs`, which is also where the binary names
 come from.
@@ -74,7 +75,7 @@ A pane's state can come from five sources, ranked highest first:
 
 1. **hook** — the agent's own exact lifecycle signals: its hooks (`tutti hooks
    claude`, `tutti hooks codex`, `tutti hooks gemini`, `tutti hooks
-   opencode`) or a
+   antigravity`, `tutti hooks opencode`) or a
    [herdr report](#herdr-compatible-reporting).
 2. **program** — the pane's program reporting itself with OSC 7501.
 3. **progress** — an OSC 9;4 progress report (ConEmu / Windows Terminal /
@@ -95,12 +96,14 @@ A pane's state can come from five sources, ranked highest first:
 Hook, program and progress are *claims*: a claim holds the state until its own
 source ends it, and nothing ranked below may move it meanwhile — so a build that
 reports `done` stays done while it keeps printing, and a hook-driven agent's own
-progress bar never fights its hooks. Two exceptions: a screen **blocked**
+progress bar never fights its hooks. Three exceptions: a screen **blocked**
 match (a visible permission dialog) overrides a program/progress **working**
-claim, which is likelier stale than right; and a hook's **blocked** gives way
+claim, which is likelier stale than right; a hook's **blocked** gives way
 to a screen **working** match once the agent's own dialog it blocked for has
 shown on the screen — answered there, which no hook reports, while tutti
-holds none of the pane's requests. A hook claim holds until the pane's
+holds none of the pane's requests; and Antigravity CLI's hooks say nothing of
+its dialogs, so a screen **blocked** match overrides its hooks' **working**
+(see [Antigravity CLI integration](#antigravity-cli-integration)). A hook claim holds until the pane's
 child exits; a herdr report's claim also ends when its agent releases or clears
 it, or when another agent is detected. A program/progress claim ends when that
 source clears it, when the pane's child exits, or when its detected agent
@@ -348,6 +351,51 @@ Gemini CLI runs as `node …/gemini`; tutti detects it by that script. Gemini's
 Notification hook only observes a permission prompt — it cannot answer one —
 so `approvals = "hold"` does not apply. `agent-event gemini` is fail-safe as
 Claude's is.
+
+## Antigravity CLI integration
+
+Antigravity CLI (`agy`) reports through a hook in its hooks.json, which keys
+each hook by a name: tutti's is the one named `tutti`. Install it (shows the
+hook and asks first):
+
+```
+tutti hooks antigravity --install            # into ~/.gemini/config/hooks.json
+tutti hooks antigravity --install --project  # …into ./.agents/hooks.json instead
+tutti hooks antigravity --install --yes      # skip the confirmation (scripts)
+tutti hooks antigravity                      # or just print the hook…
+tutti hooks antigravity --raw                # …as bare JSON, for piping
+```
+
+`--install` keeps the file's other hooks, replaces an older hook named
+`tutti`, is idempotent, backs the old file up to `hooks.json.bak`, and writes
+atomically; `Ctrl+B i` installs the same through the setup panel. A project's
+hooks run once Antigravity trusts the folder (it asks). Each wired event runs
+`tutti agent-event antigravity` (verified live against Antigravity CLI 1.5.6,
+from a project's `.agents/hooks.json`; the user file's place is from its
+docs):
+
+- **PreInvocation** comes before each model call: a turn's first starts the
+  turn and labels its checkpoint with the prompt, the rest keep it
+  **working**, as **PreToolUse**/**PostToolUse** do;
+- **Stop** marks it **done**. It carries no message, so the turn's reply for
+  `pane read --last-reply` and `tutti ask` is read from the conversation's
+  transcript: its last line, when that is the model's final message;
+- **SessionStart** and every event's `conversationId` record the
+  conversation, resumable with `agy --conversation <id>` and revived by a
+  [restore](sessions.md#restoring-after-a-restart). SessionStart comes with a
+  new conversation's first prompt, so a fresh pane has reported nothing yet:
+  `tutti ask` takes one on the strength of the installed hook, as it does a
+  fresh Codex.
+
+**Its dialogs come from the screen.** No hook fires when Antigravity asks
+for permission (PreToolUse comes before the dialog), nor when you cancel the
+dialog with Esc, which ends the turn with no Stop. So while its hooks hold a
+pane working, tutti still reads that pane's screen: a dialog there marks it
+**blocked**, the approved tool running sets it **working** again, and its
+idle prompt after a cancelled dialog marks it **done**, with no reply. Its
+hooks only observe a tool call from tutti's side, so `approvals = "hold"`
+does not apply. `agent-event antigravity` is fail-safe as Claude's is, and
+writes nothing to stdout.
 
 ## opencode integration
 

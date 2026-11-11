@@ -46,12 +46,12 @@ tutti issue list [--source <name>]   # every configured tracker's open issues (-
 tutti issue deploy <source> <id> [--agent claude] [--project <id>] [--here] [--sandbox <profile>]  # an agent on the issue, in its own workspace; prints the pane id, then writes back as the source opts in
 tutti notes [--unread]               # the notification history, newest first
 tutti notes read [--up-to <id>] [--pane <id>] | clear  # mark notes read (all, or narrowed) / empty the history
-tutti hooks claude|codex|gemini|opencode [--raw]  # print the Claude Code, Codex or Gemini CLI hooks / the opencode plugin
-tutti hooks claude|codex|gemini|opencode --install [--project] [--yes]  # install them (shows the change, asks first)
+tutti hooks claude|codex|gemini|antigravity|opencode [--raw]  # print the Claude Code, Codex, Gemini CLI or Antigravity CLI hooks / the opencode plugin
+tutti hooks claude|codex|gemini|antigravity|opencode --install [--project] [--yes]  # install them (shows the change, asks first)
 tutti hooks claude --tty [--raw]     # print Claude hooks that report over OSC 7501 to /dev/tty — for sandbox images
 tutti skill [--raw]                  # print the tutti skill (a Claude Code SKILL.md)
 tutti skill --install [--project] [--yes]  # install it into ~/.claude/skills/tutti/ (or ./.claude/skills/tutti/)
-tutti agent-event claude|codex|gemini|opencode  # forward an agent hook event (JSON on stdin) — used by the hooks/plugin
+tutti agent-event claude|codex|gemini|antigravity|opencode  # forward an agent hook event (JSON on stdin) — used by the hooks/plugin
 tutti edit <path>[:<line>[:<col>]] [--workspace <id>]  # open in the workspace's editor pane (TUTTI_EDITOR) and focus it; returns at once
 tutti shell-init zsh|bash|fish       # print the shell integration (OSC 7 cwd + OSC 133 marks) for your rc file
 tutti watch                          # JSON-line snapshots of every pane's state, one per change (read-only; never starts a daemon)

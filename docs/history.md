@@ -191,7 +191,15 @@ Goal: the differentiator. Tutti knows which panes are agents and what state they
    Pi has its own registry row, `omp`, first message and `@file` as Pi's:
    Homebrew's build runs as `omp`, and `bun install -g`'s as `bun
    ~/.bun/bin/omp`, so detection reads a bun program by its script as it
-   does a node one.
+   does a node one. ✅ Antigravity CLI (`agy`): a registry row tuned live
+   against 1.5.6 (blocked, working, done), first message by
+   `--prompt-interactive`, resume by `--conversation <id>`, and a hooks
+   integration (`tutti hooks antigravity`, the hook named `tutti` in its
+   hooks.json): a turn's start, its tools and its end, the reply read from
+   the conversation's transcript. Its hooks report no permission dialog, so
+   a pane they hold working still has its screen read: a dialog there blocks
+   it, and its idle prompt after a cancelled dialog ends the turn
+   (`SCREEN_PROMPTERS`).
 3. **Surfacing**: colored state badge per pane border + tab, workspace overview in
    navigate mode grouped by state (Blocked first), optional terminal bell / OSC 9
    desktop notification on `Working → Blocked/Done`. ✅ The go-to overlay

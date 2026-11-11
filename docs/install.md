@@ -42,8 +42,10 @@ on first use, one per named session (`-s <name>`, default `tutti`).
   asks before touching `~/.claude/settings.json`. `tutti hooks codex
   --install` and `tutti hooks gemini --install` do the same for Codex and
   Gemini CLI — see [Codex integration](agents.md#codex-integration) and
-  [Gemini CLI integration](agents.md#gemini-cli-integration) — and `tutti hooks
-  opencode --install` for opencode via a plugin — see
+  [Gemini CLI integration](agents.md#gemini-cli-integration) — `tutti hooks
+  antigravity --install` for Antigravity CLI — see
+  [Antigravity CLI integration](agents.md#antigravity-cli-integration) — and
+  `tutti hooks opencode --install` for opencode via a plugin — see
   [opencode integration](agents.md#opencode-integration).
 - `tutti skill --install` gives the Claude Code agents in your panes the tutti
   skill, so they can start and coordinate sub-agents of their own — see

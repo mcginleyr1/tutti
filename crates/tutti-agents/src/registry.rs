@@ -33,11 +33,18 @@ impl ProcessTree {
 }
 
 /// The agents whose tutti hooks report nothing before their first turn:
-/// Codex sends SessionStart only with its first prompt, and opencode's plugin
-/// hears no event before a turn. An ask may take a fresh one on its caller's
-/// word that the hooks are installed; every other agent's hooks report as it
-/// starts, so one that has not reported never will.
-pub const FIRST_TURN_REPORTERS: &[&str] = &["codex", "opencode"];
+/// Codex and Antigravity CLI send SessionStart only with the first prompt,
+/// and opencode's plugin hears no event before a turn. An ask may take a
+/// fresh one on its caller's word that the hooks are installed; every other
+/// agent's hooks report as it starts, so one that has not reported never
+/// will.
+pub const FIRST_TURN_REPORTERS: &[&str] = &["codex", "opencode", "antigravity"];
+
+/// The agents whose hooks say nothing of a permission dialog: Antigravity
+/// CLI's `PreToolUse` comes before its dialog and no event with it (observed
+/// live, 1.5.6). While their hooks hold such a pane working, its screen still
+/// says when it waits on you.
+pub const SCREEN_PROMPTERS: &[&str] = &["antigravity"];
 
 /// The name detection knows a process by: its executable's `name`, or — for
 /// a node or bun program, which runs as `node [flags] <script>` or `bun
@@ -478,6 +485,32 @@ impl Default for Registry {
                 )
                 // `--help` (0.66.0): "Execute the provided prompt and continue
                 // in interactive mode".
+                .prompted(&["--prompt-interactive"]),
+                // Observed live (Antigravity CLI 1.5.6 in a pty): a native
+                // binary that runs as `agy`. The left of its footer, the
+                // screen's bottom line, carries the state: `? for shortcuts`
+                // under the idle composer (`>` between two rules), `esc to
+                // cancel` under it for the whole turn, and `esc to cancel`
+                // under a dialog too, whose options sit over a `↑/↓ Navigate
+                // · …` hint in the composer's place (`Run this command?`,
+                // `Allow creation of this file?`). A new folder's trust
+                // dialog has only the model's name under it, so nothing ties
+                // its question to the bottom line.
+                AgentSpec::new(
+                    "antigravity",
+                    "Antigravity CLI",
+                    "https://antigravity.google",
+                    &["agy"],
+                    &[
+                        "↑/↓ Navigate\nesc to cancel",
+                        "Do you trust the contents of this project?",
+                    ],
+                    &["────\n>\n────\nesc to cancel"],
+                    &["────\n>\n────\n? for shortcuts"],
+                )
+                // `--help` (1.5.5): `--prompt-interactive`, "Run an initial
+                // prompt interactively and continue the session"; run live
+                // on 1.5.6.
                 .prompted(&["--prompt-interactive"]),
                 // `--help` (1.18.5): `--prompt`, "prompt to use"; its TUI
                 // submits it once a model is ready.
@@ -1088,6 +1121,44 @@ mod tests {
         assert_eq!(spec.classify(answered), Some(Observation::Done));
     }
 
+    /// Screens captured from Antigravity CLI 1.5.6 in a pty: a running turn
+    /// over its composer, the command and file approvals, a new folder's
+    /// trust dialog, and the turn's end at the idle composer.
+    #[test]
+    fn antigravity_screen_markers_classify_working_done_and_blocked() {
+        let spec = Registry::default().match_process("agy").unwrap().clone();
+        assert_eq!(spec.kind, AgentKind::from("antigravity"));
+        let rule = "────────────────────────────────────────";
+        let footer = "                    Gemini 3.8 Flash · high";
+        let echo = format!("{rule}\n> Run the shell command `sleep 6; echo tutti-probe`.\n\n");
+        let composer = format!("{rule}\n>\n{rule}\n");
+        let working = format!(
+            "{echo}● Running (sleep 6; echo tutti-probe) (ctrl+o to expand)\n⢿  Running command...\n{composer}esc to cancel{footer}"
+        );
+        let command = format!(
+            "{echo}● Ran (sleep 6; echo tutti-probe) (ctrl+o to expand)\n\nCommand\n{rule}\n\nRequesting permission for:\n   sleep 6; echo tutti-probe\n\nRun this command?\n> 1. Yes, run command\n  4. No, cancel\n\n  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command\nesc to cancel{footer}"
+        );
+        let file = format!(
+            "{echo}● Edited 1 file (probe.txt) (ctrl+o to expand)\n\nCreate file\n{rule}\n\n  1  +  hi\n\nAllow creation of this file?\n> 1. Yes, allow creation\n  2. No, deny creation\n\n  ↑/↓ Navigate · f full diff\nesc to cancel{footer}"
+        );
+        let trust = format!(
+            "Accessing workspace:\n\n/tmp/proj\n\nDo you trust the contents of this project?\n\nAntigravity CLI requires permission to read, edit, and execute files here.\n\n> Yes, I trust this folder\n  No, exit\n\n  ↑/↓ Navigate · enter Confirm\n{footer}"
+        );
+        let ended = format!(
+            "{echo}● Ran (sleep 6; echo tutti-probe) (ctrl+o to expand)\n\n  The command completed and printed:\n\n    tutti-probe\n\n{composer}? for shortcuts{footer}"
+        );
+        assert_eq!(spec.classify(&working), Some(Observation::Working));
+        assert_eq!(spec.classify(&command), Some(Observation::Blocked));
+        assert_eq!(spec.classify(&file), Some(Observation::Blocked));
+        assert_eq!(spec.classify(&trust), Some(Observation::Blocked));
+        assert_eq!(spec.classify(&ended), Some(Observation::Done));
+        // A reply naming the dialog's hint, over the idle footer, is no dialog.
+        let quoted = format!(
+            "{echo}  Its dialogs end in \"↑/↓ Navigate\" over \"esc to cancel\".\n\n{composer}? for shortcuts{footer}"
+        );
+        assert_eq!(spec.classify(&quoted), Some(Observation::Done));
+    }
+
     #[test]
     fn spec_looks_up_by_kind() {
         let reg = Registry::default();
@@ -1112,6 +1183,7 @@ mod tests {
             ("claude", &["claude", "fix it"][..]),
             ("codex", &["codex", "--no-daemon", "fix it"]),
             ("gemini", &["gemini", "--prompt-interactive", "fix it"]),
+            ("antigravity", &["agy", "--prompt-interactive", "fix it"]),
             ("opencode", &["opencode", "--prompt", "fix it"]),
             (
                 "ori",

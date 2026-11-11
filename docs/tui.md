@@ -107,8 +107,8 @@ it. The footer chip reads `GO TO`.
 ## Setup panel
 
 **Setup panel** (`Ctrl+B i`): a floating ` setup · user ` panel listing what
-tutti installs — the Claude Code, Codex and Gemini CLI hooks, the opencode
-plugin, the [tutti skill](api.md#the-tutti-skill), and the [shell integration](shell-integration.md)'s
+tutti installs — the Claude Code, Codex, Gemini CLI and Antigravity CLI
+hooks, the opencode plugin, the [tutti skill](api.md#the-tutti-skill), and the [shell integration](shell-integration.md)'s
 line in your shell's rc file — each with a status dot and word (installed,
 needs update, not installed, not tutti's, unreadable) over its target file.
 `s` switches to the active project (` setup · project <name> `). `enter` on a

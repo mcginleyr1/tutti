@@ -44,8 +44,8 @@ first use.
 Optional: [jj](https://jj-vcs.github.io) for workspaces and diffs, `kubectl`
 for Kubernetes sandboxes, `gh` or `curl` for deploying issues. Exact state for
 Claude Code needs its hooks, installed once with `tutti hooks claude
---install` (or `Ctrl+B i` in the TUI); Codex, Gemini CLI and opencode have
-theirs. The requirements in full, the agent catalog, the optional
+--install` (or `Ctrl+B i` in the TUI); Codex, Gemini CLI, Antigravity CLI and
+opencode have theirs. The requirements in full, the agent catalog, the optional
 integrations and upgrading are in [docs/install.md](docs/install.md).
 
 ## Quickstart
@@ -180,7 +180,7 @@ When you change a feature, update the file that documents it.
 | [docs/answering.md](docs/answering.md) | answering a blocked agent from the queue, reading a reply, held approvals |
 | [docs/workspaces.md](docs/workspaces.md) | jj workspaces and merge, the changed-files panel, turns (per-turn checkpoints) |
 | [docs/notifications.md](docs/notifications.md) | bells and desktop notifications, the history, `tutti notes` |
-| [docs/agents.md](docs/agents.md) | the agent catalog, state detection and its sources, OSC 9;4 / 7501 and herdr reporting, the Claude Code, Codex, Gemini CLI and opencode integrations |
+| [docs/agents.md](docs/agents.md) | the agent catalog, state detection and its sources, OSC 9;4 / 7501 and herdr reporting, the Claude Code, Codex, Gemini CLI, Antigravity CLI and opencode integrations |
 | [docs/issues.md](docs/issues.md) | deploying issues from GitHub, Linear and other trackers to agents |
 | [docs/sandboxes.md](docs/sandboxes.md) | running agents in Kubernetes sandboxes |
 | [docs/api.md](docs/api.md) | scripting: `run`, `pane wait`, `ask`, tailing a pane, the tutti skill, `tutti watch` |

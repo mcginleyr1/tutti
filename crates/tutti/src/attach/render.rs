@@ -4517,6 +4517,11 @@ mod tests {
             ("Codex hooks", "not installed", ".codex/hooks.json"),
             ("Gemini CLI hooks", "not installed", ".gemini/settings.json"),
             (
+                "Antigravity CLI hooks",
+                "not installed",
+                ".gemini/config/hooks.json",
+            ),
+            (
                 "opencode plugin",
                 "not tutti's",
                 ".config/opencode/plugins/tutti.js",

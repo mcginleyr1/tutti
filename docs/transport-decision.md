@@ -726,7 +726,7 @@ that machine instead: in the TUI's own process when it runs beside its daemon, b
 proxy across ssh. Host frames (`kind = 0x06`) carry them, one JSON object each:
 
 ```json
-{"type":"hello","rev":2,"startup":{"first_run":"/home/me","notice":null}}
+{"type":"hello","rev":3,"startup":{"first_run":"/home/me","notice":null}}
 {"type":"call","id":3,"query":{"q":"complete_dirs","input":"~/src/a"}}
 {"type":"reply","id":3,"answer":{"Ok":{"dirs":["api","app"]}}}
 ```

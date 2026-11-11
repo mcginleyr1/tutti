@@ -167,7 +167,8 @@ is deliberately left undone.
   would come twice — nor, once its reflow renumbered the rows it kept,
   which of them the terminal holds;
 - `tutti ask` needs a pane its agent's hooks have reported through. A fresh
-  Codex or opencode is taken when `ask` finds tutti's integration for it
+  Codex, opencode or Antigravity CLI is taken when `ask` finds tutti's
+  integration for it
   installed (the done parts of this entry are in docs/history.md), but
   installed is all tutti sees — Codex skips a hook not yet
   trusted in `/hooks`, so such an ask runs to its timeout; a pane detection
@@ -228,6 +229,14 @@ full. The items themselves, under the numbers given here, are in
   payloads once `WARP_CLI_AGENT_PROTOCOL_VERSION` ≥ 1, which tutti neither
   sets nor reads. And the `HERDR_*` every pane carries makes it believe it's
   in herdr: its notifier execs a `herdr` CLI that tutti's panes don't have.
+- **Phase 3 item 2, Antigravity CLI.** A dialog cancelled with Esc sends no
+  Stop (seen live), and the screen ends that turn. The screen ends no turn
+  whose dialog it has not shown, so if Esc while the model generates sends
+  no Stop either (not run), that pane reads working until its next prompt.
+  Whether a message typed into a running turn comes as a first
+  `PreInvocation`, closing that turn's checkpoint early, is not run either.
+  Its conversations are not harvested for the launcher's resume rows (its
+  store is sqlite), and its subagents get no sub-rows.
 - **Phase 3 item 3 (surfacing: notes for blocked events).** A hooks install
   without PermissionRequest (one from before it, never re-run) notes a second
   dialog's reminder in the same blocked spell not at all; so does a sandboxed
@@ -330,6 +339,11 @@ milestone above names both (M1 and M2), and its own exit is unmarked too.
 - Gemini CLI's tool and permission events, `--resume`, and its `AfterAgent`
   reply for `--last-reply`: they need the user's Gemini login (SessionStart
   and a prompt's BeforeAgent → AfterAgent ran live);
+- Antigravity CLI: its user hooks file, `~/.gemini/config/hooks.json` (from
+  its docs; a project's `.agents/hooks.json` ran live), a restore reviving
+  `agy --conversation <id>` (the command ran by hand), an `issue deploy` to
+  it (`--prompt-interactive` ran through `tutti run`), and a turn
+  interrupted mid-generation;
 - an opencode `session.error` turn read with `--last-reply`;
 - the first-message data for Goose, Qwen Code, Cursor, Copilot, Factory
   Droid, Augment and Amazon Q, from their docs only and unrun (Amazon Q's

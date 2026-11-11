@@ -27,11 +27,12 @@ last session?** (`3 projects · 7 panes · 2 agents to revive · saved 2h ago`).
 attach; it comes before the first-run prompt. Scripts use `tutti server
 restore [--discard]`.
 
-- An agent pane holding a conversation id — reported by Claude Code's, Codex's
-  or Gemini CLI's hooks, the opencode plugin, or a herdr report — comes back
+- An agent pane holding a conversation id — reported by Claude Code's, Codex's,
+  Gemini CLI's or Antigravity CLI's hooks, the opencode plugin, or a herdr
+  report — comes back
   resuming exactly that
   conversation under its old title, when tutti knows the tool's resume recipe
-  (Claude Code, Codex, Gemini CLI, opencode, Muse Code, Mistral Vibe). Every other pane comes
+  (Claude Code, Codex, Gemini CLI, Antigravity CLI, opencode, Muse Code, Mistral Vibe). Every other pane comes
   back as a fresh shell in its workspace. A saved command is never re-run:
   re-running `claude "fix the tests"` would re-issue the prompt.
 - Each pane's [turns](workspaces.md#turns-review-and-undo-one-agent-turn) come back too,

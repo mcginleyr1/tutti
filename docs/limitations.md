@@ -6,20 +6,22 @@ part; [PLAN.md](../PLAN.md) tracks what is open.
 - **From a checkout only.** Install is `cargo install --path` from this
   repository, on macOS or Linux; there is no crates.io release, Homebrew tap,
   or installer.
-- **Exact state needs an integration.** Claude Code, Codex, Gemini CLI and
-  opencode report through their hooks, and agents that speak herdr's protocol
-  (Crush) report on their own; the rest of the catalog is read from the
-  screen, tuned live only for some.
-- **Replies come from the same four hooks.** `pane read --last-reply`, `tutti
+- **Exact state needs an integration.** Claude Code, Codex, Gemini CLI,
+  Antigravity CLI and opencode report through their hooks, and agents that
+  speak herdr's protocol (Crush) report on their own; the rest of the catalog
+  is read from the screen, tuned live only for some. Antigravity CLI's hooks
+  report no permission dialog, so that part of its state is read from its
+  screen even with them installed.
+- **Replies come from the same five hooks.** `pane read --last-reply`, `tutti
   ask` and the sidebar's reply panel have nothing to show for any other
-  agent, and `ask` refuses its pane; a fresh Codex or opencode it takes on
-  the strength of tutti's installed integration, so a Codex whose hooks are
-  installed but not yet trusted in `/hooks` runs an ask to its `--timeout`.
-  Gemini CLI's reply is wired from its docs and source and not yet run
-  live; it is the whole turn's text, not only the last message. A turn
-  interrupted with Esc in Claude Code sends no Stop: it leaves the previous
-  turn's reply in place, and an `ask` waiting on it runs to its `--timeout`.
-  A daemon restart forgets every reply.
+  agent, and `ask` refuses its pane; a fresh Codex, opencode or Antigravity
+  CLI it takes on the strength of tutti's installed integration, so a Codex
+  whose hooks are installed but not yet trusted in `/hooks` runs an ask to
+  its `--timeout`. Gemini CLI's reply is wired from its docs and source and
+  not yet run live; it is the whole turn's text, not only the last message.
+  A turn interrupted with Esc in Claude Code or Antigravity CLI sends no
+  Stop: it leaves the previous turn's reply in place, and an `ask` waiting on
+  it runs to its `--timeout`. A daemon restart forgets every reply.
 - **Held approvals are Claude Code's, Codex's and opencode's only.** opencode
   shows its own dialog beside a held request (whichever answers first wins),
   and so does Claude Code; Codex keeps its dialog back while the hook runs

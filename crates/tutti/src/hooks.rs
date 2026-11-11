@@ -1,4 +1,5 @@
-//! Agent hook integrations: map a Claude Code, Codex or Gemini CLI hook-event
+//! Agent hook integrations: map a Claude Code, Codex, Gemini CLI or
+//! Antigravity CLI hook-event
 //! JSON object, or an opencode bus event forwarded by tutti's opencode plugin
 //! (each delivered on `tutti agent-event`'s stdin), to a tutti
 //! `AgentHookEvent` and the agent's own conversation id; print the hooks
@@ -21,6 +22,8 @@ pub const HOOK_COMMAND: &str = "tutti agent-event claude";
 pub const CODEX_HOOK_COMMAND: &str = "tutti agent-event codex";
 /// The command Gemini CLI's hooks run.
 pub const GEMINI_HOOK_COMMAND: &str = "tutti agent-event gemini";
+/// The command Antigravity CLI's hooks run.
+pub const ANTIGRAVITY_HOOK_COMMAND: &str = "tutti agent-event antigravity";
 
 /// The opencode plugin `tutti hooks opencode` prints and installs.
 pub const OPENCODE_PLUGIN: &str = include_str!("opencode_plugin.js");
@@ -205,6 +208,44 @@ pub fn map_gemini_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
         _ => return None,
     };
     Some((event, text(v, "session_id")))
+}
+
+/// Map one Antigravity CLI hook event, as 1.5.6 sent them live: camelCase
+/// keys, every event naming its `hookEventName` and its `conversationId`
+/// (what `agy --conversation` takes). `SessionStart` comes with a new
+/// conversation's first prompt, and never for a resumed one; `PreInvocation`
+/// before each model call of a turn, `invocationNum` 0 the turn's first, its
+/// `lastUserInput` the prompt; `PreToolUse`/`PostToolUse` around a tool;
+/// `Stop` at the turn's end, with no message of its own — the reply is the
+/// transcript's (`transcript_reply`). Nothing reports a permission dialog:
+/// `PreToolUse` comes before it, so the screen shows it
+/// (`tutti_agents::SCREEN_PROMPTERS`).
+pub fn map_antigravity_event(v: &Value) -> Option<(AgentHookEvent, Option<String>)> {
+    let first = v.get("invocationNum").and_then(Value::as_u64).unwrap_or(0) == 0;
+    let event = match v.get("hookEventName")?.as_str()? {
+        "SessionStart" => AgentHookEvent::SessionStarted,
+        "PreInvocation" if first => AgentHookEvent::Prompt {
+            text: text(v, "lastUserInput").and_then(|p| tutti_agents::first_prompt_line(&p)),
+            id: None,
+        },
+        "PreInvocation" | "PreToolUse" | "PostToolUse" => AgentHookEvent::Activity { detail: None },
+        "Stop" => AgentHookEvent::Done {
+            reply: text(v, "transcriptPath").and_then(|path| transcript_reply(&path)),
+        },
+        _ => return None,
+    };
+    Some((event, text(v, "conversationId")))
+}
+
+/// The final message of the turn an Antigravity `Stop` ends: its transcript's
+/// last line, when that is the model's response (`PLANNER_RESPONSE`) with text
+/// and no tool call — observed live (1.5.6), the line is written by the time
+/// the hook runs. A cancelled or failed turn ends on some other line.
+fn transcript_reply(path: &str) -> Option<String> {
+    let transcript = std::fs::read_to_string(path).ok()?;
+    let last: Value = serde_json::from_str(transcript.lines().next_back()?).ok()?;
+    let says = last["type"] == "PLANNER_RESPONSE" && last.get("tool_calls").is_none();
+    text(&last, "content").filter(|_| says)
 }
 
 /// A non-empty string field of an event.
@@ -486,6 +527,25 @@ pub fn gemini_hooks_json() -> Value {
             "AfterTool": every_tool,
             "Notification": every,
             "AfterAgent": every,
+        }
+    })
+}
+
+/// Antigravity CLI's hooks.json entry: one hook named `tutti`, as its file
+/// keys each hook by a name (and its `/hooks` lists it), wiring every
+/// relevant event to `tutti agent-event antigravity`. Tool events group
+/// under a matcher; the rest are flat lists (its hooks doc, 1.5.6).
+pub fn antigravity_hooks_json() -> Value {
+    let cmd = json!({ "type": "command", "command": ANTIGRAVITY_HOOK_COMMAND });
+    let every_tool = json!([{ "matcher": "*", "hooks": [cmd] }]);
+    let every = json!([cmd]);
+    json!({
+        "tutti": {
+            "SessionStart": every,
+            "PreInvocation": every,
+            "PreToolUse": every_tool,
+            "PostToolUse": every_tool,
+            "Stop": every,
         }
     })
 }
@@ -1900,6 +1960,136 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// An Antigravity CLI hook payload: the common fields 1.5.6 sent live
+    /// (ids and paths made up), with `fields` on top.
+    fn antigravity(event: &str, fields: Value) -> Option<(AgentHookEvent, Option<String>)> {
+        let mut payload = json!({
+            "conversationId": "44b0aa85-0000-4000-8000-000000000001",
+            "cwd": "/srv/api",
+            "hookEventName": event,
+            "lastUserInput": "fix the build\nit is red",
+            "modelName": "gemini-3.8-flash-high",
+            "transcriptPath": "/nowhere/transcript_full.jsonl",
+            "workspacePaths": ["/srv/api"],
+        });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        map_antigravity_event(&payload)
+    }
+
+    #[test]
+    fn antigravity_events_map_onto_a_turn_naming_the_conversation() {
+        let id = Some("44b0aa85-0000-4000-8000-000000000001".to_string());
+        assert_eq!(
+            antigravity("SessionStart", json!({})),
+            Some((AgentHookEvent::SessionStarted, id.clone()))
+        );
+        let prompt = AgentHookEvent::Prompt {
+            text: Some("fix the build".into()),
+            id: None,
+        };
+        assert_eq!(
+            antigravity(
+                "PreInvocation",
+                json!({ "invocationNum": 0, "initialNumSteps": 1 })
+            ),
+            Some((prompt, id.clone()))
+        );
+        let working = Some((AgentHookEvent::Activity { detail: None }, id.clone()));
+        assert_eq!(
+            antigravity(
+                "PreInvocation",
+                json!({ "invocationNum": 1, "initialNumSteps": 3 })
+            ),
+            working,
+            "a later model call of the same turn"
+        );
+        let call = json!({
+            "stepIdx": 2,
+            "toolCall": { "id": "call_1", "name": "run_command", "args": { "CommandLine": "ls" } },
+        });
+        assert_eq!(antigravity("PreToolUse", call.clone()), working);
+        assert_eq!(antigravity("PostToolUse", call), working);
+        assert_eq!(
+            antigravity("Stop", json!({ "terminationReason": "USER_CANCELED" })),
+            Some((AgentHookEvent::Done { reply: None }, id.clone())),
+            "no transcript to read"
+        );
+        assert_eq!(
+            antigravity("PostInvocation", json!({ "invocationNum": 0 })),
+            None
+        );
+    }
+
+    /// A turn's reply is its transcript's last line when that is the model's
+    /// final message (lines shaped as 1.5.6 wrote them).
+    #[test]
+    fn an_antigravity_stop_takes_its_reply_from_the_transcript() {
+        let dir = std::env::temp_dir().join(format!("tutti-hooks-agy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let transcript = dir.join("transcript_full.jsonl");
+        let stop = |lines: &[Value]| {
+            let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+            std::fs::write(&transcript, text).unwrap();
+            let fields =
+                json!({ "transcriptPath": transcript, "terminationReason": "NO_TOOL_CALL" });
+            antigravity("Stop", fields).unwrap().0
+        };
+        let asked = json!({
+            "step_index": 4, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE",
+            "content": "<USER_REQUEST>\nsay pong\n</USER_REQUEST>",
+        });
+        let said = json!({
+            "step_index": 5, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
+            "content": "pong",
+        });
+        let called = json!({
+            "step_index": 5, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
+            "content": "I'll run it.", "tool_calls": [{ "name": "run_command", "args": {} }],
+        });
+        assert_eq!(
+            stop(&[asked.clone(), said]),
+            AgentHookEvent::Done {
+                reply: Some("pong".into())
+            }
+        );
+        assert_eq!(
+            stop(&[asked.clone(), called]),
+            AgentHookEvent::Done { reply: None },
+            "words before a tool call are no final message"
+        );
+        assert_eq!(
+            stop(&[asked]),
+            AgentHookEvent::Done { reply: None },
+            "cancelled before the model spoke"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn antigravity_hooks_wire_every_event_to_agent_event_antigravity() {
+        let value = antigravity_hooks_json();
+        let hook = value["tutti"].as_object().unwrap();
+        let cmd = json!({ "type": "command", "command": ANTIGRAVITY_HOOK_COMMAND });
+        for event in ["SessionStart", "PreInvocation", "Stop"] {
+            assert_eq!(hook[event], json!([cmd]), "{event}");
+        }
+        for event in ["PreToolUse", "PostToolUse"] {
+            assert_eq!(
+                hook[event],
+                json!([{ "matcher": "*", "hooks": [cmd] }]),
+                "{event}"
+            );
+        }
+        for event in hook.keys() {
+            let payload = json!({ "hookEventName": event });
+            assert!(map_antigravity_event(&payload).is_some(), "{event} maps");
+        }
+        assert_eq!(hook.len(), 5);
     }
 
     #[test]

@@ -57,7 +57,8 @@ tutti pane wait $panes --until done,blocked --timeout 3600   # one state per pan
 `tutti pane read <pane> --last-reply` prints the final message of the agent's
 last finished turn as clean text: what its turn-end hook handed tutti
 (Claude Code's and Codex's `Stop`, Gemini CLI's `AfterAgent`, the opencode
-plugin's idle), never a scrape of its screen. The daemon keeps each pane's
+plugin's idle; Antigravity CLI's `Stop` names the transcript it is read
+from), never a scrape of its screen. The daemon keeps each pane's
 latest one (its first 64 KiB; a longer one notes the cut on stderr) until the
 next turn ends. With no hooks reporting the pane, no turn finished yet, or a
 last turn that ended without one (interrupted, or failed), it exits 1 saying
@@ -80,11 +81,14 @@ tutti ask "$b" "review crates/api/src/auth.rs and list the bugs you find" --time
 - **Which panes it takes.** It also refuses a pane whose agent has not reported through tutti's hooks —
   a plain shell, or an agent without `tutti hooks <agent> --install` — since no
   turn end of its would ever reach the wait.
-- **A fresh Codex or opencode.** Claude Code and Gemini CLI report
-  as they start (SessionStart); Codex and opencode only from their first turn,
+- **A fresh Codex, opencode or Antigravity CLI.** Claude Code and Gemini CLI
+  report as they start (SessionStart); Codex, opencode and Antigravity CLI
+  only from their first turn,
   so for a fresh one `ask` checks tutti's integration itself — Codex's
   `hooks.json` in `$CODEX_HOME` (else `~/.codex`) or in the pane's project's
-  `.codex/`, opencode's plugin in its user or project plugin dir — and,
+  `.codex/`, opencode's plugin in its user or project plugin dir,
+  Antigravity's `~/.gemini/config/hooks.json` or the project's
+  `.agents/hooks.json` — and,
   installed, the daemon takes the pane once detection names its agent (within
   a second of its start): the ask's message is its first turn. Codex runs a
   hook only once you have trusted it in its `/hooks`, and a project's

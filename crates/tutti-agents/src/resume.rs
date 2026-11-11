@@ -65,13 +65,16 @@ impl Stores {
 /// opencode's is from its `--help` (1.18.5: `-s, --session  session id to
 /// continue`), Codex's from its own (0.166.0: `codex resume [SESSION_ID]`,
 /// the UUID its hooks name, embedded as the registry launches it), Gemini
-/// CLI's from its session-management docs (0.66.0: `gemini --resume <UUID>`);
-/// none is harvested, but their hooks report the id.
+/// CLI's from its session-management docs (0.66.0: `gemini --resume <UUID>`),
+/// Antigravity CLI's run live (1.5.6: `agy --conversation <id>`, the
+/// `conversationId` its hooks name); none is harvested, but their hooks
+/// report the id.
 pub fn resume_cmd(agent: &str, id: &str) -> Option<Vec<String>> {
     let cmd: &[&str] = match agent {
         "claude" => &["claude", "--resume", id],
         "codex" => &["codex", "resume", "--no-daemon", id],
         "gemini" => &["gemini", "--resume", id],
+        "antigravity" => &["agy", "--conversation", id],
         "muse" => &["muse", "resume", id],
         "vibe" => &["vibe", "--resume", id],
         "opencode" => &["opencode", "--session", id],
@@ -661,6 +664,7 @@ mod tests {
         assert_eq!(cmd("opencode"), ["opencode", "--session", "s1"]);
         assert_eq!(cmd("codex"), ["codex", "resume", "--no-daemon", "s1"]);
         assert_eq!(cmd("gemini"), ["gemini", "--resume", "s1"]);
+        assert_eq!(cmd("antigravity"), ["agy", "--conversation", "s1"]);
         assert_eq!(resume_cmd("aider", "s1"), None, "no recipe known");
     }
 

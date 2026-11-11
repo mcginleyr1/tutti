@@ -11,10 +11,11 @@ use crate::integrations::{Integration, Plan, Status};
 
 /// The setup panel's rows, top to bottom: each integration tutti installs and
 /// the name it goes by there.
-const SETUP: [(Integration, &str); 6] = [
+const SETUP: [(Integration, &str); 7] = [
     (Integration::ClaudeHooks, "Claude Code hooks"),
     (Integration::CodexHooks, "Codex hooks"),
     (Integration::GeminiHooks, "Gemini CLI hooks"),
+    (Integration::AntigravityHooks, "Antigravity CLI hooks"),
     (Integration::OpencodePlugin, "opencode plugin"),
     (Integration::Skill, "tutti skill"),
     (Integration::ShellInit, "shell integration"),
@@ -218,6 +219,7 @@ mod tests {
                     "Claude Code hooks",
                     "Codex hooks",
                     "Gemini CLI hooks",
+                    "Antigravity CLI hooks",
                     "opencode plugin",
                     "tutti skill",
                     "shell integration"
@@ -229,13 +231,14 @@ mod tests {
                     home.join(".claude/settings.json"),
                     home.join(".codex/hooks.json"),
                     home.join(".gemini/settings.json"),
+                    home.join(".gemini/config/hooks.json"),
                     home.join(".config/opencode/plugins/tutti.js"),
                     home.join(".claude/skills/tutti/SKILL.md"),
                     home.join(".zshrc"),
                 ],
                 "the user scope plans against the home"
             );
-            assert!((0..6).all(|row| matches!(setup_status(&app, row), Status::Missing(_))));
+            assert!((0..7).all(|row| matches!(setup_status(&app, row), Status::Missing(_))));
 
             let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
             assert_eq!(app.on_key(esc), Vec::new());
@@ -287,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn the_codex_and_gemini_rows_install_their_hooks_into_the_home() {
+    fn the_codex_gemini_and_antigravity_rows_install_their_hooks_into_the_home() {
         let (mut app, home, project) = setup_fixture(Config::default());
         for (row, file, command) in [
             (1, ".codex/hooks.json", crate::hooks::CODEX_HOOK_COMMAND),
@@ -295,6 +298,11 @@ mod tests {
                 2,
                 ".gemini/settings.json",
                 crate::hooks::GEMINI_HOOK_COMMAND,
+            ),
+            (
+                3,
+                ".gemini/config/hooks.json",
+                crate::hooks::ANTIGRAVITY_HOOK_COMMAND,
             ),
         ] {
             app.on_key(plain('j'));
@@ -319,16 +327,16 @@ mod tests {
         app.on_key(ctrl('b'));
         app.on_key(plain('i'));
         assert!(
-            matches!(setup_status(&app, 4), Status::Outdated(_)),
+            matches!(setup_status(&app, 5), Status::Outdated(_)),
             "reopening plans again"
         );
 
-        for _ in 0..4 {
+        for _ in 0..5 {
             app.on_key(plain('j'));
         }
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         app.on_key(plain('y'));
-        assert_eq!(setup_status(&app, 4), Status::Installed);
+        assert_eq!(setup_status(&app, 5), Status::Installed);
         assert_eq!(
             std::fs::read_to_string(&skill).unwrap(),
             integrations::SKILL
@@ -376,12 +384,13 @@ mod tests {
                 project.join(".claude/settings.json"),
                 project.join(".codex/hooks.json"),
                 project.join(".gemini/settings.json"),
+                project.join(".agents/hooks.json"),
                 project.join(".opencode/plugins/tutti.js"),
                 project.join(".claude/skills/tutti/SKILL.md"),
             ],
             "the project scope plans against the workspace's dir"
         );
-        for _ in 0..4 {
+        for _ in 0..5 {
             app.on_key(plain('j'));
         }
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -394,11 +403,11 @@ mod tests {
         app.on_key(plain('s'));
         assert_eq!(app.setup_project(), None);
         assert_eq!(
-            setup_paths(&app)[4],
+            setup_paths(&app)[5],
             home.join(".claude/skills/tutti/SKILL.md")
         );
         assert!(
-            matches!(setup_status(&app, 4), Status::Missing(_)),
+            matches!(setup_status(&app, 5), Status::Missing(_)),
             "the project install left the home alone"
         );
         let _ = std::fs::remove_dir_all(&home);
@@ -416,7 +425,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         app.on_key(ctrl('b'));
         app.on_key(plain('i'));
-        for _ in 0..5 {
+        for _ in 0..6 {
             app.on_key(plain('j'));
         }
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -431,11 +440,11 @@ mod tests {
             std::fs::read_to_string(home.join(".zshrc.bak")).unwrap(),
             "export EDITOR=vi"
         );
-        assert_eq!(setup_status(&app, 5), Status::Installed);
+        assert_eq!(setup_status(&app, 6), Status::Installed);
 
         app.on_key(plain('s'));
         assert!(
-            app.setup_rows().nth(5).is_some_and(|(_, plan)| plan
+            app.setup_rows().nth(6).is_some_and(|(_, plan)| plan
                 .as_ref()
                 .is_err_and(|e| e.to_string().contains("not a project's"))),
             "a project has no rc file"
@@ -491,7 +500,7 @@ mod tests {
             "{:?}",
             app.transient()
         );
-        for _ in 0..3 {
+        for _ in 0..4 {
             app.on_key(plain('j'));
         }
         app.on_key(enter);

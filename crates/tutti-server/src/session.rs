@@ -974,7 +974,9 @@ impl Session {
     /// excluded: its state comes from exact hook signals, which the screen
     /// heuristics would only fight, and hooks never stall — except while a
     /// hook holds it blocked and tutti holds none of its requests: the answer
-    /// to the agent's own dialog shows on the screen alone (`observe`). Agent
+    /// to the agent's own dialog shows on the screen alone (`observe`); and
+    /// while one holds it working whose agent's hooks say nothing of that
+    /// dialog (`screen_prompts`), which only the screen shows. Agent
     /// detection is unaffected (it walks `detectable_panes`), so a hook-driven
     /// pane keeps its badge.
     pub fn agent_panes(&self) -> Vec<(PaneId, Option<AgentKind>, Arc<PtyPane>)> {
@@ -982,8 +984,10 @@ impl Session {
             .iter()
             .filter(|(_, s)| {
                 let dialog = s.meta.state == AgentState::Blocked && s.meta.approvals.is_empty();
+                let unasked =
+                    s.meta.state == AgentState::Working && screen_prompts(s.meta.agent.as_ref());
                 s.meta.exited.is_none()
-                    && (s.meta.source != Some(StateSource::Hook) || dialog)
+                    && (s.meta.source != Some(StateSource::Hook) || dialog || unasked)
                     && (s.meta.agent.is_some() || s.meta.source.is_some_and(StateSource::claims))
             })
             .map(|(id, s)| (*id, s.meta.agent.clone(), Arc::clone(&s.pty)))
@@ -1134,8 +1138,8 @@ impl Session {
         if slot.replies == 0 {
             bail!(
                 "pane {pane} has no reply: no turn has ended there through its agent's hooks \
-                 (Claude Code, Codex, Gemini CLI and opencode report theirs once `tutti hooks \
-                 <agent> --install` wires them)"
+                 (Claude Code, Codex, Gemini CLI, Antigravity CLI and opencode report theirs \
+                 once `tutti hooks <agent> --install` wires them)"
             );
         }
         if slot.reply.0.is_empty() {
@@ -1174,8 +1178,8 @@ impl Session {
             bail!(
                 "pane {pane}'s agent has not reported through tutti's hooks, so no turn end of \
                  its would ever reach an ask: install them (tutti hooks <agent> --install) and \
-                 restart the agent. A Codex or opencode with them installed is taken once tutti \
-                 has detected it, a second or so after it starts"
+                 restart the agent. A Codex, opencode or Antigravity CLI with them installed is \
+                 taken once tutti has detected it, a second or so after it starts"
             );
         }
         match slot.meta.state {
@@ -1476,7 +1480,11 @@ impl Session {
     /// (`StateSource::may_move`). A hook's `Blocked` gives way to a `Working`
     /// match only once a `Blocked` one has shown the agent's own dialog: Claude
     /// sends no hook when you answer it, and the screen working again is the
-    /// tool you approved running. Output or a `Working` match keeps the pane
+    /// tool you approved running. A hook's `Working` gives way to a `Blocked`
+    /// match where the agent's hooks say nothing of its dialog
+    /// (`screen_prompts`), and that block to a `Done` one — the dialog
+    /// cancelled, which no hook reports either — the claim staying the
+    /// hook's. Output or a `Working` match keeps the pane
     /// alive; a `Working` pane not held by a hook and silent for `STALL_AFTER`
     /// drops to `Unknown`, ending its claim. A `Done` match on a pane not yet
     /// seen working (`worked`: a `Working` match, hook or report — output
@@ -1521,11 +1529,25 @@ impl Session {
         if slot.rested && !slot.worked && slot.meta.state == AgentState::Unknown {
             slot.meta.state = slot.rest(now);
         }
-        if slot.meta.source == Some(StateSource::Hook) && slot.meta.state == AgentState::Blocked {
-            match classified {
-                Some(Observation::Blocked) => slot.dialog = true,
-                Some(Observation::Working) if slot.dialog => {
+        if slot.meta.source == Some(StateSource::Hook) {
+            match (slot.meta.state, classified) {
+                (AgentState::Blocked, Some(Observation::Blocked)) => slot.dialog = true,
+                (AgentState::Blocked, Some(Observation::Working)) if slot.dialog => {
                     slot.meta.state = AgentState::Working;
+                    slot.passed = false;
+                }
+                (AgentState::Working, Some(Observation::Blocked))
+                    if screen_prompts(slot.meta.agent.as_ref()) =>
+                {
+                    slot.meta.state = AgentState::Blocked;
+                    slot.dialog = true;
+                }
+                // Esc at that dialog ends the turn with no hook (observed
+                // live, Antigravity CLI 1.5.6): its idle prompt says so.
+                (AgentState::Blocked, Some(Observation::Done))
+                    if slot.dialog && screen_prompts(slot.meta.agent.as_ref()) =>
+                {
+                    slot.meta.state = AgentState::Done;
                     slot.passed = false;
                 }
                 _ => {}
@@ -2050,6 +2072,12 @@ pub struct Restored {
     pub skipped: Vec<String>,
 }
 
+/// Whether `agent`'s hooks say nothing of its permission dialog, so its
+/// screen does (`tutti_agents::SCREEN_PROMPTERS`).
+fn screen_prompts(agent: Option<&AgentKind>) -> bool {
+    agent.is_some_and(|kind| tutti_agents::SCREEN_PROMPTERS.contains(&kind.0.as_str()))
+}
+
 /// Mark a subagent stopped. Prefers the running entry whose id matches; failing
 /// that (a Claude `SubagentStop` carries no id that lines up with the `Task`
 /// tool_input) it finishes the oldest still-running subagent. Returns whether
@@ -2419,6 +2447,60 @@ mod tests {
             (Working, Some(Hook)),
             "still the hook's"
         );
+    }
+
+    /// Antigravity CLI's hooks say nothing of its permission dialog: while
+    /// they hold its pane working the screen is still read, a dialog there
+    /// blocks it, and the screen working again — or the next hook — sets it
+    /// going, the claim the hook's throughout. Any other agent's working
+    /// hook pane is never read.
+    #[test]
+    fn a_working_hook_pane_blocks_on_its_screen_where_its_hooks_report_no_dialog() {
+        let (mut s, pane, _tmp) = session_with_pane();
+        let t0 = Instant::now();
+        let working = AgentHookEvent::Activity { detail: None };
+        let classified = |s: &Session| s.agent_panes().iter().any(|(p, _, _)| *p == pane);
+        s.set_agent(pane, Some("claude".into()));
+        s.apply_agent_event(pane, working.clone(), None);
+        assert!(!classified(&s), "Claude's hooks report its dialog");
+        assert_eq!(s.observe(pane, true, Some(Observation::Blocked), t0), None);
+
+        s.set_agent(pane, Some("antigravity".into()));
+        s.apply_agent_event(pane, working.clone(), None);
+        assert!(classified(&s), "its dialog shows on the screen alone");
+        assert_eq!(s.observe(pane, true, Some(Observation::Working), t0), None);
+        assert_eq!(s.observe(pane, true, Some(Observation::Done), t0), None);
+        assert_eq!(
+            s.observe(pane, true, Some(Observation::Blocked), t0),
+            Some((Working, Blocked))
+        );
+        assert_eq!(state_of(&s, pane), (Blocked, Some(Hook)));
+        assert!(classified(&s), "and so does its answer");
+        assert_eq!(
+            s.observe(pane, true, Some(Observation::Working), t0),
+            Some((Blocked, Working)),
+            "the approved tool running"
+        );
+        s.observe(pane, true, Some(Observation::Blocked), t0);
+        s.apply_agent_event(pane, working.clone(), None);
+        assert_eq!(
+            state_of(&s, pane),
+            (Working, Some(Hook)),
+            "a hook after the answer"
+        );
+        assert_eq!(
+            s.observe(pane, true, Some(Observation::Done), t0),
+            None,
+            "its idle prompt ends no turn that showed no dialog"
+        );
+        s.observe(pane, true, Some(Observation::Blocked), t0);
+        assert_eq!(
+            s.observe(pane, true, Some(Observation::Done), t0),
+            Some((Blocked, Done)),
+            "the dialog cancelled: no hook says so"
+        );
+        assert_eq!(state_of(&s, pane), (Done, Some(Hook)));
+        assert!(!classified(&s), "a finished one is the hook's alone");
     }
 
     #[test]

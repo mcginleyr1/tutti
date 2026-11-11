@@ -48,7 +48,7 @@ project itself instead; a project that isn't a jj repo always does.
 
 The agents that take a first message on their command line:
 
-- Claude Code, Codex, Gemini CLI, OpenCode,
+- Claude Code, Codex, Gemini CLI, Antigravity CLI, OpenCode,
   Pi, Oh My Pi, Muse Code, Mistral Vibe, Ori;
 - and, from their docs alone, untried: Goose,
   Qwen Code, Cursor CLI, Copilot CLI, Factory Droid, Augment Code and Amazon Q.
