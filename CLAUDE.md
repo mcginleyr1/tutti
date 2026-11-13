@@ -96,7 +96,8 @@ cargo fmt --all --check
   lost to the buffer diff. A widget drawn over pane cells must reset them
   (`Clear`), or a pane cell's bits and link ride into it. Whatever the TUI turns on in its terminal beyond raw mode and the
   alternate screen — mouse capture, focus reports, kitty's keyboard flags, a
-  cursor shape, the claim on rtty's keys (`RTTY_KEYS=pane`) — `leave`
+  cursor shape, the claim on rtty's keys (`RTTY_KEYS=pane`) and the session
+  it names there (`TUTTI_TUI`, `rtty::showing`) — `leave`
   (attach/mod.rs) hands back, on detach, on a panic and before a SIGTSTP stop
   (`suspend`, which `enter`s again on resume). An exit path that skips it
   strands rtty's keys with a TUI that is gone or stopped.

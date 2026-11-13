@@ -15,7 +15,25 @@ use super::app::App;
 /// The OSC 1337 user var that claims rtty's focus and resize keys for the
 /// pane the TUI runs in (`pane`, base64), and the one that gives them back.
 pub const CLAIM: &[u8] = b"\x1b]1337;SetUserVar=RTTY_KEYS=cGFuZQ==\x07";
-pub const RELEASE: &[u8] = b"\x1b]1337;SetUserVar=RTTY_KEYS=\x07";
+/// Giving the keys back also unsets what `showing` set.
+pub const RELEASE: &[u8] = b"\x1b]1337;SetUserVar=RTTY_KEYS=\x07\
+    \x1b]1337;SetUserVar=TUTTI_TUI=\x07\x1b]1337;SetUserVar=TUTTI_TUI_HOST=\x07";
+
+/// The user vars that say whose TUI runs in this rtty pane: `TUTTI_TUI`, the
+/// session it shows, and `TUTTI_TUI_HOST`, the ssh `destination` of one on
+/// another machine (empty for one on this). rtty reports a pane's user vars,
+/// so what arranges rtty's windows from outside — a window manager — can
+/// find the window that holds a session's TUI, and send it `tutti pane
+/// focus`.
+pub fn showing(session: &str, destination: Option<&str>) -> Vec<u8> {
+    use base64::Engine;
+    let var = |name: &str, value: &str| {
+        let value = base64::engine::general_purpose::STANDARD.encode(value);
+        format!("\x1b]1337;SetUserVar={name}={value}\x07")
+    };
+    let host = var("TUTTI_TUI_HOST", destination.unwrap_or(""));
+    (var("TUTTI_TUI", session) + &host).into_bytes()
+}
 
 /// How long a `rtty cli` call gets before it reads as "did not move", as
 /// rtty's own editor plugins give it.
@@ -175,6 +193,20 @@ mod tests {
         std::fs::write(&program, script).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         (program.display().to_string(), log)
+    }
+
+    /// The pane says whose TUI it holds in user vars rtty can report: the
+    /// session, and the ssh destination of one on another machine. Giving
+    /// the terminal back unsets both with the claim on the keys.
+    #[test]
+    fn the_pane_names_the_session_its_tui_shows() {
+        let var = |name: &str, value: &str| format!("\x1b]1337;SetUserVar={name}={value}\x07");
+        let local = var("TUTTI_TUI", "d29yaw==") + &var("TUTTI_TUI_HOST", "");
+        assert_eq!(showing("work", None), local.into_bytes());
+        let far = var("TUTTI_TUI", "d29yaw==") + &var("TUTTI_TUI_HOST", "bWVAYm94");
+        assert_eq!(showing("work", Some("me@box")), far.into_bytes());
+        let unset = ["RTTY_KEYS", "TUTTI_TUI", "TUTTI_TUI_HOST"].map(|name| var(name, ""));
+        assert_eq!(RELEASE, unset.concat().as_bytes());
     }
 
     #[test]

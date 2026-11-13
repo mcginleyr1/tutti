@@ -69,7 +69,7 @@ const POLL: Duration = Duration::from_millis(16);
 pub fn run(session: &str, config: Config, startup: Startup, view: bool) -> Result<()> {
     let mut conn = Connection::open(session, view)?;
     let host = Host::Local(Arc::new(Local::from_env(config.clone())));
-    attach(&mut conn, host, config, startup).map(drop)
+    attach(&mut conn, host, config, startup, None).map(drop)
 }
 
 /// Attach to `session` (the far side's default when `None`) on the ssh
@@ -86,7 +86,7 @@ pub fn run_remote(
     let (mut conn, startup) = Connection::open_remote(destination, session, view)?;
     let host = Host::Remote(conn.remote());
     // On a detach ssh still runs until the connection drops: nothing to wait for.
-    let closed = attach(&mut conn, host, config, startup)?;
+    let closed = attach(&mut conn, host, config, startup, Some(destination))?;
     match closed.then(|| conn.ended()).flatten() {
         Some(why) => Err(why),
         None => Ok(()),
@@ -94,7 +94,14 @@ pub fn run_remote(
 }
 
 /// `true` when the far end closed the connection, `false` on a detach.
-fn attach(conn: &mut Connection, host: Host, config: Config, startup: Startup) -> Result<bool> {
+/// `destination` is the ssh destination of a session on another machine.
+fn attach(
+    conn: &mut Connection,
+    host: Host,
+    config: Config,
+    startup: Startup,
+    destination: Option<&str>,
+) -> Result<bool> {
     let info = host
         .info()
         .context("asking the daemon's machine for its config")?;
@@ -159,6 +166,8 @@ fn attach(conn: &mut Connection, host: Host, config: Config, startup: Startup) -
         asked,
         stop,
         resized,
+        destination: destination.map(String::from),
+        told: None,
     };
     let app = App::with_host(config, host, info);
     let result = event_loop(&mut terminal, conn, app, startup, rtty, tty);
@@ -197,6 +206,10 @@ struct Tty {
     asked: Option<Asked>,
     stop: Arc<AtomicBool>,
     resized: Arc<AtomicBool>,
+    /// The ssh destination of a session on another machine, and the session
+    /// the TUI last told its rtty pane it shows (`rtty::showing`).
+    destination: Option<String>,
+    told: Option<String>,
 }
 
 /// Whether the terminal's keyboard flags were pushed, for `leave` to pop,
@@ -303,6 +316,7 @@ fn event_loop(
     loop {
         if tty.stop.swap(false, Ordering::SeqCst) {
             suspend(terminal, tty.modes)?;
+            tty.told = None;
             // The terminal may have turned light or dark meanwhile.
             if tty.modes.scheme {
                 let (asked, query) = Asked::ask(None, tty.asked.as_ref());
@@ -310,6 +324,15 @@ fn event_loop(
                 emit_terminal(&query);
             }
             dirty = true;
+        }
+        // In rtty, the pane says whose TUI it holds once the daemon has named
+        // the session, and again after a stop, which gave the pane back.
+        if tty.modes.rtty
+            && !app.session.is_empty()
+            && tty.told.as_deref() != Some(app.session.as_str())
+        {
+            emit_terminal(&rtty::showing(&app.session, tty.destination.as_deref()));
+            tty.told = Some(app.session.clone());
         }
         if tty.resized.swap(false, Ordering::SeqCst) {
             dirty = true;

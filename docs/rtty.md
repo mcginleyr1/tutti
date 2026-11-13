@@ -28,7 +28,7 @@ The TUI knows it runs in rtty from its own environment, the one the terminal
 you attach from gives it: `RTTY_PANE` set and `RTTY_SOCKET` naming a socket.
 XTVERSION cannot tell, because rtty and tutti's own panes both answer as
 `rtty-vt`. The daemon's environment never counts, and its panes never see
-either variable. In rtty, the TUI does three things:
+either variable. In rtty, the TUI does four things:
 
 - **It claims rtty's keys.** On attach it sets the user var `RTTY_KEYS=pane`
   in its rtty pane. Under rtty's `keys = "tutti"`, rtty then hands its
@@ -37,6 +37,13 @@ either variable. In rtty, the TUI does three things:
   and when stopped. The keys can't stop it, since raw mode sends `Ctrl-Z` to
   the pane, but `kill -TSTP` does, and the shell beneath gets rtty's keys
   while it waits. On `fg` the TUI claims them again and redraws.
+- **It says whose TUI it is.** Once attached it sets two more user vars in
+  its rtty pane: `TUTTI_TUI`, the session it shows, and `TUTTI_TUI_HOST`, the
+  ssh destination of a session on another machine (`tutti --host`), empty
+  for one on this. rtty reports a pane's user vars, so a window manager
+  around rtty can find the window that holds a session's TUI and send it
+  `tutti pane focus <id>`. A view sets them too. Both are unset with the
+  keys.
 - **It hands a move past its own edge on to rtty.** It runs
   `rtty cli pane focus --direction <d> --from $RTTY_PANE` or `rtty cli pane
   resize …`, off its event loop, and gives rtty 500 ms to answer.
