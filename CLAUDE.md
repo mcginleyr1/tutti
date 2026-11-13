@@ -329,10 +329,15 @@ cargo fmt --all --check
 
 ## Dev loop
 
-- `just install` kills ALL running daemons then reinstalls both binaries —
-  deliberate dev behavior so you're always testing the code you just built.
-  End users get the non-killing flow documented in docs/install.md
-  ("Upgrading").
+- `just install` reinstalls both binaries, then kills ALL running daemons
+  when the daemon's own binary changed — deliberate dev behavior so you're
+  always testing the code you just built. It tells by building
+  `tutti-server` to one side (`target/staged`) and comparing bytes with the
+  installed one, so a client-only change leaves every session running; any
+  change the daemon links (tutti-wire, tutti-core, tutti-agents, rtty-vt)
+  counts as its own. A daemon already older than the installed binary — one
+  left running across a by-hand `cargo install` — is not noticed. End users
+  get the non-killing flow documented in docs/install.md ("Upgrading").
 - Installs — `hooks … --install`, `skill --install`, the setup panel (prefix
   `i`) — all go through `tutti::integrations`: plan, confirm, then `apply`
   with a backup and a changed-since-inspected guard. Never write
