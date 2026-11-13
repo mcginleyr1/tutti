@@ -327,8 +327,10 @@ milestone above names both (M1 and M2), and its own exit is unmarked too.
   placement, rounded corners with their outside colour and the cells a
   frame's writes wipe all landed cell for cell. That test is not in the tree
   — it needs the pinned rtty-vt to have the border API — and lands with the
-  pin. Never seen as pixels; nor the pane tints against a real terminal's
-  OSC 4 answers;
+  pin. Seen as pixels once, in rtty, in a screenshot of a single pane with
+  both panels open (2026-11-13): frames, cards, gutters and tints drew. Not
+  looked at since: split panes and the gutter's drag, popups over lined
+  cells, a resize, a light terminal, and the Ghostty branch;
 - what the w12 review changed after its run: a fresh agent's 5 s grace
   then idle (a restored agent, one given no work); a detected agent's own
   idle or done report before any work; the footer-anchored dialog and idle

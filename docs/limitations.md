@@ -36,10 +36,9 @@ part; [PLAN.md](../PLAN.md) tracks what is open.
   2031). On one that doesn't, reattach after switching the OS theme.
 - **Frames that cost no cells need a terminal that draws them.** The
   [cell-border protocol](https://www.joshka.net/cell-borders/) is a draft
-  that a Ghostty branch implements and rtty is about to; everywhere else
-  panes keep their frames of box characters. Nobody has yet seen tutti's
-  lines on a screen: its output has been checked against rtty's engine, cell
-  for cell, and painted only by a stand-in.
+  that a Ghostty branch and rtty implement; everywhere else panes keep their
+  frames of box characters. tutti's lines have been seen in rtty alone, and
+  never in the Ghostty branch.
 - **A program in a pane cannot draw cell borders in the TUI.** tutti's daemon
   does not speak the protocol to its panes: their query goes unanswered, as
   the protocol asks of a multiplexer, so they draw box characters. `pane
