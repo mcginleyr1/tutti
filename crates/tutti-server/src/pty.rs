@@ -871,6 +871,11 @@ fn verdict(seq: &[u8]) -> Verdict {
                 _ => Verdict::Pass,
             }
         }
+        // The cell-border protocol's strings: the daemon keeps none of the
+        // lines they draw, so it is no multiplexer for them, and one that is
+        // not discards them. A raw stream's terminal that heard the query
+        // would answer it into the pane.
+        [0x1b, b'P', b'1', b'+', b'b', ..] => Verdict::Own,
         [0x1b, b'Z'] | [0x1b, b']' | b'P', ..] => Verdict::Ask,
         _ => Verdict::Pass,
     }
@@ -2794,6 +2799,20 @@ mod tests {
         }
         let bytes: Vec<&[u8]> = stream.chunks(1).collect();
         assert_eq!(answered(Some(light()), &bytes), want, "a byte a read");
+    }
+
+    /// A pane's cell-border strings stop at the daemon, however a read cuts
+    /// them: no tap gets the query or a command, and the pane's program
+    /// hears only the DA1 that follows, so it draws box characters.
+    #[test]
+    fn cell_border_strings_never_reach_a_tap() {
+        let stream: &[u8] = b"a\x1bP1+bcell-border;q\x1b\\b\
+            \x1bP1+bcell-border;set;3;20;fg;0;0;1;1\x1b\\c\x1b[cd";
+        let want = (b"abcd".to_vec(), b"\x1b[?62;22c".to_vec(), 0);
+        for cut in 0..=stream.len() {
+            let got = answered(None, &[&stream[..cut], &stream[cut..]]);
+            assert_eq!(got, want, "cut at {cut}");
+        }
     }
 
     /// Kitty's keyboard protocol and xterm's modifyOtherKeys reach the

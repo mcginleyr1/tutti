@@ -150,11 +150,12 @@ is deliberately left undone.
   characters, no field is underlined nor button outlined, and the sidebar's
   selected row and state words are as they were. `host::outline`/`rule` are
   there to draw them with;
-- the daemon is no multiplexer for the cell-border protocol: `pane attach`
-  hands a pane's query on to the terminal (`Verdict::Ask`, pty.rs), whose
-  answer the program acts on though the daemon keeps none of its lines. It
-  should own the strings (`DCS 1 + b`) until it stores a pane's borders and
-  the TUI redraws them. This matters the day rtty answers the query;
+- the daemon is no multiplexer for the cell-border protocol: it drops a
+  pane's strings (`Verdict::Own`, pty.rs), so a program in a pane draws box
+  characters. rtty-vt can now keep a pane's borders and carry them in its
+  snapshots (`Terminal::set_cell_borders`, off in the daemon): turning it on
+  means the wire's snapshots carry them too and the TUI redraws them inside
+  a pane's cells;
 - under `--host`, the TUI's one-shot host questions still run on its event
   loop: expanding a submitted directory, the jj check, the launcher, setup
   plans and a deploy's argv. Each is one ssh round trip after a key that
@@ -321,13 +322,11 @@ milestone above names both (M1 and M2), and its own exit is unmarked too.
 
 ### Unverified live — cover these in the next live run
 
-- frames drawn as cell borders on a real screen. The TUI's output was run
-  through rtty's engine before rtty's commit was pushed (2026-11-13, rtty-vt
-  patched in by path): the query's answer, the rectangle commands, inside
-  placement, rounded corners with their outside colour and the cells a
-  frame's writes wipe all landed cell for cell. That test is not in the tree
-  — it needs the pinned rtty-vt to have the border API — and lands with the
-  pin. Seen as pixels once, in rtty, in a screenshot of a single pane with
+- frames drawn as cell borders on a real screen. A test runs the TUI's
+  output through rtty's engine (`rtty_takes_the_lines_the_tui_sends`,
+  host.rs): the query's answer, the rectangle commands, inside placement,
+  rounded corners with their outside colour and the cells a frame's writes
+  wipe land cell for cell. Seen as pixels once, in rtty, in a screenshot of a single pane with
   both panels open (2026-11-13): frames, cards, gutters and tints drew. Not
   looked at since: split panes and the gutter's drag, popups over lined
   cells, a resize, a light terminal, and the Ghostty branch;

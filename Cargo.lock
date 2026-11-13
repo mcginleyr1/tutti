@@ -1394,7 +1394,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rtty-vt"
 version = "0.1.0"
-source = "git+https://github.com/mcginleyr1/rtty?rev=42a861d9a4e7100aa1deb08ec57721cc70e32093#42a861d9a4e7100aa1deb08ec57721cc70e32093"
+source = "git+https://github.com/mcginleyr1/rtty?rev=53d767fd0b8eec1f4ae72640408ff6cdc1ad5bf8#53d767fd0b8eec1f4ae72640408ff6cdc1ad5bf8"
 dependencies = [
  "libc",
  "memchr",

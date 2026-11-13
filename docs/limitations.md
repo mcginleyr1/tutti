@@ -39,12 +39,11 @@ part; [PLAN.md](../PLAN.md) tracks what is open.
   that a Ghostty branch and rtty implement; everywhere else panes keep their
   frames of box characters. tutti's lines have been seen in rtty alone, and
   never in the Ghostty branch.
-- **A program in a pane cannot draw cell borders in the TUI.** tutti's daemon
-  does not speak the protocol to its panes: their query goes unanswered, as
-  the protocol asks of a multiplexer, so they draw box characters. `pane
-  attach` is the exception, and a wrong one: it hands the query on to your
-  terminal, whose answer the program then acts on though the daemon keeps
-  none of the lines it draws.
+- **A program in a pane cannot draw cell borders.** tutti's daemon does not
+  speak the protocol to its panes: it drops their query and commands, as the
+  protocol asks of a multiplexer that keeps no borders, so they draw box
+  characters — in the TUI, under `pane attach` and in rtty's own tutti
+  panes alike.
 - **In rtty, an editor's move off tutti's edge always reads as made.** The
   TUI takes it on and `tutti pane focus` exits 0, even where rtty's own edge
   then stops it. An editor that does something of its own when tutti

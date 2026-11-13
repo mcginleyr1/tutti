@@ -167,7 +167,10 @@ cargo fmt --all --check
   - **A second writer would let a typed key overtake an answer queued before
     it.** That is the 2031 server test's old race: it failed in 3 of 5 runs.
 - **Taps are fed in the same parser-lock hold as `Term::process`, minus what
-  the daemon answered or owns** (`Term::taps`, `verdict`; it owns mode 2031
+  the daemon answered or owns** (`Term::taps`, `verdict`; it owns the
+  cell-border protocol's strings, which it drops — it keeps no pane's
+  borders, and a tap's terminal that heard the query would answer it into
+  the pane — and mode 2031
   and the keyboard protocols — modifyOtherKeys and kitty's push, pop and set
   reach the terminal, whose snapshots and redraws hand them to the TUI's key
   encoder, but never a stream that did not ask for them — `PaneAttach.keys`

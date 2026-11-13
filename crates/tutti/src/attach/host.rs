@@ -602,6 +602,92 @@ mod tests {
         assert!(shown.is_empty());
     }
 
+    /// The lines the TUI sends are ones rtty's engine takes, cell for cell,
+    /// and its answer to the query is one the TUI's reader takes.
+    #[test]
+    fn rtty_takes_the_lines_the_tui_sends() {
+        use rtty_vt::{Color as Ink, Event, Terminal};
+        let mut term = Terminal::new(6, 10, 0);
+        term.set_cell_borders(true);
+        term.advance(crate::attach::reader::ASK_LINES);
+        let replies: Vec<_> = term.take_events();
+        let Some(Event::Reply(reply)) = replies.first() else {
+            panic!("no answer to the query: {replies:?}");
+        };
+        let mut decoder = crate::attach::reader::Decoder::default();
+        let inputs = decoder.feed(reply);
+        assert!(
+            matches!(&inputs[..], [crate::attach::reader::Input::Lines(f)] if f.iter().any(|f| f == "rect")),
+            "{inputs:?}"
+        );
+
+        begin();
+        let accent = Stroke {
+            color: Color::Blue,
+            wide: true,
+        };
+        let grey = Stroke {
+            color: Color::Rgb(1, 2, 255),
+            wide: false,
+        };
+        outline(Rect::new(2, 1, 4, 3), accent, ROUND_ALL, Color::Reset);
+        rule(Rect::new(0, 0, 8, 1), grey);
+        let mut shown = HashMap::new();
+        let mut out = Vec::new();
+        EDGES
+            .with_borrow(|edges| write_edges(&mut out, edges, &mut shown))
+            .unwrap();
+        term.advance(&out);
+        // Each cell's drawn segments as (bit, width, colour), and its joints.
+        let lines = |term: &Terminal, x: usize, y: u16| {
+            let borders = term.screen_row(y).borders(x)?;
+            let segments: Vec<_> = (0..12)
+                .filter_map(|bit| {
+                    let stroke = borders.segments[bit]?;
+                    assert!(!stroke.centered && !stroke.above);
+                    Some((bit, stroke.width, stroke.color))
+                })
+                .collect();
+            Some((segments, borders.joints, borders.outside))
+        };
+        let blue = |bits: &[usize]| bits.iter().map(|b| (*b, 36, Ink::Indexed(4))).collect();
+        let corner: Vec<_> = blue(&[0, 1, 6, 7]);
+        assert_eq!(lines(&term, 2, 1), Some((corner, 1, Some(Ink::Default))));
+        assert_eq!(lines(&term, 3, 1), Some((blue(&[0, 1]), 0, None)));
+        assert_eq!(lines(&term, 5, 2), Some((blue(&[2, 3]), 0, None)));
+        let corner: Vec<_> = blue(&[2, 3, 4, 5]);
+        assert_eq!(lines(&term, 5, 3), Some((corner, 4, Some(Ink::Default))));
+        let ruled = vec![(4, 20, Ink::Rgb(1, 2, 255)), (5, 20, Ink::Rgb(1, 2, 255))];
+        assert_eq!(lines(&term, 0, 0), Some((ruled, 0, None)));
+        assert_eq!(lines(&term, 3, 2), None, "inside the outline");
+
+        // A written cell loses its lines; the next frame lines it again.
+        term.advance(b"\x1b[2;4Hx");
+        assert_eq!(lines(&term, 3, 1), None);
+        shown.remove(&Position::new(3, 1));
+        out.clear();
+        EDGES
+            .with_borrow(|edges| write_edges(&mut out, edges, &mut shown))
+            .unwrap();
+        term.advance(&out);
+        assert_eq!(lines(&term, 3, 1), Some((blue(&[0, 1]), 0, None)));
+
+        // A frame with no lines takes them all off: no segment is left and
+        // no joint is round (the protocol has a corner keep its outside
+        // colour, unused).
+        begin();
+        out.clear();
+        EDGES
+            .with_borrow(|edges| write_edges(&mut out, edges, &mut shown))
+            .unwrap();
+        term.advance(&out);
+        for (x, y) in [(2, 1), (3, 1), (5, 3), (0, 0)] {
+            let bare =
+                lines(&term, x, y).is_none_or(|(drawn, round, _)| drawn.is_empty() && round == 0);
+            assert!(bare, "({x},{y}) is bare again");
+        }
+    }
+
     /// A linked cell is drawn every frame, and the frame knows its link
     /// until the next one starts.
     #[test]
