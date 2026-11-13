@@ -321,11 +321,14 @@ milestone above names both (M1 and M2), and its own exit is unmarked too.
 
 ### Unverified live — cover these in the next live run
 
-- frames drawn as cell borders in a real terminal: the TUI's rectangle
-  commands, inside placement, rounded corners with their outside fill and
-  the cells a frame's writes wipe have only met a stand-in that models the
-  protocol (2026-11-13); and the pane tints against a real terminal's OSC 4
-  answers;
+- frames drawn as cell borders on a real screen. The TUI's output was run
+  through rtty's engine before rtty's commit was pushed (2026-11-13, rtty-vt
+  patched in by path): the query's answer, the rectangle commands, inside
+  placement, rounded corners with their outside colour and the cells a
+  frame's writes wipe all landed cell for cell. That test is not in the tree
+  — it needs the pinned rtty-vt to have the border API — and lands with the
+  pin. Never seen as pixels; nor the pane tints against a real terminal's
+  OSC 4 answers;
 - what the w12 review changed after its run: a fresh agent's 5 s grace
   then idle (a restored agent, one given no work); a detected agent's own
   idle or done report before any work; the footer-anchored dialog and idle
