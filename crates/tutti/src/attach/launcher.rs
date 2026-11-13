@@ -7,7 +7,7 @@
 //! are unit-tested in isolation; the open launcher's state (`Launcher`) and
 //! `App`'s keys over it follow.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -16,6 +16,8 @@ use tutti_agents::{Registry, ResumeSession};
 use tutti_core::{Frame as WireFrame, PaneId, Request, WorkspaceId};
 
 use super::app::{App, Mode, control};
+use super::setup;
+use crate::integrations::{Integration, Plan, Status};
 use crate::issues::{self, Issue};
 
 /// What a launcher row runs when chosen.
@@ -284,6 +286,13 @@ pub(super) struct Launcher {
     /// armed from the issues panel: the agent rows run on that prompt, and
     /// the pick deploys rather than runs.
     pub(super) issue: Option<(Issue, String)>,
+    /// What the open launcher is asking before it runs the row at this
+    /// index: the agent picked has none of tutti's hooks, in this project or
+    /// for the user, and this plan installs them into the project.
+    offer: Option<(usize, Integration, Plan)>,
+    /// The hooks a project went without when asked, by its directory: the
+    /// question comes once an attach.
+    declined: HashSet<(PathBuf, Integration)>,
 }
 
 impl App {
@@ -333,6 +342,7 @@ impl App {
         self.launcher.dir = dir.map(Path::to_path_buf);
         self.launcher.sandbox = None;
         self.launcher.issue = None;
+        self.launcher.offer = None;
         self.rebuild_launcher();
         self.launcher.after_add = after_add;
         self.launcher.command.clear();
@@ -434,6 +444,9 @@ impl App {
     }
 
     pub(super) fn on_key_launcher(&mut self, key: KeyEvent) -> Vec<WireFrame> {
+        if let Some((idx, integration, plan)) = self.launcher.offer.take() {
+            return self.answer_hooks_offer(key, idx, integration, &plan);
+        }
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
                 self.launcher.selected =
@@ -482,6 +495,12 @@ impl App {
             Some(row) if row.selectable() => (row.name.clone(), row.kind.clone()),
             _ => return Vec::new(),
         };
+        if let LaunchKind::Agent(cmd) | LaunchKind::Resume(cmd) = &kind
+            && let Some((integration, plan)) = self.hooks_offer(&name, cmd)
+        {
+            self.launcher.offer = Some((idx, integration, plan));
+            return Vec::new();
+        }
         match kind {
             LaunchKind::Agent(cmd) | LaunchKind::Resume(cmd) => match self.launcher.issue.take() {
                 Some((issue, prompt)) => self.deploy_frames(&issue, &name, &prompt, cmd),
@@ -500,6 +519,71 @@ impl App {
                 Vec::new()
             }
         }
+    }
+
+    /// What to ask before running an agent — the row `name`, its command
+    /// `cmd` — in the launcher's project: whether to install tutti's hooks
+    /// for it there, when the project has none and neither has the user.
+    /// Without them tutti reads the agent's state off its screen and cannot
+    /// bring its conversation back. A sandbox's agent and a deploy's are not
+    /// asked about, nor a project that already said no.
+    fn hooks_offer(&self, name: &str, cmd: &[String]) -> Option<(Integration, Plan)> {
+        let program = Path::new(cmd.first()?).file_name()?.to_str()?;
+        let integration = Integration::of_agent(name).or(Integration::of_agent(program))?;
+        let dir = self.launcher.dir.clone()?;
+        let settled = self.launcher.sandbox.is_some()
+            || self.launcher.issue.is_some()
+            || self.launcher.declined.contains(&(dir.clone(), integration));
+        if settled {
+            return None;
+        }
+        let missing = |project| {
+            let plans = self.host.setup_plans(vec![integration], project);
+            let plan = plans.ok()?.pop()?.ok()?;
+            matches!(plan.status, Status::Missing(_)).then_some(plan)
+        };
+        let plan = missing(Some(dir))?;
+        missing(None).map(|_| (integration, plan))
+    }
+
+    /// A key at the hooks question: `y` or enter installs them into the
+    /// project and runs the pick, `n` runs it without, and any other goes
+    /// back to the list. Either answer settles it for this project.
+    fn answer_hooks_offer(
+        &mut self,
+        key: KeyEvent,
+        idx: usize,
+        integration: Integration,
+        plan: &Plan,
+    ) -> Vec<WireFrame> {
+        let install = match key.code {
+            KeyCode::Char('y' | 'Y') | KeyCode::Enter => true,
+            KeyCode::Char('n' | 'N') => false,
+            _ => return Vec::new(),
+        };
+        if let Some(dir) = self.launcher.dir.clone() {
+            self.launcher.declined.insert((dir, integration));
+        }
+        let installed = install.then(|| self.host.setup_apply(plan));
+        if let Some(Err(e)) = &installed {
+            self.set_status(format!("error: {e:#}"));
+            return Vec::new();
+        }
+        let frames = self.launch_index(idx);
+        if installed.is_some() {
+            let (label, path) = (setup::label(integration), plan.path.display());
+            self.set_status(format!("{label} installed into {path}"));
+        }
+        frames
+    }
+
+    /// The hooks question the launcher is asking, for the renderer: what it
+    /// would install, and the file it would write under the project.
+    pub fn launcher_offer(&self) -> Option<(&'static str, String)> {
+        let (_, integration, plan) = self.launcher.offer.as_ref()?;
+        let dir = self.launcher.dir.as_deref().unwrap_or(Path::new(""));
+        let file = plan.path.strip_prefix(dir).unwrap_or(&plan.path);
+        Some((setup::label(*integration), file.display().to_string()))
     }
 
     fn launch_shell_and_close(&mut self) -> Vec<WireFrame> {
@@ -557,7 +641,12 @@ impl App {
     /// Dismiss the launcher back to terminal mode, dropping its transient state.
     pub(super) fn close_launcher(&mut self) {
         self.mode = Mode::Terminal;
-        self.launcher = Launcher::default();
+        // What a project said no to outlives the launcher that asked.
+        let declined = std::mem::take(&mut self.launcher.declined);
+        self.launcher = Launcher {
+            declined,
+            ..Launcher::default()
+        };
         self.status = None;
     }
 
@@ -1014,6 +1103,73 @@ mod tests {
     /// row by the row's name (Cursor's runs a path that names nobody), a
     /// resume row by its command. A shell, a command line and a sandbox —
     /// which cannot read the file — get none.
+    /// Picking an agent for a project with none of tutti's hooks for it, the
+    /// user having none either, asks first: `y` installs them into the
+    /// project and runs the pick, `n` runs it without and settles it for
+    /// that project, and any other key goes back to the list. A resume row
+    /// is asked about by its command's agent. An agent tutti ships nothing
+    /// for is not asked about, nor one whose hooks the user has.
+    #[test]
+    fn picking_an_agent_asks_to_install_a_projects_missing_hooks() {
+        use crate::integrations::{self, Dirs};
+        let tree = temp_tree(&["home", "api", "web"]);
+        let (home, api, web) = (tree.join("home"), tree.join("api"), tree.join("web"));
+        let user = Dirs {
+            home: Some(home.clone()),
+            ..Dirs::default()
+        };
+        let mut app = App::new();
+        app.set_local(|local| local.dirs = user.clone());
+        attached(&mut app);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let pick = |app: &mut App, dir: &Path, row: LauncherRow| {
+            app.open_launcher(false, Some("api".into()), Some(dir));
+            app.launcher.rows = vec![row];
+            app.launcher.selected = 0;
+            app.on_key(enter)
+        };
+        let claude = || agent_row("claude", true);
+
+        assert!(pick(&mut app, &api, claude()).is_empty(), "asked first");
+        let asked = ("Claude Code hooks", ".claude/settings.json".to_string());
+        assert_eq!(app.launcher_offer(), Some(asked));
+        assert!(app.on_key(plain('x')).is_empty());
+        assert!(app.launcher_offer().is_none() && app.mode == Mode::Launcher);
+
+        app.on_key(enter);
+        let Request::PaneRun { cmd, .. } = only_request(&app.on_key(plain('y'))) else {
+            panic!("y runs the pick");
+        };
+        assert_eq!(cmd, ["claude"]);
+        let written = std::fs::read_to_string(api.join(".claude/settings.json")).unwrap();
+        assert!(written.contains("tutti agent-event claude"));
+        assert!(
+            app.transient()
+                .unwrap()
+                .starts_with("Claude Code hooks installed into")
+        );
+        assert!(!pick(&mut app, &api, claude()).is_empty(), "they are there");
+
+        assert!(pick(&mut app, &web, claude()).is_empty());
+        assert!(!app.on_key(plain('n')).is_empty(), "n runs it without");
+        assert!(!web.join(".claude").exists());
+        assert!(!pick(&mut app, &web, claude()).is_empty(), "web said no");
+
+        let resume = LauncherRow {
+            name: "fix the tests".into(),
+            role: "codex".into(),
+            kind: LaunchKind::Resume(vec!["/opt/bin/codex".into(), "resume".into()]),
+            available: true,
+        };
+        assert!(pick(&mut app, &web, resume).is_empty());
+        assert_eq!(app.launcher_offer().unwrap().0, "Codex hooks");
+
+        assert!(!pick(&mut app, &web, agent_row("crush", true)).is_empty());
+        let gemini = Integration::GeminiHooks.plan(&user).unwrap();
+        integrations::apply(&gemini).unwrap();
+        assert!(!pick(&mut app, &web, agent_row("gemini", true)).is_empty());
+    }
+
     #[test]
     fn an_agent_with_a_source_file_starts_behind_it_locally() {
         let sourced = "[agents.claude]\nsource = \"/h/secrets.sh\"\n\n\

@@ -76,6 +76,19 @@ command rows run `sh`. Adding a project (`a` in the sidebar) opens the launcher
 for the new project's first pane too — `esc` there just drops you into a shell.
 (Startup `[[projects]]` still mount plain shells, no launcher.)
 
+### A project without tutti's hooks
+
+Pick an agent — or one of its resume rows — for a project that has none of
+tutti's [hooks](agents.md) for it, when your user config has none either, and
+the launcher asks before it starts: `no Claude Code hooks in this project:
+install into .claude/settings.json?` `y` (or `enter`) installs them into the
+project, as the [setup panel](#setup-panel) would on its project scope, and
+runs the pick, so the agent starts with them. `n` runs it without, and the
+launcher does not ask again for that project until you reattach. `esc` goes
+back to the list. Without the hooks tutti reads the agent's state off its
+screen and cannot bring its conversation back after a restart. A sandbox's
+agent and one an issue is deployed to are not asked about.
+
 ### Resume rows
 
 At the foot of the panel sit **resume rows** — `resume   claude · 2h · <first

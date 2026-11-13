@@ -1639,10 +1639,23 @@ fn draw_launcher(frame: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(i, row)| launcher_line(i, row, i == selected))
         .collect();
-    if let Some(next) = app.launcher_tab_hint() {
-        lines.push(popup_key_line("tab", &format!("run in {next}")));
+    // While the launcher asks about a project's missing hooks, its keys are
+    // the question's.
+    if let Some((label, file)) = app.launcher_offer() {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            format!("   no {label} in this project: install into {file}?"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        lines.push(popup_key_line("y", "install, then run"));
+        lines.push(popup_key_line("n", "run without them"));
+        lines.push(popup_key_line("esc", "back"));
+    } else {
+        if let Some(next) = app.launcher_tab_hint() {
+            lines.push(popup_key_line("tab", &format!("run in {next}")));
+        }
+        lines.push(popup_key_line("esc", "cancel"));
     }
-    lines.push(popup_key_line("esc", "cancel"));
     draw_centered_popup(frame, area, &app.launcher_title(), lines);
 }
 

@@ -21,6 +21,12 @@ const SETUP: [(Integration, &str); 7] = [
     (Integration::ShellInit, "shell integration"),
 ];
 
+/// The name `integration` goes by in the setup panel.
+pub(super) fn label(integration: Integration) -> &'static str {
+    let row = SETUP.iter().find(|(shipped, _)| *shipped == integration);
+    row.map_or("", |(_, label)| label)
+}
+
 /// The setup panel's state, made afresh each time the panel opens: it means
 /// something only in `Mode::Integrations`.
 #[derive(Default)]

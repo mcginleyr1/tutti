@@ -21,7 +21,7 @@ use crate::hooks;
 pub const SKILL: &str = include_str!("../../../skills/tutti/SKILL.md");
 
 /// An integration tutti installs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Integration {
     /// Claude Code hooks in settings.json, running `tutti agent-event claude`.
     ClaudeHooks,
@@ -177,6 +177,19 @@ pub struct Change {
 }
 
 impl Integration {
+    /// What wires the agent of kind `agent` to tutti: its hooks, or
+    /// opencode's plugin. `None` for an agent tutti ships nothing for.
+    pub fn of_agent(agent: &str) -> Option<Integration> {
+        Some(match agent {
+            "claude" => Integration::ClaudeHooks,
+            "codex" => Integration::CodexHooks,
+            "gemini" => Integration::GeminiHooks,
+            "antigravity" => Integration::AntigravityHooks,
+            "opencode" => Integration::OpencodePlugin,
+            _ => return None,
+        })
+    }
+
     /// Inspect this integration's file under `dirs` and plan its install:
     /// reads that one file, writes nothing. Errs only when the file cannot be
     /// named (no `$HOME` for a user install); a file that cannot be read is a

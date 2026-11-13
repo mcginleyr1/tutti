@@ -284,7 +284,19 @@ impl App {
 
     /// An app whose daemon runs on this machine.
     pub fn with_config(config: Config) -> Self {
-        let host = Host::Local(std::sync::Arc::new(Local::from_env(config.clone())));
+        #[allow(unused_mut)]
+        let mut local = Local::from_env(config.clone());
+        // A test's app has no home until the test gives it one (`set_local`):
+        // what it does must not turn on the integrations of whoever runs it.
+        #[cfg(test)]
+        {
+            let shell = local.dirs.shell.take();
+            local.dirs = crate::integrations::Dirs {
+                shell,
+                ..Default::default()
+            };
+        }
+        let host = Host::Local(std::sync::Arc::new(local));
         let info = host.info().expect("this machine describes itself");
         Self::with_host(config, host, info)
     }

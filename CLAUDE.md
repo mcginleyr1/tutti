@@ -339,6 +339,7 @@ cargo fmt --all --check
   left running across a by-hand `cargo install` — is not noticed. End users
   get the non-killing flow documented in docs/install.md ("Upgrading").
 - Installs — `hooks … --install`, `skill --install`, the setup panel (prefix
-  `i`) — all go through `tutti::integrations`: plan, confirm, then `apply`
+  `i`), the launcher's question about a project's missing hooks — all go
+  through `tutti::integrations`: plan, confirm, then `apply`
   with a backup and a changed-since-inspected guard. Never write
   `~/.claude/settings.json` (or the plugin and skill files) outside that flow.
