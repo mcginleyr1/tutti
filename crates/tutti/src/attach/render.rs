@@ -481,9 +481,11 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
     // A blank spacer above the waiting header whenever tree rows precede it, so
     // the sections breathe. Mirrored by `Sidebar::waiting_divider_row` — the
     // click arithmetic counts this row too.
+    let tree_rows = lines.len();
     if !sidebar.projects_collapsed && tree_count > 0 {
         lines.push(Line::default());
     }
+    let waiting_at = lines.len();
     lines.push(section_header(
         sidebar.waiting_collapsed,
         "waiting",
@@ -506,8 +508,33 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, spinner: char) {
             }
         }
     }
+    // Each section is a card: the projects in the accent while the sidebar
+    // holds the keys there, the waiting queue in its most urgent agent's
+    // state.
+    let rows = |from: usize, to: usize| {
+        Rect::new(area.x, area.y + from as u16, w, (to - from) as u16).intersection(area)
+    };
+    let in_tree = selected < tree_count;
+    let waiting = sidebar.entries.iter().skip(tree_count);
+    let urgent = waiting
+        .filter_map(|entry| match entry {
+            SidebarEntry::Agent(a) => Some(a.state),
+            SidebarEntry::Workspace(_) => None,
+        })
+        .min_by_key(|state| *state != AgentState::Blocked);
+    let ground = theme::current().panel_bg;
+    let hue = (focused && in_tree).then(accent);
+    card(frame, rows(0, tree_rows), hue, focused && in_tree, ground);
+    let hue = pane_hue(focused && !in_tree, urgent);
+    card(
+        frame,
+        rows(waiting_at, lines.len()),
+        hue,
+        focused && !in_tree,
+        ground,
+    );
     frame.render_widget(Paragraph::new(lines), area);
-    if app.sidebar_focused() {
+    if app.sidebar_focused() && !host::lined() {
         draw_focus_rail(frame, area);
     }
 
@@ -574,6 +601,15 @@ fn draw_diff_panel(frame: &mut Frame, app: &App, area: Rect) {
             sel,
         ));
     }
+    // The files and the turns are a card each, in the accent while the
+    // panel holds the keys there.
+    let rows = |from: usize, to: usize| {
+        Rect::new(area.x, area.y + from as u16, area.width, (to - from) as u16).intersection(area)
+    };
+    let ground = theme::current().panel_bg;
+    let lit = focused && !in_turns;
+    card(frame, rows(0, lines.len()), lit.then(accent), lit, ground);
+    let turns_at = lines.len() + 1;
     if !turns.is_empty() {
         let total = app
             .turns_pane()
@@ -586,9 +622,17 @@ fn draw_diff_panel(frame: &mut Frame, app: &App, area: Rect) {
             let sel = focused && selected == files.len() + j;
             lines.push(bare_row(turn_inner(turn, now, sel, content_w), sel));
         }
+        let lit = focused && in_turns;
+        card(
+            frame,
+            rows(turns_at, lines.len()),
+            lit.then(accent),
+            lit,
+            ground,
+        );
     }
     frame.render_widget(Paragraph::new(lines), area);
-    if focused {
+    if focused && !host::lined() {
         draw_focus_rail(frame, area);
     }
 }
@@ -1189,28 +1233,17 @@ fn draw_pane(frame: &mut Frame, app: &App, pane: PaneId, rect: Rect, spinner: ch
         || pane_title_line(&placeholder_title(pane), focused, spinner),
         |s| pane_title_line(&s.info, focused, spinner),
     );
-    fill(frame, title_row, pane_strip(focused, pane_state));
+    // A terminal that draws lines on cell edges frames the whole rect, title
+    // and all, at no cost in cells; elsewhere a frame of box characters
+    // takes the rows below the title.
+    let ground = theme::current().pane_bg;
+    card(frame, rect, pane_hue(focused, pane_state), focused, ground);
     frame.render_widget(Paragraph::new(title), title_row);
     let id = Line::from(Span::styled(format!("#{} ", pane.0), dim()));
     frame.render_widget(Paragraph::new(id.right_aligned()), title_row);
 
-    // A terminal that draws lines on cell edges frames the whole rect, title
-    // and all, at no cost in cells; elsewhere a frame of box characters
-    // takes the rows below the title.
     let inner = screen_rect(rect);
-    if host::lined() {
-        let stroke = host::Stroke {
-            color: pane_hue(focused, pane_state).unwrap_or(theme::current().line()),
-            wide: focused,
-        };
-        let ground = theme::current().pane_bg.unwrap_or(Color::Reset);
-        host::outline(rect, stroke, host::ROUND_ALL, ground);
-        let under = host::Stroke {
-            wide: false,
-            ..stroke
-        };
-        host::rule(title_row, under);
-    } else {
+    if !host::lined() {
         let frame_rect = Rect::new(rect.x, rect.y + 1, rect.width, rect.height - 1);
         let block = Block::default()
             .borders(Borders::ALL)
@@ -2422,14 +2455,33 @@ fn pane_chip(focused: bool, state: Option<AgentState>) -> Style {
     }
 }
 
-/// The ground of a pane's title row: a tint of its hue, where the theme
-/// knows its colours well enough to mix one.
-fn pane_strip(focused: bool, state: Option<AgentState>) -> Style {
-    let amount = if focused { 0.16 } else { 0.1 };
-    let hue = pane_hue(focused, state).unwrap_or(theme::current().line());
-    match theme::tint(hue, amount) {
-        Some(tint) => Style::default().bg(tint),
-        None => Style::default(),
+/// Make `area` a card in `hue` (the frame colour without one), its first
+/// row the header: a tint of the hue under that row, where the theme knows
+/// its colours well enough to mix one, and — where the terminal draws lines
+/// on cell edges — a rounded outline over `ground`, heavier on the focused
+/// card, with a rule under the header. Drawn before the card's rows, whose
+/// own backgrounds go over the tint.
+fn card(frame: &mut Frame, area: Rect, hue: Option<Color>, focused: bool, ground: Option<Color>) {
+    if area.is_empty() {
+        return;
+    }
+    let color = hue.unwrap_or(theme::current().line());
+    let header = Rect::new(area.x, area.y, area.width, 1);
+    if let Some(tint) = theme::tint(color, if focused { 0.16 } else { 0.1 }) {
+        fill(frame, header, Style::default().bg(tint));
+    }
+    if host::lined() {
+        let stroke = host::Stroke {
+            color,
+            wide: focused,
+        };
+        host::outline(
+            area,
+            stroke,
+            host::ROUND_ALL,
+            ground.unwrap_or(Color::Reset),
+        );
+        host::rule(header, host::Stroke { color, wide: false });
     }
 }
 
@@ -3924,6 +3976,19 @@ mod tests {
         app.mode = Mode::Help;
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         assert!(!host::is_lined(Position::new(20, 2)), "the help covers it");
+
+        // The sidebar's sections are cards too, a column clear of the panes'.
+        let app = app_two_workspaces();
+        let (sidebar, panes, _) = app.regions(Rect::new(0, 2, 100, 13));
+        let sidebar = sidebar.unwrap();
+        assert_eq!(panes.x, sidebar.right() + 1);
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let header = row_containing(terminal.backend().buffer(), "waiting") as u16;
+        for at in [(0, 2), (sidebar.right() - 1, 2), (0, header), (panes.x, 2)] {
+            assert!(host::is_lined(Position::from(at)), "{at:?} is lined");
+        }
+        assert!(!host::is_lined(Position::new(sidebar.right(), 2)));
     }
 
     #[test]

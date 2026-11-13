@@ -1302,10 +1302,19 @@ impl App {
     /// region, and the changed-files panel (when shown) carved off the pane
     /// region's right edge. The single source of truth for both chrome columns.
     pub(super) fn split_content(&self, content: Rect) -> (Option<Rect>, Rect, Option<Rect>) {
+        // Where the terminal draws frames on cell edges, a panel's card and
+        // a pane's would stand line against line: a column parts them.
+        let gap = u16::from(super::host::lined());
         let (sidebar, mut panes) = if self.sidebar_shown(content.width) {
             let w = SIDEBAR_WIDTH.min(content.width);
             let sidebar = Rect::new(content.x, content.y, w, content.height);
-            let panes = Rect::new(content.x + w, content.y, content.width - w, content.height);
+            let past = (w + gap).min(content.width);
+            let panes = Rect::new(
+                content.x + past,
+                content.y,
+                content.width - past,
+                content.height,
+            );
             (Some(sidebar), panes)
         } else {
             (None, content)
@@ -1313,7 +1322,7 @@ impl App {
         let diff_panel = if self.diff_panel_shown(content.width) {
             let w = DIFF_PANEL_WIDTH.min(panes.width);
             let panel = Rect::new(panes.x + panes.width - w, panes.y, w, panes.height);
-            panes.width -= w;
+            panes.width = panes.width.saturating_sub(w + gap);
             Some(panel)
         } else {
             None

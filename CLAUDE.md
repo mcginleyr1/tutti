@@ -269,10 +269,12 @@ cargo fmt --all --check
   Red/yellow/green are also on state dots and the working spinner, and, as
   diff polarity, on `+`/`−` stats and bars (changes panel, sidebar stat,
   footer). Metadata stays dim; names (projects, agents, the active workspace
-  in the footer) stay at full intensity — don't re-dim them. Chrome panels
-  are borderless (lowercase bold-dim section headers, no box-drawing
-  frames); pane frames are the only boxes. Caps are reserved for the
-  footer's mode chip — nothing else in the chrome is uppercase.
+  in the footer) stay at full intensity — don't re-dim them. A pane and each
+  section of a chrome panel is a card (`card`, render.rs): a tint under its
+  header row and, where the terminal draws lines, an outline. Chrome panels
+  never take box-drawing frames (lowercase bold-dim section headers); pane
+  frames are the only boxes. Caps are reserved for the footer's mode chip —
+  nothing else in the chrome is uppercase.
 - **A frame is lines where the terminal draws them** (`host::lined`, the
   cell-border protocol): `host::outline`/`rule` note a frame's lined cells
   and `Host::draw` sends what changed. Three things keep it honest:
@@ -282,8 +284,8 @@ cargo fmt --all --check
   - **Whatever draws over lined cells takes the lines off** (`clear`, or
     `host::unline` beside a bare `Clear`), as it resets a pane cell's bits.
   - **Geometry asks `host::lined`** in `screen_rect`, `compute_rects`
-    (`GUTTER`) and `boundary_at` only; nothing else may assume a frame's
-    cells.
+    (`GUTTER`), `split_content` (the column between a panel's card and the
+    panes') and `boundary_at` only; nothing else may assume a frame's cells.
 - The `terminal` theme paints **no background of its own** — it draws over the
   terminal's default so it tracks the terminal's own light/dark scheme live
   (the same mechanism that keeps pane interiors in step). Its only painted

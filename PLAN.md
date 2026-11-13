@@ -146,10 +146,10 @@ is deliberately left undone.
 ### Headline items
 
 - the look the cell-border protocol opens up (2026-11-13) stops at the
-  panes: the sidebar's sections and the changes panel are not cards yet,
-  popups still frame themselves in box characters, and no field is
-  underlined nor button outlined. `host::outline`/`rule` are there to draw
-  them with;
+  panes and the two panels' cards: popups still frame themselves in box
+  characters, no field is underlined nor button outlined, and the sidebar's
+  selected row and state words are as they were. `host::outline`/`rule` are
+  there to draw them with;
 - the daemon is no multiplexer for the cell-border protocol: `pane attach`
   hands a pane's query on to the terminal (`Verdict::Ask`, pty.rs), whose
   answer the program acts on though the daemon keeps none of its lines. It

@@ -39,8 +39,12 @@ attach — a pane's frame is lines on the edges of its own cells, around the
 title row and all: no row or column of box characters, so each pane shows
 two rows more. Panes then stand a small gutter apart (two columns, one row),
 which is where the mouse grabs a split's border, and the rule under the app
-bar is a line on the bar's own edge. Everywhere else the frame is box
-characters under the title row, as before.
+bar is a line on the bar's own edge. The sidebar's two sections and the
+changes panel's files and turns are framed the same way, each a card under
+its header: in the accent while it holds the keys, and the waiting queue in
+red while an agent in it is blocked (green when all it holds is done).
+Everywhere else a pane's frame is box characters under its title row, as
+before, and the panels have none.
 
 The
 **footer** earns its row: in terminal mode it shows where you are (an accent
