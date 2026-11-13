@@ -158,10 +158,11 @@ shared across presets and override the defaults on top (e.g. set
 ## Colours and themes
 
 **Colour.** The default `theme = "terminal"` takes its colours from your
-terminal: everything renders dim, one accent (terminal blue) marks the
-focused/active thing — the focused pane's frame and title, the focused panel's
-header, the `▎` gutter and name chip on a selected row — the red/yellow/green
-state dots say what agents are doing, and green/red `+`/`−` carry diff polarity
+terminal: metadata renders dim, one accent (terminal blue) marks the
+focused/active thing — the focused panel's header, the `▎` gutter and name
+chip on a selected row, the focused pane when its agent has nothing to say —
+red/yellow/green are what agents are doing, on the state dots and on each
+pane's frame, name chip and tint, and green/red `+`/`−` carry diff polarity
 in the changes panel, sidebar stat, and footer. The chrome paints no background
 of its own — it draws over your terminal's default, so it follows your
 terminal's light/dark scheme live, the same way the agent panes do.
@@ -184,6 +185,13 @@ reports a light/dark switch (mode 2031). If it is, the highlight uses ANSI
 7 (white) rather than ANSI 8 (bright black), which some light schemes set to
 pure black. On a terminal that reports no switches, that choice lasts until
 you reattach. There is nothing to configure.
+
+**Pane tints.** The tint under a pane's title row, its name chip and its
+ground is its colour mixed into the terminal's background, so tutti needs both
+as RGB: with the background it asks the terminal for the ANSI colours it draws
+in (OSC 4: red, green, yellow, blue and the two greys), and again on each
+light/dark switch, so the tints follow the scheme too. A terminal that does not
+answer gets no tints: the colour then shows on the frame and the name alone.
 
 ## Icons
 

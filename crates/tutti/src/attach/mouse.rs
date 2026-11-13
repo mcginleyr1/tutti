@@ -6,9 +6,10 @@
 use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use rtty_vt::input::{self, Button, Code, Key, Mouse};
-use tutti_core::{Frame as WireFrame, PaneId, Request};
+use tutti_core::{Direction, Frame as WireFrame, PaneId, Request};
 
-use super::app::{App, Mode, contains, control, inner_size};
+use super::app::{App, GUTTER, Mode, contains, control, inner_size, screen_rect};
+use super::host;
 use super::layout::Boundary;
 
 const MOUSE_SCROLL_STEP: usize = 3;
@@ -287,11 +288,21 @@ impl App {
     /// with no gap, each drawing its own frame, so those are the two cells that
     /// meet there: the frame column on either side of side-by-side panes, the
     /// upper pane's bottom frame row and the lower pane's title row of stacked
-    /// ones. Where two boundaries cross, the outer split's wins.
+    /// ones. Where two boundaries cross, the outer split's wins. Frames the
+    /// terminal draws on cell edges have no cells of their own: the border
+    /// is then the gutter the first pane leaves (`App::compute_rects`).
     fn boundary_at(&self, col: u16, row: u16) -> Option<Boundary> {
         self.boundaries.iter().copied().find(|b| {
             let along = b.along(col, row);
-            contains(b.area, col, row) && (along == b.at || along + 1 == b.at)
+            let gutter = match b.direction {
+                Direction::Horizontal => GUTTER.0,
+                Direction::Vertical => GUTTER.1,
+            };
+            let grabs = match host::lined() {
+                false => along == b.at || along + 1 == b.at,
+                true => along < b.at && b.at <= along + gutter,
+            };
+            contains(b.area, col, row) && grabs
         })
     }
 
@@ -399,7 +410,7 @@ impl App {
     fn pane_cell_at(&self, col: u16, row: u16) -> Option<(PaneId, u16, u16)> {
         let (pane, rect) = self.rects.iter().find(|(_, r)| contains(*r, col, row))?;
         let (rows, cols) = inner_size(*rect);
-        let (x0, y0) = (rect.x + 1, rect.y + 2);
+        let (x0, y0) = (screen_rect(*rect).x, screen_rect(*rect).y);
         if col < x0 || row < y0 {
             return None;
         }
@@ -417,8 +428,9 @@ impl App {
             .find(|(p, _)| *p == pane)
             .map(|(_, r)| *r)?;
         let (rows, cols) = self.cell_bounds(pane, rect);
-        let c = col.saturating_sub(rect.x + 1).min(cols - 1);
-        let r = row.saturating_sub(rect.y + 2).min(rows - 1);
+        let screen = screen_rect(rect);
+        let c = col.saturating_sub(screen.x).min(cols - 1);
+        let r = row.saturating_sub(screen.y).min(rows - 1);
         Some((r, c))
     }
 
@@ -941,6 +953,38 @@ mod tests {
         );
         assert_eq!(app.focused, Some(PaneId(1)));
         assert!(app.selection_span(PaneId(2)).is_none());
+    }
+
+    /// Where the terminal draws frames on cell edges, a pane's screen is its
+    /// rect below the title but for a column either side, and a split's
+    /// border to grab is the gutter its first pane leaves.
+    #[test]
+    fn lined_frames_leave_a_gutter_that_grabs_the_border() {
+        struct Lined;
+        impl Drop for Lined {
+            fn drop(&mut self) {
+                host::set_lined(false);
+            }
+        }
+        host::set_lined(true);
+        let _lined = Lined;
+        assert_eq!(screen_rect(Rect::new(4, 2, 20, 10)), Rect::new(5, 3, 18, 9));
+        assert_eq!(inner_size(Rect::new(4, 2, 20, 10)), (9, 18));
+
+        let app = border_fixture(Direction::Horizontal);
+        let side_by_side = vec![
+            (PaneId(1), Rect::new(0, 2, 48, 21)),
+            (PaneId(2), Rect::new(50, 2, 50, 21)),
+        ];
+        assert_eq!(app.rects, side_by_side);
+        assert!(app.boundary_at(48, 10).is_some() && app.boundary_at(49, 10).is_some());
+        assert!(app.boundary_at(47, 10).is_none() && app.boundary_at(50, 10).is_none());
+        assert_eq!(app.pane_cell_at(1, 3), Some((PaneId(1), 0, 0)));
+        assert_eq!(app.pane_cell_at(0, 3), None, "the column beside the line");
+
+        let app = border_fixture(Direction::Vertical);
+        assert_eq!(app.rects[0].1, Rect::new(0, 2, 100, 10));
+        assert!(app.boundary_at(30, 12).is_some() && app.boundary_at(30, 13).is_none());
     }
 
     #[test]

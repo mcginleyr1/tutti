@@ -137,6 +137,7 @@ fn attach(conn: &mut Connection, host: Host, config: Config, startup: Startup) -
     };
     enter(modes);
     emit_terminal(reader::ASK_KEYBOARD);
+    emit_terminal(reader::ASK_LINES);
     let asked = scheme.then(|| {
         let (asked, query) = Asked::ask(None, None);
         emit_terminal(&query);
@@ -414,7 +415,7 @@ fn event_loop(
             // The terminal is gone.
             Err(RecvTimeoutError::Disconnected) => return Ok(false),
         }
-        let mut told = None;
+        let (mut told, mut ansi) = (None, [None; 16]);
         for input in inputs {
             match input {
                 Input::Key(key, report) => {
@@ -440,6 +441,12 @@ fn event_loop(
                     tty.modes.keys = app.key_flags();
                     push_keys(tty.modes.keys);
                 }
+                // The terminal draws lines on cell edges: frames stop
+                // costing cells, so every pane is laid out and sized anew.
+                Input::Lines(features) if features.iter().any(|f| f == "rect") => {
+                    host::set_lined(true);
+                    dirty = true;
+                }
                 // The terminal turned light or dark: the chrome follows at
                 // once, and the panes once its colours are in.
                 Input::Scheme(dark) if tty.modes.scheme => {
@@ -451,18 +458,19 @@ fn event_loop(
                 }
                 input => {
                     if let Some(done) = tty.asked.as_mut().and_then(|asked| asked.take(&input)) {
-                        tty.asked = None;
+                        ansi = tty.asked.take().map_or(ansi, |asked| asked.ansi);
                         told = done.or(told);
                     }
                 }
             }
         }
         if let Some(done) = tty.asked.as_ref().and_then(Asked::expired) {
-            tty.asked = None;
+            ansi = tty.asked.take().map_or(ansi, |asked| asked.ansi);
             told = done.or(told);
         }
         if let Some(colors) = told {
             theme::set_light(!colors.dark);
+            theme::set_terminal(colors.bg, ansi);
             let _ = conn.send(&control(&Request::HostColors(colors)));
             dirty = true;
         }

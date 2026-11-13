@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use rtty_vt::{Attrs, Color as VtColor, Row, Terminal};
 use tutti_core::{AgentState, Checkpoint, Note, NoteKind, PaneId, PaneInfo, SubagentInfo};
 
-use super::app::{App, Mode};
+use super::app::{App, Mode, screen_rect};
 use super::deploy::IssueRow;
 use super::host;
 use super::launcher::LauncherRow;
@@ -141,6 +141,7 @@ fn fill(frame: &mut Frame, rect: Rect, style: Style) {
 /// back to the terminal's own ground under a truecolor theme).
 fn clear(frame: &mut Frame, rect: Rect, bg: Option<Color>) {
     frame.render_widget(Clear, rect);
+    host::unline(rect);
     fill(frame, rect, theme::current().ground(bg));
 }
 
@@ -149,7 +150,7 @@ fn clear(frame: &mut Frame, rect: Rect, bg: Option<Color>) {
 /// floating panel.
 pub fn draw(frame: &mut Frame, app: &App) {
     let _theme = theme::activate(app.config().theme);
-    host::clear_links();
+    host::begin();
     let area = frame.area();
     if area.height == 0 {
         return;
@@ -281,10 +282,19 @@ fn census_spans(app: &App, spinner: char) -> Vec<Span<'static>> {
     spans
 }
 
-/// The full-width dim rule under the app bar.
+/// The full-width dim rule under the app bar: a line on the bar's own
+/// bottom edge where the terminal draws those, leaving the row beneath it
+/// clear above the panes.
 fn draw_rule(frame: &mut Frame, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
+    }
+    if host::lined() {
+        let stroke = host::Stroke {
+            color: theme::current().line(),
+            wide: false,
+        };
+        return host::rule(Rect::new(area.x, area.y - 1, area.width, 1), stroke);
     }
     let rule = "─".repeat(area.width as usize);
     frame.render_widget(Paragraph::new(Line::from(Span::styled(rule, dim()))), area);
@@ -1161,6 +1171,9 @@ fn draw_sidebar_prompt(
     );
 }
 
+/// How much of a pane's hue its ground takes.
+const PANE_TINT: f32 = 0.05;
+
 fn draw_pane(frame: &mut Frame, app: &App, pane: PaneId, rect: Rect, spinner: char) {
     if rect.width < 2 || rect.height < 3 {
         return;
@@ -1169,22 +1182,42 @@ fn draw_pane(frame: &mut Frame, app: &App, pane: PaneId, rect: Rect, spinner: ch
     let state = app.panes.get(&pane);
     let pane_state = state.map(|s| s.info.state);
 
-    // The pane rect reserves its top row for the title line, which sits above
-    // the rounded frame; the frame fills the rows below it.
+    // The pane rect's top row is its title: the name chip in the pane's hue,
+    // then what it is doing, and its id at the far end.
     let title_row = Rect::new(rect.x, rect.y, rect.width, 1);
     let title = state.map_or_else(
         || pane_title_line(&placeholder_title(pane), focused, spinner),
         |s| pane_title_line(&s.info, focused, spinner),
     );
+    fill(frame, title_row, pane_strip(focused, pane_state));
     frame.render_widget(Paragraph::new(title), title_row);
+    let id = Line::from(Span::styled(format!("#{} ", pane.0), dim()));
+    frame.render_widget(Paragraph::new(id.right_aligned()), title_row);
 
-    let frame_rect = Rect::new(rect.x, rect.y + 1, rect.width, rect.height - 1);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(pane_border_style(focused, pane_state));
-    let inner = block.inner(frame_rect);
-    frame.render_widget(block, frame_rect);
+    // A terminal that draws lines on cell edges frames the whole rect, title
+    // and all, at no cost in cells; elsewhere a frame of box characters
+    // takes the rows below the title.
+    let inner = screen_rect(rect);
+    if host::lined() {
+        let stroke = host::Stroke {
+            color: pane_hue(focused, pane_state).unwrap_or(theme::current().line()),
+            wide: focused,
+        };
+        let ground = theme::current().pane_bg.unwrap_or(Color::Reset);
+        host::outline(rect, stroke, host::ROUND_ALL, ground);
+        let under = host::Stroke {
+            wide: false,
+            ..stroke
+        };
+        host::rule(title_row, under);
+    } else {
+        let frame_rect = Rect::new(rect.x, rect.y + 1, rect.width, rect.height - 1);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(pane_border_style(focused, pane_state));
+        frame.render_widget(block, frame_rect);
+    }
 
     if let Some(state) = state {
         draw_screen(
@@ -1198,6 +1231,20 @@ fn draw_pane(frame: &mut Frame, app: &App, pane: PaneId, rect: Rect, spinner: ch
             let (row, col) = state.term.cursor_position();
             if col < inner.width && row < inner.height {
                 frame.set_cursor_position((inner.x + col, inner.y + row));
+            }
+        }
+    }
+    // The pane's own ground takes a breath of its hue: every cell its
+    // program left at the default background.
+    let tint = pane_hue(focused, pane_state).and_then(|hue| theme::tint(hue, PANE_TINT));
+    if let Some(tint) = tint {
+        let ground = theme::current().pane_bg.unwrap_or(Color::Reset);
+        let body = Rect::new(rect.x, rect.y + 1, rect.width, rect.height - 1);
+        for at in body.positions() {
+            if let Some(cell) = frame.buffer_mut().cell_mut(at)
+                && cell.bg == ground
+            {
+                cell.bg = tint;
             }
         }
     }
@@ -1410,6 +1457,7 @@ fn draw_notification(frame: &mut Frame, app: &App, area: Rect) {
         accent()
     };
     frame.render_widget(Clear, area);
+    host::unline(area);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             msg.to_string(),
@@ -2329,27 +2377,60 @@ fn border_title(info: &PaneInfo, spinner: char) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The pane title line drawn above the frame: an accent `❯` marker when focused
-/// (else two dim spaces), then the `border_title` badge — dimmed whole when the
-/// pane is unfocused so only the focused pane's title reads loud.
+/// A pane's title row: the `border_title` badge with its name as a chip in
+/// the pane's hue (`pane_chip`) — the rest dimmed when the pane is unfocused,
+/// so only the focused pane's title reads loud.
 fn pane_title_line(info: &PaneInfo, focused: bool, spinner: char) -> Line<'static> {
-    let marker = if focused {
-        Span::styled(
-            "❯ ",
-            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::styled("  ", dim())
-    };
     let mut content = border_title(info, spinner);
     if !focused {
         for span in &mut content.spans {
             span.style = dim();
         }
     }
-    let mut spans = vec![marker];
-    spans.extend(content.spans);
-    Line::from(spans)
+    let name = &mut content.spans[0];
+    name.content = format!(" {} ", name.content).into();
+    name.style = pane_chip(focused, Some(info.state));
+    content
+}
+
+/// The colour a pane wears — its frame, its name chip, its title strip: its
+/// agent's state while that is one to notice, else the accent on the focused
+/// pane and none (the frame colour) on the rest.
+fn pane_hue(focused: bool, state: Option<AgentState>) -> Option<Color> {
+    let palette = theme::current();
+    match state {
+        Some(AgentState::Blocked) => Some(palette.blocked),
+        Some(AgentState::Working) => Some(palette.working),
+        Some(AgentState::Done) => Some(palette.done),
+        _ => focused.then_some(palette.accent),
+    }
+}
+
+/// A pane's name chip: a block of its hue on the focused pane; on the rest,
+/// its hue as the text over a tint of it.
+fn pane_chip(focused: bool, state: Option<AgentState>) -> Style {
+    let palette = theme::current();
+    let hue = pane_hue(focused, state);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    match (focused, hue) {
+        (true, hue) => bold.fg(palette.on_accent).bg(hue.unwrap_or(palette.accent)),
+        (false, Some(hue)) => match theme::tint(hue, 0.25) {
+            Some(tint) => bold.fg(hue).bg(tint),
+            None => bold.fg(hue),
+        },
+        (false, None) => dim(),
+    }
+}
+
+/// The ground of a pane's title row: a tint of its hue, where the theme
+/// knows its colours well enough to mix one.
+fn pane_strip(focused: bool, state: Option<AgentState>) -> Style {
+    let amount = if focused { 0.16 } else { 0.1 };
+    let hue = pane_hue(focused, state).unwrap_or(theme::current().line());
+    match theme::tint(hue, amount) {
+        Some(tint) => Style::default().bg(tint),
+        None => Style::default(),
+    }
 }
 
 /// A stand-in `PaneInfo` for a pane whose snapshot has not yet arrived, so its
@@ -2376,16 +2457,17 @@ fn placeholder_title(pane: PaneId) -> PaneInfo {
     }
 }
 
-/// A pane's border style: accent (bold) when focused; red when an unfocused
-/// pane's agent is blocked (the one place a state colour touches a border);
-/// dim otherwise.
+/// The style of a pane's frame of box characters: its hue (`pane_hue`), dim
+/// without one, and bold on the focused pane.
 fn pane_border_style(focused: bool, state: Option<AgentState>) -> Style {
+    let style = match pane_hue(focused, state) {
+        Some(hue) => Style::default().fg(hue),
+        None => theme::current().frame(),
+    };
     if focused {
-        Style::default().fg(accent()).add_modifier(Modifier::BOLD)
-    } else if state == Some(AgentState::Blocked) {
-        Style::default().fg(theme::current().blocked)
+        style.add_modifier(Modifier::BOLD)
     } else {
-        theme::current().frame()
+        style
     }
 }
 
@@ -2470,7 +2552,7 @@ mod tests {
             }
             let area = Rect::new(0, 0, 6, 1);
             let mut buf = Buffer::empty(area);
-            host::clear_links();
+            host::begin();
             draw_screen(&mut buf, area, &term, 0, None);
             buf
         };
@@ -2496,7 +2578,7 @@ mod tests {
         term.advance(b"\x1b]8;;https://example.com\x1b\\ab\x1b]8;;\x1b\\c");
         let area = Rect::new(0, 0, 6, 1);
         let mut buf = Buffer::empty(area);
-        host::clear_links();
+        host::begin();
         draw_screen(&mut buf, area, &term, 0, None);
         let marked =
             |x: usize| buf.content[x].diff_option == ratatui::buffer::CellDiffOption::AlwaysUpdate;
@@ -3315,10 +3397,16 @@ mod tests {
             Some(Color::Red),
             "an unfocused blocked pane border turns red"
         );
+        let blocked = pane_border_style(true, Some(AgentState::Blocked));
+        assert_eq!(blocked.fg, Some(Color::Red), "a blocked pane stays red");
+        assert!(
+            blocked.add_modifier.contains(Modifier::BOLD),
+            "the focus shows as the frame's weight"
+        );
         assert_eq!(
-            pane_border_style(true, Some(AgentState::Blocked)).fg,
-            Some(accent()),
-            "focus wins over the blocked red"
+            pane_border_style(false, Some(AgentState::Working)).fg,
+            Some(theme::TERMINAL.working),
+            "a working pane wears its state too"
         );
         assert!(
             pane_border_style(false, Some(AgentState::Idle))
@@ -3789,18 +3877,53 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let buf = terminal.backend().buffer();
-        // Content starts at row 2: the pane title line, then the frame's top
+        // Content starts at row 2: the pane's title row, then the frame's top
         // border on row 3.
         let title = row_text(buf, 2);
         assert!(
-            title.contains('❯'),
-            "focused pane marker missing: {title:?}"
+            title.starts_with(" shell "),
+            "pane title missing: {title:?}"
         );
-        assert!(title.contains("shell"), "pane title missing: {title:?}");
+        assert!(
+            title.trim_end().ends_with("#1"),
+            "pane id missing: {title:?}"
+        );
         assert!(
             row_text(buf, 3).contains('╭'),
             "the rounded frame should open on the row below the title"
         );
+    }
+
+    /// In a terminal that draws lines on cell edges a pane's frame is lines
+    /// around its whole rect, title and all — no box characters, no rows —
+    /// the app bar is ruled on its own bottom edge, and what floats over a
+    /// pane takes the lines off the cells it covers.
+    #[test]
+    fn a_lined_terminal_frames_a_pane_with_no_cells() {
+        struct Lined;
+        impl Drop for Lined {
+            fn drop(&mut self) {
+                host::set_lined(false);
+            }
+        }
+        host::set_lined(true);
+        let _lined = Lined;
+        let mut app = app_with_pane(b"HELLO");
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let text = buffer_text(buf);
+        assert!(!text.contains('╭') && !text.contains('─'), "{text}");
+        assert!(row_text(buf, 2).starts_with(" shell "));
+        assert!(row_text(buf, 3).starts_with(" HELLO"), "{text}");
+        for (x, y) in [(0, 2), (39, 2), (0, 6), (39, 6), (20, 2), (5, 0)] {
+            assert!(host::is_lined(Position::new(x, y)), "({x},{y}) is lined");
+        }
+        assert!(!host::is_lined(Position::new(5, 4)) && !host::is_lined(Position::new(5, 1)));
+
+        app.mode = Mode::Help;
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert!(!host::is_lined(Position::new(20, 2)), "the help covers it");
     }
 
     #[test]
@@ -4732,9 +4855,14 @@ mod tests {
                 "chrome at ({row},{col}) is on the panel shade"
             );
         }
-        // A pane's interior sits on the pane ground, its default text on the
-        // theme foreground.
-        assert_eq!(cells[5 * w + 60].bg, theme::DARK.pane_bg.unwrap());
+        // A pane's interior sits on the pane ground — the focused pane's with
+        // a breath of the accent in it — its default text on the theme
+        // foreground.
+        let tinted = {
+            let _dark = theme::activate(crate::config::Theme::Dark);
+            theme::tint(theme::DARK.accent, PANE_TINT).unwrap()
+        };
+        assert_eq!(cells[5 * w + 60].bg, tinted);
         assert_eq!(cells[5 * w + 60].fg, theme::DARK.fg.unwrap());
         // Metadata is an explicit muted colour — the DIM attribute is the
         // terminal theme's device.
@@ -4824,9 +4952,9 @@ mod tests {
         assert!(row_text(buf, newest).contains("now done"));
         let plus = col_of(buf, newest, "+3");
         assert_eq!(buf.content()[newest * w + plus].fg, theme::TERMINAL.added);
-        let start = row_text(buf, row_containing(buf, "#1"));
+        let start = row_text(buf, newest + 1);
         assert!(
-            start.contains("start") && !start.contains("+3"),
+            start.contains("#1") && start.contains("start") && !start.contains("+3"),
             "the first state has no diff to count: {start:?}"
         );
         assert!(
@@ -5030,22 +5158,55 @@ mod tests {
             workspace: None,
         };
         let focused = pane_title_line(&info, true, ' ');
+        let chip = &focused.spans[0];
+        assert_eq!(chip.content, " claude ");
         assert_eq!(
-            focused.spans[0].style.fg,
-            Some(accent()),
-            "the ❯ marker is accent"
+            (chip.style.bg, chip.style.fg),
+            (Some(theme::TERMINAL.done), Some(theme::TERMINAL.on_accent)),
+            "the focused pane's name is a block of its state's colour"
         );
-        assert!(
-            !focused.spans[1].style.add_modifier.contains(Modifier::DIM)
-                && focused.spans[1].style.add_modifier.contains(Modifier::BOLD),
-            "the focused pane's name reads at full intensity"
-        );
+        assert!(chip.style.add_modifier.contains(Modifier::BOLD));
         let unfocused = pane_title_line(&info, false, ' ');
+        assert_eq!(
+            (unfocused.spans[0].style.fg, unfocused.spans[0].style.bg),
+            (Some(theme::TERMINAL.done), None),
+            "an unfocused pane's name wears the colour as text"
+        );
         assert!(
             unfocused.spans[1]
                 .style
                 .add_modifier
                 .contains(Modifier::DIM)
         );
+        let idle = PaneInfo {
+            state: AgentState::Idle,
+            ..info
+        };
+        assert_eq!(
+            pane_title_line(&idle, true, ' ').spans[0].style.bg,
+            Some(accent())
+        );
+        assert_eq!(pane_title_line(&idle, false, ' ').spans[0].style, dim());
+    }
+
+    /// The tints under a chip and a title strip are mixed from colours known
+    /// as RGB: a truecolor theme's own, or the terminal's once it told them.
+    #[test]
+    fn tints_are_mixed_only_from_colours_known_as_rgb() {
+        assert_eq!(theme::tint(Color::Red, 0.5), None, "nothing told yet");
+        let wide = |v: u16| tutti_core::Rgb { r: v, g: v, b: v };
+        let mut ansi = [None; 16];
+        ansi[1] = Some(wide(0xffff));
+        theme::set_terminal(wide(0), ansi);
+        assert_eq!(
+            theme::tint(Color::Red, 0.5),
+            Some(Color::Rgb(128, 128, 128))
+        );
+        assert_eq!(theme::tint(Color::Green, 0.5), None, "a slot never told");
+        {
+            let _dark = theme::activate(crate::config::Theme::Dark);
+            let hue = theme::DARK.blocked;
+            assert!(matches!(theme::tint(hue, 0.1), Some(Color::Rgb(..))));
+        }
     }
 }

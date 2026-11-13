@@ -145,6 +145,16 @@ is deliberately left undone.
 
 ### Headline items
 
+- the look the cell-border protocol opens up (2026-11-13) stops at the
+  panes: the sidebar's sections and the changes panel are not cards yet,
+  popups still frame themselves in box characters, and no field is
+  underlined nor button outlined. `host::outline`/`rule` are there to draw
+  them with;
+- the daemon is no multiplexer for the cell-border protocol: `pane attach`
+  hands a pane's query on to the terminal (`Verdict::Ask`, pty.rs), whose
+  answer the program acts on though the daemon keeps none of its lines. It
+  should own the strings (`DCS 1 + b`) until it stores a pane's borders and
+  the TUI redraws them. This matters the day rtty answers the query;
 - under `--host`, the TUI's one-shot host questions still run on its event
   loop: expanding a submitted directory, the jj check, the launcher, setup
   plans and a deploy's argv. Each is one ssh round trip after a key that
@@ -311,6 +321,11 @@ milestone above names both (M1 and M2), and its own exit is unmarked too.
 
 ### Unverified live — cover these in the next live run
 
+- frames drawn as cell borders in a real terminal: the TUI's rectangle
+  commands, inside placement, rounded corners with their outside fill and
+  the cells a frame's writes wipe have only met a stand-in that models the
+  protocol (2026-11-13); and the pane tints against a real terminal's OSC 4
+  answers;
 - what the w12 review changed after its run: a fresh agent's 5 s grace
   then idle (a restored agent, one given no work); a detected agent's own
   idle or done report before any work; the footer-anchored dialog and idle

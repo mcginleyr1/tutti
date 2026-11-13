@@ -25,9 +25,22 @@ itself; a tab of plain shells carries none. After the session title the app
 bar also carries a census of agent states and the unread notification count:
 see [The census in the app bar](#the-census-in-the-app-bar).
 
-Each pane carries its **title on
-its own line above its rounded frame** — an
-accent `❯` plus the agent/state for the focused pane, dim for the rest.
+Each pane **wears a colour**: its agent's state while that is one to notice
+— red blocked, yellow working, green done — else the accent on the focused
+pane and a quiet grey on the rest. Its rounded frame is that colour, drawn
+heavier on the focused pane; its ground takes a faint tint of it; and its
+**title row** carries its name as a chip of it (a solid block on the focused
+pane), then what the agent is doing, with the pane's id (`#29`, the id `tutti
+pane …` takes) at the far end.
+
+**Frames that cost no cells.** In a terminal that speaks the
+[cell-border protocol](https://www.joshka.net/cell-borders/) — tutti asks at
+attach — a pane's frame is lines on the edges of its own cells, around the
+title row and all: no row or column of box characters, so each pane shows
+two rows more. Panes then stand a small gutter apart (two columns, one row),
+which is where the mouse grabs a split's border, and the rule under the app
+bar is a line on the bar's own edge. Everywhere else the frame is box
+characters under the title row, as before.
 
 The
 **footer** earns its row: in terminal mode it shows where you are (an accent

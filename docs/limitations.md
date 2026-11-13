@@ -34,6 +34,18 @@ part; [PLAN.md](../PLAN.md) tracks what is open.
   and 16) gets presses only, and its text derived from the key.
 - **The TUI follows light/dark only on terminals that report it** (mode
   2031). On one that doesn't, reattach after switching the OS theme.
+- **Frames that cost no cells need a terminal that draws them.** The
+  [cell-border protocol](https://www.joshka.net/cell-borders/) is a draft
+  only a Ghostty branch implements so far; everywhere else panes keep their
+  frames of box characters. tutti's own wire is unverified against a real
+  terminal: it has been drawn only by a stand-in that models the protocol's
+  rectangle commands.
+- **A program in a pane cannot draw cell borders in the TUI.** tutti's daemon
+  does not speak the protocol to its panes: their query goes unanswered, as
+  the protocol asks of a multiplexer, so they draw box characters. `pane
+  attach` is the exception, and a wrong one: it hands the query on to your
+  terminal, whose answer the program then acts on though the daemon keeps
+  none of the lines it draws.
 - **In rtty, an editor's move off tutti's edge always reads as made.** The
   TUI takes it on and `tutti pane focus` exits 0, even where rtty's own edge
   then stops it. An editor that does something of its own when tutti

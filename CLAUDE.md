@@ -257,21 +257,42 @@ cargo fmt --all --check
   - **The selection colour:** a light terminal selects with ANSI 7 instead of
     ANSI 8 (`theme::set_light`), because some light schemes (Ghostty
     "Primary") map ANSI 8 to pure black.
-- Dim by default; ONE accent marks the focused/active thing (focused pane frame
-  and title, the focused panel's header and the rail down its edge, the `▎`
-  gutter + name chip on a selected row); red/yellow/green on state dots, the working spinner, the
-  blocked border — and, as diff polarity, on `+`/`−` stats and bars (changes
-  panel, sidebar stat, footer). Names (projects, agents, the active workspace
-  in the footer) stay at full intensity — identity bright, metadata dim; don't
-  re-dim them. Chrome panels are borderless (lowercase bold-dim section
-  headers, no box-drawing frames); pane frames are the only boxes. Caps are
-  reserved for the footer's mode chip — nothing else in the chrome is uppercase.
+- **Colour means state, and a pane wears its agent's** (`pane_hue`,
+  render.rs; the user asked for this on 2026-11-13, replacing "dim by
+  default, one accent"): red blocked, yellow working, green done — on its
+  frame, its name chip, its title strip and a faint tint of its ground
+  (`PANE_TINT`). The accent is the focused pane's hue only when its agent
+  has none, and still marks the focused/active thing in the chrome (the
+  focused panel's header and the rail down its edge, the `▎` gutter + name
+  chip on a selected row). Focus on a pane shows as weight — a solid chip, a
+  wider line or bold frame — never by taking its state's colour away.
+  Red/yellow/green are also on state dots and the working spinner, and, as
+  diff polarity, on `+`/`−` stats and bars (changes panel, sidebar stat,
+  footer). Metadata stays dim; names (projects, agents, the active workspace
+  in the footer) stay at full intensity — don't re-dim them. Chrome panels
+  are borderless (lowercase bold-dim section headers, no box-drawing
+  frames); pane frames are the only boxes. Caps are reserved for the
+  footer's mode chip — nothing else in the chrome is uppercase.
+- **A frame is lines where the terminal draws them** (`host::lined`, the
+  cell-border protocol): `host::outline`/`rule` note a frame's lined cells
+  and `Host::draw` sends what changed. Three things keep it honest:
+  - **A written cell loses its lines** (the terminal's empty pen), so
+    `Host` forgets a cell's lines as it writes it and lines it again; tutti
+    never sets the pen.
+  - **Whatever draws over lined cells takes the lines off** (`clear`, or
+    `host::unline` beside a bare `Clear`), as it resets a pane cell's bits.
+  - **Geometry asks `host::lined`** in `screen_rect`, `compute_rects`
+    (`GUTTER`) and `boundary_at` only; nothing else may assume a frame's
+    cells.
 - The `terminal` theme paints **no background of its own** — it draws over the
   terminal's default so it tracks the terminal's own light/dark scheme live
   (the same mechanism that keeps pane interiors in step). Its only painted
   background is the selected row, in an **ANSI palette colour** (never RGB) so
   the terminal repaints it too on a scheme flip. Never put a fixed-RGB shade in
-  that palette — it would stay dark over a light terminal. The `dark`/`light`
+  that palette — it would stay dark over a light terminal. The one RGB it
+  draws is a pane's tint (`theme::tint`), mixed from the background and ANSI
+  colours the terminal itself told (`theme::set_terminal`, asked again on
+  each light/dark report) and absent until it has. The `dark`/`light`
   palettes are the opposite by design: fixed truecolor grounds (chrome a step
   apart from the pane ground, pane default colours re-grounded too) and an
   explicit muted grey instead of DIM — that is what the user opts into.

@@ -1,7 +1,8 @@
 //! The chrome's colour vocabulary, one `Palette` per theme. `terminal` (the
 //! default) is the palette-tracking look: no painted grounds, ANSI colours
 //! only, the DIM attribute for metadata — the terminal's own light/dark scheme
-//! flows through live and flips with it. `dark` and `light` are opt-in
+//! flows through live and flips with it. Its one RGB is a pane's tint
+//! (`tint`), mixed from colours the terminal told. `dark` and `light` are opt-in
 //! truecolor themes: a shaded chrome over a tinted pane ground, an explicit
 //! muted grey instead of DIM, and state/diff colours tuned to that ground. A
 //! theme is a fixed choice made in config. The one thing detected is the
@@ -71,6 +72,13 @@ impl Palette {
             Some(colour) => Style::default().fg(colour),
             None => self.dim(),
         }
+    }
+
+    /// The colour of a line drawn on cell edges that is nobody's hue: an
+    /// unfocused pane's frame, the rule under the app bar. A line cannot be
+    /// DIM, so the `terminal` theme takes the selection's grey.
+    pub fn line(&self) -> Color {
+        self.border.unwrap_or(self.select_bg)
     }
 
     /// The style that paints a ground: the theme foreground over `bg`. Empty
@@ -214,8 +222,45 @@ pub fn palette(theme: Theme) -> &'static Palette {
     }
 }
 
+/// A terminal's background and its ANSI colours, those it told.
+type Told = ([u8; 3], [Option<[u8; 3]>; 16]);
+
 thread_local! {
     static CURRENT: Cell<&'static Palette> = const { Cell::new(&TERMINAL) };
+    /// The terminal's own colours, as it last told them (`set_terminal`).
+    static TOLD: Cell<Option<Told>> = const { Cell::new(None) };
+}
+
+/// The terminal told its background and the ANSI colours asked of it
+/// (`reader::Asked`): what the `terminal` theme mixes its tints from. It is
+/// asked again on each light/dark flip, so the tints follow the scheme as
+/// the palette colours do.
+pub fn set_terminal(bg: Rgb, ansi: [Option<Rgb>; 16]) {
+    let narrow = |c: Rgb| [(c.r >> 8) as u8, (c.g >> 8) as u8, (c.b >> 8) as u8];
+    TOLD.set(Some((narrow(bg), ansi.map(|slot| slot.map(narrow)))));
+}
+
+/// `color` let into the pane ground by `amount`: the ground of a chip or a
+/// title strip in a pane's hue. `None` where the two are not both known as
+/// RGB — on the `terminal` theme, until the terminal has told its colours —
+/// and the hue then shows as text and lines alone.
+pub fn tint(color: Color, amount: f32) -> Option<Color> {
+    let told = TOLD.get();
+    let rgb = |color| match color {
+        Color::Rgb(r, g, b) => Some([r, g, b]),
+        Color::Reset => None,
+        Color::Indexed(n) => told?.1.get(usize::from(n)).copied().flatten(),
+        named => told?.1[usize::from(super::host::named_index(named))],
+    };
+    let ground = match current().pane_bg {
+        Some(ground) => rgb(ground)?,
+        None => told?.0,
+    };
+    let color = rgb(color)?;
+    let mix = |i: usize| {
+        (f32::from(color[i]) * amount + f32::from(ground[i]) * (1.0 - amount)).round() as u8
+    };
+    Some(Color::Rgb(mix(0), mix(1), mix(2)))
 }
 
 /// The palette every styling helper reads: the one activated by the draw in

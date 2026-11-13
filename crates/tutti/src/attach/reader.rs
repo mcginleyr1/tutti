@@ -39,6 +39,8 @@ pub enum Input {
     Focus(bool),
     /// A colour asked for: 10 the foreground, 11 the background.
     Color(u8, Rgb),
+    /// An ANSI palette slot asked for (OSC 4), and its colour.
+    Palette(u8, Rgb),
     /// The terminal turned dark (`true`) or light (mode 2031).
     Scheme(bool),
     /// The primary device attributes (DA1). Every terminal answers, so it
@@ -50,6 +52,8 @@ pub enum Input {
     Version(String),
     /// DECRPM: a DEC private mode and its state (0 unknown, 1 set, 2 reset).
     Mode(u16, u8),
+    /// The cell-border protocol's answer: the features the terminal draws.
+    Lines(Vec<String>),
 }
 
 /// A key as kitty's protocol reported it (`CSI code:shifted:base ; mods ;
@@ -311,7 +315,8 @@ fn string_end(b: &[u8], from: usize) -> Option<Option<(usize, usize)>> {
 const STRING_MAX: usize = 4096;
 
 /// `ESC ]`: an OSC — only the colour replies the TUI asks for (`10;` or
-/// `11;` then the colour). Anything else after `ESC ]` was typed: Alt+].
+/// `11;` then the colour, `4;` then an ANSI slot and its colour). Anything
+/// else after `ESC ]` was typed: Alt+].
 fn osc(b: &[u8]) -> Step {
     let digits = b[2..].iter().take_while(|c| c.is_ascii_digit()).count();
     match b.get(2 + digits) {
@@ -326,10 +331,16 @@ fn osc(b: &[u8]) -> Step {
             let body = &b[2..content];
             let color = std::str::from_utf8(body).ok().and_then(|s| {
                 let (which, spec) = s.split_once(';')?;
-                Some((which.parse::<u8>().ok()?, parse_rgb(spec)?))
+                let (slot, spec) = match which {
+                    "4" => spec.split_once(';')?,
+                    _ => ("0", spec),
+                };
+                let (which, slot) = (which.parse::<u8>().ok()?, slot.parse::<u8>().ok()?);
+                Some((which, slot, parse_rgb(spec)?))
             });
             match color {
-                Some((which @ (10 | 11), rgb)) => Step::Input(Input::Color(which, rgb), len),
+                Some((which @ (10 | 11), _, rgb)) => Step::Input(Input::Color(which, rgb), len),
+                Some((4, slot @ 0..16, rgb)) => Step::Input(Input::Palette(slot, rgb), len),
                 _ => Step::Skip(len),
             }
         }
@@ -347,12 +358,12 @@ fn parse_rgb(spec: &str) -> Option<Rgb> {
     channels.next().is_none().then_some(Rgb { r, g, b })
 }
 
-/// `ESC P`: a DCS — only XTVERSION's answer (`>|` then the name) and the
-/// replies to DECRQSS (`1$r`, `0$r`). Anything else after `ESC P` was
-/// typed: Alt+P.
+/// `ESC P`: a DCS — only XTVERSION's answer (`>|` then the name), the
+/// replies to DECRQSS (`1$r`, `0$r`) and the cell-border protocol's
+/// (`1+b`). Anything else after `ESC P` was typed: Alt+P.
 fn dcs(b: &[u8]) -> Step {
     let rest = &b[2..];
-    let known: [&[u8]; 3] = [b">|", b"1$r", b"0$r"];
+    let known: [&[u8]; 4] = [b">|", b"1$r", b"0$r", b"1+b"];
     if known.iter().any(|k| k.starts_with(rest)) {
         return Step::More;
     }
@@ -362,13 +373,17 @@ fn dcs(b: &[u8]) -> Step {
     match string_end(b, 2) {
         None if b.len() > STRING_MAX => alt_key(b),
         None | Some(None) => Step::More,
-        Some(Some((content, len))) => match b[2..content].strip_prefix(b">|") {
-            Some(name) => Step::Input(
-                Input::Version(String::from_utf8_lossy(name).into_owned()),
-                len,
-            ),
-            None => Step::Skip(len),
-        },
+        Some(Some((content, len))) => {
+            let body = String::from_utf8_lossy(&b[2..content]);
+            if let Some(name) = body.strip_prefix(">|") {
+                Step::Input(Input::Version(name.to_string()), len)
+            } else if let Some(features) = body.strip_prefix("1+bcell-border;ok;1;") {
+                let features = features.split(',').map(str::to_string).collect();
+                Step::Input(Input::Lines(features), len)
+            } else {
+                Step::Skip(len)
+            }
+        }
     }
 }
 
@@ -771,8 +786,18 @@ pub fn spawn(reads: Sender<Vec<u8>>) -> std::io::Result<()> {
 /// to hear.
 pub const ASK_KEYBOARD: &[u8] = b"\x1b[?u";
 
-/// The terminal's colours (OSC 10/11), asked and yet to be heard in full:
-/// a DA1 goes after the queries — every terminal answers it — so its reply
+/// Whether the terminal draws lines on cell edges (the cell-border
+/// protocol): one that does answers with its features (`Input::Lines`), and
+/// one that does not drops the string unanswered.
+pub const ASK_LINES: &[u8] = b"\x1bP1+bcell-border;q\x1b\\";
+
+/// The ANSI slots the `terminal` theme draws in: red, green, yellow and blue
+/// (blocked, done, working, the accent), and the two greys of its selection.
+const ASKED_SLOTS: [u8; 6] = [1, 2, 3, 4, 7, 8];
+
+/// The terminal's colours (OSC 10/11, and OSC 4 for the ANSI slots the
+/// chrome's hues are, `ASKED_SLOTS`), asked and yet to be heard in full: a
+/// DA1 goes after the queries — every terminal answers it — so its reply
 /// says the rest is in.
 pub struct Asked {
     at: Instant,
@@ -780,6 +805,9 @@ pub struct Asked {
     dark: Option<bool>,
     fg: Option<Rgb>,
     bg: Option<Rgb>,
+    /// The ANSI slots told, which the `terminal` theme's tints are mixed
+    /// from (`theme::set_terminal`).
+    pub ansi: [Option<Rgb>; 16],
     /// The DA1s yet to come back: an ask that takes over from one still
     /// out waits for its fence too, so the colours last told are the ones
     /// that count.
@@ -796,9 +824,15 @@ impl Asked {
             dark,
             fg: before.and_then(|b| b.fg),
             bg: before.and_then(|b| b.bg),
+            ansi: before.map_or([None; 16], |b| b.ansi),
             fences: 1 + before.map_or(0, |b| b.fences),
         };
-        (asked, b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b[c".to_vec())
+        let mut query = b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\".to_vec();
+        for slot in ASKED_SLOTS {
+            query.extend(format!("\x1b]4;{slot};?\x1b\\").bytes());
+        }
+        query.extend(b"\x1b[c");
+        (asked, query)
     }
 
     /// Take `input` if it answers. Once the last DA1 is in, or `ASK_WAIT`
@@ -808,6 +842,7 @@ impl Asked {
         match input {
             Input::Color(10, rgb) => self.fg = Some(*rgb),
             Input::Color(11, rgb) => self.bg = Some(*rgb),
+            Input::Palette(slot, rgb) => self.ansi[usize::from(*slot)] = Some(*rgb),
             Input::Attributes => {
                 self.fences = self.fences.saturating_sub(1);
                 return (self.fences == 0).then(|| self.colors());
@@ -998,6 +1033,10 @@ mod tests {
                 b"\x1bP>|rtty-vt 0.1\x1b\\",
                 vec![Input::Version("rtty-vt 0.1".into())],
             ),
+            (
+                b"\x1bP1+bcell-border;ok;1;pen,rect,round\x1b\\\x1bP1+bother\x1b\\",
+                vec![Input::Lines(vec!["pen".into(), "rect".into(), "round".into()])],
+            ),
             // What the TUI has no use for goes, and what only looks like the
             // start of a reply was typed: Alt+] and Alt+P, then the key.
             (b"\x1b[?1;2x\x1b]x\x1bPx", vec![c(']', ALT), c('x', NONE), c('P', SHIFT | ALT), c('x', NONE)]),
@@ -1170,14 +1209,24 @@ mod tests {
         let (dark_fg, dark_bg) = (rgb(0xabab, 0xb2b2, 0xbfbf), rgb(0x2828, 0x2c2c, 0x3434));
         let (light_fg, light_bg) = (rgb(0x6565, 0x7b7b, 0x8383), rgb(0xfdfd, 0xf6f6, 0xe3e3));
         let (mut asked, query) = Asked::ask(None, None);
-        assert_eq!(query, b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b[c");
+        assert_eq!(
+            query,
+            b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]4;1;?\x1b\\\x1b]4;2;?\x1b\\\x1b]4;3;?\x1b\\\
+              \x1b]4;4;?\x1b\\\x1b]4;7;?\x1b\\\x1b]4;8;?\x1b\\\x1b[c"
+        );
         for input in [
             Input::Color(10, dark_fg),
             Input::Color(11, dark_bg),
+            Input::Palette(4, light_bg),
             c('x', NONE),
         ] {
             assert_eq!(asked.take(&input), None);
         }
+        assert_eq!(asked.ansi[4], Some(light_bg), "a slot told is kept");
+        assert_eq!(
+            decode(&[b"\x1b]4;4;rgb:fdfd/f6f6/e3e3\x1b\\\x1b]4;99;rgb:0/0/0\x07"]),
+            vec![Input::Palette(4, light_bg)]
+        );
         let dark = HostColors {
             fg: dark_fg,
             bg: dark_bg,

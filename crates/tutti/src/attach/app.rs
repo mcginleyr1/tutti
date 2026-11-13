@@ -42,9 +42,9 @@ use crate::config::{self, Action, Config, PrefixAction, RESIZE_DELTA};
 use crate::host::{Host, Info, Local};
 use crate::issues;
 
-/// Rows the top chrome header claims: the full-width app bar plus the dim rule
-/// beneath it. The content region begins below them.
-const HEADER_ROWS: u16 = 2;
+/// The columns and rows between two panes whose frames the terminal draws
+/// on cell edges: two columns look about as wide as one row is tall.
+pub(super) const GUTTER: (u16, u16) = (2, 1);
 
 const STATUS_TTL: Duration = Duration::from_secs(4);
 /// How long the prefix can sit unanswered before the which-key popup appears.
@@ -1334,10 +1334,11 @@ impl App {
     /// Split the terminal `area` vertically into the content region (between the
     /// top app-bar header and the footer) and the one-row footer — the single
     /// source of truth for that split, shared by the renderer and the resize
-    /// sync. The app bar and its rule claim `HEADER_ROWS` at the top.
+    /// sync. The app bar and its rule (`header_rects`) claim the top.
     pub fn content_rect(area: Rect) -> (Rect, Rect) {
-        let top = HEADER_ROWS.min(area.height);
-        let content_h = area.height.saturating_sub(HEADER_ROWS + 1);
+        let header = Self::header_rects(area);
+        let top = (header.0.height + header.1.height).min(area.height);
+        let content_h = area.height.saturating_sub(top + 1);
         let content = Rect::new(area.x, area.y + top, area.width, content_h);
         let footer = Rect::new(
             area.x,
@@ -1597,13 +1598,29 @@ impl App {
         vec![control(&Request::ViewSizes { panes: view })]
     }
 
+    /// The active tab's panes laid out in `content`'s pane area. Frames of
+    /// box characters tile edge to edge. Frames the terminal draws on cell
+    /// edges (`host::lined`) take no cells, so a pane gives up `GUTTER` to
+    /// the pane on its right and the one below: each frame stands whole, and
+    /// the gutter is the split's border to grab.
     pub fn compute_rects(&self, content: Rect) -> Vec<(PaneId, Rect)> {
         let (_, panes, _) = self.regions(content);
         let Some(layout) = self.active_tab_view().and_then(|t| t.layout.as_ref()) else {
             return Vec::new();
         };
         let zoom = if self.zoom { self.focused } else { None };
-        pane_rects(layout, panes, zoom)
+        let mut rects = pane_rects(layout, panes, zoom);
+        if super::host::lined() {
+            for (_, rect) in &mut rects {
+                if rect.right() < panes.right() {
+                    rect.width = rect.width.saturating_sub(GUTTER.0);
+                }
+                if rect.bottom() < panes.bottom() {
+                    rect.height = rect.height.saturating_sub(GUTTER.1);
+                }
+            }
+        }
+        rects
     }
 
     // ---- helpers used by the render/event loop --------------------------
@@ -1938,15 +1955,26 @@ fn center(r: Rect) -> (u16, u16) {
     (r.x + r.width / 2, r.y + r.height / 2)
 }
 
-/// Inner (borderless) size of a pane rect as `(rows, cols)`, clamped to at
-/// least 1 so a pty is never asked for a zero dimension. A pane rect reserves
-/// its top row for the title line drawn above the frame, so height loses that
-/// row plus the two border rows.
-pub(super) fn inner_size(rect: Rect) -> (u16, u16) {
-    (
-        rect.height.saturating_sub(3).max(1),
-        rect.width.saturating_sub(2).max(1),
+/// The cells of a pane rect that show its program's screen. The rect's top
+/// row is the pane's title. A frame of box characters takes a row and a
+/// column on every side below it. One a terminal draws on cell edges
+/// (`host::lined`) takes no rows, and the screen keeps a column clear of
+/// the line on either side, where text would touch it.
+pub(super) fn screen_rect(rect: Rect) -> Rect {
+    let rows = u16::from(!super::host::lined());
+    Rect::new(
+        rect.x + 1,
+        rect.y + 1 + rows,
+        rect.width.saturating_sub(2),
+        rect.height.saturating_sub(1 + 2 * rows),
     )
+}
+
+/// A pane rect's screen as `(rows, cols)`, clamped to at least 1 so a pty is
+/// never asked for a zero dimension.
+pub(super) fn inner_size(rect: Rect) -> (u16, u16) {
+    let screen = screen_rect(rect);
+    (screen.height.max(1), screen.width.max(1))
 }
 
 /// What a key's press and its release have in common: kitty's code for the
