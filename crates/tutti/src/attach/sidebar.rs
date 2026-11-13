@@ -346,6 +346,11 @@ pub fn build(
         let owns = active_tab.is_some_and(|at| w.tabs.iter().any(|t| t.id == at));
         let jump_tab = active_tab
             .filter(|at| w.tabs.iter().any(|t| t.id == *at))
+            .or_else(|| {
+                let mut tabs = w.tabs.iter();
+                let running = tabs.find(|t| t.panes.iter().any(|p| p.exited.is_none()));
+                running.map(|t| t.id)
+            })
             .or_else(|| w.tabs.first().map(|t| t.id))?;
         Some(SidebarEntry::Workspace(WorkspaceRow {
             id: w.id,
@@ -534,6 +539,15 @@ impl App {
     /// client's collapse state so the frame headers and row math agree.
     pub fn sidebar(&self) -> Sidebar {
         let mut sidebar = build(&self.workspaces, self.active_tab, self.home.as_deref());
+        for entry in &mut sidebar.entries {
+            if let SidebarEntry::Workspace(row) = entry
+                && !row.active
+                && let Some(tab) = self.visited.get(&row.id)
+                && self.all_tabs().iter().any(|t| t.id == *tab)
+            {
+                row.jump_tab = *tab;
+            }
+        }
         sidebar.projects_collapsed = self.sidebar.collapsed_projects;
         sidebar.waiting_collapsed = self.sidebar.collapsed_waiting;
         sidebar
@@ -1251,6 +1265,43 @@ mod tests {
             a.subagents.is_empty(),
             "waiting rows strip subagents to stay two rows tall"
         );
+    }
+
+    /// From another project, a project's row goes to the tab it last
+    /// showed; one never shown here goes to a tab with something running
+    /// before one whose program exited.
+    #[test]
+    fn a_workspace_row_goes_back_to_the_tab_it_last_showed() {
+        let mut exited = shell(1);
+        exited.exited = Some(0);
+        let api_tabs = vec![
+            tab(1, "omp", false, leaf(1), vec![exited]),
+            tab(2, "claude", false, leaf(2), vec![shell(2)]),
+            tab(3, "zsh", false, leaf(3), vec![shell(3)]),
+        ];
+        let view = vec![
+            workspace(1, "api", Some("main"), api_tabs),
+            workspace(
+                2,
+                "web",
+                None,
+                vec![tab(4, "4", true, leaf(4), vec![shell(4)])],
+            ),
+        ];
+        let jump = |app: &App| match &app.sidebar().entries[0] {
+            SidebarEntry::Workspace(api) => api.jump_tab,
+            SidebarEntry::Agent(_) => panic!("expected api's row"),
+        };
+        let mut app = App::new();
+        attach_with(&mut app, view);
+        app.focus_change();
+        assert_eq!(jump(&app), TabId(2), "the first tab with a live pane");
+
+        app.jump_to(TabId(3), None);
+        app.focus_change();
+        app.jump_to(TabId(4), None);
+        app.focus_change();
+        assert_eq!(jump(&app), TabId(3), "where api was left");
     }
 
     #[test]

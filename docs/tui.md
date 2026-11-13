@@ -166,8 +166,10 @@ each followed by *its* agents one level deeper.
   kind` line, with any hook-reported subagents hanging below on their own
   guides. Agent rows keep **pane order** — a state change never reshuffles the
   tree under your cursor; attention order lives in the waiting queue.
-- **Selecting** a workspace jumps to its tab; selecting an agent jumps to its
-  pane, switching workspace and tab as needed.
+- **Selecting** a workspace jumps to the tab you last had open there (one you
+  have not opened since attaching: its first tab with a program still
+  running); selecting an agent jumps to its pane, switching workspace and tab
+  as needed.
 - **The 🔔 mark.** A pane that rings a bell or
   fires a desktop notification while in the background gets a 🔔 mark that
   clears once you focus it or its [notifications](notifications.md) are read.

@@ -200,6 +200,9 @@ pub struct App {
     /// The focus last reported to the server via `PaneFocus`; lets the event
     /// loop notice a focus change from any source (input, layout, attach).
     focus_sent: Option<PaneId>,
+    /// The tab each workspace last showed, which its sidebar row goes back
+    /// to from another workspace.
+    pub(super) visited: HashMap<WorkspaceId, TabId>,
     /// Whether the terminal the TUI runs in has the focus, as it last
     /// reported (mode 1004); it has until it says otherwise.
     host_focused: bool,
@@ -310,6 +313,7 @@ impl App {
             status: None,
             view_sent: Vec::new(),
             focus_sent: None,
+            visited: HashMap::new(),
             host_focused: true,
             focus_reported: None,
             rtty: None,
@@ -420,6 +424,11 @@ impl App {
             return None;
         }
         self.focus_sent = self.focused;
+        if let (Some(tab), Some(workspace)) =
+            (self.active_tab, self.active_workspace().map(|w| w.id))
+        {
+            self.visited.insert(workspace, tab);
+        }
         // A pane gaining focus clears its pending notification mark.
         if let Some(pane) = self.focused {
             self.notified.remove(&pane);
